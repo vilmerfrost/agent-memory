@@ -12,8 +12,10 @@ runs ──amem score──▶ scores ──amem escalations──▶ Vilmer ─
 
 Postgres only (psycopg) in V1: on the REST backend (docs/cloud.md) every
 scoring command exits 1 with a clear message. Jev runs in fixture mode unless the live rule
-in the README holds. Nothing in this flow pushes a notification: `escalations`
-only prints.
+in the README holds. The commands on this page never push a notification:
+`amem escalations` only prints. The daily job `amem daily` does push: it scores,
+then sends one phone (ntfy) or Mac notification for escalations it has not pushed
+before (counts and routine names only). See [daily.md](daily.md).
 
 ## Tables (`supabase/migrations/20261014020000_scores_labels.sql`)
 
@@ -101,7 +103,7 @@ failures:
 
 | Command | Does |
 |---|---|
-| `amem score [--routine R] [--since ISO] [--limit N]` | Scores unscored runs whose routine has a question file, newest first, at most N (default 100) sent to Jev. Prints `scored N runs, skipped M (no questions), K missing fixtures`. |
+| `amem score [--routine R] [--since ISO] [--limit N]` | Scores unscored runs whose routine has a question file, newest first, at most N (default 100) sent to Jev. Prints `scored N runs, skipped M (no questions), K missing fixtures`, plus `, F failed` when Jev failed for F runs (then exit 1). |
 | `amem label <run_id> up\|down [--note TEXT]` | Sets the run's label. Prints `labeled <id> <verdict> (new\|relabeled)`. A relabel overwrites the note too (no `--note` clears it). |
 | `amem escalations [--routine R]` | JSON lines, newest first: unlabeled scored runs where any choice or score confidence is **strictly below** the routine's `threshold`. |
 | `amem calibrate [--routine R] [--min-labels 10] [--target 0.9]` | JSON line per routine with a question file: agreement between Jev and labels, counts, suggested threshold. |
@@ -115,8 +117,14 @@ The other three only read. JSON goes to stdout; counts go to stderr.
 - Missing fixture (fixture mode): stderr names the run, the fixture key and the
   expected file. The run stays unscored, so the next `amem score` retries it.
   It counts toward `--limit`. Exit code stays 0.
-- Other Jev errors (bad fixture, API error): reported, counted as `F failed`,
-  exit 1. Already scored runs are kept.
+- Other Jev errors for one run: reported, counted as `F failed`, exit 1. This
+  covers SDK errors (HTTP 4xx/5xx, rate limit, connection, timeout), an invalid
+  API response, and a fixture that is not JSON or holds an invalid answer. The
+  run stays unscored (the next `amem score` retries it) and scoring goes on with
+  the next run, so one bad run never blocks the rest of its routine. The summary
+  line ends with `, F failed`. Already scored runs are kept. Error text never
+  holds the API key.
+- `--since` without a UTC offset is read as UTC.
 - A scored run is never rescored. Scores for one run are written together.
 
 ### escalations
@@ -134,7 +142,16 @@ Noul answers never escalate: they carry no confidence.
   counts, the current `threshold`, `suggested_threshold`, `note`.
 - **Suggested threshold**: the lowest pass_question confidence `t` such that the
   runs with confidence ≥ `t` number at least `--min-labels` and agree at least
-  `--target` of the time. Runs at or above it would be trusted without asking.
+  `--target` of the time.
+- What it measures: only the `pass_question`. Calibrate checks how often the
+  pass_question verdict agrees with the label at each confidence level. It does
+  not look at the other questions.
+- What escalations use: a run escalates when **any** choice or score question
+  has a confidence below `threshold`. So with `threshold` set to the suggestion,
+  a run whose pass_question confidence is at or above it does not escalate *for
+  that question*, but another question with low confidence can still escalate
+  it. The agreement rate is a measured fact about the pass_question only; it is
+  not a guarantee for the other questions.
 - Under `--min-labels` labels (default 10): `suggested_threshold: null`,
   `note: "not enough labels (n < 10)"`. When no level reaches the target, the
   note says so.
@@ -143,6 +160,8 @@ Noul answers never escalate: they carry no confidence.
 
 - Window = `[now - window, now)`. Baseline = the period of length `baseline`
   just before the window. They do not overlap.
+- `--now` without a UTC offset is read as UTC (`2026-10-12T00:00:00` =
+  `2026-10-12T00:00:00+00:00`).
 - Metrics, both 0..1:
   - `pass_rate`: share of runs with status `pass`. `skip` runs are left out.
     Every routine with runs.

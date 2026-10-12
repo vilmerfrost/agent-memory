@@ -15,6 +15,7 @@ from pathlib import Path
 
 import psycopg
 import pytest
+import typesafe_sdk
 
 from agent_memory import cli, jev, scoring
 from conftest import run_amem
@@ -27,7 +28,17 @@ from test_daily_support import (  # noqa: F401
     daily_io,
     gh_contents,
 )
-from test_scoring_support import TEST_QUESTIONS, ScoringDb, add_run, sdb  # noqa: F401
+from test_scoring_support import (  # noqa: F401
+    DUMMY_KEY,
+    TEST_QUESTIONS,
+    FakeJevClient,
+    ScoringDb,
+    add_run,
+    fixture_dir_with,
+    live_jev,
+    sdb,
+    sdk_headers,
+)
 
 from agent_memory import daily
 
@@ -177,6 +188,66 @@ def test_one_routine_jev_error_does_not_stop_others(sdb: ScoringDb, daily_io: Da
     # --no-push: nothing pushed, nothing marked; t-routine was still scored.
     assert daily_io.pushed_ids() == []
     assert _count(sdb.url, "select count(distinct run_id) from scores") == 4
+
+
+def _four_runs(url: str) -> dict[str, uuid.UUID]:
+    """The four t-routine states with recorded answers (no missing fixture)."""
+    return {
+        "edge equal": add_run(url, "t-routine", "fail", "edge equal", T0),
+        "edge below": add_run(url, "t-routine", "fail", "edge below", T0 + timedelta(hours=1)),
+        "edge score low": add_run(url, "t-routine", "pass", "edge score low", T0 + timedelta(hours=2)),
+        "all confident": add_run(url, "t-routine", "pass", "all confident", T0 + timedelta(hours=3)),
+    }
+
+
+def _scored_ids(url: str) -> set[uuid.UUID]:
+    with psycopg.connect(url) as conn:
+        return {r[0] for r in conn.execute("select distinct run_id from scores").fetchall()}
+
+
+def test_daily_jev_error_from_sdk_is_a_failed_step_and_other_runs_score(  # noqa: F811
+        sdb: ScoringDb, daily_io: DailyIO, live_jev: type[FakeJevClient]) -> None:  # noqa: F811
+    """Live mode, SDK client faked: a 5xx on one run (the real typesafe_sdk class) fails the
+    score step for that run only; the runs before and after it are scored and escalated."""
+    runs = _four_runs(sdb.url)
+    live_jev.errors = {"edge score low": typesafe_sdk.TypeSafeInternalServerError(
+        503, {"error": "upstream unavailable"}, sdk_headers())}
+
+    r = daily.run_daily(push=False, now=NOW)
+    assert live_jev.calls == ["all confident", "edge score low", "edge below", "edge equal"]
+    assert r.verdict == "FAIL" and r.scored == 3
+    assert r.failures == [
+        "score t-routine: 1 Jev error; first: Jev API error: TypeSafeInternalServerError: 503 upstream unavailable",
+    ]
+    assert _scored_ids(sdb.url) == {runs["all confident"], runs["edge below"], runs["edge equal"]}
+    assert r.escalations == 1  # edge below; edge score low is not scored yet
+    lines = daily_io.log_lines()
+    assert " amem-daily FAIL scored=3 escalations=1 new=1 push=none " in lines[0]
+    assert lines[1].endswith(" amem-daily-fail score t-routine: 1 Jev error; first: Jev API error: "
+                             "TypeSafeInternalServerError: 503 upstream unavailable")
+    assert all(DUMMY_KEY not in line for line in lines)
+
+    # Next day the API answers: the failed run is retried and scored.
+    live_jev.errors = {}
+    r = daily.run_daily(push=False, now=NOW)
+    assert (r.verdict, r.scored, r.escalations) == ("PASS", 1, 2)
+
+
+def test_daily_jev_error_from_corrupt_fixture_is_a_failed_step(  # noqa: F811
+        sdb: ScoringDb, daily_io: DailyIO, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:  # noqa: F811
+    runs = _four_runs(sdb.url)
+    corrupt = add_run(sdb.url, "t-routine", "fail", "corrupt json", T0 + timedelta(minutes=90))
+    monkeypatch.setenv("AMEM_JEV_FIXTURES_DIR",
+                       str(fixture_dir_with(tmp_path, {("fail", "corrupt json"): "not json at all"})))
+
+    r = daily.run_daily(push=False, now=NOW)
+    assert r.verdict == "FAIL" and r.scored == 4
+    (failure,) = r.failures
+    assert failure.startswith("score t-routine: 1 Jev error; first: fixture ")
+    assert "is unreadable or not JSON: JSONDecodeError" in failure
+    assert _scored_ids(sdb.url) == set(runs.values())
+    assert corrupt not in _scored_ids(sdb.url)
+    assert r.escalations == 2
 
 
 def test_ingest_failure_logs_and_parses_back(sdb: ScoringDb, daily_io: DailyIO) -> None:  # noqa: F811
