@@ -1,0 +1,24 @@
+{
+  "_note": "Hand-written fixture in the System One response shape. Not a recorded live response. Used by tests/test_jev.py.",
+  "model": "jev-latest",
+  "usage": {"input_tokens": 0, "output_tokens": 0},
+  "answers": {
+    "outcome": {
+      "type": "choice",
+      "choice": "pass",
+      "confidence": 0.92,
+      "probabilities": {"pass": 0.92, "partial": 0.06, "fail": 0.02}
+    },
+    "quality": {
+      "type": "score",
+      "score": 2.6,
+      "confidence": 0.81,
+      "legend": {"0": "Useless", "1": "Somewhat useful", "2": "Useful", "3": "Very useful"},
+      "probabilities": {"0": 0.02, "1": 0.05, "2": 0.24, "3": 0.69}
+    },
+    "needs_human": {
+      "type": "noul",
+      "noul": 0.07
+    }
+  }
+}
