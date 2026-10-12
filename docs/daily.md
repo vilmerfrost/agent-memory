@@ -1,0 +1,118 @@
+# Daily job: `amem daily`
+
+One command runs the learning loop once a day, on real data, with no human step.
+A launchd job calls it at 09:20.
+
+```
+amem daily [--no-push] [--routines-log PATH] [--state PATH]
+```
+
+```
+ cloud routines.log ──ingest──▶ runs ──score (Jev, per routine)──▶ scores
+                                                                     │
+          routines.log ◀── one summary line ◀── push new ids ◀── escalations
+```
+
+## Steps
+
+A failed step is recorded, and the next step still runs.
+
+1. **ingest**: the `ingest git-ref` logic (docs/cloud.md): `gh api` GET of
+   `reports/routines.log` on `vilmerfrost/agent-config@claude/routine-reports`.
+   Called in-process, not as a subprocess. Nothing published yet is not a failure.
+2. **score**: the `score` logic for each `questions/<routine>.toml`, one routine
+   at a time (at most 100 runs per routine). A Jev error or a crash in one
+   routine is a failed step for that routine only; the others still run.
+   A missing fixture (fixture mode only) is not a failure, the same as
+   `amem score`: the run stays unscored and is retried tomorrow.
+   `AMEM_JEV_LIVE=1` without `TYPESAFE_API_KEY` is a failed step (Jev would
+   silently stay in fixture mode).
+3. **escalations**: the open escalations (docs/scoring.md). The state file holds
+   the run ids already pushed.
+   - New = open ids not in the state. A push goes out only when there are new ids.
+   - Ids that are no longer open (labeled) are pruned from the state.
+   - An id is marked as pushed only after ntfy answers 200. The Mac fallback
+     does not mark it, so it is pushed again the next day.
+   - `--no-push` never pushes and never marks; it still prunes.
+4. **log**: one line appended to the routines log.
+
+Scoring and escalations need the Postgres backend (V1). `AMEM_REQUIRE_REMOTE=1`
+applies to every step: with a local or empty database, all three steps are
+refused (escalations too, so a local database can never cause a push).
+
+## Push
+
+Same as routine-audit:
+
+- Topic from `~/.claude/parent/notify.env`: `NTFY_TOPIC=`, optional `NTFY_SERVER=`
+  (default `https://ntfy.sh`). Only these two keys are read. The topic is never printed.
+- `POST <server>/<topic>`, body = text, headers `Title`, `Priority: default`, `Tags: label`.
+- No topic, a non-200 answer or an error: `osascript display notification` instead (`push=mac`).
+- The body names counts and routines only, never run summaries, failures or ids:
+
+  ```
+  Title: amem: 3 new runs to label
+  3 new escalations (5 open): config-check 2, routine-audit 1. Run `amem escalations`, then `amem label <run_id> up|down`.
+  ```
+
+## Routines log line
+
+Default `~/.claude/parent/routines.log`; `--routines-log` or `AMEM_ROUTINES_LOG`
+overrides it. House format (`%Y-%m-%dT%H:%M:%S%z`):
+
+```
+2026-10-13T09:20:04+0200 amem-daily FAIL scored=4 escalations=2 new=2 push=phone 3s
+2026-10-13T09:20:04+0200 amem-daily-fail score t-other: 1 Jev error; first: upstream 500
+```
+
+- `push=none|phone|mac`. One `amem-daily-fail <reason>` line per failed step.
+- `amem ingest routines-log` reads these back as routine `amem-daily`
+  (`meta.scored`, `meta.escalations`, `meta.new`, `meta.push`, `meta.duration_s`,
+  `meta.failures`).
+- stdout repeats the appended lines. Exit 0 on PASS, 1 on FAIL.
+
+## State file
+
+Default `~/.claude/parent/amem-daily-state.json`; `--state` or `AMEM_DAILY_STATE`
+overrides it. Written atomically, mode 600:
+
+```json
+{"pushed_run_ids": ["<uuid>", "..."], "updated_at": "2026-10-13T09:20:04+0200"}
+```
+
+An unreadable file is a failed step and is treated as empty (worst case: one repeat push).
+
+## launchd job
+
+`deploy/launchd/com.vilmerfrost.amem-daily.plist`:
+
+- Runs `/opt/homebrew/bin/uv run --directory /Users/vilmerfrost/Projects/agent-memory --quiet amem daily`.
+- Env: `AMEM_REQUIRE_REMOTE=1`, `AMEM_JEV_LIVE=1`, and `PATH` with
+  `~/.local/bin` (launchd's default PATH has no `gh`). The DB URL and the Jev key
+  come from the main checkout's env file, which `amem` loads itself.
+- Daily at 09:20 (`StartCalendarInterval`), `RunAtLoad` false.
+- stdout and stderr: `~/.claude/parent/reports/launchd.log`.
+
+Install (by hand; nothing in this repo installs it):
+
+```sh
+plutil -lint deploy/launchd/com.vilmerfrost.amem-daily.plist
+cp deploy/launchd/com.vilmerfrost.amem-daily.plist ~/Library/LaunchAgents/
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.vilmerfrost.amem-daily.plist
+launchctl kickstart gui/$(id -u)/com.vilmerfrost.amem-daily   # optional: one run now
+tail -n 5 ~/.claude/parent/routines.log
+```
+
+Remove: `launchctl bootout gui/$(id -u)/com.vilmerfrost.amem-daily`, then delete
+the copied plist.
+
+## Try it safely
+
+Against a throwaway database, in fixture mode, without pushing:
+
+```sh
+AMEM_DB_URL=postgresql://postgres:postgres@127.0.0.1:<port>/postgres \
+  uv run amem daily --no-push --routines-log /tmp/amem-demo/routines.log --state /tmp/amem-demo/state.json
+```
+
+Tests: `tests/test_daily_*.py` (ntfy, osascript and `gh` are stand-ins; no network).
