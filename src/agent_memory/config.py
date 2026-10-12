@@ -13,7 +13,9 @@ On the REST backend (`AMEM_BACKEND=rest`, see docs/cloud.md) it checks
 
 from __future__ import annotations
 
+import ipaddress
 import os
+import socket
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -95,6 +97,7 @@ def rest_host(url: str) -> str:
     try:
         parts = urlsplit(url)
         host = parts.hostname
+        parts.port  # noqa: B018 - raises ValueError for a bad port
     except ValueError:
         return "invalid"
     if parts.scheme not in ("http", "https"):
@@ -102,16 +105,74 @@ def rest_host(url: str) -> str:
     return host or "none"
 
 
-_LOCAL_NAMES = {"localhost", "::1", "0.0.0.0", "::"}
+_LOCAL_NAMES = {"localhost", "localhost.localdomain", "ip6-localhost", "ip6-loopback"}
+
+
+def _ip_is_local(addr: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    """Loopback or unspecified, including IPv4 hidden inside IPv6 (mapped or compatible)."""
+    if addr.is_loopback or addr.is_unspecified:
+        return True
+    if isinstance(addr, ipaddress.IPv6Address):
+        inner = addr.ipv4_mapped
+        if inner is None and int(addr) >> 32 == 0:
+            inner = ipaddress.IPv4Address(int(addr) & 0xFFFFFFFF)  # ::a.b.c.d (IPv4-compatible)
+        return inner is not None and _ip_is_local(inner)
+    return addr in ipaddress.IPv4Network("0.0.0.0/8")  # "this host" (0, 0.x.y.z)
+
+
+def _parse_ip(host: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    """An IP address in any spelling the resolver accepts, or None for a name.
+
+    `ipaddress` parses the canonical forms (incl. long-form and mapped IPv6);
+    `socket.inet_aton` adds the legacy IPv4 forms libc/getaddrinfo also accept:
+    `0`, `127.1`, decimal `2130706433`, hex `0x7f000001`, octal `0177.0.0.1`.
+    """
+    try:
+        return ipaddress.ip_address(host)
+    except ValueError:
+        pass
+    if not host or any(c.isspace() for c in host):
+        return None
+    try:
+        return ipaddress.IPv4Address(socket.inet_aton(host))
+    except (OSError, ValueError):
+        return None
 
 
 def _is_local_host(host: str) -> bool:
-    host = host.strip().strip("[]").lower()
+    """True for every spelling of this machine: socket paths, localhost names, loopback IPs."""
+    host = host.strip()
     if not host or host.startswith("/") or host.startswith("@"):
         return True  # empty = libpq default (unix socket); "/..." = socket dir
+    host = host.strip("[]").split("%", 1)[0].lower()  # IPv6 brackets, zone id (%lo0, %25lo0)
+    host = host.rstrip(".")  # FQDN root dot: "localhost." == "localhost"
+    if not host:
+        return True
     if host in _LOCAL_NAMES or host.endswith(".localhost"):
         return True
-    return host.startswith("127.")
+    addr = _parse_ip(host)
+    return addr is not None and _ip_is_local(addr)
+
+
+def supabase_url_error(url: str | None = None) -> str | None:
+    """Why AMEM_SUPABASE_URL cannot be used for a request, or None if it can.
+
+    It must be an absolute http(s) URL with a host. Plain `http://` is allowed
+    only to a local host (the test stub); any remote host needs `https://`, so an
+    `apikey` (set here or added by a network proxy) never travels unencrypted.
+    The message names the host at most, never the URL's path, query or the key.
+    """
+    url = supabase_url() if url is None else url
+    if not url:
+        return "AMEM_SUPABASE_URL is empty or unset"
+    host = rest_host(url)
+    if host == "invalid":
+        return "AMEM_SUPABASE_URL is not an http(s) URL (expected https://<project-ref>.supabase.co)"
+    if host == "none":
+        return "AMEM_SUPABASE_URL has no host"
+    if urlsplit(url).scheme == "http" and not _is_local_host(host):
+        return f"AMEM_SUPABASE_URL uses http:// for remote host {host}; use https://"
+    return None
 
 
 def db_hosts(url: str) -> list[str]:

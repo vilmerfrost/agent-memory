@@ -6,6 +6,7 @@ backend uses and records every request (method, path, query, headers, body).
 
 from __future__ import annotations
 
+import contextlib
 import json
 import threading
 import uuid
@@ -30,6 +31,7 @@ class Stub:
         self.rows: list[dict[str, Any]] = []
         self.requests: list[dict[str, Any]] = []
         self.fail_with: int | None = None
+        self.redirect: tuple[int, str, set[str]] | None = None  # (code, target base URL, methods)
         self.lock = threading.Lock()
 
     def handle(self, method: str, raw_path: str, headers: dict[str, str], body: Any) -> tuple[int, Any]:
@@ -39,6 +41,8 @@ class Stub:
             self.requests.append(
                 {"method": method, "path": parts.path, "query": query, "headers": headers, "body": body}
             )
+            if self.redirect and method in self.redirect[2]:
+                return self.redirect[0], None
             if self.fail_with:
                 return self.fail_with, {"code": "XX000", "message": "stub failure"}
             if parts.path != "/rest/v1/runs":
@@ -88,8 +92,8 @@ class Stub:
         return 204, None
 
 
-@pytest.fixture
-def stub() -> Iterator[tuple[Stub, str]]:
+@contextlib.contextmanager
+def _serve_stub() -> Iterator[tuple[Stub, str]]:
     state = Stub()
 
     class Handler(BaseHTTPRequestHandler):
@@ -101,6 +105,8 @@ def stub() -> Iterator[tuple[Stub, str]]:
             status, payload = state.handle(self.command, self.path, headers, body)
             data = b"" if payload is None else json.dumps(payload).encode()
             self.send_response(status)
+            if state.redirect and 300 <= status < 400:
+                self.send_header("Location", state.redirect[1] + self.path)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
@@ -121,10 +127,23 @@ def stub() -> Iterator[tuple[Stub, str]]:
         server.server_close()
 
 
+@pytest.fixture
+def stub() -> Iterator[tuple[Stub, str]]:
+    with _serve_stub() as served:
+        yield served
+
+
+@pytest.fixture
+def other_stub() -> Iterator[tuple[Stub, str]]:
+    """A second server on another port: the target of a redirect."""
+    with _serve_stub() as served:
+        yield served
+
+
 @pytest.fixture(autouse=True)
 def _rest_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    for name in ("AMEM_SUPABASE_URL", "AMEM_SUPABASE_KEY", "AMEM_BACKEND", "AMEM_DB_URL"):
-        monkeypatch.delenv(name, raising=False)
+    # conftest has already removed every AMEM_* the shell exported; each test
+    # points AMEM_SUPABASE_URL at its own local stub explicitly.
     monkeypatch.setenv("no_proxy", "*")  # never route the local stub through a proxy
 
 
@@ -135,11 +154,8 @@ def _use(monkeypatch: pytest.MonkeyPatch, url: str, key: str | None = None) -> N
 
 
 def _rest_cli_env(url: str, **extra: str) -> dict[str, str]:
-    env = base_env(AMEM_SUPABASE_URL=url, no_proxy="*", **extra)
-    for name in ("AMEM_SUPABASE_KEY", "AMEM_BACKEND"):
-        if name not in extra:
-            env.pop(name, None)
-    return env
+    # base_env carries no AMEM_* from the shell: only the stub URL and `extra`.
+    return base_env(AMEM_SUPABASE_URL=url, no_proxy="*", **extra)
 
 
 # ------------------------------------------------------------ backend selection
@@ -358,3 +374,119 @@ def test_cli_refuses_local_stub_and_sends_nothing(stub: tuple[Stub, str], args: 
     assert "AMEM_REQUIRE_REMOTE=1" in result.stderr and "refusing to write" in result.stderr
     assert state.requests == []
     assert KEY not in result.stdout + result.stderr
+
+
+# ------------------------------------------------------------ redirects are never followed
+
+
+@pytest.mark.parametrize("code", [301, 302, 303, 307, 308])
+def test_redirect_is_an_error_and_key_never_reaches_target(
+    stub: tuple[Stub, str], other_stub: tuple[Stub, str], code: int
+) -> None:
+    state, url = stub
+    target, target_url = other_stub
+    state.redirect = (code, target_url, {"GET", "POST", "PATCH"})
+    result = run_amem("log-run", "--routine", "r1", "--status", "pass",
+                      env=_rest_cli_env(url, AMEM_SUPABASE_KEY=KEY))
+    assert result.returncode == 1
+    assert f"HTTP {code} redirect refused" in result.stderr
+    assert "Traceback" not in result.stderr
+    assert result.stdout == ""  # no run id printed
+    assert len(state.requests) == 1
+    assert target.requests == []  # nothing (and no apikey) reached the second server
+    assert KEY not in result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("methods", [{"GET"}, {"POST"}, {"GET", "POST", "PATCH"}])
+def test_ingest_redirect_reports_no_new_rows(
+    stub: tuple[Stub, str], other_stub: tuple[Stub, str], monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str], methods: set[str]
+) -> None:
+    state, url = stub
+    target, target_url = other_stub
+    _use(monkeypatch, url, KEY)
+    state.redirect = (302, target_url, methods)
+    assert cli.main(["ingest", "routines-log", str(FIXTURE)]) == 1
+    out = capsys.readouterr()
+    assert "ingested" not in out.out
+    assert "HTTP 302 redirect refused" in out.err
+    assert target.requests == []
+    assert state.rows == [] and target.rows == []
+    assert KEY not in out.out + out.err
+
+
+def test_doctor_redirect_is_unreachable(stub: tuple[Stub, str], other_stub: tuple[Stub, str]) -> None:
+    state, url = stub
+    target, target_url = other_stub
+    state.redirect = (302, target_url, {"GET"})
+    result = run_amem("doctor", env=_rest_cli_env(url, AMEM_SUPABASE_KEY=KEY))
+    assert result.returncode == 0, result.stderr
+    assert "db=unreachable" in result.stdout.splitlines()
+    assert target.requests == []
+
+
+# ------------------------------------------------------------ AMEM_SUPABASE_URL validation
+
+
+def _no_network(monkeypatch: pytest.MonkeyPatch) -> None:
+    def tripwire(*_a: object, **_k: object) -> None:
+        raise AssertionError("REST request attempted for a URL that must be refused")
+
+    monkeypatch.setattr(backend_rest._OPENER, "open", tripwire)
+
+
+@pytest.mark.parametrize("url", ["project.supabase.co", "project.supabase.co/rest", "ftp://project.example.com",
+                                 "https://", "http://[bad"])
+@pytest.mark.parametrize(
+    "args",
+    [("log-run", "--routine", "x", "--status", "pass"), ("runs", "--routine", "x"),
+     ("ingest", "routines-log", str(FIXTURE))],
+)
+def test_unusable_url_is_a_clean_error(url: str, args: tuple[str, ...]) -> None:
+    result = run_amem(*args, env=_rest_cli_env(url, AMEM_BACKEND="rest"))
+    assert result.returncode == 1, result.stderr
+    assert result.stderr.startswith("amem: ")
+    assert "AMEM_SUPABASE_URL" in result.stderr
+    assert "Traceback" not in result.stderr
+    assert result.stdout == ""
+
+
+@pytest.mark.parametrize("url", ["project.supabase.co", "https://", "http://[bad"])
+def test_doctor_unusable_url_is_unreachable(url: str) -> None:
+    # Without AMEM_BACKEND: a set AMEM_SUPABASE_URL alone selects rest.
+    result = run_amem("doctor", env=_rest_cli_env(url))
+    assert result.returncode == 0, result.stderr
+    assert "Traceback" not in result.stderr
+    lines = result.stdout.splitlines()
+    assert "backend=rest" in lines
+    assert "db=unreachable" in lines
+    assert any(line in ("db_host=invalid", "db_host=none") for line in lines)
+
+
+@pytest.mark.parametrize("key", [KEY, None])
+def test_remote_plain_http_is_refused_before_any_request(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], key: str | None
+) -> None:
+    _no_network(monkeypatch)
+    _use(monkeypatch, "http://project.example.com", key)
+    assert cli.main(["log-run", "--routine", "x", "--status", "pass"]) == 1
+    assert cli.main(["runs", "--routine", "x"]) == 1
+    assert cli.main(["ingest", "routines-log", str(FIXTURE)]) == 1
+    err = capsys.readouterr().err
+    assert err.count("uses http:// for remote host project.example.com; use https://") == 3
+    assert KEY not in err
+    assert backend_rest.reachable() is False
+
+
+def test_local_plain_http_with_key_is_allowed(stub: tuple[Stub, str], monkeypatch: pytest.MonkeyPatch) -> None:
+    # The test stub is http://127.0.0.1:<port>: a local host may use plain http.
+    state, url = stub
+    _use(monkeypatch, url, KEY)
+    assert config.supabase_url_error() is None
+    assert backend_rest.reachable() is True
+    assert state.requests[0]["headers"]["apikey"] == KEY
+
+
+def test_https_remote_url_passes_validation(monkeypatch: pytest.MonkeyPatch) -> None:
+    _use(monkeypatch, "https://project.example.com", KEY)
+    assert config.supabase_url_error() is None
