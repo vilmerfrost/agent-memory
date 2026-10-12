@@ -32,6 +32,19 @@ Env for REST:
 HTTP is stdlib `urllib` (no extra dependency). It honours `HTTPS_PROXY` /
 `NO_PROXY`.
 
+Transport rules, checked before any request (a failure is an `amem: ...`
+error, exit 1; `doctor` prints `db=unreachable` and exits 0):
+
+- `AMEM_SUPABASE_URL` must be an absolute `https://` URL with a host, e.g.
+  `https://<project-ref>.supabase.co`. A schemeless value
+  (`<project-ref>.supabase.co`) is refused, not guessed.
+- Plain `http://` is allowed only to a local host (a test stub on
+  `127.0.0.1`). A remote `http://` URL is refused, with or without
+  `AMEM_SUPABASE_KEY`, so the `apikey` never travels unencrypted.
+- Redirects are never followed. A 30x answer is an error
+  (`HTTP 302 redirect refused`): the `apikey` header and the body never reach
+  another host, and a redirected write is never counted as written.
+
 ### Requests
 
 | Command | Request |
@@ -60,8 +73,26 @@ POST. The server skips it (no duplicate), but this run counts it as new.
 ### `AMEM_REQUIRE_REMOTE=1`
 
 Holds for both backends. On REST, writes exit 3 when `AMEM_SUPABASE_URL` is
-empty, not an http(s) URL, or its host is local (`localhost`, `127.x`, `::1`,
-`*.localhost`). `db migrate` always checks `AMEM_DB_URL`.
+empty, not an http(s) URL, or its host is local. `db migrate` always checks
+`AMEM_DB_URL`.
+
+"Local" is the same rule for a Postgres DSN host (and `hostaddr`, and `PGHOST`
+when the DSN has no host) and for the REST URL host. Hosts are normalised
+first: lower case, IPv6 brackets and zone id (`%lo0`) removed, one trailing
+root dot removed. Then a host is local when it is:
+
+- empty, or a Unix socket path (`/tmp`, `@abstract`);
+- `localhost`, `*.localhost`, `localhost.localdomain`, `ip6-localhost`,
+  `ip6-loopback` (any case, with or without a trailing dot);
+- an IP address, in any spelling the resolver accepts, that is loopback
+  (`127.0.0.0/8`, `::1`), unspecified (`0.0.0.0`, `::`) or in `0.0.0.0/8`.
+  This includes long-form IPv6 (`0:0:0:0:0:0:0:1`), IPv4-mapped and
+  IPv4-compatible IPv6 (`::ffff:127.0.0.1`, `::127.0.0.1`) and the legacy
+  IPv4 forms `socket.inet_aton` parses: `0`, `127.1`, decimal `2130706433`,
+  hex `0x7f000001`, octal `0177.0.0.1`.
+
+Names are not resolved (no DNS lookup). A remote name that merely contains
+`localhost` or `127` (`localhost.example.com`, `127.example.com`) is allowed.
 
 ### `amem doctor`
 

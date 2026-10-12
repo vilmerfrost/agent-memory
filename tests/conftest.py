@@ -1,5 +1,12 @@
 """Shared fixtures.
 
+- The test process never inherits a store, a key or a live flag from the calling
+  shell. Every `AMEM_*`, `PG*`, `TYPESAFE_*` and `SUPABASE_*` variable is removed
+  from `os.environ` when this conftest loads (before collection and before any
+  session fixture), again before every test, and from every subprocess env built
+  by `base_env`. So `AMEM_SUPABASE_URL` / `AMEM_BACKEND=rest` / `AMEM_DB_URL`
+  exported by a cloud session can never route a test to a hosted DB. A test that
+  wants the REST backend sets its own stub URL explicitly.
 - Every test runs with env files disabled and Jev forced to fixture mode.
 - The SDK client is replaced by a tripwire, so no test can make a live Jev call.
 - `pg_url` starts one throwaway Postgres container per session on an OS-assigned
@@ -13,7 +20,7 @@ import shutil
 import subprocess
 import sys
 import time
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from pathlib import Path
 
 import psycopg
@@ -22,14 +29,41 @@ import pytest
 PG_IMAGE = "pgvector/pgvector:pg17"
 AMEM = str(Path(sys.executable).parent / "amem")
 
+# Env names a test must never inherit: they pick or authenticate a store
+# (AMEM_DB_URL, AMEM_BACKEND, AMEM_SUPABASE_URL/KEY, PG* for libpq), carry a key
+# (TYPESAFE_API_KEY, SUPABASE_*), or change behaviour (AMEM_JEV_LIVE,
+# AMEM_REQUIRE_REMOTE, AMEM_QUESTIONS_DIR, ...). Tests set what they need.
+ISOLATED_PREFIXES = ("AMEM_", "PG", "TYPESAFE_", "SUPABASE_")
+
+
+def is_isolated_name(name: str) -> bool:
+    return name.upper().startswith(ISOLATED_PREFIXES)
+
+
+def isolated_environ(source: Mapping[str, str]) -> dict[str, str]:
+    """A copy of `source` without any isolated name, with env files disabled."""
+    env = {k: v for k, v in source.items() if not is_isolated_name(k)}
+    env["AMEM_NO_DOTENV"] = "1"
+    return env
+
+
+def _scrub_process_env() -> None:
+    for name in [k for k in os.environ if is_isolated_name(k)]:
+        del os.environ[name]
+    os.environ["AMEM_NO_DOTENV"] = "1"
+
+
+# At import: runs before collection, before session fixtures (pg_url) and before
+# any agent_memory code reads the environment.
+_scrub_process_env()
+
 
 @pytest.fixture(autouse=True)
 def _offline_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Again per test, in case anything outside monkeypatch wrote one of the names.
+    for name in [k for k in os.environ if is_isolated_name(k)]:
+        monkeypatch.delenv(name)
     monkeypatch.setenv("AMEM_NO_DOTENV", "1")
-    monkeypatch.delenv("AMEM_JEV_LIVE", raising=False)
-    monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
-    monkeypatch.delenv("AMEM_REQUIRE_REMOTE", raising=False)
-    monkeypatch.delenv("PGHOST", raising=False)
 
     import typesafe_sdk
 
@@ -41,10 +75,12 @@ def _offline_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def base_env(**extra: str) -> dict[str, str]:
-    """Env for CLI subprocesses: no env files, no Jev key, no live flag, no remote requirement."""
-    drop = ("TYPESAFE_API_KEY", "AMEM_JEV_LIVE", "AMEM_DB_URL", "AMEM_REQUIRE_REMOTE", "PGHOST")
-    env = {k: v for k, v in os.environ.items() if k not in drop}
-    env["AMEM_NO_DOTENV"] = "1"
+    """Env for CLI subprocesses: the current env minus every isolated name, plus `extra`.
+
+    No env files, no Jev key, no live flag, no remote requirement, no store
+    selection. Only what the test passes in `extra` reaches the subprocess.
+    """
+    env = isolated_environ(os.environ)
     env.update(extra)
     return env
 

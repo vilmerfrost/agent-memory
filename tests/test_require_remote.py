@@ -73,6 +73,65 @@ def test_remote_hosts_are_allowed(monkeypatch: pytest.MonkeyPatch, url: str) -> 
     assert config.remote_write_error() is None
 
 
+# Every spelling of "this machine" a resolver accepts. As URL/DSN host parts:
+# IPv6 in brackets. Each is refused on both backends.
+LOOPBACK_SPELLINGS = [
+    "127.0.0.1", "127.0.0.2", "127.255.255.254",
+    "localhost", "LOCALHOST", "localhost.", "app.localhost", "app.localhost.", "localhost.localdomain",
+    "[::1]", "[0:0:0:0:0:0:0:1]", "[0000:0000:0000:0000:0000:0000:0000:0001]",
+    "[::ffff:127.0.0.1]", "[::ffff:7f00:1]", "[::127.0.0.1]",  # IPv4-mapped / -compatible
+    "[::1%25lo0]",  # zone id
+    "[::]", "[0:0:0:0:0:0:0:0]", "0.0.0.0", "0", "0.1.2.3",  # unspecified / "this host"
+    "2130706433", "0x7f000001", "0x7F.0.0.1", "0177.0.0.1", "127.1", "127.0.1",  # inet_aton forms
+    "127.0.0.1.",
+]
+# Real remote hosts stay allowed, including names that merely contain "localhost"/"127".
+REMOTE_SPELLINGS = [
+    "db.example.com", "aws-0-eu-north-1.pooler.example.com", "project.supabase.co", "203.0.113.5",
+    "[2001:db8::1]", "[::ffff:203.0.113.5]", "localhost.example.com", "mylocalhost", "127.example.com",
+    "0x7f.example.com", "db.example.com.",
+]
+
+
+@pytest.mark.parametrize("host", LOOPBACK_SPELLINGS)
+def test_loopback_spellings_refused_on_postgres(monkeypatch: pytest.MonkeyPatch, host: str) -> None:
+    _on(monkeypatch, f"postgresql://postgres:{PW}@{host}:5432/postgres")
+    error = config.remote_write_error()
+    assert error is not None and "database host is local" in error, host
+    assert PW not in error
+
+
+@pytest.mark.parametrize("host", LOOPBACK_SPELLINGS)
+def test_loopback_spellings_refused_on_rest(monkeypatch: pytest.MonkeyPatch, host: str) -> None:
+    monkeypatch.setenv("AMEM_REQUIRE_REMOTE", "1")
+    monkeypatch.setenv("AMEM_SUPABASE_URL", f"https://{host}")
+    assert config.backend() == "rest"
+    error = config.remote_write_error()
+    assert error is not None and "REST host is local" in error, host
+
+
+@pytest.mark.parametrize("host", REMOTE_SPELLINGS)
+def test_remote_spellings_allowed_on_both_backends(monkeypatch: pytest.MonkeyPatch, host: str) -> None:
+    _on(monkeypatch, f"postgresql://postgres:{PW}@{host}:5432/postgres")
+    assert config.remote_write_error() is None, host
+    monkeypatch.delenv("AMEM_DB_URL")
+    monkeypatch.setenv("AMEM_SUPABASE_URL", f"https://{host}")
+    assert config.backend() == "rest"
+    assert config.remote_write_error() is None, host
+
+
+def test_loopback_spelling_blocks_cli_write() -> None:
+    # End to end through the CLI: refused with exit 3 before any connection.
+    for url in ("postgresql://postgres:pw@[::ffff:127.0.0.1]:5432/postgres",
+                "postgresql://postgres:pw@2130706433:5432/postgres"):
+        result = run_amem("log-run", "--routine", "x", "--status", "pass",
+                          env=base_env(AMEM_REQUIRE_REMOTE="1", AMEM_DB_URL=url))
+        assert result.returncode == cli.REMOTE_REQUIRED_EXIT, result.stderr
+    result = run_amem("log-run", "--routine", "x", "--status", "pass",
+                      env=base_env(AMEM_REQUIRE_REMOTE="1", AMEM_SUPABASE_URL="https://0x7f000001"))
+    assert result.returncode == cli.REMOTE_REQUIRED_EXIT, result.stderr
+
+
 def test_pghost_counts_when_dsn_has_no_host(monkeypatch: pytest.MonkeyPatch) -> None:
     _on(monkeypatch, "postgresql:///postgres")
     monkeypatch.setenv("PGHOST", "db.example.com")

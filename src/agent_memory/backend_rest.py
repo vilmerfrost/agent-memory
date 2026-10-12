@@ -10,6 +10,12 @@ keys belong in `apikey` only: they are not JWTs, so they never go in
 way out, so the session needs no key at all. The key is never printed or logged:
 error messages hold the HTTP status and PostgREST's message only.
 
+Transport rules (checked before any I/O, see `config.supabase_url_error`):
+the URL must be http(s) with a host, and a remote host needs `https://`
+(plain http only reaches a local test stub). Redirects are never followed: a
+30x is a RestError, so neither the `apikey` header nor the body ever reaches a
+host other than AMEM_SUPABASE_URL's, and a redirected write is never counted.
+
 Ingest counts (`N new / M already present`): a pre-check GET of the batch's
 `source_key`s (`source_key=in.(...)`) splits rows into new and present. New rows
 are POSTed in batches as an upsert with `on_conflict=source_key` and
@@ -29,7 +35,7 @@ from datetime import UTC, datetime
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from agent_memory import config
 from agent_memory.routines_log import ParsedRun
@@ -49,6 +55,20 @@ def _chunks(items: Sequence[Any], size: int) -> Iterator[Sequence[Any]]:
         yield items[i : i + size]
 
 
+class _RefuseRedirects(HTTPRedirectHandler):
+    """Never follow a 30x. urllib's default handler re-sends every header,
+    `apikey` included, to whatever host the Location names, and turns a POST
+    into a GET whose 200 would count rows as written. A redirect is an error."""
+
+    def redirect_request(self, req: Request, fp: Any, code: int, msg: str, headers: Any,
+                         newurl: str) -> None:
+        return None  # urllib then raises HTTPError(code) via the default error handler
+
+
+# Proxy support (HTTPS_PROXY / NO_PROXY) stays: build_opener keeps ProxyHandler.
+_OPENER = build_opener(_RefuseRedirects)
+
+
 def _request(
     method: str,
     query: list[tuple[str, str]] | None = None,
@@ -57,10 +77,15 @@ def _request(
     *,
     table: str = TABLE,
 ) -> Any:
-    """One PostgREST call. Returns the parsed JSON body, or None for an empty body."""
+    """One PostgREST call. Returns the parsed JSON body, or None for an empty body.
+
+    Raises RestError before any network I/O when AMEM_SUPABASE_URL is unusable
+    (empty, not an http(s) URL, or plain http to a remote host).
+    """
     base = config.supabase_url()
-    if not base:
-        raise RestError("AMEM_SUPABASE_URL is empty or unset")
+    problem = config.supabase_url_error(base)
+    if problem:
+        raise RestError(problem)
     url = f"{base}/rest/v1/{table}"
     if query:
         url += "?" + urlencode(query, quote_via=quote, safe=",().*")
@@ -74,15 +99,22 @@ def _request(
     key = config.supabase_key()
     if key:
         headers["apikey"] = key
-    req = Request(url, data=data, headers=headers, method=method)
     try:
-        with urlopen(req, timeout=TIMEOUT_S) as resp:
+        req = Request(url, data=data, headers=headers, method=method)
+        with _OPENER.open(req, timeout=TIMEOUT_S) as resp:
+            if not 200 <= resp.status < 300:  # e.g. a 304, which urllib returns as-is
+                raise RestError(f"{method} /rest/v1/{table} -> unexpected HTTP {resp.status}")
             raw = resp.read()
     except HTTPError as exc:
+        if 300 <= exc.code < 400:
+            raise RestError(f"{method} /rest/v1/{table} -> HTTP {exc.code} redirect refused "
+                            "(check AMEM_SUPABASE_URL)") from None
         raise RestError(f"{method} /rest/v1/{table} -> HTTP {exc.code}: {_error_text(exc)}") from None
     except (URLError, TimeoutError, OSError) as exc:
         reason = getattr(exc, "reason", exc)
         raise RestError(f"{method} /rest/v1/{table} failed: {reason}") from None
+    except ValueError:
+        raise RestError(f"{method} /rest/v1/{table} failed: AMEM_SUPABASE_URL is not a valid URL") from None
     if not raw.strip():
         return None
     try:
