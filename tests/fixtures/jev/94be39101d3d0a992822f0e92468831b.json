@@ -1,0 +1,39 @@
+{
+  "_note": "Hand-written fixture for tests/test_scoring_*.py (t-routine question set). Not a live response.",
+  "_state": "routine: t-routine\nstatus: pass\nsummary: all confident\nfailure_reason: (none)\nfailures: (none)",
+  "model": "jev-latest",
+  "usage": {
+    "input_tokens": 0,
+    "output_tokens": 0
+  },
+  "answers": {
+    "verdict": {
+      "type": "choice",
+      "choice": "ok",
+      "confidence": 0.97,
+      "probabilities": {
+        "ok": 0.97,
+        "needs_action": 0.03
+      }
+    },
+    "severity": {
+      "type": "score",
+      "score": 0.09,
+      "confidence": 0.93,
+      "legend": {
+        "0": "Fine",
+        "1": "Minor",
+        "2": "Major"
+      },
+      "probabilities": {
+        "0": 0.93,
+        "1": 0.05,
+        "2": 0.02
+      }
+    },
+    "flag": {
+      "type": "noul",
+      "noul": 0.5
+    }
+  }
+}
