@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import uuid
+from collections.abc import Iterable
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -12,6 +13,7 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
 from agent_memory import config
+from agent_memory.routines_log import ParsedRun
 
 STATUSES = ("pass", "fail", "skip", "error")
 SOURCES = ("launchd", "scheduled-task", "cloud", "manual")
@@ -48,6 +50,39 @@ def insert_run(
         ).fetchone()
     assert row is not None
     return row[0]
+
+
+_INGEST_SQL = """
+insert into runs (routine, source, started_at, status, summary, report_path, meta, source_key)
+values (%s, %s, %s, %s, %s, %s, %s, %s)
+on conflict (source_key) do update
+    set meta = runs.meta || jsonb_build_object('failures', excluded.meta -> 'failures')
+    where runs.meta -> 'failures' is distinct from excluded.meta -> 'failures'
+returning (xmax = 0) as inserted
+"""
+
+
+def ingest_runs(rows: Iterable[ParsedRun], *, db_url: str | None = None) -> tuple[int, int]:
+    """Insert parsed rows keyed by `source_key`, in one transaction.
+
+    Returns (new, already_present). A row that is already present is left alone,
+    except that its `meta.failures` is refreshed when the source now has more
+    detail lines (an ingest that raced a routine still writing its details).
+    Other `meta` keys are never overwritten.
+    """
+    new = present = 0
+    with connect(db_url) as conn:
+        for r in rows:
+            got = conn.execute(
+                _INGEST_SQL,
+                (r.routine, r.source, r.started_at, r.status, r.summary,
+                 r.report_path, Jsonb(r.meta), r.source_key),
+            ).fetchone()
+            if got is not None and got[0]:
+                new += 1
+            else:
+                present += 1
+    return new, present
 
 
 def recent_runs(routine: str, limit: int = 10, *, db_url: str | None = None) -> list[dict[str, Any]]:

@@ -28,6 +28,8 @@ def _offline_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("AMEM_NO_DOTENV", "1")
     monkeypatch.delenv("AMEM_JEV_LIVE", raising=False)
     monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
+    monkeypatch.delenv("AMEM_REQUIRE_REMOTE", raising=False)
+    monkeypatch.delenv("PGHOST", raising=False)
 
     import typesafe_sdk
 
@@ -39,8 +41,9 @@ def _offline_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def base_env(**extra: str) -> dict[str, str]:
-    """Env for CLI subprocesses: no env files, no Jev key, no live flag."""
-    env = {k: v for k, v in os.environ.items() if k not in ("TYPESAFE_API_KEY", "AMEM_JEV_LIVE", "AMEM_DB_URL")}
+    """Env for CLI subprocesses: no env files, no Jev key, no live flag, no remote requirement."""
+    drop = ("TYPESAFE_API_KEY", "AMEM_JEV_LIVE", "AMEM_DB_URL", "AMEM_REQUIRE_REMOTE", "PGHOST")
+    env = {k: v for k, v in os.environ.items() if k not in drop}
     env["AMEM_NO_DOTENV"] = "1"
     env.update(extra)
     return env
