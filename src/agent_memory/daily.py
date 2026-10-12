@@ -261,8 +261,9 @@ def step_score(result: DailyResult, *, limit: int = SCORE_LIMIT) -> None:
             continue
         result.scored += report.scored
         result.missing += len(report.missing)
-        for run_id, _, msg in report.missing:
-            _err(f"score {routine}: missing fixture: run {run_id}: {msg}")
+        if report.missing:  # fixture mode only; one line per routine keeps launchd.log readable
+            _err(f"score {routine}: {len(report.missing)} runs have no Jev fixture (left unscored); "
+                 f"first: run {report.missing[0][0]}: {report.missing[0][2]}")
         if report.failed:
             n = len(report.failed)
             result.fail(f"score {routine}: {n} Jev error{'s' if n != 1 else ''}; first: {report.failed[0][2]}")
