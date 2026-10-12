@@ -11,7 +11,7 @@ from typing import Any
 
 import psycopg
 
-from agent_memory import config, scoring
+from agent_memory import config, jev, scoring
 from agent_memory.questions import QuestionCache, QuestionConfigError
 
 REMOTE_REQUIRED_EXIT = 3
@@ -42,10 +42,12 @@ def _remote_guard(name: str) -> int | None:
 
 
 def _iso(value: str) -> datetime:
+    """ISO timestamp for --since/--now. Without an offset it is read as UTC."""
     try:
-        return datetime.fromisoformat(value)
+        parsed = datetime.fromisoformat(value)
     except ValueError as exc:
         raise argparse.ArgumentTypeError(f"not an ISO timestamp: {value!r}") from exc
+    return scoring.as_utc(parsed)
 
 
 def _duration(value: str):
@@ -82,13 +84,19 @@ def _emit(rows: list[dict[str, Any]]) -> None:
 
 
 def _guarded(name: str, fn) -> int:
-    """Run a command body; map config and DB errors to exit 1 with a one-line message."""
+    """Run a command body; map config, Jev and DB errors to exit 1 with a one-line message.
+
+    `score` records per-run Jev errors itself; the JevError branch is a last guard so
+    no Jev failure ever ends in a traceback.
+    """
     if (code := _backend_guard(name)) is not None:
         return code
     try:
         return fn()
     except QuestionConfigError as exc:
         print(f"amem: {name} failed: bad question file: {exc}", file=sys.stderr)
+    except jev.JevError as exc:
+        print(f"amem: {name} failed: jev error: {exc}", file=sys.stderr)
     except psycopg.Error as exc:
         print(f"amem: {name} failed: {type(exc).__name__}: {exc}".strip(), file=sys.stderr)
     return 1
@@ -172,7 +180,7 @@ def cmd_drift(args: argparse.Namespace) -> int:
 def register(sub: argparse._SubParsersAction) -> None:
     p = sub.add_parser("score", help="score unscored runs with Jev (routines with a question file)")
     p.add_argument("--routine")
-    p.add_argument("--since", type=_iso, help="only runs started at or after this ISO time")
+    p.add_argument("--since", type=_iso, help="only runs started at or after this ISO time (no offset = UTC)")
     p.add_argument("--limit", type=_positive_int, default=100, help="max runs to send to Jev (default 100)")
     p.set_defaults(func=cmd_score)
 
@@ -198,5 +206,5 @@ def register(sub: argparse._SubParsersAction) -> None:
     p.add_argument("--baseline", type=_duration, default=scoring.parse_duration("28d"))
     p.add_argument("--delta", type=_unit, default=scoring.DEFAULT_DELTA, help="flag when the drop exceeds this")
     p.add_argument("--min-runs", type=_positive_int, default=scoring.DEFAULT_MIN_RUNS)
-    p.add_argument("--now", type=_iso, help="end of the window (default: now); for replays and tests")
+    p.add_argument("--now", type=_iso, help="end of the window, ISO time, no offset = UTC (default: now); for replays and tests")
     p.set_defaults(func=cmd_drift)

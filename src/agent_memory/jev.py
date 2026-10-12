@@ -6,6 +6,11 @@ Mode rule:
   `<key>` is a hash of the state and the questions. A missing fixture raises
   `JevFixtureMissing`; it never falls back to a live call.
 
+Errors: every failure of one `ask` raises `JevError` (SDK HTTP/rate-limit/connection
+errors, network errors, an invalid response, an unreadable or invalid fixture), so a
+caller can count it and go on. A missing fixture raises its subclass `JevFixtureMissing`.
+Error text never holds the API key.
+
 Fixture files hold the API response body (`{"model", "usage", "answers"}`), so
 fixture and live answers are parsed by the same SDK answer models.
 
@@ -19,6 +24,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
+import re
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -155,8 +162,43 @@ def _collect(questions: list[Question], answers: dict[str, Any]) -> dict[str, Je
         result = _to_result(q.name, answers[q.name])
         if result.kind != q.kind:
             raise JevError(f"answer for {q.name!r} is {result.kind}, expected {q.kind}")
+        _check_range(result)
         results[q.name] = result
     return results
+
+
+def _is_unit(x: Any) -> bool:
+    return isinstance(x, (int, float)) and math.isfinite(x) and 0 <= x <= 1
+
+
+def _check_range(result: JevResult) -> None:
+    """The SDK models accept any float; a confidence or P(yes) outside 0..1 (or a
+    non-finite score) is an invalid answer, never something to store."""
+    if result.confidence is not None and not _is_unit(result.confidence):
+        raise JevError(f"answer for {result.name!r} has confidence {result.confidence!r} outside 0..1")
+    if result.kind == "noul" and not _is_unit(result.value):
+        raise JevError(f"answer for {result.name!r} has P(yes) {result.value!r} outside 0..1")
+    if result.kind == "score" and not (isinstance(result.value, (int, float)) and math.isfinite(result.value)):
+        raise JevError(f"answer for {result.name!r} has a non-finite score {result.value!r}")
+
+
+_WS_RE = re.compile(r"\s+")
+_DESCRIBE_MAX = 300
+
+
+def _describe(exc: BaseException) -> str:
+    """One line `<Type>: <message>`, at most 300 chars, with the API key masked.
+
+    The SDK already keeps credentials out of its messages; the mask is a second guard
+    in case a server ever echoes the key back in an error body.
+    """
+    text = _WS_RE.sub(" ", f"{type(exc).__name__}: {exc}").strip()
+    key = config.typesafe_api_key()
+    if key:
+        text = text.replace(key, "[redacted]")
+    if len(text) > _DESCRIBE_MAX:
+        text = text[: _DESCRIBE_MAX - 3] + "..."
+    return text
 
 
 def _ask_fixture(state: str, questions: list[Question]) -> dict[str, JevResult]:
@@ -167,21 +209,34 @@ def _ask_fixture(state: str, questions: list[Question]) -> dict[str, JevResult]:
             f"no Jev fixture for this state+questions (key {key}); expected file {path}. "
             "Fixture mode never calls the API: add the fixture file."
         )
-    body = json.loads(path.read_text(encoding="utf-8"))
-    raw_answers = body.get("answers")
+    try:
+        body = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:  # unreadable, not UTF-8 or not JSON
+        raise JevError(f"fixture {path} is unreadable or not JSON: {_describe(exc)}") from exc
+    raw_answers = body.get("answers") if isinstance(body, dict) else None
     if not isinstance(raw_answers, dict):
         raise JevError(f"fixture {path} has no 'answers' object")
     adapter = _answer_adapter()
-    answers = {name: adapter.validate_json(json.dumps(raw)) for name, raw in raw_answers.items()}
+    try:
+        answers = {name: adapter.validate_json(json.dumps(raw)) for name, raw in raw_answers.items()}
+    except ValueError as exc:  # pydantic ValidationError: an answer the SDK models reject
+        raise JevError(f"fixture {path} has an invalid answer: {_describe(exc)}") from exc
     return _collect(questions, answers)
 
 
 def _ask_live(state: str, questions: list[Question]) -> dict[str, JevResult]:
-    from typesafe_sdk import TypeSafeClient
+    """One System One call. Every SDK, network or response error becomes a JevError."""
+    from typesafe_sdk import TypeSafeClient, TypeSafeError
 
-    with TypeSafeClient(api_key=config.typesafe_api_key()) as client:
-        response = client.system_one(state=state, questions={q.name: q.to_sdk() for q in questions})
-    return _collect(questions, dict(response.answers))
+    try:
+        with TypeSafeClient(api_key=config.typesafe_api_key()) as client:
+            response = client.system_one(state=state, questions={q.name: q.to_sdk() for q in questions})
+        answers = dict(response.answers)
+    except TypeSafeError as exc:  # HTTP 4xx/5xx, rate limit, connection, timeout, invalid response
+        raise JevError(f"Jev API error: {_describe(exc)}") from exc
+    except (OSError, ValueError) as exc:  # network below the SDK, or a response the models reject
+        raise JevError(f"Jev call failed: {_describe(exc)}") from exc
+    return _collect(questions, answers)
 
 
 def ask(state: str, questions: list[Question]) -> dict[str, JevResult]:

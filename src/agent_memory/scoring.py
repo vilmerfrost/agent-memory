@@ -23,7 +23,7 @@ from __future__ import annotations
 import re
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from psycopg.rows import dict_row
@@ -82,7 +82,7 @@ def candidate_runs(
         params.append(routine)
     if since is not None:
         clauses.append("r.started_at >= %s")
-        params.append(since)
+        params.append(as_utc(since))
     sql = (
         "select r.id, r.routine, r.status, r.summary, r.failure_reason, r.meta, r.started_at "
         f"from runs r where {' and '.join(clauses)} "
@@ -130,7 +130,10 @@ def score_runs(
     """Score unscored runs that have a question file, newest first, at most `limit` of them.
 
     A missing fixture (fixture mode) is counted and the run stays unscored, so a
-    later `amem score` retries it. Runs with no question file are counted as skipped.
+    later `amem score` retries it. Any other Jev error for one run (SDK, network,
+    invalid response, corrupt fixture; `jev.ask` raises them all as `JevError`) is
+    recorded in `failed`, the run stays unscored, and scoring goes on with the next
+    run. Runs with no question file are counted as skipped.
     """
     cache = cache or QuestionCache()
     report = ScoreReport()
@@ -340,6 +343,11 @@ def parse_duration(value: str) -> timedelta:
     return timedelta(days=n) if m.group(2) == "d" else timedelta(hours=n)
 
 
+def as_utc(value: datetime) -> datetime:
+    """A naive datetime is read as UTC; an aware one is kept as is."""
+    return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value
+
+
 def _mean(values: list[float]) -> float | None:
     return sum(values) / len(values) if values else None
 
@@ -365,6 +373,7 @@ def drift(
     baseline - window > delta.
     """
     cache = cache or QuestionCache()
+    now = as_utc(now)
     w_start = now - window
     b_start = w_start - baseline
     params: list[Any] = [b_start, now]
