@@ -6,6 +6,7 @@ import json
 import uuid
 
 import psycopg
+import pytest
 
 from agent_memory import lessons, store
 from conftest import run_amem
@@ -108,3 +109,51 @@ def test_score_no_baseline(db_env: dict[str, str], pg_url: str) -> None:
 def test_score_apply_respects_require_remote(db_env: dict[str, str]) -> None:
     result = run_amem("lessons", "score", "--apply", env=dict(db_env, AMEM_REQUIRE_REMOTE="1"))
     assert result.returncode == 3
+
+
+def _zero_use_lesson() -> tuple[str, str]:
+    """A trial lesson with no uses, in a repo whose baseline runs all pass (so it would lose)."""
+    repo = f"score-{uuid.uuid4().hex[:8]}"
+    slug = f"{repo}-unused"
+    lessons.upsert([lessons.Lesson(slug=slug, title="t", rule="r", scope_repo=repo)])
+    _runs(repo, "pass", 3)
+    return repo, slug
+
+
+@pytest.mark.parametrize("value", ["0", "-3", "0.5", "abc", "1.0"])
+def test_bad_min_uses_env_is_refused_and_writes_nothing(db_env: dict[str, str], value: str) -> None:
+    repo, slug = _zero_use_lesson()
+    env = dict(db_env, AMEM_SCORE_MIN_USES=value)
+    result = run_amem("lessons", "score", "--repo", repo, "--apply", env=env)
+    assert result.returncode == 2, (result.stdout, result.stderr)
+    assert result.stdout == ""
+    assert result.stderr.startswith("amem: lessons score: AMEM_SCORE_MIN_USES must be a positive integer")
+    assert repr(value) in result.stderr
+    assert lessons.get_lesson(slug).status == "trial"
+
+
+def test_good_min_uses_env_is_used_and_flag_wins(db_env: dict[str, str], pg_url: str) -> None:
+    repo, slug = _zero_use_lesson()
+    for run in _runs(repo, "fail", 2):
+        _use(pg_url, slug, run)
+    env = dict(db_env, AMEM_SCORE_MIN_USES=" 2 ")
+    result = run_amem("lessons", "score", "--repo", repo, env=env)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["decision"] == "retire"  # 2 uses >= 2
+    flag = run_amem("lessons", "score", "--repo", repo, "--min-uses", "3", env=env)
+    assert json.loads(flag.stdout)["decision"] == "insufficient"  # the flag beats the env
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "0.5", "abc"])
+def test_bad_min_uses_flag_is_a_usage_error(db_env: dict[str, str], value: str) -> None:
+    result = run_amem("lessons", "score", f"--min-uses={value}", env=db_env)
+    assert result.returncode == 2
+    assert "--min-uses: must be a positive integer" in result.stderr
+
+
+@pytest.mark.parametrize("min_uses", [0, -3, 0.5])
+def test_zero_use_lesson_never_retires_through_the_library(db_env: dict[str, str], min_uses: float) -> None:
+    repo, slug = _zero_use_lesson()
+    (row,) = lessons.score(min_uses, apply=True, repo=repo)  # type: ignore[arg-type]
+    assert (row["uses"], row["decision"], row["applied"]) == (0, "insufficient", False)
+    assert lessons.get_lesson(slug).status == "trial"

@@ -11,10 +11,16 @@ lessons.md format (what `amem lessons import` reads and `amem lessons export` wr
     Since: YYYY-MM-DD
 
 - Text before the first `### ` heading is a preamble and is ignored.
+- Only a `### ` heading ends a lesson (and starts the next). Any other line, `# ` and
+  `## ` lines included, belongs to the current lesson.
 - A key starts a field. Every following line that is not a key continues that field.
+  Keys are case-sensitive and written `Key: value`.
 - Optional keys the export adds when the table has the data: `Rule:` (when the rule
   differs from the title), `Repo:`, `Task:` (scope) and `Source-runs:` (run ids).
-- A `# ` or `## ` heading ends the current lesson.
+  `Rule:`, `Repo:` and `Task:` are keys only before `Evidence:`; after it they are text.
+  After `Evidence:`, `Source-runs:` is a key only when its whole value is uuids.
+- A line that would be a key but is spelled in another case or without the space
+  (`status: kept`, `Status:kept`) is an error, not text.
 - A missing `Id:` becomes a slug of the title. A missing `Status:` becomes `trial`.
 """
 
@@ -39,9 +45,11 @@ ACTIVE_STATUSES = ("trial", "kept", "promoted")
 
 # Export order. Import accepts any order.
 _KEYS = ("Id", "Rule", "Repo", "Task", "Evals", "Promoted-to", "Evidence", "Source-runs", "Status", "Since")
-_KEY_RE = re.compile(r"^(" + "|".join(re.escape(k) for k in _KEYS) + r"):(?: (.*)|)$")
+# Any known key in any case, then a colon. Whether it is a key depends on its position.
+_KEY_LIKE_RE = re.compile(r"^(" + "|".join(re.escape(k) for k in _KEYS) + r"):(.*)$", re.IGNORECASE)
+_CANONICAL_KEY = {k.lower(): k for k in _KEYS}
+_BEFORE_EVIDENCE_KEYS = ("Rule", "Repo", "Task")  # text once Evidence has started
 _TITLE_RE = re.compile(r"^### +(.+?)\s*$")
-_SECTION_RE = re.compile(r"^#{1,2} ")
 
 
 class LessonsError(RuntimeError):
@@ -129,8 +137,40 @@ def _build(title: str, fields: dict[str, str], preface: list[str]) -> Lesson:
     )
 
 
+def _all_uuids(value: str) -> bool:
+    parts = [p for p in re.split(r"[,\s]+", value) if p]
+    try:
+        return bool(parts) and all(uuid.UUID(p) for p in parts)
+    except ValueError:
+        return False
+
+
+def _key_at(line: str, fields: dict[str, str], title: str, lineno: int) -> tuple[str, str] | None:
+    """(key, value) when `line` starts a field here, None when it is text.
+
+    A line that would be a key here but is miscased or lacks the space after the
+    colon raises, so a typo never lands silently in the previous field.
+    """
+    m = _KEY_LIKE_RE.match(line)
+    if m is None:
+        return None
+    written, rest = m.group(1), m.group(2)
+    key = _CANONICAL_KEY[written.lower()]
+    if "Evidence" in fields:
+        if key in _BEFORE_EVIDENCE_KEYS:
+            return None  # e.g. a quoted `Task: ...` line inside Evidence
+        if key == "Source-runs" and not _all_uuids(rest):
+            return None
+    if written != key or (rest and not rest.startswith(" ")):
+        raise LessonsError(
+            f"lesson {title!r}, line {lineno}: {line.strip()!r} looks like the {key}: key; "
+            f"write it exactly as '{key}: <value>' (keys are case-sensitive)")
+    return key, rest[1:] if rest else ""
+
+
 def parse_markdown(text: str) -> list[Lesson]:
-    """Parse lessons.md text. Raises LessonsError on bad Status/Since or a repeated Id."""
+    """Parse lessons.md text. Raises LessonsError on bad Status/Since, a repeated or
+    miscased key, or a repeated Id."""
     lessons: list[Lesson] = []
     title: str | None = None
     fields: dict[str, str] = {}
@@ -141,25 +181,21 @@ def parse_markdown(text: str) -> list[Lesson]:
         if title is not None:
             lessons.append(_build(title, fields, preface))
 
-    for raw in text.splitlines():
+    for lineno, raw in enumerate(text.splitlines(), start=1):
         line = raw.rstrip("\r")
         heading = _TITLE_RE.match(line)
         if heading:
             flush()
             title, fields, preface, current = heading.group(1), {}, [], None
             continue
-        if _SECTION_RE.match(line):
-            flush()
-            title, fields, preface, current = None, {}, [], None
-            continue
         if title is None:
             continue  # preamble
-        key = _KEY_RE.match(line)
+        key = _key_at(line, fields, title, lineno)
         if key:
-            current = key.group(1)
+            current = key[0]
             if current in fields:
                 raise LessonsError(f"lesson {title!r}: key {current}: appears twice")
-            fields[current] = key.group(2) or ""
+            fields[current] = key[1]
         elif current is None:
             preface.append(line)
         else:
@@ -274,9 +310,10 @@ _STATUS_ORDER = "case l.status when 'promoted' then 0 when 'kept' then 1 else 2 
 
 _FOR_SQL = f"""
 select l.id, l.slug, l.title, l.rule, l.status, l.scope_repo, l.scope_task,
-       ts_rank(l.tsv, %(q)s::tsquery) as rank
+       ts_rank(l.tsv, %(pos)s::tsquery) as rank
 from lessons l
 where l.tsv @@ %(q)s::tsquery
+  and ts_rank(l.tsv, %(pos)s::tsquery) > 0
   and l.status in ('trial', 'kept', 'promoted')
   and (l.scope_repo is null or l.scope_repo = %(repo)s)
   and (l.scope_task is null or position(lower(l.scope_task) in lower(%(task)s)) > 0)
@@ -285,19 +322,29 @@ limit %(limit)s
 """
 
 
-def _relaxed_query(conn: psycopg.Connection, task: str) -> str | None:
-    """websearch_to_tsquery(task), with AND relaxed to OR so any matching term retrieves.
+def _relaxed_query(conn: psycopg.Connection, task: str) -> tuple[str, str] | None:
+    """(match query, positive query) for a task.
 
-    A query with a negation (`-word`) stays strict, so the exclusion keeps its meaning.
-    Returns None when the task has no searchable terms (only stop words, say).
+    The match query is websearch_to_tsquery(task) with AND relaxed to OR, so any matching
+    term retrieves. A query with a negation (`-word`) stays strict, so the exclusion keeps
+    its meaning. The positive query is its `querytree`: the part a lesson must contain
+    (`'x' & !'y'` -> `'x'`). Hits match the full query and are ranked by the positive one.
+
+    Returns None when the task carries no positive information: no searchable terms
+    (only stop words), or only negations (`-x`, `-x -y`, `x or -y`), whose matches are
+    every lesson that lacks a word.
     """
     row = conn.execute("select websearch_to_tsquery('english', %s)::text", (task,)).fetchone()
     text = row[0] if row else ""
     if not text:
         return None
-    if "!" in text:
-        return text
-    return text.replace(" & ", " | ")
+    if "!" not in text:
+        text = text.replace(" & ", " | ")
+    row = conn.execute("select querytree(%s::tsquery)", (text,)).fetchone()
+    positive = (row[0] if row else "") or ""
+    if positive.strip() in ("", "T"):
+        return None
+    return text, positive
 
 
 def memory_enabled() -> bool:
@@ -315,14 +362,18 @@ def lessons_for(repo: str, task: str, *, limit: int = 5, run_id: uuid.UUID | Non
 
     Hits ranked below `min_relative_rank` x the top rank are dropped: with OR matching,
     a lesson that shares one common word with the task is noise in a brief.
+    A task with no positive term (only negations, such as `-word`) returns nothing, and
+    a hit with rank 0 is never returned or recorded, whatever the floor.
     """
     with store.connect(db_url) as conn:
-        q = _relaxed_query(conn, task)
-        if q is None:
+        queries = _relaxed_query(conn, task)
+        if queries is None:
             return []
+        q, pos = queries
         with conn.cursor(row_factory=dict_row) as cur:
-            cur.execute(_FOR_SQL, {"q": q, "repo": repo, "task": task, "limit": limit})
+            cur.execute(_FOR_SQL, {"q": q, "pos": pos, "repo": repo, "task": task, "limit": limit})
             hits = cur.fetchall()
+        hits = [h for h in hits if float(h["rank"]) > 0]
         if hits:
             floor = float(hits[0]["rank"]) * min_relative_rank
             hits = [h for h in hits if float(h["rank"]) >= floor]
@@ -517,6 +568,7 @@ def score(min_uses: int, *, apply: bool = False, repo: str | None = None,
     routine name; every run for a null scope) that never had this lesson injected.
     Decision: `insufficient` (uses < min_uses), `no_baseline`, `keep` (beats baseline),
     else `retire` (trial/kept) or `review` (promoted lessons are never auto-retired).
+    A lesson with zero uses is always `insufficient`, whatever `min_uses` is.
     """
     out: list[dict[str, Any]] = []
     with store.connect(db_url) as conn, conn.cursor(row_factory=dict_row) as cur:
@@ -536,7 +588,7 @@ def score(min_uses: int, *, apply: bool = False, repo: str | None = None,
             cur.execute(_BASELINE_SQL, {"repo": lesson["scope_repo"], "id": lesson["id"]})
             base = cur.fetchone() or {"passed": 0, "total": 0}
             with_rate, base_rate = _rate(used_pass, used), _rate(base["passed"], base["total"])
-            if used < min_uses:
+            if used < 1 or used < min_uses:
                 decision = "insufficient"
             elif base_rate is None:
                 decision = "no_baseline"

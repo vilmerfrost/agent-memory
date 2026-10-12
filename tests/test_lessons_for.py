@@ -5,6 +5,7 @@ from __future__ import annotations
 import uuid
 
 import psycopg
+import pytest
 
 from agent_memory import lessons, store
 from conftest import run_amem
@@ -111,6 +112,40 @@ def test_no_match_and_stopwords_only(db_env: dict[str, str]) -> None:
         result = run_amem("lessons", "for", "--repo", "agent-memory", "--task", task, env=db_env)
         assert result.returncode == 0, result.stderr
         assert result.stdout == ""
+
+
+def _uses_for_context(pg_url: str, context: str) -> int:
+    with psycopg.connect(pg_url) as conn:
+        return conn.execute("select count(*) from lesson_uses where context = %s", (context,)).fetchone()[0]
+
+
+@pytest.mark.parametrize("shape", ["-{a}", "-{a} -{b}", '-"{a} {b}"', "{a} or -{b}", "the -{a}"])
+def test_negation_only_task_returns_and_records_nothing(db_env: dict[str, str], pg_url: str, shape: str) -> None:
+    # A negation-only query matches every lesson that lacks the word (ts_rank 0 or 1e-20).
+    # `x or -y` is no better: every lesson without y matches. Neither carries information.
+    tag, w1, w2, repo = f"for-{uuid.uuid4().hex[:6]}", _word(), _word(), f"repo-{uuid.uuid4().hex[:6]}"
+    _setup(tag, w1, w2, repo)
+    a = w1 if "or" in shape else _word()  # `x or -y` with x present in lessons: still nothing
+    task = shape.format(a=a, b=_word())
+    for floor in ("0.2", "0"):
+        result = run_amem("lessons", "for", "--repo", repo, f"--task={task}", "--limit", "50",
+                          "--min-relative-rank", floor, env=db_env)
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == ""
+    assert _uses_for_context(pg_url, task) == 0
+    assert lessons.lessons_for(repo, task, limit=50, min_relative_rank=0) == []
+    assert _uses_for_context(pg_url, task) == 0
+
+
+def test_positive_term_with_negation_still_retrieves(db_env: dict[str, str], pg_url: str) -> None:
+    tag, w1, w2, repo = f"for-{uuid.uuid4().hex[:6]}", _word(), _word(), f"repo-{uuid.uuid4().hex[:6]}"
+    slugs = _setup(tag, w1, w2, repo)
+    task = f"{w1} -{_word()}"
+    hits = lessons.lessons_for(repo, task, limit=50, min_relative_rank=0)
+    assert [h["slug"] for h in hits] == [f"{tag}-best", f"{tag}-global", f"{tag}-weak"]  # ranked by w1
+    assert all(float(h["rank"]) > 1e-6 for h in hits)  # the positive part ranks, not a 1e-20 artefact
+    assert sorted(u[0] for u in _uses(pg_url, slugs)) == sorted(h["slug"] for h in hits)
+    assert _uses_for_context(pg_url, task) == len(hits)  # nothing else in the shared db was recorded
 
 
 def test_negation_keeps_query_strict(db_env: dict[str, str]) -> None:
