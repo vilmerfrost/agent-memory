@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import uuid
 from datetime import date
 from pathlib import Path
@@ -58,9 +59,6 @@ def test_parser_edge_cases() -> None:
         "Task: migration",
         "Source-runs: 00000000-0000-0000-0000-000000000001, 00000000-0000-0000-0000-000000000002",
         "Since: 2026-10-12",
-        "",
-        "## Archive",
-        "Id: ignored-outside-a-lesson",
     ])
     a, b = lessons.parse_markdown(text)
     assert a.slug == "no-id-here-so-the-title-becomes-the-slug"
@@ -71,6 +69,81 @@ def test_parser_edge_cases() -> None:
         "scoped-one", "Do the thing.", "agent-memory", "migration", "trial")
     assert [str(r)[-1] for r in b.source_run_ids] == ["1", "2"]
     assert lessons.parse_markdown(lessons.render_markdown([a, b])) == [a, b]
+
+
+# sha256 of repr(parse_markdown(...)) for both real copies, taken with the parser before the
+# R10 import-safety change. The new rules must not change how the real file imports.
+REAL_PARSE_SHA256 = "f1424c3a1541f09d209d39552d5142d4ad53717c2e259ea83d48501cc17f0f5c"
+
+
+@pytest.mark.parametrize("path", [PARENT, AGENT_CONFIG], ids=["parent", "agent-config"])
+def test_real_file_parses_exactly_as_before(path: Path) -> None:
+    parsed = lessons.parse_markdown(path.read_text(encoding="utf-8"))
+    assert hashlib.sha256(repr(parsed).encode()).hexdigest() == REAL_PARSE_SHA256
+
+
+def test_hash_lines_inside_a_lesson_stay_in_the_field() -> None:
+    text = "\n".join([
+        "# Lessons",
+        "## Preamble section, ignored",
+        "### First",
+        "Id: first",
+        "Evidence: intro.",
+        "# not a heading here",
+        "## also text",
+        "#hashtag",
+        "#### deeper",
+        "Status: kept",
+        "### Second",
+        "Id: second",
+    ])
+    first, second = lessons.parse_markdown(text)
+    assert first.evidence == "intro.\n# not a heading here\n## also text\n#hashtag\n#### deeper"
+    assert (first.status, second.slug) == ("kept", "second")
+
+
+def test_scope_keys_are_text_after_evidence() -> None:
+    run = "00000000-0000-0000-0000-00000000000a"
+    text = "\n".join([
+        "### Quoted brief",
+        "Id: quoted",
+        "Task: migration",
+        "Evidence: the brief said:",
+        "Task: rewrite everything",
+        "Repo: somewhere-else",
+        "Rule: never test",
+        "task: lowercase after Evidence is text too",
+        "Source-runs: see the log",
+        f"Source-runs: {run}",
+        "Status: trial",
+    ])
+    (lesson,) = lessons.parse_markdown(text)
+    assert lesson.scope_task == "migration"  # the key before Evidence
+    assert (lesson.scope_repo, lesson.rule) == (None, "Quoted brief")
+    assert lesson.evidence == ("the brief said:\nTask: rewrite everything\nRepo: somewhere-else\n"
+                               "Rule: never test\ntask: lowercase after Evidence is text too\n"
+                               "Source-runs: see the log")
+    assert [str(r) for r in lesson.source_run_ids] == [run]  # export shape: all uuids, still a key
+    assert lessons.parse_markdown(lessons.render_markdown([lesson])) == [lesson]
+
+
+def test_round_trip_keeps_tricky_evidence() -> None:
+    lesson = lessons.Lesson(
+        slug="tricky", title="Tricky", rule="Other rule.", scope_repo="r", scope_task="t",
+        source_run_ids=[uuid.UUID(int=7)], status="kept", since=date(2026, 10, 12),
+        evidence="first\n## a markdown heading\nTask: quoted\nRepo: quoted\n\nRule: quoted",
+    )
+    assert lessons.parse_markdown(lessons.render_markdown([lesson])) == [lesson]
+
+
+@pytest.mark.parametrize("line", ["status: kept", "STATUS: kept", "Status:kept", "id: x", "evidence: text",
+                                  "task: before evidence", "source-runs: 00000000-0000-0000-0000-000000000001"])
+def test_miscased_or_glued_key_is_an_error(line: str) -> None:
+    text = f"### t\nId: t\nEvals: e\n{line}\n"
+    if line.startswith("source-runs"):
+        text = f"### t\nEvidence: e\n{line}\n"  # after Evidence it would be a key: still an error
+    with pytest.raises(lessons.LessonsError, match=r"looks like the .*: key; write it exactly as"):
+        lessons.parse_markdown(text)
 
 
 @pytest.mark.parametrize("text, match", [
@@ -150,6 +223,14 @@ def test_import_errors(db_env: dict[str, str], tmp_path: Path) -> None:
     bad.write_text("### t\nStatus: maybe\n", encoding="utf-8")
     result = run_amem("lessons", "import", str(bad), env=db_env)
     assert result.returncode == 1 and "unknown Status" in result.stderr
+
+    slug = f"miscased-{uuid.uuid4().hex[:8]}"
+    miscased = tmp_path / "miscased.md"
+    miscased.write_text(f"### ok\nId: {slug}\nEvidence: fine\nstatus: kept\n", encoding="utf-8")
+    result = run_amem("lessons", "import", str(miscased), env=db_env)
+    assert result.returncode == 1
+    assert "line 4: 'status: kept' looks like the Status: key" in result.stderr
+    assert lessons.get_lesson(slug) is None  # nothing written
 
 
 def test_lessons_refuse_the_rest_backend(db_env: dict[str, str]) -> None:
