@@ -12,7 +12,9 @@ def test_doctor_fixture_mode_with_key_but_no_live_flag() -> None:
     )
     result = run_amem("doctor", env=env)
     assert result.returncode == 0, result.stderr
-    assert result.stdout.splitlines() == ["jev_mode=fixture", "db_host=127.0.0.1", "db=unreachable"]
+    assert result.stdout.splitlines() == [
+        "jev_mode=fixture", "db_host=127.0.0.1", "db=unreachable", "require_remote=off",
+    ]
     assert DUMMY_KEY not in result.stdout + result.stderr
     assert "secretpw" not in result.stdout + result.stderr
 
@@ -24,9 +26,20 @@ def test_doctor_default_db_url_is_local_supabase() -> None:
     assert lines[0] == "jev_mode=fixture"
     assert lines[1] == "db_host=127.0.0.1"
     assert lines[2] in ("db=reachable", "db=unreachable")
+    assert lines[3] == "require_remote=off"
 
 
 def test_doctor_reachable(db_env: dict[str, str]) -> None:
     result = run_amem("doctor", env=db_env)
     assert result.returncode == 0, result.stderr
-    assert result.stdout.splitlines() == ["jev_mode=fixture", "db_host=127.0.0.1", "db=reachable"]
+    assert result.stdout.splitlines() == [
+        "jev_mode=fixture", "db_host=127.0.0.1", "db=reachable", "require_remote=off",
+    ]
+
+
+def test_doctor_require_remote_on() -> None:
+    env = base_env(AMEM_REQUIRE_REMOTE="1", AMEM_DB_URL="postgresql://postgres:secretpw@127.0.0.1:1/postgres")
+    result = run_amem("doctor", env=env)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines()[-1] == "require_remote=on"
+    assert "secretpw" not in result.stdout + result.stderr
