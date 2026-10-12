@@ -152,6 +152,18 @@ def test_import_errors(db_env: dict[str, str], tmp_path: Path) -> None:
     assert result.returncode == 1 and "unknown Status" in result.stderr
 
 
+def test_lessons_refuse_the_rest_backend(db_env: dict[str, str]) -> None:
+    # Lessons are Postgres-only in V1; on REST the runs live elsewhere. No HTTP call is made.
+    env = dict(db_env, AMEM_BACKEND="rest", AMEM_SUPABASE_URL="https://example.invalid")
+    for args in (("lessons", "import", str(PARENT)), ("lessons", "export"), ("lessons", "score"),
+                 ("lessons", "for", "--repo", "r", "--task", "t"),
+                 ("lesson", "propose", "--run", "00000000-0000-0000-0000-000000000000")):
+        result = run_amem(*args, env=env)
+        assert result.returncode == 1, args
+        assert "need the Postgres backend" in result.stderr
+        assert result.stdout == ""
+
+
 def test_import_respects_require_remote(db_env: dict[str, str]) -> None:
     env = dict(db_env, AMEM_REQUIRE_REMOTE="1")
     result = run_amem("lessons", "import", str(PARENT), env=env)

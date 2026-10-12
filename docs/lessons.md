@@ -44,7 +44,9 @@ Both tables have RLS on with no policies, and no grants for `anon`/`authenticate
 | `amem lesson propose --run ID [--repo R] [--task T]` | Jev write gate. Prints `accept ...` or `reject ...`. |
 | `amem gate friction --text "..." [--seen N]` | Jev improver gate. Prints `accept\|reject confidence=...`. |
 
-Write commands (`import`, `for`, `propose`, `score --apply`) obey `AMEM_REQUIRE_REMOTE=1` and exit 3 like the other write commands.
+Write commands (`import`, `for`, `propose`, `score --apply`) obey `AMEM_REQUIRE_REMOTE=1` against `AMEM_DB_URL` and exit 3 like the other write commands.
+
+Lessons are Postgres-only in V1. On the REST backend (`AMEM_BACKEND=rest`, see docs/cloud.md) every lessons command except `gate friction` exits 1, because the runs live in another store.
 
 ## lessons.md format
 

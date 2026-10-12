@@ -33,11 +33,33 @@ def _err(command: str, exc: BaseException) -> int:
 
 
 def _remote_guard() -> int | None:
-    error = config.remote_write_error()
+    """Exit code when the command may not run here, else None.
+
+    Lessons live in Postgres only (V1). On the REST backend the runs live elsewhere,
+    so a lessons command would read and write a different store: refuse (exit 1).
+    AMEM_REQUIRE_REMOTE=1 is checked against Postgres, like `db migrate` (exit 3).
+    """
+    if (code := _read_guard()) is not None:
+        return code
+    error = config.remote_write_error(for_backend="postgres")
     if error is None:
         return None
     print(error, file=sys.stderr)
     return REMOTE_REQUIRED_EXIT
+
+
+def _read_guard() -> int | None:
+    """Backend check for read-only commands (no AMEM_REQUIRE_REMOTE check)."""
+    try:
+        active = config.backend()
+    except config.BackendError as exc:
+        print(f"amem: {exc}", file=sys.stderr)
+        return 1
+    if active != "postgres":
+        print("amem: lessons commands need the Postgres backend in V1 (AMEM_DB_URL); "
+              f"backend is {active}. Set AMEM_BACKEND=postgres.", file=sys.stderr)
+        return 1
+    return None
 
 
 def _uuid(value: str) -> uuid.UUID:
@@ -74,6 +96,8 @@ def cmd_import(args: argparse.Namespace) -> int:
 
 
 def cmd_export(_args: argparse.Namespace) -> int:
+    if (code := _read_guard()) is not None:
+        return code
     try:
         rows = lessons.all_lessons()
     except psycopg.Error as exc:
@@ -106,7 +130,7 @@ def cmd_for(args: argparse.Namespace) -> int:
 
 
 def cmd_score(args: argparse.Namespace) -> int:
-    if args.apply and (code := _remote_guard()) is not None:
+    if (code := (_remote_guard() if args.apply else _read_guard())) is not None:
         return code
     try:
         min_uses = args.min_uses or int(lessons.env_float("AMEM_SCORE_MIN_USES", DEFAULT_MIN_USES))
