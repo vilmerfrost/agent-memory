@@ -12,6 +12,7 @@ import psycopg
 from psycopg.conninfo import conninfo_to_dict
 
 from agent_memory import cli_cloud, config, jev, routines_log, store
+from agent_memory import cli_lessons
 
 
 def _db_host(url: str) -> str:
@@ -168,6 +169,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_db_migrate)
 
     cli_cloud.register(sub, ingest_sub=ingest_sub)
+    cli_lessons.register(sub)
     return parser
 
 

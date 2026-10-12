@@ -1,0 +1,14 @@
+{
+  "_note": "Hand-written fixture in the System One response shape. Not a recorded live response. Used by tests/test_lessons_gates.py (friction accept).",
+  "model": "jev-latest",
+  "usage": {
+    "input_tokens": 0,
+    "output_tokens": 0
+  },
+  "answers": {
+    "recurring": {
+      "type": "noul",
+      "noul": 0.88
+    }
+  }
+}
