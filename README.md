@@ -81,6 +81,21 @@ results = jev.ask(state, [jev.choice("outcome", "Did it work?", {"pass": None, "
 results["outcome"].value, results["outcome"].confidence   # noul has no confidence (None)
 ```
 
+## V1: the learning loop
+
+Each part has its own doc:
+
+| Part | Commands | Doc |
+|---|---|---|
+| Cloud path (HTTPS, no raw Postgres) | `AMEM_BACKEND=rest`, `ingest git-ref`, `jev record` | [docs/cloud.md](docs/cloud.md) |
+| Jev scoring + human labels | `score`, `label`, `escalations`, `calibrate`, `drift` | [docs/scoring.md](docs/scoring.md) |
+| Lessons memory | `lessons import/export/for/score`, `lesson propose`, `gate friction` | [docs/lessons.md](docs/lessons.md) |
+| A/B proof | `ab report` | [docs/ab.md](docs/ab.md) |
+
+The loop: runs are logged → Jev scores outcomes (low confidence → you label 👍/👎) → Jev gates which runs become lessons → `lessons for` injects the top lessons into briefs (`AMEM_MEMORY=off` turns injection off) → `ab report` shows whether each lesson actually helps → losers retire.
+
+Scoring, lessons and A/B commands use the Postgres backend only in V1; the REST backend covers `runs` (`log-run`, `ingest`, `runs`).
+
 ## Tests
 
 ```sh

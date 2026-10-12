@@ -1,0 +1,25 @@
+# Test-only question set (tests/test_scoring_*.py). Fixtures for its states live in
+# tests/fixtures/jev/ (each holds `_state`). Changing this file changes every fixture key.
+
+threshold = 0.7
+pass_question = "verdict"
+pass_options = ["ok"]
+
+[[questions]]
+name = "verdict"
+kind = "choice"
+prompt = "Did the routine do its job?"
+[questions.options]
+ok = "Yes, nothing to do."
+needs_action = "No, a human should look."
+
+[[questions]]
+name = "severity"
+kind = "score"
+prompt = "How bad is it?"
+levels = ["Fine", "Minor", "Major"]
+
+[[questions]]
+name = "flag"
+kind = "noul"
+prompt = "Should this run be flagged?"

@@ -1,0 +1,38 @@
+# Jev questions for config-check: the daily audit of Vilmer's machine and agent config.
+# Summary looks like `pass=36 fail=5 info=0 10s report=...`; each failure is one finding,
+# e.g. "Orca LAN reach: answers on 192.168.50.152:6768" or "repos in iCloud: 1: ~/...".
+# Format: docs/scoring.md.
+
+threshold = 0.7
+pass_question = "verdict"
+pass_options = ["ok"]
+
+[[questions]]
+name = "verdict"
+kind = "choice"
+prompt = "Does this config-check run need Vilmer to act? Judge the findings, not the FAIL word: config-check reports FAIL whenever any finding exists."
+[questions.options]
+ok = "No findings, or only findings that are harmless or purely informational."
+needs_action = "At least one finding is a real problem Vilmer should fix (exposure, data at risk, broken setup)."
+check_broken = "The check itself looks broken: crashed, missing output, or findings that cannot be right."
+
+[[questions]]
+name = "exposure"
+kind = "noul"
+prompt = "Does any finding expose a service, port or secret beyond this machine (for example a LAN or wildcard listener, or a secret in a tracked file)?"
+
+[[questions]]
+name = "data_at_risk"
+kind = "noul"
+prompt = "Could any finding lose work or data (unpushed commits, repos in iCloud sync, stale workers with uncommitted changes)?"
+
+[[questions]]
+name = "urgency"
+kind = "score"
+prompt = "How soon should the worst finding be fixed?"
+levels = [
+    "No action needed.",
+    "Can wait: tidy up some time.",
+    "Fix this week.",
+    "Fix today: exposure or data loss is possible now.",
+]

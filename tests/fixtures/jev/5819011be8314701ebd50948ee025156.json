@@ -1,0 +1,46 @@
+{
+  "_note": "Hand-written fixture for the config-check demo (questions/config-check.toml, tests/fixtures/routines.sample.log). Not a live response.",
+  "_state": "routine: config-check\nstatus: fail\nsummary: pass=35 fail=4 info=0 10s report=~/.claude/parent/reports/config-check-2026-10-11.md\nfailure_reason: (none)\nfailures:\n- Orca LAN reach: answers on 192.168.50.152:6768\n- repos in iCloud: 1: ~/Desktop/Projects/Classifed\n- parent footprint junk-orchestra: tracked: .claude/worktree-setup.sh; tracked: .worktreeinclude\n- parent footprint simplitics drift check: tracked: .claude/worktree-setup.sh; tracked: .worktreeinclude",
+  "model": "jev-latest",
+  "usage": {
+    "input_tokens": 0,
+    "output_tokens": 0
+  },
+  "answers": {
+    "verdict": {
+      "type": "choice",
+      "choice": "needs_action",
+      "confidence": 0.62,
+      "probabilities": {
+        "ok": 0.33,
+        "needs_action": 0.62,
+        "check_broken": 0.05
+      }
+    },
+    "exposure": {
+      "type": "noul",
+      "noul": 0.83
+    },
+    "data_at_risk": {
+      "type": "noul",
+      "noul": 0.35
+    },
+    "urgency": {
+      "type": "score",
+      "score": 1.22,
+      "confidence": 0.74,
+      "legend": {
+        "0": "No action needed.",
+        "1": "Can wait: tidy up some time.",
+        "2": "Fix this week.",
+        "3": "Fix today: exposure or data loss is possible now."
+      },
+      "probabilities": {
+        "0": 0.04,
+        "1": 0.74,
+        "2": 0.18,
+        "3": 0.04
+      }
+    }
+  }
+}
