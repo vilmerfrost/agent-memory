@@ -466,13 +466,41 @@ where lu.lesson_id = %s
 order by lu.injected_at
 """
 
-_BASELINE_SQL = """
+# The run scope of a lesson, shared by `lessons score` (baseline) and `ab report` (both arms):
+# non-skip runs whose repo (`runs.meta.repo`, else the routine name) equals the lesson's
+# scope_repo; every non-skip run for a null scope. Binds %(repo)s; the runs alias is `r`.
+RUN_SCOPE_SQL = ("r.status <> 'skip' "
+                 "and (%(repo)s::text is null or coalesce(r.meta ->> 'repo', r.routine) = %(repo)s)")
+
+_BASELINE_SQL = f"""
 select count(*) filter (where r.status = 'pass') as passed, count(*) as total
 from runs r
-where r.status <> 'skip'
-  and (%(repo)s::text is null or coalesce(r.meta ->> 'repo', r.routine) = %(repo)s)
+where {RUN_SCOPE_SQL}
   and not exists (select 1 from lesson_uses lu where lu.lesson_id = %(id)s and lu.run_id = r.id)
 """
+
+
+def scored_lessons(cur: psycopg.Cursor[Any], repo: str | None = None,
+                   slug: str | None = None) -> list[dict[str, Any]]:
+    """Lessons that `lessons score` / `ab report` evaluate: id, slug, status, scope_repo.
+
+    Default: active lessons (trial, kept, promoted), optionally only those with
+    scope_repo = `repo`. A given `slug` selects that lesson whatever its status.
+    `cur` must use the dict_row factory.
+    """
+    clauses: list[str] = []
+    params: list[Any] = []
+    if slug is not None:
+        clauses.append("slug = %s")
+        params.append(slug)
+    else:
+        clauses.append("status in ('trial', 'kept', 'promoted')")
+    if repo is not None:
+        clauses.append("scope_repo = %s")
+        params.append(repo)
+    cur.execute(f"select id, slug, status, scope_repo from lessons where {' and '.join(clauses)} "
+                "order by created_at, slug", params)
+    return cur.fetchall()
 
 
 def _rate(passed: int, total: int) -> float | None:
@@ -492,14 +520,7 @@ def score(min_uses: int, *, apply: bool = False, repo: str | None = None,
     """
     out: list[dict[str, Any]] = []
     with store.connect(db_url) as conn, conn.cursor(row_factory=dict_row) as cur:
-        where = "status in ('trial', 'kept', 'promoted')"
-        params: tuple[Any, ...] = ()
-        if repo is not None:
-            where += " and scope_repo = %s"
-            params = (repo,)
-        cur.execute(f"select id, slug, status, scope_repo from lessons where {where} "
-                    "order by created_at, slug", params)
-        for lesson in cur.fetchall():
+        for lesson in scored_lessons(cur, repo):
             cur.execute(_USES_SQL, (lesson["id"],))
             seen_runs: set[uuid.UUID] = set()
             used = used_pass = 0
