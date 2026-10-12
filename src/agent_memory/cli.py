@@ -12,6 +12,7 @@ import psycopg
 from psycopg.conninfo import conninfo_to_dict
 
 from agent_memory import config, jev, routines_log, store
+from agent_memory import cli_lessons
 
 
 def _db_host(url: str) -> str:
@@ -165,6 +166,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dir", type=Path, default=None, help="migrations directory (default: supabase/migrations)")
     p.set_defaults(func=cmd_db_migrate)
 
+    cli_lessons.register(sub)
     return parser
 
 

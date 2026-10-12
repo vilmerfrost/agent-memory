@@ -1,0 +1,27 @@
+{
+  "_note": "Hand-written fixture in the System One response shape. Not a recorded live response. Used by tests/test_lessons_gates.py (propose accept).",
+  "model": "jev-latest",
+  "usage": {
+    "input_tokens": 0,
+    "output_tokens": 0
+  },
+  "answers": {
+    "reusable": {
+      "type": "noul",
+      "noul": 0.86
+    },
+    "generalizable": {
+      "type": "score",
+      "score": 0.78,
+      "confidence": 0.74,
+      "legend": {
+        "0": "Specific to this one run",
+        "1": "Applies to many future runs"
+      },
+      "probabilities": {
+        "0": 0.22,
+        "1": 0.78
+      }
+    }
+  }
+}
