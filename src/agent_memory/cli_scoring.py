@@ -17,8 +17,24 @@ from agent_memory.questions import QuestionCache, QuestionConfigError
 REMOTE_REQUIRED_EXIT = 3
 
 
-def _remote_guard() -> int | None:
-    error = config.remote_write_error()
+def _backend_guard(name: str) -> int | None:
+    """Scoring is Postgres only in V1: refuse the REST backend instead of silently using the default DSN."""
+    try:
+        active = config.backend()
+    except config.BackendError as exc:
+        print(f"amem: {name} failed: {exc}", file=sys.stderr)
+        return 1
+    if active != "postgres":
+        print(f"amem: {name} needs the Postgres backend in V1 (backend={active}); "
+              "set AMEM_DB_URL (or AMEM_BACKEND=postgres).", file=sys.stderr)
+        return 1
+    return None
+
+
+def _remote_guard(name: str) -> int | None:
+    if (code := _backend_guard(name)) is not None:
+        return code
+    error = config.remote_write_error(for_backend="postgres")
     if error is None:
         return None
     print(error, file=sys.stderr)
@@ -67,6 +83,8 @@ def _emit(rows: list[dict[str, Any]]) -> None:
 
 def _guarded(name: str, fn) -> int:
     """Run a command body; map config and DB errors to exit 1 with a one-line message."""
+    if (code := _backend_guard(name)) is not None:
+        return code
     try:
         return fn()
     except QuestionConfigError as exc:
@@ -77,7 +95,7 @@ def _guarded(name: str, fn) -> int:
 
 
 def cmd_score(args: argparse.Namespace) -> int:
-    if (code := _remote_guard()) is not None:
+    if (code := _remote_guard("score")) is not None:
         return code
 
     def body() -> int:
@@ -97,7 +115,7 @@ def cmd_score(args: argparse.Namespace) -> int:
 
 
 def cmd_label(args: argparse.Namespace) -> int:
-    if (code := _remote_guard()) is not None:
+    if (code := _remote_guard("label")) is not None:
         return code
     try:
         new = scoring.set_label(args.run_id, args.verdict, args.note)

@@ -10,7 +10,8 @@ runs ──amem score──▶ scores ──amem escalations──▶ Vilmer ─
                         └──────────── amem calibrate / amem drift ◀────────┘
 ```
 
-Postgres only (psycopg) in V1. Jev runs in fixture mode unless the live rule
+Postgres only (psycopg) in V1: on the REST backend (docs/cloud.md) every
+scoring command exits 1 with a clear message. Jev runs in fixture mode unless the live rule
 in the README holds. Nothing in this flow pushes a notification: `escalations`
 only prints.
 

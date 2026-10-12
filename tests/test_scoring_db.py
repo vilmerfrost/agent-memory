@@ -118,6 +118,14 @@ def test_label_rejects_bad_input(sdb: ScoringDb) -> None:
     assert f"no run with id {unknown}" in missing.stderr
 
 
+def test_scoring_commands_refuse_rest_backend(sdb: ScoringDb) -> None:
+    env = dict(sdb.env, AMEM_BACKEND="rest")
+    for args in (("score",), ("label", str(uuid.uuid4()), "up"), ("escalations",), ("calibrate",), ("drift",)):
+        result = run_amem(*args, env=env)
+        assert result.returncode == 1, (args, result.stderr)
+        assert "needs the Postgres backend in V1 (backend=rest)" in result.stderr
+
+
 def test_write_commands_respect_require_remote(sdb: ScoringDb) -> None:
     env = dict(sdb.env, AMEM_REQUIRE_REMOTE="1")
     for args in (("score",), ("label", str(uuid.uuid4()), "up")):

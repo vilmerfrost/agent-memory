@@ -1,4 +1,9 @@
-"""Run log storage (psycopg 3) and the SQL migration runner."""
+"""Run log storage (psycopg 3) and the SQL migration runner.
+
+`insert_run`, `ingest_runs` and `recent_runs` go to `backend_rest` when
+`config.backend()` is `rest` and no explicit `db_url` is passed. Migrations are
+always Postgres.
+"""
 
 from __future__ import annotations
 
@@ -12,11 +17,16 @@ import psycopg
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
-from agent_memory import config
+from agent_memory import backend_rest, config
 from agent_memory.routines_log import ParsedRun
 
 STATUSES = ("pass", "fail", "skip", "error")
 SOURCES = ("launchd", "scheduled-task", "cloud", "manual")
+
+
+def _rest() -> bool:
+    """True when the run functions below go over HTTPS (see backend_rest)."""
+    return config.backend() == "rest"
 
 
 def connect(db_url: str | None = None, **kwargs: Any) -> psycopg.Connection:
@@ -37,6 +47,11 @@ def insert_run(
     db_url: str | None = None,
 ) -> uuid.UUID:
     """Insert one run row and return its id. started_at defaults to now()."""
+    if db_url is None and _rest():
+        return backend_rest.insert_run(
+            routine, status, source=source, started_at=started_at, finished_at=finished_at,
+            summary=summary, failure_reason=failure_reason, report_path=report_path, meta=meta,
+        )
     with connect(db_url) as conn:
         row = conn.execute(
             """
@@ -70,6 +85,8 @@ def ingest_runs(rows: Iterable[ParsedRun], *, db_url: str | None = None) -> tupl
     detail lines (an ingest that raced a routine still writing its details).
     Other `meta` keys are never overwritten.
     """
+    if db_url is None and _rest():
+        return backend_rest.ingest_runs(rows)
     new = present = 0
     with connect(db_url) as conn:
         for r in rows:
@@ -87,6 +104,8 @@ def ingest_runs(rows: Iterable[ParsedRun], *, db_url: str | None = None) -> tupl
 
 def recent_runs(routine: str, limit: int = 10, *, db_url: str | None = None) -> list[dict[str, Any]]:
     """Newest runs first for one routine."""
+    if db_url is None and _rest():
+        return backend_rest.recent_runs(routine, limit)
     with connect(db_url) as conn, conn.cursor(row_factory=dict_row) as cur:
         cur.execute(
             """

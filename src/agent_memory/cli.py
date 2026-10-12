@@ -11,7 +11,7 @@ from pathlib import Path
 import psycopg
 from psycopg.conninfo import conninfo_to_dict
 
-from agent_memory import config, jev, routines_log, store
+from agent_memory import cli_cloud, config, jev, routines_log, store
 from agent_memory import cli_scoring
 
 
@@ -36,9 +36,9 @@ def _db_reachable(url: str) -> bool:
 REMOTE_REQUIRED_EXIT = 3
 
 
-def _remote_guard() -> int | None:
+def _remote_guard(for_backend: str | None = None) -> int | None:
     """Exit code if AMEM_REQUIRE_REMOTE=1 forbids this write, else None."""
-    error = config.remote_write_error()
+    error = config.remote_write_error(for_backend)
     if error is None:
         return None
     print(error, file=sys.stderr)
@@ -48,8 +48,10 @@ def _remote_guard() -> int | None:
 def cmd_doctor(_args: argparse.Namespace) -> int:
     url = config.db_url()
     print(f"jev_mode={jev.mode()}")
-    print(f"db_host={_db_host(url)}")
-    print(f"db={'reachable' if _db_reachable(url) else 'unreachable'}")
+    backend, host, ok = cli_cloud.doctor_backend(lambda: (_db_host(url), _db_reachable(url)))
+    print(f"backend={backend}")
+    print(f"db_host={host}")
+    print(f"db={'reachable' if ok else 'unreachable'}")
     print(f"require_remote={'on' if config.require_remote() else 'off'}")
     return 0
 
@@ -75,7 +77,7 @@ def cmd_log_run(args: argparse.Namespace) -> int:
             failure_reason=args.failure_reason,
             report_path=args.report_path,
         )
-    except psycopg.Error as exc:
+    except (psycopg.Error, config.BackendError) as exc:
         print(f"amem: log-run failed: {type(exc).__name__}: {exc}".strip(), file=sys.stderr)
         return 1
     print(run_id)
@@ -85,7 +87,7 @@ def cmd_log_run(args: argparse.Namespace) -> int:
 def cmd_runs(args: argparse.Namespace) -> int:
     try:
         rows = store.recent_runs(args.routine, args.limit)
-    except psycopg.Error as exc:
+    except (psycopg.Error, config.BackendError) as exc:
         print(f"amem: runs failed: {type(exc).__name__}: {exc}".strip(), file=sys.stderr)
         return 1
     for row in rows:
@@ -103,7 +105,7 @@ def cmd_ingest_routines_log(args: argparse.Namespace) -> int:
     parsed = routines_log.parse_file(path)
     try:
         new, present = store.ingest_runs(parsed.runs)
-    except psycopg.Error as exc:
+    except (psycopg.Error, config.BackendError) as exc:
         print(f"amem: ingest failed: {type(exc).__name__}: {exc}".strip(), file=sys.stderr)
         return 1
     if parsed.unparsed:
@@ -118,11 +120,11 @@ def cmd_ingest_routines_log(args: argparse.Namespace) -> int:
 
 
 def cmd_db_migrate(args: argparse.Namespace) -> int:
-    if (code := _remote_guard()) is not None:
+    if (code := _remote_guard("postgres")) is not None:
         return code
     try:
         applied = store.migrate(migrations_dir=args.dir)
-    except psycopg.Error as exc:
+    except (psycopg.Error, config.BackendError) as exc:
         print(f"amem: migrate failed: {type(exc).__name__}: {exc}".strip(), file=sys.stderr)
         return 1
     for name in applied:
@@ -166,6 +168,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dir", type=Path, default=None, help="migrations directory (default: supabase/migrations)")
     p.set_defaults(func=cmd_db_migrate)
 
+    cli_cloud.register(sub, ingest_sub=ingest_sub)
     cli_scoring.register(sub)
     return parser
 
