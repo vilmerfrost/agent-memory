@@ -3,7 +3,7 @@
 Exit codes:
 - 0 report printed (also when there is no lesson to report).
 - 1 REST backend, unknown lesson, bad question file or a database error.
-- 2 argparse usage errors.
+- 2 argparse usage errors; `--runs` without `--json`.
 - 3 AMEM_REQUIRE_REMOTE=1 and AMEM_DB_URL is local or unset.
 """
 
@@ -42,10 +42,14 @@ def _guard() -> int | None:
 
 
 def cmd_report(args: argparse.Namespace) -> int:
+    if args.runs and not args.json:
+        print("amem: ab report: --runs needs --json", file=sys.stderr)
+        return 2
     if (code := _guard()) is not None:
         return code
     try:
-        entries = ab.report(slug=args.lesson, repo=args.repo, n=args.n, margin=args.margin, since=args.since)
+        entries = ab.report(slug=args.lesson, repo=args.repo, n=args.n, margin=args.margin,
+                            since=args.since, include_runs=args.runs)
     except ab.AbError as exc:
         print(f"amem: ab report failed: {exc}", file=sys.stderr)
         return 1
@@ -99,4 +103,6 @@ def register(sub: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
                    help=f"pass-rate difference beyond which A wins or loses (default {ab.DEFAULT_MARGIN})")
     p.add_argument("--since", type=_iso, help="only runs started at or after this ISO time")
     p.add_argument("--json", action="store_true", help="one JSON line per lesson")
+    p.add_argument("--runs", action="store_true",
+                   help="with --json: add every run with its arm, outcome and deciding source")
     p.set_defaults(func=cmd_report)

@@ -146,10 +146,14 @@ def report(
     n: int = DEFAULT_N,
     margin: float = DEFAULT_MARGIN,
     since: datetime | None = None,
+    include_runs: bool = False,
     cache: QuestionCache | None = None,
     db_url: str | None = None,
 ) -> list[dict[str, Any]]:
-    """One entry per lesson (active lessons, or the one `slug`), in `lessons score` order."""
+    """One entry per lesson (active lessons, or the one `slug`), in `lessons score` order.
+
+    `include_runs` adds `runs`: every run with its arm, outcome and deciding source.
+    """
     cache = cache or QuestionCache()
     out: list[dict[str, Any]] = []
     with store.connect(db_url) as conn, conn.cursor(row_factory=dict_row) as cur:
@@ -168,7 +172,10 @@ def report(
             arms: dict[str, list[Outcome]] = {"with": [], "without": []}
             for o in scopes[scope]:
                 arms["with" if o.run_id in used else "without"].append(o)
-            out.append(_entry(lesson, arms, n=n, margin=margin, since=since))
+            entry = _entry(lesson, arms, n=n, margin=margin, since=since)
+            if include_runs:
+                entry["runs"] = run_details(arms)
+            out.append(entry)
     return out
 
 
@@ -197,12 +204,16 @@ def _entry(lesson: dict[str, Any], arms: dict[str, list[Outcome]], *, n: int, ma
         "diff": diff,
         "z": z_score(a["pass"], a["runs"], b["pass"], b["runs"]),
         "low_confidence": low,
-        "runs": [
-            {"run_id": str(o.run_id), "arm": arm, "outcome": "pass" if o.passed else "fail",
-             "source": o.source}
-            for arm in ARMS for o in arms[arm]
-        ],
     }
+
+
+def run_details(arms: dict[str, list[Outcome]]) -> list[dict[str, Any]]:
+    """Every run of both arms with its outcome and the source that decided it."""
+    return [
+        {"run_id": str(o.run_id), "routine": o.routine, "arm": arm,
+         "outcome": "pass" if o.passed else "fail", "source": o.source}
+        for arm in ARMS for o in arms[arm]
+    ]
 
 
 # --------------------------------------------------------------------------- text output
