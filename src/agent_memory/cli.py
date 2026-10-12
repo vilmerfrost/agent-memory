@@ -11,7 +11,7 @@ from pathlib import Path
 import psycopg
 from psycopg.conninfo import conninfo_to_dict
 
-from agent_memory import config, jev, store
+from agent_memory import config, jev, routines_log, store
 
 
 def _db_host(url: str) -> str:
@@ -32,11 +32,24 @@ def _db_reachable(url: str) -> bool:
         return False
 
 
+REMOTE_REQUIRED_EXIT = 3
+
+
+def _remote_guard() -> int | None:
+    """Exit code if AMEM_REQUIRE_REMOTE=1 forbids this write, else None."""
+    error = config.remote_write_error()
+    if error is None:
+        return None
+    print(error, file=sys.stderr)
+    return REMOTE_REQUIRED_EXIT
+
+
 def cmd_doctor(_args: argparse.Namespace) -> int:
     url = config.db_url()
     print(f"jev_mode={jev.mode()}")
     print(f"db_host={_db_host(url)}")
     print(f"db={'reachable' if _db_reachable(url) else 'unreachable'}")
+    print(f"require_remote={'on' if config.require_remote() else 'off'}")
     return 0
 
 
@@ -48,6 +61,8 @@ def _iso(value: str) -> datetime:
 
 
 def cmd_log_run(args: argparse.Namespace) -> int:
+    if (code := _remote_guard()) is not None:
+        return code
     try:
         run_id = store.insert_run(
             args.routine,
@@ -77,7 +92,33 @@ def cmd_runs(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_ingest_routines_log(args: argparse.Namespace) -> int:
+    if (code := _remote_guard()) is not None:
+        return code
+    path: Path = args.path.expanduser()
+    if not path.is_file():
+        print(f"amem: ingest failed: no such file: {path}", file=sys.stderr)
+        return 1
+    parsed = routines_log.parse_file(path)
+    try:
+        new, present = store.ingest_runs(parsed.runs)
+    except psycopg.Error as exc:
+        print(f"amem: ingest failed: {type(exc).__name__}: {exc}".strip(), file=sys.stderr)
+        return 1
+    if parsed.unparsed:
+        shown = ", ".join(str(n) for n in parsed.unparsed[:20])
+        more = " ..." if len(parsed.unparsed) > 20 else ""
+        print(f"amem: unparsed lines: {shown}{more}", file=sys.stderr)
+    if parsed.incomplete_tail:
+        print("amem: skipped the last line: no trailing newline yet (next ingest picks it up)",
+              file=sys.stderr)
+    print(f"ingested {new} new, {present} already present, {len(parsed.unparsed)} unparsed")
+    return 0
+
+
 def cmd_db_migrate(args: argparse.Namespace) -> int:
+    if (code := _remote_guard()) is not None:
+        return code
     try:
         applied = store.migrate(migrations_dir=args.dir)
     except psycopg.Error as exc:
@@ -93,7 +134,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="amem", description="agent-memory: run log and Jev gate.")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p = sub.add_parser("doctor", help="print jev mode, db host and db reachability")
+    p = sub.add_parser("doctor", help="print jev mode, db host, db reachability and require_remote")
     p.set_defaults(func=cmd_doctor)
 
     p = sub.add_parser("log-run", help="insert one run row and print its id")
@@ -111,6 +152,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--routine", required=True)
     p.add_argument("--limit", type=int, default=10)
     p.set_defaults(func=cmd_runs)
+
+    ingest = sub.add_parser("ingest", help="ingest external logs into runs (idempotent)")
+    ingest_sub = ingest.add_subparsers(dest="ingest_command", required=True)
+    p = ingest_sub.add_parser("routines-log", help="ingest ~/.claude/parent/routines.log lines into runs")
+    p.add_argument("path", type=Path, help="path to routines.log")
+    p.set_defaults(func=cmd_ingest_routines_log)
 
     db = sub.add_parser("db", help="database commands")
     db_sub = db.add_subparsers(dest="db_command", required=True)
