@@ -7,6 +7,7 @@ import psycopg
 import pytest
 
 from agent_memory import store
+from agent_memory.config import MIGRATIONS_DIR
 from conftest import run_amem
 
 
@@ -24,7 +25,8 @@ def test_migrate_is_idempotent(db_env: dict[str, str], pg_url: str) -> None:
     assert "(0 applied now)" in second.stdout
     with psycopg.connect(pg_url) as conn:
         rows = conn.execute("select filename from schema_migrations order by filename").fetchall()
-        assert [r[0] for r in rows] == ["20261012220000_runs.sql"]
+        expected = sorted(f.name for f in MIGRATIONS_DIR.glob("*.sql"))
+        assert [r[0] for r in rows] == expected
         assert conn.execute("select to_regclass('public.runs') is not null").fetchone() == (True,)
 
 
@@ -78,3 +80,16 @@ def test_log_run_db_error_exits_nonzero(db_env: dict[str, str]) -> None:
     result = run_amem("log-run", "--routine", _routine(), "--status", "pass", env=env)
     assert result.returncode == 1
     assert "log-run failed" in result.stderr
+
+
+def test_rls_enabled_on_all_public_tables(pg_url):
+    import psycopg
+
+    with psycopg.connect(pg_url) as conn:
+        rows = conn.execute(
+            "select c.relname, c.relrowsecurity from pg_class c "
+            "join pg_namespace n on n.oid = c.relnamespace "
+            "where n.nspname = 'public' and c.relkind = 'r'"
+        ).fetchall()
+    assert rows, "no public tables found"
+    assert all(rls for _, rls in rows), f"RLS off on: {[n for n, rls in rows if not rls]}"
