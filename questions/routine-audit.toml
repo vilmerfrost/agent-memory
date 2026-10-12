@@ -1,0 +1,41 @@
+# Jev questions for routine-audit: the morning audit of all routines' last runs.
+# Summary looks like `problems=3 push=new via=phone 1s report=...`; each failure is
+# `<routine>: <problem>`, e.g. "config-check: last run FAIL".
+# Format: docs/scoring.md.
+
+threshold = 0.7
+pass_question = "verdict"
+pass_options = ["ok"]
+
+[[questions]]
+name = "verdict"
+kind = "choice"
+prompt = "Does this audit show something Vilmer must act on?"
+[questions.options]
+ok = "No problems, or only problems that need no action."
+needs_action = "At least one routine has a problem that needs a human."
+
+[[questions]]
+name = "triage"
+kind = "choice"
+prompt = "Classify the problems the audit reported. If there are none, answer environment_noise."
+[questions.options]
+real_failure = "A routine is really broken or found a real issue."
+environment_noise = "Problems come from the environment: the machine was asleep or offline, a known recurring finding, a flaky dependency."
+unclear = "The audit line does not give enough detail to tell."
+
+[[questions]]
+name = "push_justified"
+kind = "noul"
+prompt = "Was the notification decision right? push=new means a new phone push was sent; push=none means no push. Answer yes if the push decision fits the problems."
+
+[[questions]]
+name = "breadth"
+kind = "score"
+prompt = "How widespread are the problems?"
+levels = [
+    "No problems.",
+    "One routine affected.",
+    "Several routines affected.",
+    "Most routines affected: a systemic problem.",
+]

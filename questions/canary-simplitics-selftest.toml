@@ -1,0 +1,38 @@
+# Jev questions for canary-simplitics-selftest: the canary's own selftest. It runs the
+# simplitics canary against planted scenarios. The scenario is the report file name:
+# report-clean.md must PASS; report-fake-real-host, -env-local, -dirty-tree,
+# -setup-log-missing, -setup-log-noport, -setup-log-secret-* must FAIL on the planted check.
+# So a FAIL row is often the correct result. Format: docs/scoring.md.
+
+threshold = 0.75
+pass_question = "verdict"
+pass_options = ["expected"]
+
+[[questions]]
+name = "verdict"
+kind = "choice"
+prompt = "Does the canary result match the planted scenario named in the report path? The clean scenario should pass; every other scenario should fail on its planted problem."
+[questions.options]
+expected = "The result matches the scenario: clean passed, or a planted scenario failed on the planted problem."
+missed = "A planted scenario passed or was not caught: the canary would miss a real problem."
+unexpected_failure = "The canary failed on something that was not planted (a crash, a wrong finding, a failing clean run)."
+
+[[questions]]
+name = "crash"
+kind = "noul"
+prompt = "Did a check crash or error (exception, permission denied, non-zero exit) instead of giving a judgment?"
+
+[[questions]]
+name = "extra_findings"
+kind = "noul"
+prompt = "Did the canary report failures beyond what the scenario planted?"
+
+[[questions]]
+name = "canary_trust"
+kind = "score"
+prompt = "How much does this run let us trust the canary to catch real leaks of hosts or secrets?"
+levels = [
+    "Not at all: it missed or crashed.",
+    "Somewhat: right outcome with noise or crashes.",
+    "Fully: exactly the planted problems, nothing else.",
+]
