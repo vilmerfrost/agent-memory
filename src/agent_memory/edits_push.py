@@ -10,7 +10,8 @@ an `http` action "Undo" that POSTs {edit_id, token} to the edge function `amem-u
 Undo poll (`amem edits undo-poll`, every 15 minutes from agent-config's amem-ingest):
 pending undo_requests -> `improve revert <improve id> --reason "phone undo"` -> request
 handled, edit status `reverted`, a short confirmation push. A failed revert is recorded and
-retried; after MAX_ATTEMPTS it is closed as failed and pushed.
+retried; after MAX_ATTEMPTS it is closed as failed and pushed. A busy revert (improve's write
+lock held, exit 75) is retried without counting as an attempt.
 
 The ntfy and osascript calls go through `daily.http_post` / `daily.mac_notify` (tests
 replace them; no network in tests).
@@ -22,6 +23,7 @@ import hashlib
 import json
 import os
 import secrets
+import subprocess
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -38,6 +40,14 @@ UNDO_URL_ENV = "AMEM_EDITS_UNDO_URL"
 FUNCTION_PATH = "/functions/v1/amem-undo"
 MAX_ATTEMPTS = 3
 REVERTABLE = ("kept", "trial")
+# `improve revert` waits IMPROVE_REVERT_WAIT s for its write lock (an apply may be running
+# evals), then exits 75 "busy" with nothing changed. A busy revert is retried next poll and
+# never counts as an attempt. amem-ingest kills the whole undo-poll after 120 s
+# (AMEM_UNDO_POLL_TIMEOUT), so improve must give up first: wait 60 s, our own kill at 100 s.
+REVERT_WAIT_ENV = "IMPROVE_REVERT_WAIT"
+REVERT_WAIT = 60
+REVERT_TIMEOUT = 100
+EX_BUSY = 75
 
 
 def token_hash(token: str) -> str:
@@ -172,7 +182,8 @@ class PollReport:
 
     def summary(self) -> str:
         return (f"undo-poll: requests={len(self.outcomes)} reverted={self.count('reverted')} "
-                f"nothing={self.count('nothing')} retry={self.count('retry')} failed={self.count('failed')}")
+                f"nothing={self.count('nothing')} retry={self.count('retry')} failed={self.count('failed')} "
+                f"busy={self.count('busy')}")
 
 
 _PENDING_SQL = """
@@ -182,6 +193,20 @@ from undo_requests u join edits e on e.id = u.edit_id
 where u.handled_at is null {only}
 order by u.requested_at, u.id
 """
+
+
+def _revert(improve_id: str, reason: str) -> subprocess.CompletedProcess[str]:
+    """`improve revert`, bounded: improve waits at most REVERT_WAIT s for its write lock (then
+    exit 75 busy), and the process is killed after REVERT_TIMEOUT s; both stay under
+    amem-ingest's 120 s undo-poll timeout."""
+    argv = [edits.improve_bin(), "revert", improve_id, "--reason", reason]
+    env = {**os.environ, REVERT_WAIT_ENV: str(REVERT_WAIT)}
+    try:
+        return subprocess.run(argv, capture_output=True, text=True, timeout=REVERT_TIMEOUT, env=env)
+    except subprocess.TimeoutExpired:
+        raise edits.ImproveError(f"improve revert timed out after {REVERT_TIMEOUT}s") from None
+    except OSError as exc:
+        raise edits.ImproveError(f"cannot run improve: {type(exc).__name__}: {exc}") from None
 
 
 def _handle(conn: psycopg.Connection, r: dict[str, Any], *, push: bool, notify: dict[str, str] | None) -> UndoOutcome:
@@ -195,11 +220,17 @@ def _handle(conn: psycopg.Connection, r: dict[str, Any], *, push: bool, notify: 
     reason = "phone undo" if r["source"] == "phone" else "manual undo"
     attempts = int(r["attempts"]) + 1
     try:
-        proc = edits._improve(["revert", str(r["improve_id"]), "--reason", reason], timeout=600)
+        proc = _revert(str(r["improve_id"]), reason)
         ok, why = proc.returncode == 0, edits._one_line(proc.stderr or proc.stdout or "", 200)
         why = f"exit {proc.returncode}: {why}" if not ok else why
+        busy = not ok and (proc.returncode == EX_BUSY or "busy" in (proc.stderr or "").lower())
     except edits.ImproveError as exc:
-        ok, why = False, str(exc)
+        ok, busy, why = False, False, str(exc)
+    if busy:  # improve's write lock is held (an apply's evals): nothing changed, not an attempt
+        detail = f"busy, retrying: {why}"
+        conn.execute("update undo_requests set result = %s where id = %s", (detail[:500], r["request_id"]))
+        conn.commit()
+        return UndoOutcome(r["edit_id"], "busy", detail)
     label = r["rule_title"] or r["rule_id"]
     if ok:
         conn.execute("update undo_requests set handled_at = now(), result = 'reverted', attempts = %s where id = %s",

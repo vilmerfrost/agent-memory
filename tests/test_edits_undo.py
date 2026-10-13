@@ -177,6 +177,59 @@ def test_revert_failure_is_recorded_retried_and_closed(live: ScoringDb, ehome: E
     assert req["result"] == "reverted" and req["attempts"] == 1
 
 
+def test_busy_revert_is_retried_without_using_attempts(live: ScoringDb, ehome: EHome, ewriter: Any,  # noqa: F811
+                                                       daily_io: DailyIO) -> None:  # noqa: F811
+    push = daily_io.use_push(Push(status=200))
+    edit_id = make_kept(live.url, ehome, ewriter)
+    phone_request(live.url, edit_id)
+    busy = {"stdout": "", "stderr": "improve revert: busy: write lock held by pid 1 (improve apply)", "exit": 75}
+    busy_text_only = {"stdout": "", "stderr": "improve revert: busy, try again later", "exit": 1}
+    ehome.improve.queue("revert", *([busy] * 4), busy_text_only)
+    polls = 5   # more polls than MAX_ATTEMPTS: an apply's hour of evals must not close the request
+    for _ in range(polls):
+        r = edits_push.undo_poll(notify=NOTIFY, db_url=live.url)
+        (o,) = r.outcomes
+        assert o.result == "busy" and o.detail.startswith("busy, retrying") and "busy=1" in r.summary()
+        (req,) = requests(live.url)
+        assert req["handled_at"] is None and req["attempts"] == 0 and req["result"].startswith("busy, retrying")
+    assert polls > edits_push.MAX_ATTEMPTS and push.posts == []
+    assert edit_rows(live.url)[0]["status"] == "kept"
+    ehome.improve.queue("revert", {"stdout": "ok\n", "exit": 0})
+    (o,) = edits_push.undo_poll(notify=NOTIFY, db_url=live.url).outcomes
+    assert o.result == "reverted"
+    (req,) = requests(live.url)
+    assert req["result"] == "reverted" and req["attempts"] == 1 and req["handled_at"] is not None
+
+
+def test_undo_poll_exits_0_when_busy(live: ScoringDb, ehome: EHome, ewriter: Any) -> None:  # noqa: F811
+    edit_id = make_kept(live.url, ehome, ewriter)
+    phone_request(live.url, edit_id)
+    ehome.improve.queue("revert", {"stdout": "", "stderr": "improve revert: busy", "exit": 75})
+    res = run_amem("edits", "undo-poll", "--no-push", env={**live.env, **home_env(ehome)})
+    assert res.returncode == 0, res.stdout + res.stderr
+    assert f"busy edit={edit_id}" in res.stdout and "busy=1" in res.stdout
+
+
+def test_revert_is_bounded_below_the_poll_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    # amem-ingest kills undo-poll after AMEM_UNDO_POLL_TIMEOUT (default 120 s); improve's own
+    # default revert wait is 300 s. improve must give up (exit 75) before we kill it, and we before amem-ingest.
+    assert edits_push.REVERT_WAIT < edits_push.REVERT_TIMEOUT < 120
+    seen: dict[str, Any] = {}
+
+    def fake_run(argv: list[str], **kw: Any) -> Any:
+        seen.update(argv=argv, **kw)
+        raise edits_push.subprocess.TimeoutExpired(argv, kw["timeout"])
+
+    monkeypatch.setenv(edits.IMPROVE_ENV, "/fake/improve")
+    monkeypatch.setenv(edits_push.REVERT_WAIT_ENV, "300")
+    monkeypatch.setattr(edits_push.subprocess, "run", fake_run)
+    with pytest.raises(edits.ImproveError, match="timed out after 100s"):
+        edits_push._revert("c-1", "phone undo")
+    assert seen["argv"] == ["/fake/improve", "revert", "c-1", "--reason", "phone undo"]
+    assert seen["timeout"] == edits_push.REVERT_TIMEOUT
+    assert seen["env"][edits_push.REVERT_WAIT_ENV] == str(edits_push.REVERT_WAIT)
+
+
 def test_request_undo_states(live: ScoringDb, ehome: EHome, ewriter: Any) -> None:  # noqa: F811
     assert phone_request(live.url, uuid.uuid4()) == "missing"
     assert requests(live.url) == []

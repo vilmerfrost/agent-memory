@@ -294,7 +294,10 @@ each pending request whose edit is kept / trial → `improve revert <improve id>
 (`result = reverted`), edit `status = reverted`, `reverted_at` set, a short "Agent edit
 undone" push. A failed revert is recorded (`attempts`, `result = failed (attempt N): ...`)
 and retried on the next poll; after 3 attempts the request is closed and an "undo failed"
-push goes out. An edit with nothing to revert (auto-reverted, refused, already reverted)
+push goes out. A busy revert (improve's write lock held by an apply's evals: exit 75 or
+"busy" on stderr) is not an attempt: `result = busy, retrying: ...`, the request stays open
+for the next poll. The poll runs `improve revert` with `IMPROVE_REVERT_WAIT=60` and kills it
+after 100 s, both under amem-ingest's 120 s `AMEM_UNDO_POLL_TIMEOUT`. An edit with nothing to revert (auto-reverted, refused, already reverted)
 closes the request with `nothing to revert (status ...)`.
 
 ## Scoreboard (E5)
