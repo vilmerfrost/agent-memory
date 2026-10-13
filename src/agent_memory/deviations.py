@@ -647,7 +647,7 @@ def transcript_path(row: SessionRow, root: Path | None = None) -> Path:
 
 
 _RECURRENCE_SQL = """
-select count(distinct d.session_id) from deviations d join sessions s using (session_id)
+select distinct d.session_id from deviations d join sessions s using (session_id)
 where d.instruction_source = %(src)s and lower(d.instruction_ref) = %(ref)s
   and d.session_id <> %(sid)s and coalesce(s.started_at, s.created_at) >= %(since)s
 """
@@ -664,10 +664,9 @@ class _Recurrence:
     def count(self, f: Finding, session_id: str) -> int:
         key = (f.instruction_source, f.instruction_ref.lower())
         with store.connect(self.db_url) as conn:
-            row = conn.execute(_RECURRENCE_SQL, {"src": key[0], "ref": key[1], "sid": session_id,
-                                                 "since": self.since}).fetchone()
-        stored = int(row[0]) if row else 0
-        return stored + len(self.fresh[key] - {session_id})
+            stored = {r[0] for r in conn.execute(_RECURRENCE_SQL, {"src": key[0], "ref": key[1],
+                                                                  "sid": session_id, "since": self.since})}
+        return len((stored | self.fresh[key]) - {session_id})
 
     def add(self, f: Finding, session_id: str) -> None:
         self.fresh[(f.instruction_source, f.instruction_ref.lower())].add(session_id)
