@@ -158,7 +158,7 @@ Output: one JSON object, the `cloud_digests` row.
 | `digest`, `digest_sha` | the redacted, capped digest and its sha256 |
 | `instructions` | `[{name, sha256, text}]`: text redacted, capped at 100k chars; sha256 of the text as read |
 | `skills` | `Skill` calls and slash commands, no built-ins |
-| `meta` | `{cloud: true, repo, script_version, transcript_bytes, tool_calls, prompts}` |
+| `meta` | `{cloud: true, repo, script_version, transcript_bytes, tool_calls, prompts, tokens}`; `tokens` (script version 2+) = `{input, output, cache_read, cache_creation, models}`, the session's token totals (docs/sessions-live.md) |
 
 ### The routine's last step
 
@@ -200,7 +200,8 @@ its prompt in a file in its repo, pass `--prompt <file>` instead.
 - `amem sessions ingest` (Postgres backend) also reads every `cloud_digests` row with
   `ingested_at` null: one `sessions` row each (id = `source_key`, `tool` claude, `kind`
   routine, `project_dir` cloud, `meta.cloud` true, `meta.routine`, `repo`), then sets
-  `ingested_at`, in one transaction. Idempotent; a re-ingest keeps `scanned_at`. The summary
+  `ingested_at`, in one transaction. `meta.tokens` of the digest fills the token columns
+  (`turns` = `meta.prompts`). Idempotent; a re-ingest keeps `scanned_at`. The summary
   line ends with `cloud=N` when it ingested any (`cloud_bad=N`: rows it could not use).
   `--tool codex` skips them.
 - `sessions.instructions`: `routine:<routine>` for the prompt, `cloud-file:<name>` for each

@@ -33,6 +33,10 @@ personal owner (AMEM_PERSONAL_OWNERS, default `vilmerfrost`) or
 `<claude home>/parent/<repo>/profile.md` says `mode: team`. The edit step never edits a
 team repo's files.
 
+Tokens (session_tokens.py, docs/sessions-live.md): every row also gets its token totals,
+per-model breakdown, turns and last activity; a parent's `meta.subagent_tokens` sums its
+subagents. Pings the hook spooled (session_live.py) are flushed first.
+
 Idempotent: one upsert per session_id. A re-ingest refreshes the facts and keeps
 `scanned_at` and the scan keys in `meta`.
 """
@@ -50,7 +54,7 @@ from typing import Any
 
 from psycopg.types.json import Jsonb
 
-from agent_memory import codex_sessions, config, store
+from agent_memory import codex_sessions, config, session_tokens, store
 
 KINDS = ("chat", "parent", "worker", "headless", "eval", "routine")
 TOOLS = ("claude", "codex")
@@ -338,6 +342,7 @@ class SessionRow:
     meta: dict[str, Any] = field(default_factory=dict)
     path: Path | None = None
     tool: str = "claude"   # claude | codex
+    tokens: session_tokens.Summary | None = None  # None: not measured (the token columns stay as they are)
 
     @property
     def cwd(self) -> str:
@@ -484,7 +489,7 @@ def session_row(path: Path, project_dir: str, *, parent_session: str | None = No
     repo = repo_of(cwd)
     meta.update(team_info(cwd, repo))
     row = SessionRow(sid, kind, repo, project_dir, facts.start, facts.end, size,
-                     facts.skills, [], meta, path)
+                     facts.skills, [], meta, path, tokens=session_tokens.claude_summary(events))
     return _with_instructions(row)
 
 
@@ -538,7 +543,10 @@ def codex_row(path: Path, rel_dir: str) -> SessionRow:
     except OSError:
         size = 0
     sid = codex_sessions.PREFIX + (f.thread_id or path.stem)
-    row = SessionRow(sid, kind, repo, rel_dir, f.start, f.end, size, f.skills, [], meta, path, tool="codex")
+    tokens = session_tokens.codex_summary(events)
+    tokens.turns = f.prompts
+    row = SessionRow(sid, kind, repo, rel_dir, f.start, f.end, size, f.skills, [], meta, path, tool="codex",
+                     tokens=tokens)
     return _with_instructions(row)
 
 
@@ -598,14 +606,16 @@ class IngestReport:
     team: int = 0
     cloud: int = 0      # cloud routine sessions ingested from cloud_digests in this run
     cloud_bad: int = 0  # cloud_digests rows that could not be ingested
+    spool: int = 0      # hook pings flushed from the local spool file (docs/sessions-live.md)
 
     def line(self) -> str:
         kinds = " ".join(f"{k}={self.kinds.get(k, 0)}" for k in KINDS)
         tools = " ".join(f"{t}={self.tools.get(t, 0)}" for t in TOOLS)
         cloud = f" cloud={self.cloud}" if self.cloud or self.cloud_bad else ""
         bad = f" cloud_bad={self.cloud_bad}" if self.cloud_bad else ""
+        spool = f" spool={self.spool}" if self.spool else ""
         return (f"sessions: {self.files} files, {self.new} new, {self.updated} updated, "
-                f"{self.skipped} skipped ({kinds}) tools({tools}) team={self.team}{cloud}{bad}")
+                f"{self.skipped} skipped ({kinds}) tools({tools}) team={self.team}{cloud}{bad}{spool}")
 
 
 def collect(root: Path | None, *, days: int = DEFAULT_DAYS, now: datetime | None = None,
@@ -628,26 +638,105 @@ def collect(root: Path | None, *, days: int = DEFAULT_DAYS, now: datetime | None
             continue
         rows.append(row)
     spread_team(rows)
+    rollup_subagents(rows)
     return rows, skipped
 
 
+def rollup_subagents(rows: list[SessionRow]) -> None:
+    """`meta.subagent_tokens` on each parent row: the summed tokens of its subagents
+    ({input, output, cache_read, cache_creation, sessions}). Claude Code: every
+    `<session>/subagents/agent-*.jsonl` next to the parent transcript (a subagent file not in
+    this ingest is read for its tokens only). Codex: the subagent rows of this ingest whose
+    `meta.parent_session` is the parent. The subagents keep their own rows: a sum over all
+    rows never adds this field."""
+    by_id = {r.session_id: r for r in rows}
+    sums: dict[str, tuple[session_tokens.Tokens, int]] = {}
+
+    def add(parent: str, t: session_tokens.Tokens) -> None:
+        total, n = sums.get(parent, (session_tokens.Tokens(), 0))
+        total.add(t)
+        sums[parent] = (total, n + 1)
+
+    for r in rows:
+        if r.tool == "claude" and r.path is not None and "parent_session" not in r.meta:
+            sub_dir = r.path.parent / r.path.stem / "subagents"
+            for f in sorted(sub_dir.glob("agent-*.jsonl")) if sub_dir.is_dir() else []:
+                got = by_id.get(f"{r.session_id}/{f.stem}")
+                summary = got.tokens if got is not None and got.tokens is not None \
+                    else session_tokens.scan_claude_file(f)
+                add(r.session_id, summary.tokens)
+        elif r.tool == "codex" and r.meta.get("parent_session") and r.tokens is not None:
+            add(str(r.meta["parent_session"]), r.tokens.tokens)
+    for sid, (total, n) in sums.items():
+        parent = by_id.get(sid)
+        if parent is not None:
+            parent.meta["subagent_tokens"] = {**total.as_dict(), "sessions": n}
+
+
+# The token columns: a full read of the transcript is the truth, so ingest overwrites them
+# (a row without tokens, `SessionRow.tokens is None`, keeps what is stored).
+# `tokens_updated_at` moves only when a token column changed. `last_activity_at` never goes back
+# (a hook ping may have stored a newer time).
+_TOKEN_COLS = ("tokens_input", "tokens_output", "tokens_cache_read", "tokens_cache_creation", "models", "turns")
+
 _UPSERT_SQL = """
 insert into sessions (session_id, tool, kind, repo, project_dir, started_at, ended_at, transcript_bytes,
-                      skills, instructions, meta)
-values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                      skills, instructions, meta,
+                      tokens_input, tokens_output, tokens_cache_read, tokens_cache_creation, models, turns,
+                      last_activity_at, tokens_updated_at)
+values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+        case when %s::bigint is null then null else now() end)
 on conflict (session_id) do update
     set tool = excluded.tool, kind = excluded.kind, repo = excluded.repo, project_dir = excluded.project_dir,
         started_at = excluded.started_at, ended_at = excluded.ended_at,
         transcript_bytes = excluded.transcript_bytes, skills = excluded.skills,
-        instructions = excluded.instructions, meta = sessions.meta || excluded.meta
+        instructions = excluded.instructions, meta = sessions.meta || excluded.meta,
+        tokens_input = coalesce(excluded.tokens_input, sessions.tokens_input),
+        tokens_output = coalesce(excluded.tokens_output, sessions.tokens_output),
+        tokens_cache_read = coalesce(excluded.tokens_cache_read, sessions.tokens_cache_read),
+        tokens_cache_creation = coalesce(excluded.tokens_cache_creation, sessions.tokens_cache_creation),
+        models = coalesce(excluded.models, sessions.models),
+        turns = coalesce(excluded.turns, sessions.turns),
+        last_activity_at = greatest(sessions.last_activity_at, excluded.last_activity_at),
+        tokens_updated_at = case
+            when excluded.tokens_input is not null
+                 and (sessions.tokens_input, sessions.tokens_output, sessions.tokens_cache_read,
+                      sessions.tokens_cache_creation, sessions.models, sessions.turns)
+                     is distinct from
+                     (excluded.tokens_input, excluded.tokens_output, excluded.tokens_cache_read,
+                      excluded.tokens_cache_creation, excluded.models, excluded.turns)
+            then now() else sessions.tokens_updated_at end
     where (sessions.tool, sessions.kind, sessions.repo, sessions.project_dir, sessions.started_at,
            sessions.ended_at, sessions.transcript_bytes, sessions.skills, sessions.instructions)
           is distinct from
           (excluded.tool, excluded.kind, excluded.repo, excluded.project_dir, excluded.started_at,
            excluded.ended_at, excluded.transcript_bytes, excluded.skills, excluded.instructions)
        or not (sessions.meta @> excluded.meta)
+       or (excluded.tokens_input is not null
+           and (sessions.tokens_input, sessions.tokens_output, sessions.tokens_cache_read,
+                sessions.tokens_cache_creation, sessions.models, sessions.turns)
+               is distinct from
+               (excluded.tokens_input, excluded.tokens_output, excluded.tokens_cache_read,
+                excluded.tokens_cache_creation, excluded.models, excluded.turns))
+       or excluded.last_activity_at > coalesce(sessions.last_activity_at, '-infinity'::timestamptz)
 returning (xmax = 0) as inserted
 """
+
+
+def token_values(t: session_tokens.Summary | None) -> tuple[Any, ...]:
+    """(input, output, cache_read, cache_creation, models, turns) for the token columns, all None
+    when not measured."""
+    if t is None:
+        return (None,) * len(_TOKEN_COLS)
+    models = {k: dict(v) for k, v in sorted(t.models.items())}
+    return (*t.tokens.as_list(), Jsonb(models), t.turns)
+
+
+def _params(r: SessionRow) -> tuple[Any, ...]:
+    tv = token_values(r.tokens)
+    last = (r.tokens.last_at if r.tokens is not None else None) or r.ended_at
+    return (r.session_id, r.tool, r.kind, r.repo, r.project_dir, r.started_at, r.ended_at,
+            r.transcript_bytes, Jsonb(r.skills), Jsonb(r.instructions), Jsonb(r.meta), *tv, last, tv[0])
 
 
 def upsert(rows: list[SessionRow], *, db_url: str | None = None) -> tuple[int, int]:
@@ -655,10 +744,7 @@ def upsert(rows: list[SessionRow], *, db_url: str | None = None) -> tuple[int, i
     new = updated = 0
     with store.connect(db_url) as conn:
         for r in rows:
-            got = conn.execute(_UPSERT_SQL, (
-                r.session_id, r.tool, r.kind, r.repo, r.project_dir, r.started_at, r.ended_at,
-                r.transcript_bytes, Jsonb(r.skills), Jsonb(r.instructions), Jsonb(r.meta),
-            )).fetchone()
+            got = conn.execute(_UPSERT_SQL, _params(r)).fetchone()
             if got is None:
                 continue
             if got[0]:
@@ -712,7 +798,22 @@ def cloud_row(rec: dict[str, Any]) -> SessionRow | None:
     }
     size = _count(src.get("transcript_bytes")) or len(rec.get("digest") or "")
     return SessionRow(key, "routine", repo, CLOUD_PROJECT_DIR, rec.get("started_at"), rec.get("ended_at"),
-                      size, skills, names, meta)
+                      size, skills, names, meta, tokens=cloud_tokens(src, rec.get("ended_at")))
+
+
+def cloud_tokens(src: dict[str, Any], ended_at: Any) -> session_tokens.Summary | None:
+    """The token totals a digest carries in `meta.tokens` (script_version 2+), else None (an
+    older digest: the token columns stay empty)."""
+    raw = src.get("tokens")
+    if not isinstance(raw, dict):
+        return None
+    t = session_tokens.Summary(tokens=session_tokens.Tokens.of(raw), turns=_count(src.get("prompts")))
+    models = raw.get("models") if isinstance(raw.get("models"), dict) else {}
+    for name, v in models.items():
+        if isinstance(v, dict) and isinstance(name, str) and 0 < len(name) <= 100:
+            t.models[name] = {**session_tokens.Tokens.of(v).as_dict(), "calls": _count(v.get("calls"))}
+    t.last_at = ended_at if isinstance(ended_at, datetime) else None
+    return t
 
 
 _CLOUD_PENDING_SQL = """
@@ -747,10 +848,7 @@ def ingest_cloud(*, db_url: str | None = None) -> CloudReport:
             if row is None:
                 report.bad += 1
                 continue
-            got = conn.execute(_UPSERT_SQL, (
-                row.session_id, row.tool, row.kind, row.repo, row.project_dir, row.started_at, row.ended_at,
-                row.transcript_bytes, Jsonb(row.skills), Jsonb(row.instructions), Jsonb(row.meta),
-            )).fetchone()
+            got = conn.execute(_UPSERT_SQL, _params(row)).fetchone()
             if got is not None:
                 if got[0]:
                     report.new += 1
@@ -764,8 +862,12 @@ def ingest_cloud(*, db_url: str | None = None) -> CloudReport:
 def ingest(root: Path | None, *, days: int = DEFAULT_DAYS, now: datetime | None = None,
            db_url: str | None = None, codex: Path | None = None,
            tools: tuple[str, ...] = TOOLS) -> IngestReport:
+    from agent_memory import session_live  # local import: session_live imports this module
+
     rows, skipped = collect(root, days=days, now=now, codex=codex, tools=tools)
     report = IngestReport(files=len(rows) + skipped, skipped=skipped)
+    # Pings spooled while the database was unreachable go first: the full read below wins.
+    report.spool = session_live.flush_spool(db_url=db_url)
     report.new, report.updated = upsert(rows, db_url=db_url)
     if "claude" in tools:  # cloud routine sessions are Claude Code sessions
         cloud = ingest_cloud(db_url=db_url)

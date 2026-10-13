@@ -1,4 +1,5 @@
-"""`amem sessions ingest` and `amem deviations scan|report|reref|rules` (docs/deviations.md).
+"""`amem sessions ingest|tokens` and `amem deviations scan|report|reref|rules` (docs/deviations.md,
+docs/sessions-live.md). `amem sessions ping` is session_live.main (cli.main routes it).
 
 Postgres only (like the lessons commands): on the REST backend they exit 1 (`rules` needs
 no database). Writes honour AMEM_REQUIRE_REMOTE=1 (exit 3). `deviations scan` without
@@ -16,7 +17,7 @@ from typing import Any
 
 import psycopg
 
-from agent_memory import config, deviations, questions, sessions_ingest
+from agent_memory import config, deviations, questions, sessions_ingest, tokens_report
 
 USAGE_EXIT = 2
 REMOTE_REQUIRED_EXIT = 3
@@ -73,6 +74,22 @@ def cmd_sessions_ingest(args: argparse.Namespace) -> int:
     except (OSError, psycopg.Error) as exc:
         return _err("sessions ingest", exc)
     print(report.line())
+    return 0
+
+
+def cmd_sessions_tokens(args: argparse.Namespace) -> int:
+    if (code := _read_guard("sessions tokens")) is not None:
+        return code
+    try:
+        rows = tokens_report.fetch(days=args.days, repo=args.repo, tool=args.tool)
+    except psycopg.Error as exc:
+        return _err("sessions tokens", exc)
+    doc = tokens_report.summarize(rows, days=args.days, repo=args.repo, tool=args.tool, top=args.top)
+    if args.json:
+        print(json.dumps(doc, indent=1, sort_keys=True, default=str))
+    else:
+        for line in tokens_report.lines(doc):
+            print(line)
     return 0
 
 
@@ -153,6 +170,21 @@ def register(sub: Any) -> None:
     p.add_argument("--tool", choices=("all", *sessions_ingest.TOOLS), default="all",
                    help="which transcripts to index (default all)")
     p.set_defaults(func=cmd_sessions_ingest)
+
+    p = s_sub.add_parser("tokens", help="token totals per repo / tool / kind / model and the top sessions "
+                                        "(docs/sessions-live.md)")
+    p.add_argument("--days", type=_positive, default=tokens_report.DEFAULT_DAYS,
+                   help="sessions active in the last N days (default 7)")
+    p.add_argument("--repo", default=None, help="this repo only")
+    p.add_argument("--tool", choices=sessions_ingest.TOOLS, default=None, help="this tool only")
+    p.add_argument("--top", type=_positive, default=tokens_report.TOP, help="top sessions to list (default 10)")
+    p.add_argument("--json", action="store_true", help="the report as JSON")
+    p.set_defaults(func=cmd_sessions_tokens)
+
+    # Handled in cli.main before parsing (it must exit 0 even for bad arguments).
+    s_sub.add_parser("ping", add_help=False,
+                     help="Claude Code hook: upsert this session's live row from the hook payload on stdin "
+                          "(docs/sessions-live.md); always exits 0")
 
     d = sub.add_parser("deviations", help="where agents deviated from their instructions (docs/deviations.md)")
     d_sub = d.add_subparsers(dest="deviations_command", required=True)
