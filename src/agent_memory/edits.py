@@ -4,7 +4,9 @@ Per candidate from the deviations report (deviations.candidates, the `deviations
 --json` groups), most recurring first:
 
 1. Filter: Jev verdict edit_instruction or enforce, confidence >= --min-confidence, not a
-   team repo (`team: true`), a real rule id, not already handled at this file version.
+   team repo (`team: true`), a real rule id, not already handled at this file version, not
+   in cooldown (a kept/trial edit in the last AMEM_EDITS_COOLDOWN_DAYS, unless the
+   scoreboard says `more`; scoreboard.active_cooldown).
 2. Target (edits_targets.resolve): edit the real file, suggest (`improve suggest`) for repo
    files and files outside improve's allowed targets, or skip.
 3. Edit: the writer (edits_writer) rewrites the one rule section, it is validated and
@@ -35,7 +37,17 @@ import psycopg
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
-from agent_memory import config, deviations, distill, edits_sections, edits_targets, edits_writer, rule_catalog, store
+from agent_memory import (
+    config,
+    deviations,
+    distill,
+    edits_sections,
+    edits_targets,
+    edits_writer,
+    rule_catalog,
+    scoreboard,
+    store,
+)
 from agent_memory.sessions_ingest import agent_config_dir
 
 LIVE_ENV = "AMEM_EDITS_LIVE"
@@ -216,7 +228,7 @@ def update_edit(conn: psycopg.Connection, edit_id: uuid.UUID, *, meta: dict[str,
 
 _LIST_SQL = """
 select id, created_at, status, instruction_source, rule_id, rule_title, target_path, improve_id, summary,
-       pushed_at, undo_requested_at, reverted_at
+       pushed_at, undo_requested_at, reverted_at, meta->>'kind' as kind, meta->>'kind_reason' as kind_reason
 from edits where created_at >= %s order by created_at desc, id
 """
 
@@ -232,8 +244,13 @@ def list_line(r: dict[str, Any]) -> str:
     when = r["created_at"].astimezone().strftime("%Y-%m-%d %H:%M")
     rule = f"{r['instruction_source']} / {r['rule_title'] or r['rule_id']} [{r['rule_id']}]"
     extra = f" improve={r['improve_id']}" if r["improve_id"] else ""
-    return (f"{r['id']} {when} {r['status']} {rule} -> {r['target_path'] or '-'}{extra}"
+    if r.get("kind"):
+        extra += f" kind={r['kind']}"
+    text = (f"{r['id']} {when} {r['status']} {rule} -> {r['target_path'] or '-'}{extra}"
             + (f": {r['summary']}" if r["summary"] else ""))
+    if r.get("kind") and r.get("kind_reason"):
+        text += f" ({r['kind']}: {r['kind_reason']})"
+    return text
 
 
 # --------------------------------------------------------------------------- run
@@ -254,6 +271,8 @@ class Outcome:
     why: str | None = None
     token: str | None = field(default=None, repr=False)   # kept/trial only; never stored, never printed
     push: str | None = None                               # phone | mac | off
+    kind: str | None = None                               # contract | hop | prose (the writer's own label)
+    kind_reason: str | None = None
 
     def line(self) -> str:
         rule = f"{self.source} {self.rule_id or '-'}"
@@ -263,6 +282,8 @@ class Outcome:
             text += f" edit={self.edit_id}"
         if self.improve_id:
             text += f" improve={self.improve_id}"
+        if self.kind:
+            text += f" kind={self.kind}"
         if self.push:
             text += f" push={self.push}"
         return text + (f": {self.reason}" if self.reason else "")
@@ -323,8 +344,10 @@ def _conf(cand: dict[str, Any]) -> float | None:
     return None if v is None else float(v)
 
 
-def plan_candidate(conn: psycopg.Connection, cand: dict[str, Any], *, min_confidence: float) -> _Plan | None:
-    """None: not an edit candidate at all (verdict leave / unjudged)."""
+def plan_candidate(conn: psycopg.Connection, cand: dict[str, Any], *, min_confidence: float,
+                   now: datetime | None = None) -> _Plan | None:
+    """None: not an edit candidate at all (verdict leave / unjudged). A rule with a kept or
+    trial edit inside the cooldown window is skipped unless its scoreboard verdict is `more`."""
     if cand.get("verdict") not in VERDICTS:
         return None
     conf = _conf(cand)
@@ -347,8 +370,15 @@ def plan_candidate(conn: psycopg.Connection, cand: dict[str, Any], *, min_confid
             text = sha = None
     if handled(conn, cand["instruction_source"], rule_id, sha, list(cand.get("instruction_shas") or [])):
         return _Plan(cand, "skip", "already handled at this version", t.path)
+    lifted = ""
+    cd = scoreboard.active_cooldown(conn, cand["instruction_source"], rule_id, now=now)
+    if cd is not None and cd.cooldown_until:
+        if not cd.cooldown_lifted:
+            return _Plan(cand, "skip", f"cooldown until {cd.cooldown_until[:10]} (last edit {cd.status} "
+                                       f"{cd.edited_at[:10]}, scoreboard: {cd.verdict})", t.path)
+        lifted = f"; cooldown lifted: scoreboard says more since the {cd.edited_at[:10]} edit"
     if t.action == edits_targets.SUGGEST:
-        return _Plan(cand, "suggest", t.reason, t.path, text, sha)
+        return _Plan(cand, "suggest", t.reason + lifted, t.path, text, sha)
     if text is None:
         return _Plan(cand, "skip", "target file unreadable", t.path)
     try:
@@ -357,7 +387,7 @@ def plan_candidate(conn: psycopg.Connection, cand: dict[str, Any], *, min_confid
         return _Plan(cand, "skip", f"{exc} (the file changed since the scan)", t.path)
     if deviations.redact(section) != section:
         return _Plan(cand, "skip", "the rule holds secret-shaped text: not sent to the writer", t.path)
-    return _Plan(cand, "edit", f"{cand['verdict']} {conf:.2f}, {evidence(cand)}", t.path, text, sha)
+    return _Plan(cand, "edit", f"{cand['verdict']} {conf:.2f}, {evidence(cand)}{lifted}", t.path, text, sha)
 
 
 def _suggest(conn: psycopg.Connection, p: _Plan) -> Outcome:
@@ -419,8 +449,11 @@ def _edit(conn: psycopg.Connection, p: _Plan, *, days: int, timeout: float) -> O
         out.reason = f"target unreadable: {exc}"
         return out
     out.why, out.summary = proposal.why, proposal.summary
+    out.kind, out.kind_reason = proposal.kind, proposal.kind_reason
     edit_id = insert_edit(conn, c, status="proposed", target=p.target, sha_before=p.sha, why=proposal.why,
-                          summary=proposal.summary, meta={"topic": proposal.topic})
+                          summary=proposal.summary,
+                          meta={"topic": proposal.topic, "kind": proposal.kind, "kind_reason": proposal.kind_reason,
+                                "writer_model": edits_writer.writer_model()})
     conn.commit()   # crash-safe: the row exists before improve touches the file
     out.edit_id = edit_id
     fd, tmp = tempfile.mkstemp(prefix="amem-edit-", suffix=p.target.suffix or ".md")
@@ -464,7 +497,7 @@ def run(*, days: int = DEFAULT_DAYS, limit: int = DEFAULT_LIMIT, min_confidence:
     with store.connect(db_url) as conn:
         for cand in cands:
             try:
-                p = plan_candidate(conn, cand, min_confidence=min_confidence)
+                p = plan_candidate(conn, cand, min_confidence=min_confidence, now=now)
             except Exception as exc:  # never block: this candidate's error
                 report.outcomes.append(Outcome(cand.get("instruction_source", "?"), cand.get("rule_id"), "error",
                                                _one_line(f"plan: {type(exc).__name__}: {exc}")))

@@ -125,3 +125,59 @@ def test_prompt_holds_the_section_neighbours_policy_and_numbers() -> None:
 def test_writer_argv_has_no_tools() -> None:
     argv = edits_writer.writer_argv()
     assert argv[argv.index("--tools") + 1] == "" and "--strict-mcp-config" in argv and "--disable-slash-commands" in argv
+    assert "--no-session-persistence" in argv and "--bare" not in argv
+
+
+def test_writer_model_is_opus_and_env_overrides(monkeypatch: pytest.MonkeyPatch) -> None:
+    from agent_memory import deviations, distill
+    argv = edits_writer.writer_argv()
+    assert argv[argv.index("--model") + 1] == "opus"
+    monkeypatch.setenv(edits_writer.MODEL_ENV, "sonnet")
+    argv = edits_writer.writer_argv()
+    assert argv[argv.index("--model") + 1] == "sonnet"
+    monkeypatch.setenv(edits_writer.MODEL_ENV, "claude-opus-4-1")
+    assert edits_writer.writer_model() == "claude-opus-4-1"
+    for bad in ("--bare", "opus --bare", ""):           # not one plain token: the default
+        monkeypatch.setenv(edits_writer.MODEL_ENV, bad)
+        assert edits_writer.writer_model() == "opus", bad
+    # distill (frozen) and the deviations writer keep their own model.
+    for other in (distill.writer_argv(), deviations.writer_argv()):
+        assert other[other.index("--model") + 1] == distill.WRITER_MODEL == "sonnet"
+
+
+def test_prompt_puts_contract_and_hop_fixes_before_prose() -> None:
+    sec = edits_sections.find(SKILL_MD, "spawn")
+    prompt = edits_writer.writer_prompt(CAND, target="~/x/SKILL.md", section=sec,
+                                        section_text=edits_sections.section_text(SKILL_MD, "spawn"),
+                                        prev="", nxt="", days=7)
+    contract, hop, prose = (prompt.index("1. contract:"), prompt.index("2. hop:"), prompt.index("3. prose:"))
+    assert contract < hop < prose
+    for needle in ("required output explicit and checkable", "done-check", "report field",
+                   "after X, then", "loop-back", "only when neither a contract nor a hop fix fits",
+                   '"kind": string', '"kind_reason": string'):
+        assert needle in prompt, needle
+
+
+@pytest.mark.parametrize("kind,want", [("contract", "contract"), ("Hop", "hop"), (" prose ", "prose")])
+def test_kind_is_parsed(kind: str, want: str) -> None:
+    p = parse(SPAWN_NEW, kind=kind, kind_reason="Reordering makes the branch step come first.")
+    assert p.kind == want and p.kind_reason == "Reordering makes the branch step come first."
+
+
+@pytest.mark.parametrize("over,match", [
+    ({"kind": "rule"}, "kind must be one of contract, hop, prose"),
+    ({"kind": None}, "kind must be one of"),
+    ({"kind": ["hop"]}, "kind must be one of"),
+    ({"kind_reason": ""}, "kind_reason is empty"),
+    ({"kind_reason": "r" * 141}, "kind_reason is"),
+    ({"kind_reason": f"Follows {DEV_ID}"}, "kind_reason holds an id"),
+])
+def test_kind_rejections(over: dict[str, Any], match: str) -> None:
+    with pytest.raises(ProposalError, match=match):
+        parse(SPAWN_NEW, **over)
+
+
+def test_missing_kind_is_an_error() -> None:
+    reply = {k: v for k, v in proposal(SPAWN_NEW).items() if k not in ("kind", "kind_reason")}
+    with pytest.raises(ProposalError, match="kind must be one of"):
+        parse_proposal(json.dumps(reply), file_text=SKILL_MD, rule_id="spawn", cand=CAND)

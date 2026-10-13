@@ -14,7 +14,7 @@ from typing import Any
 import psycopg
 import pytest
 
-from agent_memory import distill, edits
+from agent_memory import distill, edits, edits_push, scoreboard
 from conftest import run_amem
 from test_daily_support import DailyIO, Push, daily_io  # noqa: F401
 from test_edits_support import (  # noqa: F401
@@ -127,6 +127,9 @@ def test_kept_edit_full_contract(live: ScoringDb, ehome: EHome, ewriter: Any, da
     assert row["verdict"] == "edit_instruction" and abs(row["jev_confidence"] - 0.8) < 1e-6
     assert row["summary"] == "Spawn rule now names the branch line explicitly." and row["pushed_at"] is not None
     assert row["meta"]["improve"] == {"reason": "evals ok", "revert": "improve revert c-0042"}
+    assert row["meta"]["kind"] == "contract" and row["meta"]["writer_model"] == "opus"
+    assert row["meta"]["kind_reason"] == "The brief must now carry the branch as a checkable first line."
+    assert " kind=contract" in o.line()
     # The push: JSON to the server root, Undo action with the token; only its hash is stored.
     (post,) = push.posts
     assert post["url"] == "https://ntfy.example.test/" and post["headers"] == {"Content-Type": "application/json"}
@@ -134,6 +137,7 @@ def test_kept_edit_full_contract(live: ScoringDb, ehome: EHome, ewriter: Any, da
     assert payload["topic"] == "secret-topic-xyz" and payload["title"] == "Agent edit: 4. Spawn"
     assert "Spawn rule now names the branch line explicitly." in payload["message"]
     assert "Why: Agents skipped the branch name" in payload["message"] and "File: dispatch/SKILL.md" in payload["message"]
+    assert "Kind: contract (The brief must now carry the branch as a checkable first line.)" in payload["message"]
     (action,) = payload["actions"]
     assert action["action"] == "http" and action["label"] == "Undo" and action["method"] == "POST"
     assert action["url"] == "https://fn.example.test/functions/v1/amem-undo"
@@ -148,7 +152,7 @@ def test_kept_edit_full_contract(live: ScoringDb, ehome: EHome, ewriter: Any, da
 
 
 def test_second_run_skips_the_handled_rule(live: ScoringDb, ehome: EHome, ewriter: Any,  # noqa: F811
-                                           daily_io: DailyIO) -> None:  # noqa: F811
+                                           daily_io: DailyIO, monkeypatch: pytest.MonkeyPatch) -> None:  # noqa: F811
     seed_spawn(live.url, ehome, n=3)
     w = ewriter(envelope(proposal(SPAWN_NEW)))
     ehome.improve.queue("apply", apply_answer("kept", "c-1"))
@@ -156,8 +160,12 @@ def test_second_run_skips_the_handled_rule(live: ScoringDb, ehome: EHome, ewrite
     (o,) = edits.run(db_url=live.url, push=False).outcomes
     assert o.status == "skip" and o.reason == "already handled at this version"
     assert len(w.prompts) == 1 and len(ehome.improve.calls()) == 1
-    # A new deviation on the edited text is new evidence: the rule is a candidate again.
+    # A new deviation on the edited text is new evidence, but the fresh kept edit holds the
+    # rule in its cooldown first; without a cooldown the rule is a candidate again.
     seed(live.url, "skill:dispatch", "spawn", "4. Spawn", n=1, sha=sha_of(ehome.skill))
+    (o,) = edits.run(dry_run=True, db_url=live.url).outcomes
+    assert o.status == "skip" and o.reason.startswith("cooldown until ")
+    monkeypatch.setenv(scoreboard.COOLDOWN_ENV, "0")
     (o,) = edits.run(dry_run=True, db_url=live.url).outcomes
     assert o.status == "plan-edit"
 
@@ -321,6 +329,99 @@ def test_cli_list(live: ScoringDb, ehome: EHome, ewriter: Any) -> None:  # noqa:
     edits.run(db_url=live.url, push=False)
     rows = edits.list_edits(days=1, now=datetime.now(UTC) + timedelta(minutes=1), db_url=live.url)
     (line,) = [edits.list_line(r) for r in rows]
-    assert " kept skill:dispatch / 4. Spawn [spawn] -> " in line and "improve=c-11" in line
+    assert " kept skill:dispatch / 4. Spawn [spawn] -> " in line and "improve=c-11 kind=contract" in line
+    assert line.endswith("(contract: The brief must now carry the branch as a checkable first line.)")
     res = run_amem("edits", "list", "--days", "2", env={**live.env, **home_env(ehome)})
-    assert res.returncode == 0 and "edits (last 2 days): 1" in res.stdout
+    assert res.returncode == 0 and "edits (last 2 days): 1" in res.stdout and " kind=contract" in res.stdout
+
+
+def test_prose_kind_is_allowed_and_shown(live: ScoringDb, ehome: EHome, ewriter: Any) -> None:  # noqa: F811
+    seed_spawn(live.url, ehome)
+    ewriter(envelope(proposal(SPAWN_NEW, kind="prose", kind_reason="No output or order to tighten here.")))
+    ehome.improve.queue("apply", apply_answer("trial", "c-12"))
+    (o,) = edits.run(db_url=live.url, push=False).outcomes
+    assert o.status == "trial" and o.kind == "prose"
+    (row,) = edit_rows(live.url)
+    assert row["meta"]["kind"] == "prose"
+    title, body = edits_push.edit_message(o, with_cli_undo=False)
+    assert "Kind: prose (No output or order to tighten here.)" in body
+
+
+# --------------------------------------------------------------------------- cooldown
+
+
+def add_edit_row(url: str, status: str, created: datetime, rule: str = "spawn") -> None:
+    """An earlier edit on the rule, made on another version of the file (so it is not `handled`)."""
+    with psycopg.connect(url) as conn:
+        conn.execute("insert into edits (status, instruction_source, rule_id, rule_title, target_path, "
+                     "instruction_sha_before, improve_id, created_at) values (%s, 'skill:dispatch', %s, '4. Spawn', "
+                     "'~/.agents/skills/dispatch/SKILL.md', %s, 'c-old', %s)", (status, rule, "a" * 64, created))
+
+
+def quiet_sessions(url: str, n: int, started: datetime, prefix: str) -> None:
+    with psycopg.connect(url) as conn:
+        for i in range(n):
+            conn.execute("insert into sessions (session_id, kind, project_dir, started_at, instructions, scanned_at) "
+                         "values (%s, 'chat', 'p', %s, '[\"skill:dispatch\"]', now())",
+                         (f"{prefix}-{i}", started + timedelta(hours=i)))
+
+
+def test_cooldown_skips_a_recently_kept_rule(sdb: ScoringDb, ehome: EHome, ewriter: Any,  # noqa: F811
+                                             monkeypatch: pytest.MonkeyPatch) -> None:
+    w = ewriter()
+    now = datetime.now(UTC)
+    created = now - timedelta(days=2)
+    add_edit_row(sdb.url, "kept", created)
+    seed_spawn(sdb.url, ehome, n=3)
+    (o,) = edits.run(dry_run=True, db_url=sdb.url).outcomes
+    until = (created + timedelta(days=7)).date().isoformat()
+    assert o.status == "skip" and o.line().startswith("skip skill:dispatch spawn -> "), o.line()
+    assert o.reason.startswith(f"cooldown until {until} (last edit kept {created.date().isoformat()}"), o.reason
+    assert w.prompts == [] and ehome.improve.calls() == []
+    # A trial edit holds the rule too; an edit older than the cooldown does not.
+    with psycopg.connect(sdb.url) as conn:
+        conn.execute("update edits set status = 'trial'")
+    assert edits.run(dry_run=True, db_url=sdb.url).outcomes[0].reason.startswith("cooldown until ")
+    with psycopg.connect(sdb.url) as conn:
+        conn.execute("update edits set created_at = %s", (now - timedelta(days=8),))
+    assert edits.run(dry_run=True, db_url=sdb.url).outcomes[0].status == "plan-edit"
+    # The window is configurable.
+    monkeypatch.setenv(scoreboard.COOLDOWN_ENV, "10")
+    assert edits.run(dry_run=True, db_url=sdb.url).outcomes[0].reason.startswith("cooldown until ")
+    monkeypatch.delenv(scoreboard.COOLDOWN_ENV)
+    # The CLI dry run shows it.
+    with psycopg.connect(sdb.url) as conn:
+        conn.execute("update edits set created_at = %s", (created,))
+    res = run_amem("edits", "run", "--dry-run", env={**sdb.env, **home_env(ehome)})
+    assert res.returncode == 0 and "skip skill:dispatch spawn -> " in res.stdout
+    assert f"cooldown until {until}" in res.stdout and "skip=1" in res.stdout
+
+
+@pytest.mark.parametrize("status", ["reverted", "refused", "auto-reverted", "suggested", "skipped", "proposed"])
+def test_unapplied_edits_start_no_cooldown(sdb: ScoringDb, ehome: EHome, status: str) -> None:  # noqa: F811
+    add_edit_row(sdb.url, status, datetime.now(UTC) - timedelta(days=1))
+    seed_spawn(sdb.url, ehome, n=3)
+    (o,) = edits.run(dry_run=True, db_url=sdb.url).outcomes
+    assert o.status == "plan-edit", o.line()
+    assert "cooldown" not in o.reason
+
+
+def test_cooldown_lifted_when_the_scoreboard_says_more(sdb: ScoringDb, ehome: EHome) -> None:  # noqa: F811
+    now = datetime.now(UTC)
+    created = now - timedelta(days=3)
+    add_edit_row(sdb.url, "kept", created)
+    # before: 3 deviations in 6 sessions (0.50); after: 5 in 5 on the new text (1.00) -> more
+    seed(sdb.url, "skill:dispatch", "spawn", "4. Spawn", n=3, sha="a" * 64, started=created - timedelta(days=5))
+    quiet_sessions(sdb.url, 3, created - timedelta(days=4), "before")
+    seed_spawn(sdb.url, ehome, n=5, started=now - timedelta(days=1))
+    (s,) = scoreboard.scores(db_url=sdb.url)
+    assert s.verdict == "more" and s.cooldown_lifted and s.line().endswith("; cooldown lifted (more)")
+    assert "in cooldown" not in scoreboard.text_lines([s], 28)[0]
+    (o,) = edits.run(dry_run=True, db_url=sdb.url).outcomes
+    assert o.status == "plan-edit", o.line()
+    assert "cooldown lifted: scoreboard says more" in o.reason
+    # `fewer` / `same` / `too early` keep the cooldown: 5 in 45 after (0.11) is fewer.
+    quiet_sessions(sdb.url, 40, now - timedelta(days=2), "after-quiet")
+    (s,) = scoreboard.scores(db_url=sdb.url)
+    assert s.verdict == "fewer" and not s.cooldown_lifted and "; cooldown until " in s.line()
+    assert edits.run(dry_run=True, db_url=sdb.url).outcomes[0].reason.startswith("cooldown until ")

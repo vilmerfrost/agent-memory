@@ -85,6 +85,23 @@ def test_reverted_edit_stops_at_the_revert_and_unapplied_edits_are_left_out(sdb:
     assert s.status == "reverted" and s.after_deviations == 0 and s.after_sessions == 0 and s.verdict == "too early"
 
 
+def test_cooldown_is_shown(sdb: ScoringDb, ehome: EHome, monkeypatch: pytest.MonkeyPatch) -> None:  # noqa: F811
+    add_edit(sdb.url, status="kept", created=NOW - timedelta(days=2))
+    add_edit(sdb.url, status="reverted", created=NOW - timedelta(days=2), reverted=NOW - timedelta(days=1),
+             rule="track")
+    by = {s.rule_id: s for s in scoreboard.scores(days=28, now=NOW, db_url=sdb.url)}
+    assert by["spawn"].cooldown_until == "2026-11-04T12:00:00+00:00" and not by["spawn"].cooldown_lifted
+    assert by["spawn"].line().endswith(": too early; cooldown until 2026-11-04")
+    assert by["track"].cooldown_until is None and "cooldown" not in by["track"].line()   # reverted: none
+    head = scoreboard.text_lines(list(by.values()), 28)[0]
+    assert head == "edits scoreboard (last 28 days): 2 edits, 0 fewer, 0 same, 0 more, 2 too early, 1 in cooldown"
+    (doc,) = scoreboard.as_json([by["spawn"]], 28)["edits"]
+    assert doc["cooldown_until"] == "2026-11-04T12:00:00+00:00" and doc["cooldown_lifted"] is False
+    monkeypatch.setenv(scoreboard.COOLDOWN_ENV, "1")
+    (s, _) = sorted(scoreboard.scores(days=28, now=NOW, db_url=sdb.url), key=lambda s: s.rule_id)
+    assert s.rule_id == "spawn" and s.cooldown_until is None
+
+
 def test_empty_and_cli(sdb: ScoringDb, ehome: EHome) -> None:  # noqa: F811
     assert scoreboard.text_lines([], 28) == ["edits scoreboard (last 28 days): 0 edits, 0 fewer, 0 same, 0 more, "
                                              "0 too early", "No applied edits in this window yet."]
