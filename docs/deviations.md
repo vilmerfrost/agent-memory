@@ -9,7 +9,7 @@ Editing comes later (step E4), through agent-config's `improve apply` / `improve
 
 ```
 ~/.claude/projects/*.jsonl ──sessions ingest──▶ sessions
-                                                   │ deviations scan (weekly)
+                                                   │ deviations scan (daily) 
                                                    ▼
             digest (redacted, capped) + instructions in force + rule catalog
                                                    │ writer: claude -p, JSON, ref = a rule id
@@ -228,9 +228,9 @@ Rows without a rule id yet show `[no rule id]`; run `amem deviations reref`.
 
 ## Daily
 
-`amem daily` runs `sessions ingest` and `deviations scan` once a week, after the escalations
+`amem daily` runs `sessions ingest` and `deviations scan` once a day, after the escalations
 step. The daily state file holds `deviations_last_scan`; the step runs when it is missing or
-at least 7 days old. Off (not a failure) unless `AMEM_DEVIATIONS_LIVE=1`. When it ran, the
+at least 20 hours old (`AMEM_DEVIATIONS_EVERY_HOURS`). Off (not a failure) unless `AMEM_DEVIATIONS_LIVE=1`. When it ran, the
 log line gets `deviations=D deviation_sessions=N deviations_edit=E deviations_enforce=F
 deviations_leave=L deviation_errors=X`. Any session error fails the step. The timestamp moves
 when the scan finished, so failed sessions wait for next week; a crash before the scan leaves

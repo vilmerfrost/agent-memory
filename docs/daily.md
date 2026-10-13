@@ -36,8 +36,8 @@ A failed step is recorded, and the next step still runs.
    - An id is marked as pushed only after ntfy answers 200. The Mac fallback
      does not mark it, so it is pushed again the next day.
    - `--no-push` never pushes and never marks; it still prunes.
-   Then **deviations** (weekly, docs/deviations.md): `sessions ingest` + `deviations scan`
-   when `deviations_last_scan` in the state file is missing or at least 7 days old. Off (not a
+   Then **deviations** (daily, docs/deviations.md): `sessions ingest` + `deviations scan`
+   when `deviations_last_scan` in the state file is missing or at least 20 hours old (`AMEM_DEVIATIONS_EVERY_HOURS`). Off (not a
    failure) unless `AMEM_DEVIATIONS_LIVE=1`; the launchd job sets it. A session error fails the step.
    (The `lessons distill` step after scoring is frozen: off unless `AMEM_DISTILL_LIVE=1`.)
 4. **log**: one line appended to the routines log.
@@ -73,7 +73,7 @@ overrides it. House format (`%Y-%m-%dT%H:%M:%S%z`):
 
 - `push=none|phone|mac`. `tasks=N` = new dispatch tasks ingested (always present). When the
   distill step ran, `distilled=N lessons_new=A lessons_merged=M lessons_rejected=R distill_errors=E`
-  follows `tasks=N` (docs/lessons.md). When the weekly deviations step ran,
+  follows `tasks=N` (docs/lessons.md). When the deviations step ran,
   `deviations=D deviation_sessions=N deviations_edit=E deviations_enforce=F deviations_leave=L
   deviation_errors=X` follows (docs/deviations.md). One `amem-daily-fail <reason>` line per failed step.
 - `amem ingest routines-log` reads these back as routine `amem-daily`
@@ -100,7 +100,7 @@ An unreadable file is a failed step and is treated as empty (worst case: one rep
 `deploy/launchd/com.vilmerfrost.amem-daily.plist`:
 
 - Runs `/opt/homebrew/bin/uv run --directory /Users/vilmerfrost/Projects/agent-memory --quiet amem daily`.
-- Env: `AMEM_REQUIRE_REMOTE=1`, `AMEM_JEV_LIVE=1`, `AMEM_DEVIATIONS_LIVE=1` (the weekly
+- Env: `AMEM_REQUIRE_REMOTE=1`, `AMEM_JEV_LIVE=1`, `AMEM_DEVIATIONS_LIVE=1` (the daily
   deviations step runs: one `claude -p` writer call per scanned session, at most 15 a week),
   and `PATH` with `~/.local/bin` (launchd's default PATH has no `gh`; `claude` lives there
   too). The DB URL and the Jev key come from the main checkout's env file, which `amem`
