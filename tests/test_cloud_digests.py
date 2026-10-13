@@ -181,7 +181,8 @@ def test_row_shape_redaction_and_no_env(files: dict[str, Path], tmp_path: Path) 
     assert row["digest_sha"] == hashlib.sha256(row["digest"].encode()).hexdigest()
     assert row["skills"] == ["systematic-debugging", "handoff"]
     assert row["meta"] == {"cloud": True, "repo": "nightly-trials", "script_version": amem_digest.SCRIPT_VERSION,
-                           "transcript_bytes": files["transcript"].stat().st_size, "tool_calls": 5, "prompts": 1}
+                           "transcript_bytes": files["transcript"].stat().st_size, "tool_calls": 5, "prompts": 1,
+                           "tokens": {"input": 0, "output": 0, "cache_read": 0, "cache_creation": 0, "models": {}}}
     (instr,) = row["instructions"]
     assert instr["name"] == "nightly-md" and "[redacted]" in instr["text"]
     assert instr["sha256"] == hashlib.sha256(nightly.read_bytes()).hexdigest()

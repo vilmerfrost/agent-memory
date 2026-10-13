@@ -36,7 +36,9 @@ Output (stdout, one JSON object):
                 the routine prompt) and `--instruction NAME=PATH`. text is redacted and
                 capped; sha256 is of the text as read.
   skills        Skill tool calls and slash commands (no Claude Code built-ins)
-  meta          {cloud: true, repo, script_version, transcript_bytes, tool_calls, prompts}
+  meta          {cloud: true, repo, script_version, transcript_bytes, tool_calls, prompts,
+                tokens: {input, output, cache_read, cache_creation, models}} (script_version 2+:
+                the session's token totals, see token_totals)
 """
 
 from __future__ import annotations
@@ -51,7 +53,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-SCRIPT_VERSION = "1"
+SCRIPT_VERSION = "2"
 SOURCE_PREFIX = "cloud:"
 PROMPT_NAME = "prompt"     # the routine prompt: instruction source routine:<routine>
 
@@ -327,6 +329,49 @@ def facts(events: list[dict[str, Any]]) -> dict[str, Any]:
             "tool_calls": tool_calls, "prompts": prompts}
 
 
+# --------------------------------------------------------------------------- tokens
+
+TOKEN_FIELDS = ("input", "output", "cache_read", "cache_creation")
+_USAGE_KEYS = ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
+
+
+def _n(value: Any) -> int:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else 0
+
+
+def token_totals(events: list[dict[str, Any]]) -> dict[str, Any]:
+    """{input, output, cache_read, cache_creation, models: {model: {..., calls}}} from the
+    assistant lines' `message.usage` (session_tokens.claude_summary). One API response is
+    written as several lines with the same `message.id`: the latest line of an id wins.
+    `<synthetic>` messages are left out."""
+    per_id: dict[str, tuple[str, list[int]]] = {}
+    loose: list[tuple[str, list[int]]] = []
+    for e in events:
+        m = e.get("message") if isinstance(e.get("message"), dict) else {}
+        if e.get("type") != "assistant" or not isinstance(m.get("usage"), dict):
+            continue
+        model = m.get("model").strip() if isinstance(m.get("model"), str) and m.get("model").strip() \
+            and len(m.get("model")) <= 100 else "unknown"
+        if model == "<synthetic>":
+            continue
+        counts = [_n(m["usage"].get(k)) for k in _USAGE_KEYS]
+        mid = m.get("id")
+        if isinstance(mid, str) and mid:
+            per_id.pop(mid, None)  # keeps first-seen order of the latest line
+            per_id[mid] = (model, counts)
+        else:
+            loose.append((model, counts))
+    total = [0, 0, 0, 0]
+    models: dict[str, dict[str, int]] = {}
+    for model, counts in [*per_id.values(), *loose]:
+        m = models.setdefault(model, {**{f: 0 for f in TOKEN_FIELDS}, "calls": 0})
+        for i, f in enumerate(TOKEN_FIELDS):
+            total[i] += counts[i]
+            m[f] += counts[i]
+        m["calls"] += 1
+    return {**dict(zip(TOKEN_FIELDS, total)), "models": dict(sorted(models.items()))}
+
+
 # --------------------------------------------------------------------------- inputs
 
 
@@ -463,7 +508,7 @@ def build_row(transcript: Path, *, routine: str, instructions: list[tuple[str, P
         "instructions": instr,
         "skills": f["skills"],
         "meta": {"cloud": True, "repo": repo, "script_version": SCRIPT_VERSION, "transcript_bytes": size,
-                 "tool_calls": f["tool_calls"], "prompts": f["prompts"]},
+                 "tool_calls": f["tool_calls"], "prompts": f["prompts"], "tokens": token_totals(events)},
     }
 
 

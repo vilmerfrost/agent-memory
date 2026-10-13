@@ -29,7 +29,9 @@ cloud_digests (cloud routines) ─┴─sessions ingest──▶ sessions (tool 
 
 | Command | Does |
 |---|---|
-| `amem sessions ingest [--days 7] [--projects-dir DIR] [--codex-home DIR] [--tool all\|claude\|codex]` | Indexes Claude Code and Codex transcripts touched in the last N days into `sessions`. Prints `sessions: ... (kinds) tools(claude=N codex=M) team=T`. Idempotent. |
+| `amem sessions ingest [--days 7] [--projects-dir DIR] [--codex-home DIR] [--tool all\|claude\|codex]` | Indexes Claude Code and Codex transcripts touched in the last N days into `sessions`, with token totals per session (docs/sessions-live.md). Flushes the hook spool first. Prints `sessions: ... (kinds) tools(claude=N codex=M) team=T` (`spool=N` when it flushed any). Idempotent. |
+| `amem sessions tokens [--days 7] [--repo R] [--tool claude\|codex] [--json]` | Token totals per repo / tool / kind / model and the top sessions (docs/sessions-live.md). Read only. |
+| `amem sessions ping` | Claude Code hook (SessionStart / Stop): the live row of the running session (docs/sessions-live.md). Always exits 0. |
 | `amem deviations scan [--days 7] [--limit 15] [--session ID] [--dry-run] [--timeout 300]` | Scans unscanned sessions. Prints one line per session and `deviations: sessions=N found=D edit=E enforce=F leave=L errors=X`. Exit 1 when a session failed. |
 | `amem deviations report [--days 7] [--json]` | Groups deviations by instruction source + rule id, most recurring first. `--json` prints the candidates file. |
 | `amem deviations reref [--dry-run]` | Backfills `rule_id` / `rule_title` on stored rows: snaps each row's writer ref against today's rule catalog. No writer, no Jev. Prints one mapping line per source + ref and `reref: rows=N exact=E snapped=S unmatched=U no_source=X changed=C`. Idempotent. |
@@ -68,6 +70,9 @@ id `<parent session>/agent-<id>`.
 - Cloud routine sessions come from the `cloud_digests` table, not a transcript file: id
   `cloud:<session id>`, kind `routine`, `project_dir` `cloud`, `meta.cloud` true (docs/cloud.md).
 - `meta.team`: true for a team repo's session (see Team repos below).
+- Tokens: `tokens_input`, `tokens_output`, `tokens_cache_read`, `tokens_cache_creation`,
+  `models`, `turns`, `last_activity_at`; a parent's `meta.subagent_tokens` sums its
+  subagents (docs/sessions-live.md). A row a hook created (`meta.live`) is completed by ingest.
 - A re-ingest refreshes the facts and keeps `scanned_at` and the scan keys in `meta`.
 
 ## Codex
