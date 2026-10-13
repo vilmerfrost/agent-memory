@@ -26,7 +26,7 @@ deviations report ──▶ candidates (edit_instruction | enforce, confidence >
 | Command | Does |
 |---|---|
 | `amem edits run [--dry-run] [--limit 5] [--min-confidence 0.6] [--days 7] [--no-push]` | Plans and applies edits. Prints one line per candidate and `edits: edits=N kept=K reverted=R refused=F suggested=S skipped=X errors=E`. Exit 1 when a candidate failed. |
-| `amem edits list [--days 28]` | Recent edits, newest first: id, time, status, rule, file, improve id, `kind=`, summary, `(kind: reason)`. |
+| `amem edits list [--days 28]` | Recent edits, newest first: id, time, status, rule, file, improve id, `kind=` (checked; `writer_kind=` on a mismatch), summary, `(kind: reason)`. |
 | `amem edits undo <edit_id> [--no-push]` | Reverts one edit now (`improve revert <id> --reason "manual undo"`). |
 | `amem edits undo-poll [--no-push]` | Handles pending phone undo requests. Exit 0 when there is nothing to do. |
 | `amem edits scoreboard [--days 28] [--json]` | Deviations per scanned session before vs after each edit. |
@@ -41,7 +41,8 @@ All need the Postgres backend. The write commands honour `AMEM_REQUIRE_REMOTE=1`
   plan suggest claude-md:demo-repo whole -> ~/work/demo-repo/CLAUDE.md: repo file: never edited, suggested instead
   skip parent-md merge -> -: jev confidence 0.40 < 0.60
   skip claude-md:global shell-habits -> ~/.claude/CLAUDE.md: cooldown until 2026-10-20 (last edit kept 2026-10-13, scoreboard: too early)
-  edits (dry run, nothing called or written): plan_edit=1 plan_suggest=1 skip=2
+  skip routine:evals-parent whole -> ~/.claude/scheduled-tasks/evals-parent/SKILL.md: file pinned (judge prompt: the measuring stick is never changed by the loop (Vilmer, 2026-10-13))
+  edits (dry run, nothing called or written): plan_edit=1 plan_suggest=1 skip=3
   ```
 
 - `--limit` caps edits + suggestions per run (writer calls cost money and time); the rest
@@ -60,7 +61,30 @@ From `deviations report --json` (`deviations.candidates`, same data), most recur
   candidate's deviations were found on. So a rule is edited once per version; a new
   deviation found on the edited text makes it a candidate again; an undone edit (the file
   is back at the old sha) is never retried.
+- Not pinned (below).
 - Not in cooldown (below).
+
+## Pins
+
+improve refuses a pinned file or rule. `edits run` reads the same pins up front, so it never
+plans an edit that improve would refuse at the end. It reads
+`~/agent-config/improve/pins.json` (read only):
+
+- `files`: a key (`~/...` or an absolute path) that names the target file, also through a
+  symlink → `skip ...: file pinned (<reason from pins.json>)`.
+- `rules`: improve's own rule id. That is the namespaced `--rule-id` (`skill-dispatch--spawn`,
+  see "The improve contract"), not the bare catalog id: `spawn` alone pins nothing here,
+  because catalog ids repeat across files. A pinned id → `skip ...: rule <id> pinned
+  (<reason>)`.
+- A pinned rule's marker inside the section (`improve:<id>`, or an `Id: <id>` line as in
+  lessons.md) → the same skip. improve's content guard keeps that paragraph word for word.
+
+A pinned candidate gets no writer call and no `edits` row, also when the target would only
+be suggested. Nothing is recorded, so the rule is a candidate again once the pin is gone. A missing or
+unreadable pins.json means no pins. improve stays the final guard: its refusal (`refused`,
+reason `file pinned (...)`) is still recorded as before. Rule ids that improve blocks because
+they were reverted before are left to improve (the `edits` rows already keep an undone edit
+from being retried).
 
 ## Cooldown
 
@@ -88,8 +112,11 @@ or `; cooldown lifted (more)` per edit and `N in cooldown` in its head line.
 
 An "edit" file outside improve's `allowed_targets` (read from
 `~/agent-config/improve/criteria.json`) becomes an `improve suggest` too. Today that is the
-routine prompts, `~/.codex/AGENTS.md` and agents other than `worker`, until agent-config
-allows them. A skill whose real file is not under `~/.agents/skills` is suggested as well.
+agents other than `worker`. A skill whose real file is not under `~/.agents/skills` is
+suggested as well. The fence (`~/agent-config/improve/fence.txt`) is mirrored the way improve
+uses it: a fenced file counts as allowed only when an entry names it, or names a fenced folder
+that holds it (`~/.claude/scheduled-tasks/`). The routine prompts are in scope this way; the
+four judge prompts among them are pinned (see "Pins").
 
 ## Writer
 
@@ -108,16 +135,58 @@ deviations writer stay on Sonnet. Each edit row records `meta.writer_model`. It 
   rule to match what works. Never add an ask-Vilmer permission gate on his own projects.
   Never remove or loosen anything about spending money. When two instructions conflict,
   fix the conflict. Minimal change, same style, one rule = one topic.
-- the order to look for a change in, first fit wins:
-  1. **contract**: make the step's required output explicit and checkable (a done-check,
-     a report field, "returns X with Y checked");
-  2. **hop**: fix the step order (move a step, add "after X, then Y" or a loop-back);
-  3. **prose**: add or reword general guidance, only when neither fits.
+- the order to look for a change in, first fit wins, each with a definition and one short
+  example:
+  1. **contract**: what a step must output or check, made explicit and checkable (a
+     done-check, a report field, "returns X with Y checked"). Example: "The report must
+     include the test command and its exit code."
+  2. **hop**: the order of steps (move a step, add an explicit "after X, then Y" or a
+     loop-back). Example: "After the tests pass, then merge; if they fail, go back to step 2."
+  3. **prose**: general wording, scope or explanation, only when neither fits. Example:
+     adding "this also covers polling loops" to an existing bullet.
+  It is told to label the change it made, not the one it aimed for, and that the label is
+  checked against the diff.
 
 It answers `{"new_section", "topic" (2-5 words), "why" (<= 200 chars), "summary" (<= 140 chars),
-"kind" (contract | hop | prose), "kind_reason" (<= 140 chars)}`. `kind` and `kind_reason`
-go to `edits.meta`, the `edits run` line (`kind=`), `edits list` and the push body
-(`Kind: <kind> (<reason>)`). Prose edits are allowed; the kind is a label to track, not a gate.
+"kind" (contract | hop | prose), "kind_reason" (<= 140 chars)}`. The writer's `kind` is then
+checked against the diff (below). The checked label goes to `edits.meta.kind`, the `edits run`
+line (`kind=`), `edits list` and the push body (`Kind: <kind> (<reason>)`). Prose edits are
+allowed; the kind is a label to track, not a gate.
+
+## Kind check
+
+The writer's label is not trusted on its own. In the first live run it labelled two
+CLAUDE.md edits `hop`: one only added prose to a Shell Habits bullet, the other widened the
+Design System scope list and added "read the file before your first design step".
+`edits_kind.classify` looks at the section's actual diff:
+
+- **hop** needs a real step-order change: existing lines in a new order, plain lines turned
+  into numbered steps, a new numbered step put in front of an existing one, or new text with
+  explicit order ("after X, then Y", "first X, then Y", "only after", "before step 3", a
+  loop-back such as "go back to step 2").
+- **contract** needs a new or sharpened required-output or check clause: "must report /
+  include / return ...", "the reply names ...", "done only when ...", "verify that ...",
+  "must pass", "exit code", an `Evidence:` line.
+- **prose** is everything else: rewording, a wider or narrower scope list, an explanation, a
+  precondition such as "read X before your first Y".
+
+A cue counts only when the edit's new words fall inside it (a word-level diff over the
+section, with soft-wrapped lines joined first), so a cue already in the old text does not
+count. When the diff supports both contract and hop, the writer's label decides between
+them.
+
+`edits.meta` keeps `kind` (the checked label), `kind_writer` (the writer's label),
+`kind_reason` (the writer's reason), `kind_check` (what in the diff decided) and
+`kind_mismatch` (true when the two labels differ). On a mismatch the checked label wins: the
+run line and `edits list` show `kind=<checked> writer_kind=<writer>`, and the reason shown
+(list and push) is the check's, ending in `; writer said <writer>`.
+
+Limits: keyword cues, English only, so it can be fooled by wording. A moved line that was
+also reworded counts as a new line, not a move. A bare "X, then Y" (no "after", "first" or
+"once") is not counted as a hop, so a real but loosely worded order change reads as prose. A
+required output written without the cue words reads as prose too. The scoreboard per kind is
+only as good as these labels; `kind_mismatch` shows how often the writer and the check
+disagree.
 
 **Validation** (any failure is that candidate's error; nothing is written):
 
@@ -243,8 +312,9 @@ deviations writer extract and summarize; they stay on Sonnet.
 agent must return, with its checks) and hops (call order, loop-backs), not from role text
 or more instructions. So the writer first looks for a contract fix, then a hop fix, and only
 then adds or rewords prose. It labels each edit with `kind`, so the scoreboard can later show
-which kind actually lowers deviations. Prose stays allowed: a hard refusal would block rules
-that are plain guidance.
+which kind actually lowers deviations. That comparison needs labels that match the change, so
+the label is checked against the diff ("Kind check"). Prose stays allowed: a hard refusal
+would block rules that are plain guidance.
 
 **3. A cooldown as the learning-rate schedule.** MASS finds workflow search noisy, with sharp
 regressions, and damps its steps. Here the damping is the per-rule cooldown: a rule with a
