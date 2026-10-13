@@ -2,9 +2,11 @@
 
 Exit codes:
 - 0 success (for `lesson propose`: a decision was made, accept or reject).
-- 1 a database, file or input error; for `gate friction`: reject.
+- 1 a database, file or input error; for `gate friction`: reject; for `lessons distill`:
+  at least one run ended as `error`.
 - 2 `gate friction` could not decide (Jev error); argparse usage errors; for
-  `lessons score`: AMEM_SCORE_MIN_USES is not a positive integer (nothing is read or written).
+  `lessons score`: AMEM_SCORE_MIN_USES is not a positive integer (nothing is read or written);
+  for `lessons distill`: AMEM_DISTILL_LIVE is not 1 (nothing is called or written).
 - 3 AMEM_REQUIRE_REMOTE=1 refused a write (same as the other write commands).
 """
 
@@ -15,17 +17,18 @@ import json
 import os
 import sys
 import uuid
+from datetime import datetime
 from pathlib import Path
 
 import psycopg
 
-from agent_memory import config, jev, lessons
+from agent_memory import config, distill, jev, lessons
 
 REMOTE_REQUIRED_EXIT = 3
 USAGE_EXIT = 2
 
-DEFAULT_MIN_REUSABLE = 0.6
-DEFAULT_MIN_GENERALIZABLE = 0.5
+DEFAULT_MIN_REUSABLE = lessons.PROPOSE_MIN_REUSABLE
+DEFAULT_MIN_GENERALIZABLE = lessons.PROPOSE_MIN_GENERALIZABLE
 DEFAULT_FRICTION_MIN = 0.5
 DEFAULT_MIN_USES = 3
 
@@ -173,10 +176,7 @@ def cmd_propose(args: argparse.Namespace) -> int:
     if (code := _remote_guard()) is not None:
         return code
     try:
-        min_reusable = (args.min_reusable if args.min_reusable is not None
-                        else lessons.env_float("AMEM_PROPOSE_MIN_REUSABLE", DEFAULT_MIN_REUSABLE))
-        min_general = (args.min_generalizable if args.min_generalizable is not None
-                       else lessons.env_float("AMEM_PROPOSE_MIN_GENERALIZABLE", DEFAULT_MIN_GENERALIZABLE))
+        min_reusable, min_general = lessons.propose_thresholds(args.min_reusable, args.min_generalizable)
         run = lessons.get_run(args.run)
         if run is None:
             print(f"amem: lesson propose failed: no run with id {args.run}", file=sys.stderr)
@@ -186,11 +186,7 @@ def cmd_propose(args: argparse.Namespace) -> int:
     except (lessons.LessonsError, jev.JevError, psycopg.Error) as exc:
         return _err("lesson propose", exc)
 
-    reusable, general = results["reusable"], results["generalizable"]
-    p_reusable, g_score = float(reusable.value), float(general.value)
-    accept = p_reusable >= min_reusable and g_score >= min_general
-    detail = (f"reusable={p_reusable:.2f} (min {min_reusable:.2f}) "
-              f"generalizable={g_score:.2f} (min {min_general:.2f}, confidence {general.confidence or 0:.2f})")
+    accept, detail = lessons.gate_decision(results, min_reusable, min_general)
     if not accept:
         print(f"reject {detail}")
         return 0
@@ -202,6 +198,36 @@ def cmd_propose(args: argparse.Namespace) -> int:
     note = "stored as trial" if created else "already stored, left unchanged"
     print(f"accept {detail} -> lesson {lesson.slug} ({note})")
     return 0
+
+
+# --- lessons distill (dispatch runs -> trial lessons) -------------------------------------
+
+
+def _since(value: str) -> datetime:
+    try:
+        when = datetime.fromisoformat(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not an ISO date or datetime: {value!r}") from None
+    return when if when.tzinfo is not None else when.astimezone()
+
+
+def cmd_distill(args: argparse.Namespace) -> int:
+    if not distill.live():
+        print(f"amem: lessons distill calls the Claude Code CLI (an LLM) for every run that passes "
+              f"the Jev gate and needs live mode: set {distill.LIVE_ENV}=1. Nothing was called or written.",
+              file=sys.stderr)
+        return USAGE_EXIT
+    if (code := (_read_guard() if args.dry_run else _remote_guard())) is not None:
+        return code
+    try:
+        report = distill.distill(since=args.since, limit=args.limit, dry_run=args.dry_run,
+                                 retry_errors=args.retry_errors, timeout=args.timeout)
+    except (lessons.LessonsError, psycopg.Error) as exc:
+        return _err("lessons distill", exc)
+    for outcome in report.outcomes:
+        print(outcome.line())
+    print(report.summary())
+    return 1 if report.errors else 0
 
 
 # --- gate friction (improver gate) ------------------------------------------------------
@@ -257,7 +283,18 @@ def register(sub: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
     p.add_argument("--apply", action="store_true", help="write `retired` (default: dry run)")
     p.set_defaults(func=cmd_score)
 
-    single = sub.add_parser("lesson", help="lesson write gate")
+    p = lsub.add_parser("distill", help="turn finished dispatch runs into trial lessons "
+                                        f"(Jev gate + Claude Code writer; needs {distill.LIVE_ENV}=1)")
+    p.add_argument("--since", type=_since, default=None, help="only runs started at or after this ISO date/time")
+    p.add_argument("--limit", type=_positive, default=distill.DEFAULT_LIMIT,
+                   help=f"max runs to consider (default {distill.DEFAULT_LIMIT}); bounds LLM cost")
+    p.add_argument("--dry-run", action="store_true", help="run the gate and the writer, write nothing")
+    p.add_argument("--retry-errors", action="store_true", help="consider runs recorded as `error` again")
+    p.add_argument("--timeout", type=float, default=distill.DEFAULT_TIMEOUT,
+                   help=f"seconds per writer call (default {distill.DEFAULT_TIMEOUT:g})")
+    p.set_defaults(func=cmd_distill)
+
+    single =sub.add_parser("lesson", help="lesson write gate")
     ssub = single.add_subparsers(dest="lesson_command", required=True)
     p = ssub.add_parser("propose", help="ask Jev whether a run holds a reusable lesson; store it as trial")
     p.add_argument("--run", required=True, type=_uuid)
