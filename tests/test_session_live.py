@@ -344,9 +344,11 @@ def test_tokens_report(db: str) -> None:
     assert {g["key"]: g["total"] for g in doc["by_kind"]} == {"chat": 54050, "worker": 9605}
     assert {g["key"]: g["total"] for g in doc["by_model"]} == {"claude-x": 62615, "gpt-y": 1040}
     assert [s["session_id"] for s in doc["top"]] == ["t-a", "t-a/agent-w1", "codex:t-b"]
-    text = "\n".join(tokens_report.lines(doc))
+    text = "\n".join(tokens_report.lines(doc, by=("repo", "model")))
     assert text.startswith("tokens: last 7 days: 4 sessions (3 measured), total 63.7k")
     assert "by repo" in text and "by model" in text and "(subagents 9.6k)" in text
+    default = "\n".join(tokens_report.lines(doc))
+    assert "by category / project" in default and "by model" in default and "by repo" not in default
     only = tokens_report.summarize(tokens_report.fetch(days=7, tool="codex", now=NOW, db_url=db), days=7,
                                    tool="codex")
     assert only["sessions"] == 1 and only["totals"]["total"] == 1040

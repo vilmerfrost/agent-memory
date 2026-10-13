@@ -293,7 +293,8 @@ def test_report_groups_and_json_candidates(setup_home: Home, db: str, writer: Wr
     assert set(doc["candidates"][0]) == {
         "instruction_source", "rule_id", "rule_title", "instruction_ref", "refs", "instruction_shas",
         "target_paths", "count", "sessions", "kinds", "tools", "team", "team_sessions",
-        "followed_grade_mean", "result_grade_mean", "jev", "verdict", "session_ids", "deviation_ids", "examples"}
+        "followed_grade_mean", "result_grade_mean", "jev", "verdict", "session_ids", "deviation_ids", "examples",
+        "session_titles"}  # session_titles: {session id: title} for sessions with a known title
 
 
 def test_rls_on_new_tables_and_api_roles_revoked(db: str) -> None:

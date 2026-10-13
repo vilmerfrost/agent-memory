@@ -24,6 +24,20 @@ stderr, nothing on stdout, and exits 0. Any other error does the same. The routi
 fails because of this step. It never reads or prints environment values, never reads a
 `.env*` file, and never sends anything itself (the routine's curl does).
 
+Hook mode (`--hook`, script_version 3, docs/cloud.md "Cloud chats"): a Claude Code Stop /
+SessionEnd command hook in a cloud session. It reads the hook JSON on stdin (session_id,
+transcript_path, cwd, hook_event_name), builds the same row with `kind: chat`, no routine,
+`ingested_at: null` and the CLAUDE.md / AGENTS.md of the hook's cwd as instructions
+(`claude-md`, `agents-md`), and POSTs it itself (urllib, honours HTTPS_PROXY / NO_PROXY) to
+`$AMEM_SUPABASE_URL/rest/v1/cloud_digests?on_conflict=source_key` with
+`Prefer: resolution=merge-duplicates,return=minimal`. A Stop less than 60 s after the last
+successful POST of the same session is skipped (SessionEnd never is). Hard timeout 8 s.
+It prints nothing (stdout or stderr), always exits 0, and logs one line per run to
+`$HOME/.claude/amem/hook.log` (event, session id prefix, status; never the URL or text).
+The environment values it reads: AMEM_SUPABASE_URL, HOME, the proxy variables, and the CA
+bundle paths REQUESTS_CA_BUNDLE / CURL_CA_BUNDLE / NODE_EXTRA_CA_CERTS. It sends no key: the
+cloud network secret adds the `apikey` header.
+
 Output (stdout, one JSON object):
   source_key    cloud:<session id>
   routine       --routine, slugged (`Nightly Trials` -> `nightly-trials`)
@@ -38,22 +52,33 @@ Output (stdout, one JSON object):
   skills        Skill tool calls and slash commands (no Claude Code built-ins)
   meta          {cloud: true, repo, script_version, transcript_bytes, tool_calls, prompts,
                 tokens: {input, output, cache_read, cache_creation, models}} (script_version 2+:
-                the session's token totals, see token_totals)
+                the session's token totals, see token_totals), plus `title` (script_version 3+)
+                when the session was named: the last `custom-title` line, redacted, max 200 chars,
+                `profile` (model, effort, duration: see profile) and `outcome` ({signals, end}:
+                signal names and counts, see SignalTracker)
+  hook mode adds `kind: chat`, `ingested_at: null` and meta.hook (the event); no `routine`.
 """
 
 from __future__ import annotations
 
 import argparse
 import hashlib
+import ipaddress
 import json
+import os
 import re
+import signal
+import ssl
 import sys
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-SCRIPT_VERSION = "2"
+SCRIPT_VERSION = "3"
 SOURCE_PREFIX = "cloud:"
 PROMPT_NAME = "prompt"     # the routine prompt: instruction source routine:<routine>
 
@@ -69,6 +94,17 @@ NOTICE_MAX = 300
 INSTRUCTION_TEXT_MAX = 100_000   # per instruction file
 INSTRUCTIONS_MAX_FILES = 12
 DEFAULT_MAX_AGE_MINUTES = 120
+TITLE_MAX = 200
+
+HOOK_EVENTS = ("Stop", "SessionEnd")
+HOOK_DEBOUNCE_SECONDS = 60.0
+HOOK_TIMEOUT_SECONDS = 8
+HTTP_TIMEOUT_SECONDS = 5.0
+HOOK_STATE_KEEP_DAYS = 14
+HOOK_PAYLOAD_MAX = 1_000_000
+HOOK_LOG_MAX = 1_000_000
+HOOK_INSTRUCTIONS = (("claude-md", "CLAUDE.md"), ("agents-md", "AGENTS.md"))
+CA_BUNDLE_ENVS = ("REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE", "NODE_EXTRA_CA_CERTS")
 
 # The redaction of deviations.redact: tasks_ingest's patterns, then the extra key shapes.
 REDACT_RES = (
@@ -162,6 +198,23 @@ def redact(text: str) -> str:
 def _one_line(text: Any, limit: int) -> str:
     out = " ".join(str(text).split())
     return out if len(out) <= limit else out[: limit - 1].rstrip() + "…"
+
+
+def clean_title(value: Any) -> str | None:
+    """A session title as stored: redacted, one line, at most TITLE_MAX chars. None for no title."""
+    if not isinstance(value, str):
+        return None
+    out = _one_line(redact(value), TITLE_MAX)
+    return out or None
+
+
+def title_of(events: list[dict[str, Any]]) -> str | None:
+    """The session's name: the last `custom-title` line's `customTitle` (a rename wins)."""
+    title = None
+    for e in events:
+        if e.get("type") == "custom-title":
+            title = clean_title(e.get("customTitle")) or title
+    return title
 
 
 def _clip(text: str, limit: int) -> str:
@@ -372,6 +425,259 @@ def token_totals(events: list[dict[str, Any]]) -> dict[str, Any]:
     return {**dict(zip(TOKEN_FIELDS, total)), "models": dict(sorted(models.items()))}
 
 
+IDLE_GAP_SECONDS = 600
+_EFFORT_RE = re.compile(r"[a-z][a-z0-9_-]{0,30}")
+
+
+def _effort(value: Any) -> str | None:
+    if isinstance(value, str) and _EFFORT_RE.fullmatch(value.strip().lower()):
+        return value.strip().lower()
+    return None
+
+
+def _real_model(name: str) -> bool:
+    return bool(name) and name != "unknown" and not name.startswith("<")
+
+
+def _nonneg(value: Any) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+        return None
+    return int(value)
+
+
+def profile(events: list[dict[str, Any]]) -> dict[str, Any]:
+    """Model, effort and time facts (session_tokens.Summary.profile): the main model (most
+    output tokens, a tie goes to the most recent), the latest reply's model, the effort per
+    reply (`perTurnEffort`, else `effort`), wall clock and active seconds (gaps over 10 minutes
+    are idle), and the last `cost-state` line's API / tool time (ms) and lines added / removed."""
+    seq = 0
+    ids: set[str] = set()
+    model_seen: dict[str, int] = {}
+    effort_seen: dict[str, int] = {}
+    efforts: dict[str, int] = {}
+    model_last = effort_last = None
+    first = last = prev = None
+    active = 0.0
+    cost: dict[str, Any] | None = None
+    for e in events:
+        ts = parse_ts(e.get("timestamp"))
+        if ts is not None:
+            first = min(first, ts) if first else ts
+            last = max(last, ts) if last else ts
+            if prev is not None:
+                gap = (ts - prev).total_seconds()
+                if 0 < gap <= IDLE_GAP_SECONDS:
+                    active += gap
+            if prev is None or ts > prev:
+                prev = ts
+        if e.get("type") == "cost-state":
+            cost = e
+            continue
+        m = e.get("message") if isinstance(e.get("message"), dict) else {}
+        if e.get("type") != "assistant" or not isinstance(m.get("usage"), dict):
+            continue
+        raw = m.get("model")
+        model = raw.strip() if isinstance(raw, str) and raw.strip() and len(raw) <= 100 else "unknown"
+        if model == "<synthetic>":
+            continue
+        mid = m.get("id") if isinstance(m.get("id"), str) and m.get("id") else None
+        if mid is None or mid not in ids:
+            seq += 1
+            if _real_model(model):
+                model_last, model_seen[model] = model, seq
+            eff = _effort(e.get("perTurnEffort")) or _effort(e.get("effort"))
+            if eff:
+                efforts[eff] = efforts.get(eff, 0) + 1
+                effort_last, effort_seen[eff] = eff, seq
+        if mid is not None:
+            ids.add(mid)
+    models = token_totals(events)["models"]
+    named = [k for k in models if _real_model(k)]
+    main_model = max(named, key=lambda k: (models[k]["output"], model_seen.get(k, -1), k)) if named else None
+    main_effort = max(efforts, key=lambda k: (efforts[k], effort_seen.get(k, -1), k)) if efforts else None
+    api = _nonneg(cost.get("totalAPIDuration")) if cost else None
+    tool = _nonneg(cost.get("totalToolDuration")) if cost else None
+    return {
+        "model": main_model, "model_last": model_last,
+        "effort": main_effort, "effort_last": effort_last, "efforts": dict(sorted(efforts.items())),
+        "duration_seconds": round((last - first).total_seconds(), 3) if first and last else None,
+        "active_seconds": round(active, 3) if first else None,
+        "api_seconds": None if api is None else round(api / 1000, 3),
+        "tool_seconds": None if tool is None else round(tool / 1000, 3),
+        "lines_added": _nonneg(cost.get("totalLinesAdded")) if cost else None,
+        "lines_removed": _nonneg(cost.get("totalLinesRemoved")) if cost else None,
+    }
+
+
+# --------------------------------------------------------------------------- outcome signals
+# docs/sessions-live.md, "Outcome". Signal names and counts only: no command text is kept.
+
+EDIT_TOOLS = frozenset({"Edit", "Write", "MultiEdit", "NotebookEdit", "apply_patch"})
+_SEGMENT_SPLIT_RE = re.compile(r"&&|\|\||;|\n|\|")
+# The tool must be the segment's command word: `echo "git push"` is not a push. Allowed before it:
+# `(`, env assignments, and runners such as `sudo`, `uv run`, `npx`.
+_START = (r"^[\s(]*(?:[A-Za-z_]\w*=\S*\s+)*"
+          r"(?:(?:sudo|command|exec|time|env|npx|bunx|uv\s+run(?:\s+--?\S+)*|pnpm\s+(?:dlx|exec))\s+)*")
+_GIT = _START + r"git(?:\s+(?:-C\s+(?:\"[^\"]*\"|'[^']*'|\S+)|-c\s+\S+|--no-pager))*\s+"
+_SIGNAL_RES = (
+    ("pr_merge", re.compile(_START + r"gh\s+pr\s+merge\b")),
+    ("pr_create", re.compile(_START + r"gh\s+pr\s+create\b")),
+    ("commit", re.compile(_GIT + r"commit\b")),
+    ("deploy", re.compile(_START + r"(?:vercel\b.*\s--prod\b|supabase\s+functions\s+deploy\b|supabase\s+db\s+push\b"
+                          r"|railway\s+up\b|amem\s+db\s+migrate\b)")),
+)
+_PUSH_RE = re.compile(_GIT + r"push\b(.*)")
+_MERGE_RE = re.compile(_GIT + r"merge\b")
+_TO_MAIN_RE = re.compile(r"(?:^|[\s:/])(?:main|master)(?:\s|$)")
+_SWITCH_MAIN_RE = re.compile(_GIT + r"(?:checkout|switch)\s+(?:main|master)\b")
+REPORT_RE = re.compile(r"^\W*Status:\W*(DONE|PARTIAL|BLOCKED)\b", re.M)
+
+
+def command_signals(command: str) -> list[str]:
+    """Signal names in one shell command (git / gh / deploy). Never the text itself."""
+    out: list[str] = []
+    on_main = False
+    for seg in _SEGMENT_SPLIT_RE.split(command or ""):
+        for name, pattern in _SIGNAL_RES:
+            if pattern.search(seg):
+                out.append(name)
+        push = _PUSH_RE.search(seg)
+        if push:
+            out.append("push_main" if _TO_MAIN_RE.search(push.group(1)) else "push")
+        if _SWITCH_MAIN_RE.search(seg):
+            on_main = True
+        elif on_main and _MERGE_RE.search(seg):
+            out.append("merge_main")
+    return out
+
+
+def _report_signals(text: str) -> list[str]:
+    return [f"report_{m.lower()}" for m in REPORT_RE.findall(text or "")]
+
+
+def _command_of(name: str, inp: Any) -> str:
+    """The shell command of a tool call (Claude `Bash`, Codex shell / exec_command), else ''."""
+    if not isinstance(inp, dict):
+        return ""
+    cmd = inp.get("command", inp.get("cmd"))
+    if isinstance(cmd, list):
+        cmd = " ".join(str(c) for c in cmd)
+    return cmd if isinstance(cmd, str) else ""
+
+
+class SignalTracker:
+    """Outcome signals of one Claude Code transcript, line by line. `state()` / `__init__(state)`
+    let a hook ping continue where it stopped. `end`: how the session stands now:
+    reply | user (a prompt with no reply yet) | tool (a call with no result yet) | error |
+    interrupt."""
+
+    PENDING_MAX = 64
+
+    def __init__(self, state: dict[str, Any] | None = None) -> None:
+        s = state if isinstance(state, dict) else {}
+        raw = s.get("signals") if isinstance(s.get("signals"), dict) else {}
+        self.signals: dict[str, int] = {str(k): int(v) for k, v in raw.items()
+                                         if isinstance(v, int) and not isinstance(v, bool) and v > 0}
+        self.end: str | None = s.get("end") if isinstance(s.get("end"), str) else None
+        self.pending: list[str] = [str(p) for p in s.get("pending") or [] if isinstance(p, str)][-self.PENDING_MAX:]
+
+    def state(self) -> dict[str, Any]:
+        return {"signals": dict(self.signals), "end": self.end, "pending": list(self.pending)}
+
+    def add(self, names: list[str]) -> None:
+        for n in names:
+            self.signals[n] = self.signals.get(n, 0) + 1
+
+    def tool_call(self, call_id: str | None, name: str, inp: Any) -> None:
+        if name in EDIT_TOOLS:
+            self.add(["edit"])
+        self.add(command_signals(_command_of(name, inp)))
+        if name == "SubagentHandback" and isinstance(inp, dict):
+            self.add(_report_signals(str(inp.get("message") or "")))
+        if call_id:
+            self.pending = (self.pending + [call_id])[-self.PENDING_MAX:]
+        self.end = "tool"
+
+    def tool_result(self, call_id: str | None, error: bool) -> None:
+        if call_id in self.pending:
+            self.pending.remove(call_id)
+        self.end = "error" if error else ("tool" if self.pending else "result")
+
+    def feed(self, e: dict[str, Any]) -> None:
+        etype = e.get("type")
+        m = e.get("message") if isinstance(e.get("message"), dict) else {}
+        content = m.get("content")
+        if etype == "assistant":
+            if e.get("isApiErrorMessage"):
+                self.end = "error"
+                return
+            if m.get("model") == "<synthetic>":
+                return
+            for b in content if isinstance(content, list) else []:
+                if not isinstance(b, dict):
+                    continue
+                if b.get("type") == "text" and str(b.get("text", "")).strip():
+                    self.add(_report_signals(str(b["text"])))
+                    if not self.pending:
+                        self.end = "reply"
+                elif b.get("type") == "tool_use":
+                    self.tool_call(str(b.get("id") or "") or None, str(b.get("name") or ""), b.get("input"))
+        elif etype == "user" and not e.get("isMeta"):
+            if isinstance(content, list) and any(isinstance(b, dict) and b.get("type") == "tool_result"
+                                                 for b in content):
+                for b in content:
+                    if isinstance(b, dict) and b.get("type") == "tool_result":
+                        denied = bool(e.get("toolDenialKind"))
+                        self.tool_result(str(b.get("tool_use_id") or "") or None, bool(b.get("is_error")) and not denied)
+                return
+            text = text_of(content)
+            if text.lstrip().startswith("[Request interrupted"):
+                self.pending = []
+                self.end = "interrupt"
+            elif is_human(text):
+                self.end = "user"
+
+
+def outcome_signals(events: list[dict[str, Any]]) -> dict[str, Any]:
+    """{signals: {name: count}, end} of a whole Claude Code transcript (the digest carries it)."""
+    t = SignalTracker()
+    for e in events:
+        t.feed(e)
+    return {"signals": dict(sorted(t.signals.items())), "end": t.end}
+
+
+ACTIVE_HOURS = 2
+ABANDONED_HOURS = 24
+OUTCOMES = ("shipped", "pushed", "committed", "partial", "active", "abandoned", "failed", "no-change")
+
+
+def outcome(signals: dict[str, int], end: str | None, last_at: datetime | None,
+            now: datetime | None = None) -> tuple[str, dict[str, Any]]:
+    """(outcome, evidence). The most advanced state wins (docs/sessions-live.md, "Outcome")."""
+    now = now or datetime.now(timezone.utc)
+    s = {k: v for k, v in signals.items() if isinstance(v, int) and v > 0}
+    evidence: dict[str, Any] = {**dict(sorted(s.items())), "end": end}
+    age_h = (now - last_at).total_seconds() / 3600 if last_at else None
+    if s.get("pr_merge") or s.get("push_main") or s.get("merge_main") or s.get("deploy"):
+        return "shipped", evidence
+    if s.get("push") or s.get("pr_create"):
+        return "pushed", evidence
+    if s.get("commit"):
+        return "committed", evidence
+    if s.get("report_partial") or s.get("report_blocked"):
+        return "partial", evidence
+    if age_h is not None and age_h < ACTIVE_HOURS:
+        return "active", evidence
+    dangling = end in ("user", "tool", "result")
+    if age_h is not None and age_h > ABANDONED_HOURS and (dangling or (s.get("edit") and not s.get("report_done"))):
+        return "abandoned", evidence
+    if s.get("edit"):
+        return "partial", evidence
+    if end in ("error", "interrupt"):
+        return "failed", evidence
+    return "no-change", evidence
+
+
 # --------------------------------------------------------------------------- inputs
 
 
@@ -459,10 +765,11 @@ def _iso(ts: datetime | None) -> str | None:
     return ts.astimezone(timezone.utc).isoformat() if ts else None
 
 
-def build_row(transcript: Path, *, routine: str, instructions: list[tuple[str, Path]],
+def build_row(transcript: Path, *, routine: str | None, instructions: list[tuple[str, Path]],
               repo: str | None = None, prompt_from_transcript: bool = False) -> dict[str, Any]:
     """The `cloud_digests` row for one transcript. `prompt_from_transcript`: when no
-    `prompt` file is given, the session's first user message is the `prompt` instruction."""
+    `prompt` file is given, the session's first user message is the `prompt` instruction.
+    `routine` None (hook mode): the row has no `routine` key."""
     events = load_events(transcript)
     f = facts(events)
     digest = build_digest(events)
@@ -497,9 +804,16 @@ def build_row(transcript: Path, *, routine: str, instructions: list[tuple[str, P
         size = transcript.stat().st_size
     except OSError:
         size = 0
-    return {
-        "source_key": SOURCE_PREFIX + session_id,
-        "routine": slug(routine),
+    meta: dict[str, Any] = {"cloud": True, "repo": repo, "script_version": SCRIPT_VERSION, "transcript_bytes": size,
+                            "tool_calls": f["tool_calls"], "prompts": f["prompts"], "tokens": token_totals(events),
+                            "profile": profile(events), "outcome": outcome_signals(events)}
+    title = title_of(events)
+    if title:
+        meta["title"] = title
+    row: dict[str, Any] = {"source_key": SOURCE_PREFIX + session_id}
+    if routine is not None:
+        row["routine"] = slug(routine)
+    row.update({
         "session_id": session_id,
         "started_at": _iso(f["start"]),
         "ended_at": _iso(f["end"]),
@@ -507,9 +821,244 @@ def build_row(transcript: Path, *, routine: str, instructions: list[tuple[str, P
         "digest_sha": hashlib.sha256(digest.encode("utf-8")).hexdigest(),
         "instructions": instr,
         "skills": f["skills"],
-        "meta": {"cloud": True, "repo": repo, "script_version": SCRIPT_VERSION, "transcript_bytes": size,
-                 "tool_calls": f["tool_calls"], "prompts": f["prompts"], "tokens": token_totals(events)},
-    }
+        "meta": meta,
+    })
+    return row
+
+
+# --------------------------------------------------------------------------- hook mode
+
+
+class HookSkip(Exception):
+    """The hook has nothing to do. The message is the status for the log line."""
+
+
+def hook_dir() -> Path:
+    """`$HOME/.claude/amem`: the debounce state and the log."""
+    return Path.home() / ".claude" / "amem"
+
+
+def _local_host(host: str) -> bool:
+    host = host.strip("[]").lower()
+    if host == "localhost" or host.endswith(".localhost"):
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def endpoint(base: str) -> str:
+    """The cloud_digests upsert URL. https only; plain http only to a local host (a test stub).
+    Raises HookSkip for anything else."""
+    base = base.strip().rstrip("/")
+    if not base:
+        raise HookSkip("no AMEM_SUPABASE_URL")
+    parts = urllib.parse.urlsplit(base)
+    if not parts.hostname or parts.scheme not in ("https", "http") or (
+            parts.scheme == "http" and not _local_host(parts.hostname)):
+        raise HookSkip("bad AMEM_SUPABASE_URL")
+    return base + "/rest/v1/cloud_digests?on_conflict=source_key"
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """A 30x is an error: the body never goes to another host."""
+
+    def redirect_request(self, *args: Any, **kwargs: Any) -> None:
+        return None
+
+
+def _ssl_context() -> ssl.SSLContext:
+    """The default trust store (honours SSL_CERT_FILE) plus any CA bundle the environment names
+    for other tools: a TLS-inspecting proxy's CA is often only there."""
+    ctx = ssl.create_default_context()
+    for name in CA_BUNDLE_ENVS:
+        path = os.environ.get(name, "").strip()
+        if path and os.path.isfile(path):
+            try:
+                ctx.load_verify_locations(cafile=path)
+            except (OSError, ssl.SSLError):
+                pass
+    return ctx
+
+
+def post_row(url: str, row: dict[str, Any], timeout: float = HTTP_TIMEOUT_SECONDS) -> int:
+    """POST one row as a merge upsert. Returns the HTTP status (0: no answer). Proxies come
+    from the environment (HTTPS_PROXY, HTTP_PROXY, NO_PROXY), as urllib reads them."""
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler(), _NoRedirect(),
+                                         urllib.request.HTTPSHandler(context=_ssl_context()))
+    req = urllib.request.Request(url, data=json.dumps(row, ensure_ascii=False).encode("utf-8"), method="POST",
+                                 headers={"Content-Type": "application/json",
+                                          "Prefer": "resolution=merge-duplicates,return=minimal"})
+    try:
+        with opener.open(req, timeout=timeout) as resp:
+            return int(resp.status)
+    except urllib.error.HTTPError as exc:
+        return int(exc.code)
+    except (urllib.error.URLError, OSError, ValueError):
+        return 0
+
+
+def _load_state(path: Path) -> dict[str, Any]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _save_state(path: Path, state: dict[str, Any], now: float) -> None:
+    cutoff = now - HOOK_STATE_KEEP_DAYS * 86400
+    keep = {k: v for k, v in state.items() if isinstance(v, (int, float)) and v >= cutoff}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        json.dump(keep, fh, separators=(",", ":"))
+    os.replace(tmp, path)
+
+
+def hook_instructions(cwd: str) -> list[tuple[str, Path]]:
+    """CLAUDE.md / AGENTS.md of the hook's cwd, else of the git root above it."""
+    if not cwd or not os.path.isabs(cwd):
+        return []
+    base = Path(cwd)
+    dirs = [base]
+    for d in base.parents:
+        if (d / ".git").exists():
+            dirs.append(d)
+            break
+    out: list[tuple[str, Path]] = []
+    for name, file in HOOK_INSTRUCTIONS:
+        for d in dirs:
+            if (d / file).is_file():
+                out.append((name, d / file))
+                break
+    return out
+
+
+def run_hook(raw: bytes, extra: list[tuple[str, Path]] | None = None, now: float | None = None) -> str:
+    """Handle one hook payload. Returns the status for the log line."""
+    now = time.time() if now is None else now
+    try:
+        data = json.loads(raw)
+    except (ValueError, UnicodeDecodeError):
+        raise HookSkip("bad payload") from None
+    if not isinstance(data, dict):
+        raise HookSkip("bad payload")
+    event, sid = data.get("hook_event_name"), data.get("session_id")
+    if event not in HOOK_EVENTS or data.get("agent_id"):
+        raise HookSkip("ignored")
+    if not isinstance(sid, str) or not _SESSION_ID_RE.fullmatch(sid):
+        raise HookSkip("bad session id")
+    url = endpoint(os.environ.get("AMEM_SUPABASE_URL", ""))
+    state_path = hook_dir() / "hook-state.json"
+    state = _load_state(state_path)
+    last = state.get(sid)
+    if event == "Stop" and isinstance(last, (int, float)) and now - last < HOOK_DEBOUNCE_SECONDS:
+        raise HookSkip("debounced")
+    tp = data.get("transcript_path")
+    transcript = Path(tp).expanduser() if isinstance(tp, str) and tp.endswith(".jsonl") else None
+    if transcript is None or not transcript.is_file():
+        raise HookSkip("no transcript")
+    cwd = data.get("cwd") if isinstance(data.get("cwd"), str) else ""
+    row = build_row(transcript, routine=None, instructions=hook_instructions(cwd) + list(extra or []))
+    if row["session_id"] != sid:
+        raise HookSkip("transcript of another session")
+    row["kind"] = "chat"
+    row["ingested_at"] = None
+    row["meta"]["hook"] = event
+    code = post_row(url, row)
+    if 200 <= code < 300:
+        state[sid] = now
+        _save_state(state_path, state, now)
+        return f"posted {code}"
+    return f"failed {code:03d}"
+
+
+def _log(event: str, sid: str, status: str, took: float) -> None:
+    try:
+        d = hook_dir()
+        d.mkdir(parents=True, exist_ok=True)
+        path = d / "hook.log"
+        try:
+            if path.stat().st_size > HOOK_LOG_MAX:
+                os.replace(path, d / "hook.log.1")
+        except OSError:
+            pass
+        stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        try:
+            os.write(fd, f"amem-digest {stamp} {event} {sid} {status} {took:.2f}s\n".encode())
+        finally:
+            os.close(fd)
+    except Exception:
+        pass
+
+
+class _Timeout(Exception):
+    pass
+
+
+def _on_alarm(_signum: int, _frame: Any) -> None:
+    raise _Timeout()
+
+
+def hook_main(argv: list[str]) -> int:
+    """`--hook`: always exit 0, never a byte on stdout or stderr (docs/cloud.md, "Cloud chats")."""
+    try:
+        _hook_main(argv)
+    except BaseException:  # a late alarm or anything else: still exit 0
+        if hasattr(signal, "SIGALRM"):
+            signal.alarm(0)
+    return 0
+
+
+def _hook_main(argv: list[str]) -> None:
+    started = time.monotonic()
+    status, event, sid = "error", "-", "-"
+    alarm = hasattr(signal, "SIGALRM")
+    saved = sys.stdout, sys.stderr
+    try:
+        sys.stdout = sys.stderr = open(os.devnull, "w", encoding="utf-8")  # noqa: SIM115
+    except OSError:
+        pass
+    try:
+        if alarm:
+            signal.signal(signal.SIGALRM, _on_alarm)
+            signal.alarm(HOOK_TIMEOUT_SECONDS)
+        extra: list[tuple[str, Path]] = []
+        for i, arg in enumerate(argv):
+            if arg == "--instruction" and i + 1 < len(argv):
+                try:
+                    extra.append(parse_instruction(argv[i + 1]))
+                except argparse.ArgumentTypeError:
+                    pass
+        raw = sys.stdin.buffer.read(HOOK_PAYLOAD_MAX)
+        try:
+            data = json.loads(raw)
+            if isinstance(data, dict):
+                event = str(data.get("hook_event_name") or "-")[:20]
+                sid = str(data.get("session_id") or "-")[:8]
+        except (ValueError, UnicodeDecodeError):
+            pass
+        status = run_hook(raw, extra)
+    except HookSkip as exc:
+        status = str(exc)
+    except _Timeout:
+        status = "timeout"
+    except BaseException as exc:  # never fail the session
+        status = f"error ({type(exc).__name__})"
+    finally:
+        if alarm:
+            signal.alarm(0)
+        if sys.stdout is not saved[0]:
+            try:
+                sys.stdout.close()
+            except Exception:
+                pass
+        sys.stdout, sys.stderr = saved
+    _log(re.sub(r"[^\w-]", "?", event), re.sub(r"[^\w-]", "?", sid), status, time.monotonic() - started)
 
 
 # --------------------------------------------------------------------------- main
@@ -518,8 +1067,11 @@ def build_row(transcript: Path, *, routine: str, instructions: list[tuple[str, P
 def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="amem_digest",
-        description="Print the redacted digest of this cloud session as one JSON row for cloud_digests.")
-    p.add_argument("--routine", required=True, help="routine name (slugged: 'Nightly Trials' -> nightly-trials)")
+        description="Print the redacted digest of this cloud session as one JSON row for cloud_digests. "
+                    "--hook: a Stop / SessionEnd hook that POSTs it itself (docs/cloud.md).")
+    p.add_argument("--hook", action="store_true",
+                   help="hook mode: payload on stdin, POST to $AMEM_SUPABASE_URL, no output, exit 0")
+    p.add_argument("--routine", default=None, help="routine name (slugged: 'Nightly Trials' -> nightly-trials)")
     p.add_argument("--transcript", type=Path, default=None,
                    help="transcript file (default: the newest *.jsonl under --projects-dir)")
     p.add_argument("--projects-dir", type=Path, default=None, help="default ~/.claude/projects")
@@ -536,7 +1088,13 @@ def parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = parser().parse_args(argv)
+    argv = sys.argv[1:] if argv is None else list(argv)
+    if "--hook" in argv:
+        return hook_main([a for a in argv if a != "--hook"])
+    p = parser()
+    args = p.parse_args(argv)
+    if not args.routine:
+        p.error("the following arguments are required: --routine (or --hook)")
     try:
         if args.transcript is not None:
             transcript = args.transcript.expanduser()

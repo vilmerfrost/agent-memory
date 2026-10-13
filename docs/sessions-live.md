@@ -73,7 +73,7 @@ is ignored: `sessions ingest` makes the subagent rows.
 | Event | Writes |
 |---|---|
 | `SessionStart` | A minimal row: `session_id`, `tool` claude, `cwd` → `repo`, `project_dir` (the transcript folder), `started_at`, a best-effort `kind` (`eval` for eval clones, `headless` when `CLAUDE_CODE_ENTRYPOINT` starts with `sdk`, else `chat`), `meta.live`, `meta.start_source`, `meta.model`. An existing row keeps its kind and facts; `meta` is merged. |
-| `Stop` | Token columns, `models`, `turns`, `last_activity_at`, `ended_at`, `meta.subagent_tokens`. |
+| `Stop` | Token columns, `models`, `turns`, `last_activity_at`, `ended_at`, `meta.subagent_tokens`, and the profile columns (title, model, effort, time, outcome; see "Profile columns"). SessionStart sets `category` / `project` and the title an earlier scan saw. |
 | `SessionEnd` (optional) | As Stop, never debounced, plus `meta.ended`. |
 
 Cheap by design:
@@ -163,6 +163,8 @@ Check after install: start a session, send one prompt, then
   deleted right after reading.
 - The state and spool files hold the same numbers and labels, mode 600.
 - `cwd` is stored (as `sessions ingest` already does).
+- The session title is the one user-named label stored: redacted, max 200 chars. Outcome
+  evidence is signal names and counts, never commands.
 
 ## Disable
 
@@ -172,17 +174,107 @@ Check after install: start a session, send one prompt, then
 - Clean up local files: `~/.claude/parent/amem-session-{state.json,spool.jsonl,hook.log,lock}`
   and `~/.claude/parent/amem-hook-tmp/`. Rows already in `sessions` stay.
 
+## Profile columns
+
+Migration `20261018040000_session_profile.sql`. `sessions ingest` fills them for every tool
+(and backfills old rows on the next ingest), `sessions ping` fills them from its incremental
+scan, cloud digests (script version 3+) carry them. Null means "not known"; nothing is guessed.
+
+### Title
+
+`title` (+ `title_updated_at`): the name the session was given. Claude Code: the last
+`"type": "custom-title"` line's `customTitle` (a rename wins). Codex:
+`<codex home>/session_index.jsonl` lines `{id, thread_name, updated_at}`, the latest
+`updated_at` per thread id wins. Cloud: the digest's `meta.title`. A title is not content,
+but it is user-typed, so it is redacted like other text and capped at 200 chars.
+
+### Project and category
+
+`category` = the session kind: `routine`, `chat` (local or cloud), `parent`, `worker`
+(subagents, dispatch workers), `eval`, `headless` (`claude -p`, `codex exec`).
+
+`project` = where the work happened, first match wins:
+
+| Where | project |
+|---|---|
+| a routine | `routine:<name>` (`routine:nightly-trials`) |
+| an eval clone (`~/.cache/agent-evals`, `~/.cache/skill-evals`, `eval-jo-*`, probes) | `evals` |
+| a Claude Desktop scratch workspace, a Codex `~/Documents/Codex/<date>/<slug>` folder, a session scratchpad | `scratch` |
+| a worktree (`<repo>/.claude/worktrees/<x>`, `~/worktrees/<repo>/<x>`, a git worktree checkout) | its main repo |
+| inside a git repo | the repo folder's name (`simplitics drift check`) |
+| the home folder | `home` |
+| anything else | the folder's basename; never empty (`unknown`) |
+
+Cloud chats use the repo of the session's cwd.
+
+### Model, effort, duration
+
+| Column | Value |
+|---|---|
+| `model` | the main model: the most output tokens; a tie goes to the most recent |
+| `model_last` | the model of the latest reply (a mid-session switch shows) |
+| `effort`, `effort_last`, `efforts` | the effort on the most replies (tie: most recent), the latest reply's, `{level: replies}`. Claude Code: `perTurnEffort`, else `effort` on the assistant line; Codex: `effort` / `reasoning_effort` of the turn context |
+| `duration_seconds` | wall clock, first to last transcript event (every tool) |
+| `active_seconds` | the sum of the gaps between consecutive events; a gap over 10 minutes is idle and left out |
+| `api_seconds`, `tool_seconds`, `lines_added`, `lines_removed` | Claude Code `cost-state` lines (the last one wins): `totalAPIDuration`, `totalToolDuration` (milliseconds in the transcript; checked: `totalDuration` 140305 for a 139.6 s session), `totalLinesAdded`, `totalLinesRemoved`. Codex: null |
+
+`<synthetic>` and `unknown` are never a model. One response written as several lines is one reply.
+
+### Outcome
+
+`outcome` (+ `outcome_evidence`, `outcome_at` = when it last changed), from the session's own
+tool calls (Claude Code `tool_use`, Codex command / file-change events). The most advanced
+state wins, in this order:
+
+| outcome | when |
+|---|---|
+| `shipped` | `gh pr merge`, a `git push` to main/master, `git checkout main && git merge`, or a deploy (`vercel ... --prod`, `supabase functions deploy`, `supabase db push`, `railway up`, `amem db migrate`) |
+| `pushed` | `git push` of another branch, or `gh pr create` |
+| `committed` | `git commit`, nothing pushed |
+| `partial` | a worker report `Status: PARTIAL` / `BLOCKED` (also in a `SubagentHandback`) |
+| `active` | last activity under 2 h ago |
+| `abandoned` | last activity over 24 h ago and the session ended on a prompt with no reply or a tool call with no result, or it edited files, never committed and reported no `Status: DONE` |
+| `partial` | files were edited (Edit, Write, MultiEdit, NotebookEdit, apply_patch, a Codex FileChange), nothing committed |
+| `failed` | it ended on an API / tool error or an interrupt |
+| `no-change` | none of the above: Q&A, research, reviews |
+
+`outcome_evidence` holds signal names and counts only (`edit`, `commit`, `push`,
+`push_main`, `pr_create`, `pr_merge`, `merge_main`, `deploy`, `report_done`,
+`report_partial`, `report_blocked`) plus `end` (`reply`, `user`, `tool`, `result`, `error`,
+`interrupt`). Never command text, paths or messages.
+
+Limits: a heuristic. It is git- and English-centric: the tool must be the command word of a
+shell segment (`echo git push` does not count); a push or merge done another way (an IDE,
+a script, a merge on GitHub) is not seen; `git merge` counts as a merge into main only
+after `git checkout main` / `git switch main` in the same command; `amem db migrate`
+counts as a deploy even against a local DB. `active` and `abandoned` depend on the time of
+the last ingest or ping.
+
+## View `session_groups`
+
+One row per `category` + `project`: `sessions`, token sums (`tokens_input`, ...,
+`tokens_total`), `duration_seconds` and `active_seconds` (sum) with
+`duration_median_seconds` / `active_median_seconds`, `last_activity_at`, and session counts
+per value in `models`, `efforts`, `outcomes` (`{"claude-opus-5-5": 12}`). It is
+`security_invoker`, so RLS on `sessions` applies; `anon` / `authenticated` have no grants.
+
 ## Report: `amem sessions tokens`
 
 ```
-amem sessions tokens [--days 7] [--repo R] [--tool claude|codex] [--top 10] [--json]
+amem sessions tokens [--days 7] [--repo R] [--tool claude|codex] [--top 10]
+                     [--by category|project|repo|tool|kind|model|effort|outcome ...] [--json]
 ```
 
 A session counts when its last activity (else end, start or creation time) is in the
-window. Output: the total, then sums by repo, tool, kind and model, then the top sessions.
-Subagent rows (kind `worker`) count once; a parent's `(subagents ...)` note is shown, not
-added. `--json` prints the same as a document (`totals`, `by_repo`, `by_tool`, `by_kind`,
-`by_model`, `top`). Postgres backend only (exit 1 on REST), read only.
+window. Output: the total (with wall-clock and active time), then the sections. Default:
+`by category / project` (each category, then its projects indented), then `by model`.
+`--by` (repeatable) picks the sections. Every group shows sessions, tokens and active time
+(sum and median). `by model` splits each session's tokens by model; every other section
+counts a session under its own value (`(none)` when null). The top sessions show project,
+model, effort, outcome, active time and title. Subagent rows (kind `worker`) count once; a
+parent's `(subagents ...)` note is shown, not added. `--json` prints every section
+(`by_category` with `projects`, `by_project`, `by_repo`, `by_tool`, `by_kind`, `by_model`,
+`by_effort`, `by_outcome`, `top`). Postgres backend only (exit 1 on REST), read only.
 
 ```
 tokens: last 7 days: 42 sessions (40 measured), total 812.4M

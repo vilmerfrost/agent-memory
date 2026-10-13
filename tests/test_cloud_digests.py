@@ -180,9 +180,13 @@ def test_row_shape_redaction_and_no_env(files: dict[str, Path], tmp_path: Path) 
     assert row["started_at"] == "2026-10-14T09:00:00+00:00" and row["ended_at"] == "2026-10-14T09:12:00+00:00"
     assert row["digest_sha"] == hashlib.sha256(row["digest"].encode()).hexdigest()
     assert row["skills"] == ["systematic-debugging", "handoff"]
-    assert row["meta"] == {"cloud": True, "repo": "nightly-trials", "script_version": amem_digest.SCRIPT_VERSION,
-                           "transcript_bytes": files["transcript"].stat().st_size, "tool_calls": 5, "prompts": 1,
-                           "tokens": {"input": 0, "output": 0, "cache_read": 0, "cache_creation": 0, "models": {}}}
+    meta = dict(row["meta"])
+    profile, outcome = meta.pop("profile"), meta.pop("outcome")
+    assert meta == {"cloud": True, "repo": "nightly-trials", "script_version": amem_digest.SCRIPT_VERSION,
+                    "transcript_bytes": files["transcript"].stat().st_size, "tool_calls": 5, "prompts": 1,
+                    "tokens": {"input": 0, "output": 0, "cache_read": 0, "cache_creation": 0, "models": {}}}
+    assert profile["duration_seconds"] == 720.0 and profile["model"] is None and profile["api_seconds"] is None
+    assert outcome["signals"] == {"push": 1}  # the `git push` call: a signal name, never the command
     (instr,) = row["instructions"]
     assert instr["name"] == "nightly-md" and "[redacted]" in instr["text"]
     assert instr["sha256"] == hashlib.sha256(nightly.read_bytes()).hexdigest()
