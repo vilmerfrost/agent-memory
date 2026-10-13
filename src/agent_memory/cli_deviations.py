@@ -63,12 +63,13 @@ def _positive(value: str) -> int:
 def cmd_sessions_ingest(args: argparse.Namespace) -> int:
     if (code := _write_guard("sessions ingest")) is not None:
         return code
+    tools = sessions_ingest.TOOLS if args.tool == "all" else (args.tool,)
     root = sessions_ingest.projects_dir(args.projects_dir)
-    if not root.is_dir():
+    if "claude" in tools and not root.is_dir():
         print(f"amem: sessions ingest failed: no such directory: {root}", file=sys.stderr)
         return 1
     try:
-        report = sessions_ingest.ingest(root, days=args.days)
+        report = sessions_ingest.ingest(root, days=args.days, codex=args.codex_home, tools=tools)
     except (OSError, psycopg.Error) as exc:
         return _err("sessions ingest", exc)
     print(report.line())
@@ -130,7 +131,7 @@ def cmd_rules(args: argparse.Namespace) -> int:
         if path.name.lower().startswith(".env") or not path.is_file():
             print(f"amem: deviations rules: not a readable instruction file: {path}", file=sys.stderr)
             return 1
-    for path in args.files:
+    for path in args.files:  # CLAUDE.md, AGENTS.md, SKILL.md, ...: the same markdown rules
         src = deviations.InstructionSource(path.name, [path])
         print(f"--- {path} ---")
         for i, rule in enumerate(deviations.source_catalog(src), 1):
@@ -139,13 +140,18 @@ def cmd_rules(args: argparse.Namespace) -> int:
 
 
 def register(sub: Any) -> None:
-    s = sub.add_parser("sessions", help="local Claude Code transcripts (docs/deviations.md)")
+    s = sub.add_parser("sessions", help="local Claude Code and Codex transcripts (docs/deviations.md)")
     s_sub = s.add_subparsers(dest="sessions_command", required=True)
-    p = s_sub.add_parser("ingest", help="index ~/.claude/projects transcripts into sessions (idempotent)")
+    p = s_sub.add_parser("ingest", help="index ~/.claude/projects and ~/.codex/sessions transcripts into "
+                                        "sessions (idempotent)")
     p.add_argument("--days", type=_positive, default=sessions_ingest.DEFAULT_DAYS,
                    help="transcripts touched in the last N days (default 7)")
     p.add_argument("--projects-dir", type=Path, default=None,
                    help="Claude Code projects folder (default AMEM_PROJECTS_DIR or ~/.claude/projects)")
+    p.add_argument("--codex-home", type=Path, default=None,
+                   help="Codex home with sessions/ (default AMEM_CODEX_HOME or ~/.codex)")
+    p.add_argument("--tool", choices=("all", *sessions_ingest.TOOLS), default="all",
+                   help="which transcripts to index (default all)")
     p.set_defaults(func=cmd_sessions_ingest)
 
     d = sub.add_parser("deviations", help="where agents deviated from their instructions (docs/deviations.md)")
