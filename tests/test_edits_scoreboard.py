@@ -95,7 +95,8 @@ def test_cooldown_is_shown(sdb: ScoringDb, ehome: EHome, monkeypatch: pytest.Mon
     assert by["track"].cooldown_until is None and "cooldown" not in by["track"].line()   # reverted: none
     head = scoreboard.text_lines(list(by.values()), 28)[0]
     assert head == "edits scoreboard (last 28 days): 2 edits, 0 fewer, 0 same, 0 more, 2 too early, 1 in cooldown"
-    assert scoreboard.as_json(list(by.values()), 28)["edits"][0]["cooldown_until"]
+    (doc,) = scoreboard.as_json([by["spawn"]], 28)["edits"]
+    assert doc["cooldown_until"] == "2026-11-04T12:00:00+00:00" and doc["cooldown_lifted"] is False
     monkeypatch.setenv(scoreboard.COOLDOWN_ENV, "1")
     (s, _) = sorted(scoreboard.scores(days=28, now=NOW, db_url=sdb.url), key=lambda s: s.rule_id)
     assert s.rule_id == "spawn" and s.cooldown_until is None
