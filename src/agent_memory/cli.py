@@ -14,6 +14,7 @@ from psycopg.conninfo import conninfo_to_dict
 from agent_memory import cli_cloud, config, jev, routines_log, store
 from agent_memory import cli_ab
 from agent_memory import cli_daily
+from agent_memory import dedupe
 from agent_memory import cli_lessons
 from agent_memory import cli_scoring
 from agent_memory import cli_tasks
@@ -171,6 +172,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = db_sub.add_parser("migrate", help="apply supabase/migrations/*.sql in order")
     p.add_argument("--dir", type=Path, default=None, help="migrations directory (default: supabase/migrations)")
     p.set_defaults(func=cmd_db_migrate)
+    dedupe.register(db_sub)
 
     cli_cloud.register(sub, ingest_sub=ingest_sub)
     cli_tasks.register(sub, ingest_sub=ingest_sub)
