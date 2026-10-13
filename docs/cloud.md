@@ -117,11 +117,76 @@ amem ingest git-ref --git-dir ~/clone --ref origin/claude/routine-reports   # gi
 - Reads only: `gh api repos/<repo>/contents/<path>?ref=<ref>` (GET), or
   `git show <ref>:<path>` in a clone you name. Never fetches or writes.
   Files over 1 MB fall back to the raw media type.
-- Same parser and dedupe keys as `ingest routines-log`. Every row gets
-  `source=cloud` and `meta.log_source="routine-reports"`.
+- Same parser and dedupe keys as `ingest routines-log` (see "Dedupe keys"
+  below). Every row gets `source=cloud` and `meta.log_source="routine-reports"`.
 - Branch or file missing: prints `no routines.log published at ... yet` and
   exits 0.
 - Options: `--repo`, `--ref`, `--path`, `--git-dir`.
+
+## Dedupe keys
+
+One cloud run reaches `runs` by two paths:
+
+- `amem ingest git-ref` reads the line as published on `claude/routine-reports`.
+- `routine-sync` (agent-config) copies that line into the local
+  `~/.claude/parent/routines.log`. It rewrites a trailing `report=<dir>/<file>`
+  to `report=~/.claude/parent/reports/cloud/<file>`. Then
+  `amem ingest routines-log` reads the copy.
+
+Both paths must give the same key. So the key ignores the part routine-sync
+changes:
+
+```
+canonical line = raw line, each `report=<path>` token cut to `report=<basename>`
+source_key     = sha256(routine + "\n" + canonical line [+ "\n#<n>"])
+```
+
+Example: both lines below have the canonical line
+`2026-10-11T08:26:30+0000 fresh-machine PASS pass=4 fail=0 2s report=fresh-machine-2026-10-11.md`.
+
+```
+published: ... 2s report=/tmp/tmp.HIatBDBcYC/.claude/parent/reports/fresh-machine-2026-10-11.md
+local:     ... 2s report=~/.claude/parent/reports/cloud/fresh-machine-2026-10-11.md
+```
+
+Rules:
+
+- The key keeps the timestamp (as written), the routine, the verdict word and
+  every other field. Two lines that differ in any of these are two runs.
+- Whichever ingest sees a run first writes the row. The other ingest counts it
+  as `already present`. This holds on both backends.
+- `#<n>` (n = 2, 3, ...) marks a byte-identical raw line seen again in the same
+  file. Such a repeat is a separate event and gets its own row. n counts raw
+  lines, so routine-sync's copy (different raw text) gets n = 1, the key of its
+  original.
+- A routine-sync copy in the same file as its original (the local log holds
+  both) is dropped by the parser: same run. Detail lines that follow it attach
+  to the original.
+
+### `amem db dedupe-runs [--apply]`
+
+Rows stored before canonical keys have old keys (sha256 of the raw line), so a
+cloud run may be stored twice. This command fixes stored data. Postgres only
+(it refuses the REST backend). It honors `AMEM_REQUIRE_REMOTE=1`, also for the
+dry run.
+
+- It rebuilds each row's line from its columns (ts offset tried from -12:00 to
+  +14:00) and checks the stored key, old or canonical. A row whose key matches
+  no rebuilt line is left alone and listed as unmatched.
+- Rows with the same canonical key are one run. The oldest row (`created_at`)
+  stays. References on the others move to it: `scores` (same question: the
+  newer score wins), `labels` (the newer label wins), `lesson_uses`, any other
+  foreign key to `runs.id`, and `lessons.source_run_ids`. Then the duplicates
+  are deleted.
+- Every kept row gets its canonical `source_key`, so later ingests dedupe.
+- Without `--apply` it prints the plan and changes nothing. With `--apply` it
+  does everything in one transaction, under a lock on `runs`. A second run
+  finds nothing to do.
+
+```sh
+amem db dedupe-runs           # dry run: groups, references, keys to rewrite
+amem db dedupe-runs --apply
+```
 
 ## `amem jev record`
 

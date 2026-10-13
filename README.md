@@ -62,9 +62,12 @@ Every local routine appends to `~/.claude/parent/routines.log`:
   and not written. A last line without a newline may be mid-write, so it waits
   for the next ingest.
 - Idempotency: `runs.source_key` (unique, nullable) = sha256 of the routine plus
-  the raw line. A byte-identical repeat line gets an occurrence suffix, so it is
-  kept too. Re-ingesting inserts nothing. If a detail line arrives after its
-  summary was ingested, the next ingest refreshes only `meta.failures`.
+  the canonical line (`report=<path>` cut to its basename), so a cloud run that
+  arrives by `ingest git-ref` and by routine-sync's copy is one row. A
+  byte-identical repeat line gets an occurrence suffix, so it is kept too.
+  Re-ingesting inserts nothing. If a detail line arrives after its summary was
+  ingested, the next ingest refreshes only `meta.failures`. Full rule and
+  `amem db dedupe-runs` for old rows: [docs/cloud.md](docs/cloud.md#dedupe-keys).
 
 ## Jev: fixture vs live
 
