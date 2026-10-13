@@ -26,7 +26,7 @@ deviations report ──▶ candidates (edit_instruction | enforce, confidence >
 | Command | Does |
 |---|---|
 | `amem edits run [--dry-run] [--limit 5] [--min-confidence 0.6] [--days 7] [--no-push]` | Plans and applies edits. Prints one line per candidate and `edits: edits=N kept=K reverted=R refused=F suggested=S skipped=X errors=E`. Exit 1 when a candidate failed. |
-| `amem edits list [--days 28]` | Recent edits, newest first: id, time, status, rule, file, improve id, summary. |
+| `amem edits list [--days 28]` | Recent edits, newest first: id, time, status, rule, file, improve id, `kind=`, summary, `(kind: reason)`. |
 | `amem edits undo <edit_id> [--no-push]` | Reverts one edit now (`improve revert <id> --reason "manual undo"`). |
 | `amem edits undo-poll [--no-push]` | Handles pending phone undo requests. Exit 0 when there is nothing to do. |
 | `amem edits scoreboard [--days 28] [--json]` | Deviations per scanned session before vs after each edit. |
@@ -40,7 +40,8 @@ All need the Postgres backend. The write commands honour `AMEM_REQUIRE_REMOTE=1`
   plan edit skill:dispatch spawn -> ~/.agents/skills/dispatch/SKILL.md: edit_instruction 0.80, dev:3 deviations, 3 sessions
   plan suggest claude-md:demo-repo whole -> ~/work/demo-repo/CLAUDE.md: repo file: never edited, suggested instead
   skip parent-md merge -> -: jev confidence 0.40 < 0.60
-  edits (dry run, nothing called or written): plan_edit=1 plan_suggest=1 skip=1
+  skip claude-md:global shell-habits -> ~/.claude/CLAUDE.md: cooldown until 2026-10-20 (last edit kept 2026-10-13, scoreboard: too early)
+  edits (dry run, nothing called or written): plan_edit=1 plan_suggest=1 skip=2
   ```
 
 - `--limit` caps edits + suggestions per run (writer calls cost money and time); the rest
@@ -59,6 +60,19 @@ From `deviations report --json` (`deviations.candidates`, same data), most recur
   candidate's deviations were found on. So a rule is edited once per version; a new
   deviation found on the edited text makes it a candidate again; an undone edit (the file
   is back at the old sha) is never retried.
+- Not in cooldown (below).
+
+## Cooldown
+
+A kept or trial edit holds its rule (same source + rule id) for `AMEM_EDITS_COOLDOWN_DAYS`
+days (default 7; `0` turns it off). Until then `edits run` skips the rule with `skip ...:
+cooldown until <date> (last edit <status> <date>, scoreboard: <verdict>)`, even when new
+deviations arrive on the edited text. One exception: when the scoreboard verdict for that
+edit (default 28-day window) is `more`, the edit made things worse, so the rule may be
+re-edited now (the plan line says `cooldown lifted: scoreboard says more`). Reverted,
+refused, auto-reverted, suggested, skipped and proposed edits start no cooldown. The newest
+kept / trial edit on the rule decides. `edits scoreboard` shows `; cooldown until <date>`
+or `; cooldown lifted (more)` per edit and `N in cooldown` in its head line.
 
 ## Targets
 
@@ -79,8 +93,12 @@ allows them. A skill whose real file is not under `~/.agents/skills` is suggeste
 
 ## Writer
 
-A headless `claude -p` (the `lessons distill` flags: no tools, no skills, no MCP;
-`AMEM_EDITS_CLAUDE` may point at another executable) gets:
+A headless `claude -p --model opus` (the `lessons distill` flags: `--tools ""`,
+`--disable-slash-commands`, `--strict-mcp-config`, `--no-session-persistence`, never `--bare`;
+`AMEM_EDITS_CLAUDE` may point at another executable, `AMEM_EDITS_MODEL` names another model:
+an alias such as `sonnet` or a full model id; anything that is not one plain token falls
+back to `opus`). Only this writer runs on Opus: `lessons distill` (frozen) and the
+deviations writer stay on Sonnet. Each edit row records `meta.writer_model`. It gets:
 
 - the current text of the one rule section and the rules before and after it (redacted),
 - the deviations' summaries in the scanner's own words (what / why / how), the raw grades,
@@ -90,13 +108,22 @@ A headless `claude -p` (the `lessons distill` flags: no tools, no skills, no MCP
   rule to match what works. Never add an ask-Vilmer permission gate on his own projects.
   Never remove or loosen anything about spending money. When two instructions conflict,
   fix the conflict. Minimal change, same style, one rule = one topic.
+- the order to look for a change in, first fit wins:
+  1. **contract**: make the step's required output explicit and checkable (a done-check,
+     a report field, "returns X with Y checked");
+  2. **hop**: fix the step order (move a step, add "after X, then Y" or a loop-back);
+  3. **prose**: add or reword general guidance, only when neither fits.
 
-It answers `{"new_section", "topic" (2-5 words), "why" (<= 200 chars), "summary" (<= 140 chars)}`.
+It answers `{"new_section", "topic" (2-5 words), "why" (<= 200 chars), "summary" (<= 140 chars),
+"kind" (contract | hop | prose), "kind_reason" (<= 140 chars)}`. `kind` and `kind_reason`
+go to `edits.meta`, the `edits run` line (`kind=`), `edits list` and the push body
+(`Kind: <kind> (<reason>)`). Prose edits are allowed; the kind is a label to track, not a gate.
 
 **Validation** (any failure is that candidate's error; nothing is written):
 
-- JSON object with all four fields; `why` and `summary` one line, no ids, cleaned of paths
-  and code like the deviation fields.
+- JSON object with all six fields; `why`, `summary` and `kind_reason` one line, no ids,
+  cleaned of paths and code like the deviation fields; `kind` one of contract, hop, prose
+  (case and spaces ignored).
 - `new_section` keeps the rule's heading line exactly, adds no heading (the file's rule list
   must stay the same), adds no code block, holds no secret, no scanner placeholder
   (`[path]`, `[quote]`, ...), no session or deviation id, and no 8-word run copied from a
@@ -144,7 +171,8 @@ For each kept or trial edit:
 - A random token per edit; only `sha256(token)` is stored (`edits.undo_token_hash`).
 - ntfy, published as JSON to the server root (topic and server from
   `~/.claude/parent/notify.env`, as in `amem daily`; the topic is never printed). Title
-  `Agent edit: <rule title>`, body = summary, `Why: ...`, `File: <short name>` (and `Trial: ...`).
+  `Agent edit: <rule title>`, body = summary, `Why: ...`, `Kind: <kind> (<reason>)`,
+  `File: <short name>` (and `Trial: ...`).
 - An `http` action **Undo**: `POST <project URL>/functions/v1/amem-undo` with
   `{"edit_id", "token"}`, `clear: true`. The project URL is `AMEM_SUPABASE_URL`, else derived
   from `AMEM_DB_URL` (`db.<ref>.supabase.co`, or a pooler user `postgres.<ref>`);
@@ -197,6 +225,33 @@ edits scoreboard (last 28 days): 2 edits, 1 fewer, 0 same, 0 more, 1 too early
 - verdict: `too early` until both windows hold 5 scanned sessions; `fewer` when after < 75%
   of before; `more` when after > 125% of before and at least 0.05 more per session; else
   `same`.
+- cooldown: kept / trial edits inside the cooldown window end with `; cooldown until <date>`
+  (or `; cooldown lifted (more)`); `--json` has `cooldown_until` and `cooldown_lifted`.
+
+## Design notes from MASS
+
+Sakana's MASS paper (https://pub.sakana.ai/mass) has an LLM optimize multi-agent workflows
+written as prompts. Three of its findings shaped this step.
+
+**1. The optimizer gets the strong model.** In MASS the model that proposes changes matters
+more than the one that judges them. Here the writer is the optimizer and Jev plus improve's
+evals are the evaluator, so the writer runs on Opus (`AMEM_EDITS_MODEL`, default `opus`).
+The writer runs at most `--limit` times a day, so the extra cost is small. Distill and the
+deviations writer extract and summarize; they stay on Sonnet.
+
+**2. Contracts and hops before prose.** The MASS gains come mostly from contracts (what each
+agent must return, with its checks) and hops (call order, loop-backs), not from role text
+or more instructions. So the writer first looks for a contract fix, then a hop fix, and only
+then adds or rewords prose. It labels each edit with `kind`, so the scoreboard can later show
+which kind actually lowers deviations. Prose stays allowed: a hard refusal would block rules
+that are plain guidance.
+
+**3. A cooldown as the learning-rate schedule.** MASS finds workflow search noisy, with sharp
+regressions, and damps its steps. Here the damping is the per-rule cooldown: a rule with a
+kept or trial edit is not edited again for 7 days, so the scoreboard can measure the edit
+before the next one lands. The one exception is a `more` verdict: the edit made things worse,
+so waiting only costs adherence. Undone, refused and auto-reverted edits changed nothing, so
+they start no cooldown.
 
 ## Ask a Claude chat: is the loop working?
 
@@ -231,6 +286,8 @@ no grants for `anon` / `authenticated`. The edge function uses the service role.
 |---|---|
 | `AMEM_EDITS_LIVE=1` | Allows writer and improve calls (`edits run`, the daily step). The launchd job sets it. |
 | `AMEM_EDITS_CLAUDE` | Writer executable (default `claude`). |
+| `AMEM_EDITS_MODEL` | Writer model (default `opus`). |
+| `AMEM_EDITS_COOLDOWN_DAYS` | Days a kept / trial edit holds its rule (default 7, `0` = off). |
 | `AMEM_IMPROVE_BIN` | improve executable (default `~/agent-config/bin/improve`). Tests only. |
 | `AMEM_EDITS_UNDO_URL` | Full undo URL (local stack, tests). |
 | `AMEM_AGENTS_HOME`, `AMEM_CODEX_HOME` | `~/.agents`, `~/.codex` for tests. |
