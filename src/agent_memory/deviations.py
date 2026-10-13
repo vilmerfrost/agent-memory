@@ -61,6 +61,7 @@ DEFAULT_DAYS = 7
 DEFAULT_LIMIT = 15
 DEFAULT_TIMEOUT = 300.0
 MIN_BYTES = 20_000          # smaller transcripts are "tiny" and never scanned
+MIN_ACTIVITY = 4            # tool calls + human prompts; fewer is "tiny" too (attachments inflate bytes)
 MAX_SCAN_ERRORS = 3         # a session that failed this often is not picked again
 
 DIGEST_MAX = 60_000
@@ -171,7 +172,11 @@ def instruction_sources(row: SessionRow) -> list[InstructionSource]:
     if row.kind == "routine" and row.meta.get("routine"):
         name = str(row.meta["routine"])
         if re.fullmatch(r"[\w.-]+", name):
-            add(f"routine:{name}", home / "scheduled-tasks" / name / "SKILL.md")
+            # The tag's file= attribute is the fallback, only when it is a SKILL.md under the home.
+            alt = Path(str(row.meta.get("routine_file") or "")).expanduser()
+            alt_ok = alt.name == "SKILL.md" and alt.is_absolute() and home in alt.parents
+            standard = home / "scheduled-tasks" / name / "SKILL.md"
+            add(f"routine:{name}", standard if standard.is_file() or not alt_ok else alt)
     if row.kind == "parent":
         add("parent-md", agent_config_dir() / "parent" / "PARENT.md")
     for skill in row.skills:
@@ -286,7 +291,7 @@ def digest_lines(events: list[dict[str, Any]]) -> list[str]:
                 continue
             if first_user:
                 first_user = False
-                sched = re.match(r'\s*<scheduled-task\b[^>]*name="([\w.-]+)"', text)
+                sched = re.search(r'<scheduled-task\b[^>]*name="([\w.-]+)"', text)
                 if sched:
                     turn += 1
                     lines.append(f"[turn {turn}] SCHEDULED TASK {sched.group(1)} started "
@@ -604,6 +609,7 @@ select s.* from sessions s
 where s.scanned_at is null
   and s.kind <> 'eval'
   and s.transcript_bytes >= %(min_bytes)s
+  and coalesce((s.meta ->> 'tool_calls')::int, 0) + coalesce((s.meta ->> 'prompts')::int, 0) >= %(min_activity)s
   and coalesce(s.started_at, s.created_at) >= %(since)s
   and coalesce((s.meta ->> 'scan_errors')::int, 0) < %(max_errors)s
   and not (s.kind = 'worker' and coalesce(s.meta ->> 'agent_type', '') <> 'worker'
@@ -632,8 +638,8 @@ def pick_sessions(*, since: datetime, limit: int, session_id: str | None = None,
         if session_id is not None:
             cur.execute("select * from sessions where session_id = %s", (session_id,))
         else:
-            cur.execute(_PICK_SQL, {"min_bytes": MIN_BYTES, "since": since, "max_errors": MAX_SCAN_ERRORS,
-                                    "limit": limit})
+            cur.execute(_PICK_SQL, {"min_bytes": MIN_BYTES, "min_activity": MIN_ACTIVITY, "since": since,
+                                    "max_errors": MAX_SCAN_ERRORS, "limit": limit})
         return [_row(r) for r in cur.fetchall()]
 
 

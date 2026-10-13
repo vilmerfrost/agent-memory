@@ -43,6 +43,16 @@ def test_routine_name_from_scheduled_task_tag(setup_home: Home) -> None:  # noqa
     assert r.meta["routine"] == "nightly-check"
 
 
+def test_scheduled_tag_after_a_reminder_block_is_still_a_routine(setup_home: Home) -> None:  # noqa: F811
+    from test_deviations_support import routine_events, write_transcript
+
+    events = routine_events(str(setup_home.repo))
+    events[0]["message"]["content"] = "<system-reminder>context</system-reminder>\n" + events[0]["message"]["content"]
+    write_transcript(setup_home.project() / "routine-2.jsonl", events)
+    row = _rows(setup_home)["routine-2"]
+    assert (row.kind, row.meta["routine"]) == ("routine", "nightly-check")
+
+
 def test_instruction_names_per_kind(setup_home: Home) -> None:  # noqa: F811
     ids = make_all_kinds(setup_home)
     rows = _rows(setup_home)

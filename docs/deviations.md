@@ -50,7 +50,7 @@ id `<parent session>/agent-<id>`.
 |---|---|
 | `eval` | The project folder is an eval clone, a probe or the memory observer, or the cwd is under `~/.cache/agent-evals` or `~/.cache/skill-evals`. |
 | `worker` | A subagent transcript. `meta.agent_type` holds the agent type (`worker`, `Explore`, ...). |
-| `routine` | A scheduled task: the first message is a `<scheduled-task name=...>` block, or a turn has `turnOrigin = scheduled`. `meta.routine` = the name. |
+| `routine` | A scheduled task: the first message holds a `<scheduled-task name=...>` block, or a turn has `turnOrigin = scheduled`. `meta.routine` = the name. |
 | `headless` | `claude -p` or the SDK: `entrypoint` starts with `sdk`. |
 | `parent` | The session ran `parent-lock`, used the `dispatch` skill or spawned a `worker`. |
 | `chat` | Everything else. |
@@ -68,7 +68,7 @@ id `<parent session>/agent-<id>`.
 |---|---|
 | `claude-md:global` | `~/.claude/CLAUDE.md` |
 | `agent:<type>` | `~/.claude/agents/<type>.md` (subagents) |
-| `routine:<name>` | `~/.claude/scheduled-tasks/<name>/SKILL.md` |
+| `routine:<name>` | `~/.claude/scheduled-tasks/<name>/SKILL.md`, else the tag's `file=` when it is a `SKILL.md` under `~/.claude` |
 | `parent-md` | `~/agent-config/parent/PARENT.md` (parent sessions) |
 | `skill:<name>` | `~/.claude/skills/<name>/SKILL.md` (symlinks are fine). Plugin skills (`ns:name`) have no local file and are left out. |
 | `claude-md:<repo>` | `CLAUDE.md` and `CLAUDE.local.md` in the cwd, and in the main checkout when the cwd is a git worktree |
@@ -77,7 +77,8 @@ id `<parent session>/agent-<id>`.
 
 ## Scan
 
-Which sessions: unscanned, not `eval`, at least 20 kB of transcript, started in the window,
+Which sessions: unscanned, not `eval`, not tiny (at least 20 kB of transcript and at least 4
+tool calls + typed prompts; attachments alone can make a file big), started in the window,
 failed fewer than 3 times. Order: sessions that used a skill, then `routine`, `parent`,
 `worker`, `chat`, `headless`; newest first inside each group. A subagent that is not a
 `worker` (Explore, general-purpose, ...) is skipped once its parent session was scanned.

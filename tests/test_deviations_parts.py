@@ -116,6 +116,21 @@ def test_instructions_for_worker_and_routine(setup_home: Home) -> None:  # noqa:
     assert [s.name for s in r] == ["claude-md:global", "routine:nightly-check", "claude-md:demo-repo"]
 
 
+def test_routine_falls_back_to_the_tag_file_only_inside_the_claude_home(setup_home: Home,  # noqa: F811
+                                                                         tmp_path: Path) -> None:
+    alt = setup_home.claude / "old-tasks" / "gone-task" / "SKILL.md"
+    alt.parent.mkdir(parents=True)
+    alt.write_text("# Gone task\n")
+    outside = tmp_path / "elsewhere" / "SKILL.md"
+    outside.parent.mkdir()
+    outside.write_text("# Outside\n")
+    inside = deviations.instruction_sources(_row(setup_home, "routine", [], routine="gone-task", routine_file=str(alt)))
+    out = deviations.instruction_sources(_row(setup_home, "routine", [], routine="gone-task",
+                                              routine_file=str(outside)))
+    assert [s.paths for s in inside if s.name == "routine:gone-task"] == [[alt]]
+    assert "routine:gone-task" not in [s.name for s in out]
+
+
 def test_instructions_follow_a_worktree_to_the_main_checkout(setup_home: Home, tmp_path: Path) -> None:  # noqa: F811
     wt = tmp_path / "worktrees" / "demo-repo" / "wt-1"
     wt.mkdir(parents=True)

@@ -231,9 +231,10 @@ def test_dry_run_calls_and_writes_nothing(setup_home: Home, db: str, writer: Wri
 def test_tiny_and_eval_sessions_are_skipped(setup_home: Home, db: str) -> None:  # noqa: F811
     proj = setup_home.project("-work-demo-repo")
     write_transcript(proj / "tiny.jsonl", chat_events(str(setup_home.repo)), pad=False)
+    write_transcript(proj / "idle.jsonl", chat_events(str(setup_home.repo)))  # big file, 3 actions
     _ingest(setup_home, db)
     picked = {r.session_id for r in deviations.pick_sessions(since=NOW.replace(day=1), limit=50)}
-    assert "tiny" not in picked and "eval-1" not in picked and "chat-1" in picked
+    assert "tiny" not in picked and "idle" not in picked and "eval-1" not in picked and "chat-1" in picked
 
 
 def test_cli_scan_needs_live_flag_unless_dry_run(setup_home: Home, db: str) -> None:  # noqa: F811

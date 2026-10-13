@@ -15,7 +15,7 @@ The parsing rules are copied (not imported) from agent-config `lib/sessions.py`:
 Kind, first match wins:
 1. eval      see above
 2. worker    the file is under a `subagents/` folder (meta.agent_type from `agent-*.meta.json`)
-3. routine   a scheduled task: the first user message is a `<scheduled-task ...>` block,
+3. routine   a scheduled task: the first user message holds a `<scheduled-task ...>` block,
              or a turn has `turnOrigin = scheduled`
 4. headless  `claude -p` / SDK: `entrypoint` starts with `sdk` (`sdk-cli`, `sdk-ts`)
 5. parent    the session ran `parent-lock`, the `dispatch` skill, or spawned a `worker`
@@ -47,7 +47,8 @@ SCRATCH_CWD = "/scratch-workspaces/"
 SKIP_PROJECT_RE = re.compile(r"-cache-(agent|skill)-evals|-cache-sbx|claude-mem|-private-tmp-claude-\d+-probe|stallprobe")
 EVAL_CWD_RE = re.compile(r"/\.cache/(agent|skill)-evals(/|$)")
 COMMAND_RE = re.compile(r"<command-name>/?([\w:.-]+)</command-name>")
-SCHEDULED_RE = re.compile(r'^\s*<scheduled-task\b([^>]*)>')
+# Searched in the first user message only: a <system-reminder> block may come before it.
+SCHEDULED_RE = re.compile(r'<scheduled-task\b([^>]*)>')
 _ATTR_RE = re.compile(r'(\w+)="([^"]*)"')
 _ROUTINE_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,80}")
 
@@ -239,7 +240,7 @@ def scan_facts(events: list[dict[str, Any]]) -> Facts:
             text = text_of(content)
             if first_user and text.strip():
                 first_user = False
-                tag = SCHEDULED_RE.match(text)
+                tag = SCHEDULED_RE.search(text)
                 if tag:
                     f.scheduled = dict(_ATTR_RE.findall(tag.group(1)))
             for cmd in COMMAND_RE.findall(text):

@@ -161,17 +161,26 @@ def routine_events(cwd: str) -> list[dict[str, Any]]:
     ]
 
 
+def busy(cwd: str, n: int = 3) -> list[dict[str, Any]]:
+    """`n` Read calls with results: enough activity (deviations.MIN_ACTIVITY) to be scanned."""
+    out: list[dict[str, Any]] = []
+    for i in range(n):
+        out.append(assistant(tool("Read", f"r{i}", file_path="notes.txt"), minute=10 + i, cwd=cwd))
+        out.append(result(f"r{i}", "ok", 10 + i, cwd=cwd))
+    return out
+
+
 def make_all_kinds(home: Home) -> dict[str, str]:
     """One transcript of every kind. Returns kind -> session id."""
     cwd = str(home.repo)
     proj = home.project("-work-demo-repo")
-    write_transcript(proj / "chat-1.jsonl", chat_events(cwd))
-    write_transcript(proj / "parent-1.jsonl", parent_events(cwd))
+    write_transcript(proj / "chat-1.jsonl", chat_events(cwd) + busy(cwd))
+    write_transcript(proj / "parent-1.jsonl", parent_events(cwd) + busy(cwd))
     sub = proj / "parent-1" / "subagents"
-    write_transcript(sub / "agent-w1.jsonl", worker_events(cwd))
+    write_transcript(sub / "agent-w1.jsonl", worker_events(cwd) + busy(cwd))
     (sub / "agent-w1.meta.json").write_text(json.dumps({"agentType": "worker", "toolUseId": "a1"}))
-    write_transcript(proj / "headless-1.jsonl", headless_events(cwd))
-    write_transcript(proj / "routine-1.jsonl", routine_events(cwd))
+    write_transcript(proj / "headless-1.jsonl", headless_events(cwd) + busy(cwd))
+    write_transcript(proj / "routine-1.jsonl", routine_events(cwd) + busy(cwd))
     ev = home.project("-home--cache-agent-evals-eval-jo-a")
     write_transcript(ev / "eval-1.jsonl", chat_events("/home/.cache/agent-evals/eval-jo-a"))
     return {"chat": "chat-1", "parent": "parent-1", "worker": "parent-1/agent-w1", "headless": "headless-1",
