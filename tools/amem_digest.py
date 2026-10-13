@@ -78,7 +78,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-SCRIPT_VERSION = "3"
+SCRIPT_VERSION = "4"
 SOURCE_PREFIX = "cloud:"
 PROMPT_NAME = "prompt"     # the routine prompt: instruction source routine:<routine>
 
