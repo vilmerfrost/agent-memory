@@ -18,9 +18,11 @@ Per session (`scan`):
    validates them and strips quotes, paths, code and secrets; `resolve` snaps each ref to
    a rule id (or `unmatched`) and adds the source's sha.
 4. Jev: one `questions/deviation.toml` ask per deviation. The state holds the instruction
-   source, the rule id and title, the two raw grades, the session kind and the recurrence
-   count (same source + rule), never transcript text and never what/why/how (`jev_state`).
-5. store: deviations upserted by source_key, `sessions.scanned_at` set, in one transaction.
+   source, the rule id and title, the two raw grades, the objective result (from the
+   session outcome), the session kind and the recurrence count (same source + rule), never
+   transcript text and never what/why/how (`jev_state`).
+5. store: deviations upserted by source_key (with result_outcome / objective_result),
+   `sessions.scanned_at` set, in one transaction.
 
 Cloud routine sessions (`meta.cloud`, id `cloud:<session id>`, docs/cloud.md) have no
 transcript and no local instruction file here: the scan reads the stored digest and the
@@ -808,12 +810,46 @@ def question_set() -> questions.QuestionSet:
     return questions.load_file(path, QUESTION_FILE)
 
 
-def jev_state(f: Finding, kind: str, recurrence: int) -> str:
+# --------------------------------------------------------------------------- objective result
+# docs/deviations.md, "Objective result": the session's outcome (sessions.outcome, from its own
+# git / edit / report signals) as a 0..1 grade next to the writer's raw result_grade.
+
+OBJECTIVE = {"shipped": 1.0, "pushed": 0.9, "committed": 0.8, "partial": 0.4, "abandoned": 0.1, "failed": 0.0}
+NO_CHANGE_OBJECTIVE = 0.7     # no-change on a Q&A session: a question answered, nothing to ship
+QA_KINDS = ("chat", "headless", "routine")
+
+
+def qa_session(kind: str | None, agent_type: str | None = None) -> bool:
+    """A session whose normal result is an answer, not a change: a chat, `claude -p`, a
+    routine, or a research subagent (a worker whose agent type is not `worker`)."""
+    return kind in QA_KINDS or (kind == "worker" and (agent_type or "") != "worker")
+
+
+def objective_result(outcome: str | None, kind: str | None, agent_type: str | None = None) -> float | None:
+    """0..1 from the session outcome; None for active / unknown, and for no-change outside
+    the Q&A kinds (a parent or a dispatch worker that changed nothing: not graded)."""
+    if outcome == "no-change":
+        return NO_CHANGE_OBJECTIVE if qa_session(kind, agent_type) else None
+    return OBJECTIVE.get(outcome or "")
+
+
+def _agent_type(meta: Any) -> str | None:
+    v = meta.get("agent_type") if isinstance(meta, dict) else None
+    return v if isinstance(v, str) else None
+
+
+def jev_state(f: Finding, kind: str, recurrence: int, outcome: str | None = None,
+              agent_type: str | None = None) -> str:
     """What Jev reads for one deviation. Only labels, grades and counts: never transcript
     text and never the writer's what/why/how. The rule is the catalog id and the heading
-    title; an unmatched (or unresolved) ref shows the writer's ref as the title."""
+    title; an unmatched (or unresolved) ref shows the writer's ref as the title. `outcome`:
+    the session's outcome; it becomes the objective_result line next to the writer's grade."""
     rule_id = f.rule_id or rule_catalog.UNMATCHED
     title = f.rule_title if f.rule_title else f"{f.instruction_ref} (not in the rule list)"
+    objective = objective_result(outcome, kind, agent_type)
+    obj = (f"objective_result: {objective:.2f} (session outcome {outcome}; 1 = shipped, 0.8 = committed, "
+           "0.7 = answered without changes, 0.4 = partial, 0.1 = abandoned, 0 = failed)" if objective is not None
+           else f"objective_result: unknown (session outcome {outcome or 'unknown'})")
     return "\n".join([
         "A coding agent deviated from one of its standing instructions.",
         f"instruction_source: {f.instruction_source}",
@@ -821,7 +857,8 @@ def jev_state(f: Finding, kind: str, recurrence: int) -> str:
         f"rule_title: {title}",
         f"session_kind: {kind}",
         f"followed_grade: {f.followed_grade:.2f} (1 = followed fully, 0 = ignored)",
-        f"result_grade: {f.result_grade:.2f} (1 = good result anyway, 0 = bad result)",
+        f"result_grade: {f.result_grade:.2f} (the writer's view: 1 = good result anyway, 0 = bad result)",
+        obj,
         f"recurrence: {recurrence} other session{'s' if recurrence != 1 else ''} in the window "
         "deviated from the same rule",
     ])
@@ -836,11 +873,12 @@ class Judged:
     answers: dict[str, Any] = field(default_factory=dict)
 
 
-def judge(f: Finding, kind: str, recurrence: int, qset: questions.QuestionSet) -> Judged:
+def judge(f: Finding, kind: str, recurrence: int, qset: questions.QuestionSet, outcome: str | None = None,
+          agent_type: str | None = None) -> Judged:
     """Jev's call. A missing fixture (fixture mode) leaves the deviation unjudged; any other
     Jev error raises JevError (the session fails and is retried)."""
     try:
-        results = jev.ask(jev_state(f, kind, recurrence), qset.jev_questions())
+        results = jev.ask(jev_state(f, kind, recurrence, outcome, agent_type), qset.jev_questions())
     except jev.JevFixtureMissing:
         return Judged(f, None, None, "fixture-missing")
     verdict = results["verdict"]
@@ -867,10 +905,14 @@ class Outcome:
     tool: str = "claude"
     team: bool = False           # a team repo's session: the edit step never edits its repo files
     title: str | None = None     # the session's name, shown when known
+    session_outcome: str | None = None   # sessions.outcome at scan time (stored as result_outcome)
+    objective: float | None = None       # objective_result of that outcome
 
     @classmethod
     def of(cls, row: SessionRow, status: str, reason: str = "") -> Outcome:
-        return cls(row.session_id, row.kind, status, reason, tool=row.tool, team=row.team, title=row.title)
+        return cls(row.session_id, row.kind, status, reason, tool=row.tool, team=row.team, title=row.title,
+                   session_outcome=row.outcome,
+                   objective=objective_result(row.outcome, row.kind, _agent_type(row.meta)))
 
     def counts(self) -> Counter[str]:
         return Counter(j.verdict or "unjudged" for j in self.judged)
@@ -944,7 +986,7 @@ def _row(rec: dict[str, Any]) -> SessionRow:
     return SessionRow(rec["session_id"], rec["kind"], rec["repo"], rec["project_dir"], rec["started_at"],
                       rec["ended_at"], int(rec["transcript_bytes"] or 0), list(rec["skills"] or []),
                       list(rec["instructions"] or []), dict(rec["meta"] or {}), tool=rec.get("tool") or "claude",
-                      title=rec.get("title"))
+                      title=rec.get("title"), outcome=rec.get("outcome"))
 
 
 def pick_sessions(*, since: datetime, limit: int, session_id: str | None = None,
@@ -1002,11 +1044,12 @@ class _Recurrence:
 _UPSERT_SQL = """
 insert into deviations (source_key, session_id, instruction_source, instruction_ref, turn, what, why, how,
                         followed_grade, result_grade, jev_verdict, jev_confidence, jev_mode, jev_answers,
-                        writer_model, rule_id, rule_title, instruction_sha, meta)
-values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        writer_model, rule_id, rule_title, instruction_sha, meta, result_outcome, objective_result)
+values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
 on conflict (source_key) do update
     set what = excluded.what, why = excluded.why, how = excluded.how,
         followed_grade = excluded.followed_grade, result_grade = excluded.result_grade,
+        result_outcome = excluded.result_outcome, objective_result = excluded.objective_result,
         jev_verdict = excluded.jev_verdict, jev_confidence = excluded.jev_confidence,
         jev_mode = excluded.jev_mode, jev_answers = excluded.jev_answers, writer_model = excluded.writer_model,
         rule_id = excluded.rule_id, rule_title = excluded.rule_title,
@@ -1022,7 +1065,7 @@ def _store(o: Outcome, db_url: str | None) -> None:
                 source_key(o.session_id, f), o.session_id, f.instruction_source, f.instruction_ref, f.turn,
                 f.what, f.why, f.how, f.followed_grade, f.result_grade, j.verdict, j.confidence, j.mode,
                 Jsonb(j.answers), f"claude-cli:{distill.WRITER_MODEL}",
-                f.rule_id, f.rule_title, f.instruction_sha, Jsonb(f.meta()),
+                f.rule_id, f.rule_title, f.instruction_sha, Jsonb(f.meta()), o.session_outcome, o.objective,
             ))
         conn.execute(
             "update sessions set scanned_at = now(), meta = (meta - 'scan_error') || %s where session_id = %s",
@@ -1085,7 +1128,8 @@ def _scan_one(row: SessionRow, *, dry_run: bool, timeout: float, qset: questions
     judged = []
     for f in findings:
         try:
-            judged.append(judge(f, row.kind, recurrence.count(f, row.session_id), qset))
+            judged.append(judge(f, row.kind, recurrence.count(f, row.session_id), qset, row.outcome,
+                                _agent_type(row.meta)))
         except jev.JevError as exc:
             out.status, out.reason = "error", _one_line(f"jev: {exc}", 300)
             return out
@@ -1131,7 +1175,8 @@ _REPORT_SQL = """
 select d.id, d.session_id, d.instruction_source, d.instruction_ref, d.turn, d.what, d.why, d.how,
        d.followed_grade, d.result_grade, d.jev_verdict, d.jev_confidence, d.created_at,
        d.rule_id, d.rule_title, d.instruction_sha,
-       s.tool, s.kind, s.repo, s.project_dir, s.skills, s.meta, s.started_at, s.title
+       s.tool, s.kind, s.repo, s.project_dir, s.skills, s.meta, s.started_at, s.title, s.outcome,
+       s.tokens_input, s.tokens_output, s.tokens_cache_read, s.tokens_cache_creation, s.active_seconds
 from deviations d join sessions s using (session_id)
 where coalesce(s.started_at, s.created_at) >= %s
 order by s.started_at desc nulls last, d.created_at desc
@@ -1166,6 +1211,28 @@ def _is_team(rec: dict[str, Any]) -> bool:
     return (rec.get("meta") or {}).get("team") is True
 
 
+# Cost of a rule (docs/edits.md, "Order"): what its deviating sessions cost, each session once.
+COST_TOKENS_UNIT = 1_000_000   # 1M tokens (all four kinds) weigh as much as ...
+COST_SECONDS_UNIT = 60         # ... one minute of active time
+
+
+def _session_tokens(rec: dict[str, Any]) -> int:
+    return sum(int(rec.get(c) or 0) for c in ("tokens_input", "tokens_output", "tokens_cache_read",
+                                               "tokens_cache_creation"))
+
+
+def cost_of(recs: list[dict[str, Any]]) -> dict[str, Any]:
+    """{sessions, tokens, active_seconds, score} over the distinct sessions of `recs` (the
+    _REPORT_SQL rows of one rule). score = tokens / 1M + active seconds / 60."""
+    seen: dict[str, dict[str, Any]] = {}
+    for r in recs:
+        seen.setdefault(r["session_id"], r)
+    tokens = sum(_session_tokens(r) for r in seen.values())
+    active = round(sum(float(r.get("active_seconds") or 0) for r in seen.values()), 3)
+    score = round(tokens / COST_TOKENS_UNIT + active / COST_SECONDS_UNIT, 3)
+    return {"sessions": len(seen), "tokens": tokens, "active_seconds": active, "score": score}
+
+
 def candidates(*, days: int = DEFAULT_DAYS, now: datetime | None = None,
                db_url: str | None = None) -> list[dict[str, Any]]:
     """One entry per instruction source + rule, most recurring first (docs/deviations.md).
@@ -1188,6 +1255,10 @@ def candidates(*, days: int = DEFAULT_DAYS, now: datetime | None = None,
         judged = {v: verdicts[v] for v in VERDICTS}
         top = max(VERDICTS, key=lambda v: (judged[v], -VERDICTS.index(v))) if any(judged.values()) else None
         team_sessions = {r["session_id"] for r in recs if _is_team(r)}
+        # Recomputed from the session's outcome now (it may have changed since the scan).
+        sessions_seen = {r["session_id"]: r for r in recs}
+        objectives = [o for r in sessions_seen.values()
+                      if (o := objective_result(r.get("outcome"), r["kind"], _agent_type(r.get("meta")))) is not None]
         out.append({
             "instruction_source": source,
             "rule_id": rule_id,
@@ -1205,6 +1276,10 @@ def candidates(*, days: int = DEFAULT_DAYS, now: datetime | None = None,
             "team_sessions": len(team_sessions),
             "followed_grade_mean": _mean([float(r["followed_grade"]) for r in recs]),
             "result_grade_mean": _mean([float(r["result_grade"]) for r in recs]),
+            # Per distinct session: the session outcome and its objective_result (null: none graded).
+            "objective_result_mean": _mean(objectives),
+            "outcomes": dict(Counter(r.get("outcome") or "unknown" for r in sessions_seen.values())),
+            "cost": cost_of(recs),
             "jev": {**judged, "unjudged": verdicts["unjudged"], "confidence_mean": _mean(confs)},
             "verdict": top,
             "session_ids": sorted({r["session_id"] for r in recs}),
@@ -1232,9 +1307,11 @@ def report_lines(cands: list[dict[str, Any]], days: int) -> list[str]:
     for c in cands:
         j = c["jev"]
         conf = "-" if j["confidence_mean"] is None else f"{j['confidence_mean']:.2f}"
+        obj = c.get("objective_result_mean")
         lines.append(
             f"{c['instruction_source']} / {rule_label(c)}: count={c['count']} sessions={c['sessions']} "
-            f"followed={c['followed_grade_mean']:.2f} result={c['result_grade_mean']:.2f} | "
+            f"followed={c['followed_grade_mean']:.2f} result={c['result_grade_mean']:.2f} "
+            f"objective={'-' if obj is None else f'{obj:.2f}'} | "
             f"jev edit_instruction={j['edit_instruction']} enforce={j['enforce']} leave={j['leave']} "
             f"unjudged={j['unjudged']} confidence={conf}" + (" | team repo" if c.get("team") else ""))
     return lines
@@ -1250,7 +1327,8 @@ def candidates_doc(cands: list[dict[str, Any]], days: int, now: datetime | None 
 
 _REREF_SQL = """
 select d.id, d.instruction_source, d.instruction_ref, d.rule_id, d.rule_title, d.meta as dev_meta,
-       s.session_id, s.tool, s.kind, s.repo, s.project_dir, s.skills, s.meta, s.started_at
+       d.result_outcome, d.objective_result,
+       s.session_id, s.tool, s.kind, s.repo, s.project_dir, s.skills, s.meta, s.started_at, s.outcome
 from deviations d join sessions s using (session_id)
 order by d.created_at, d.id
 """
@@ -1263,13 +1341,15 @@ class RerefReport:
     dry_run: bool = False
     rows: int = 0
     changed: int = 0
+    objective: int = 0   # rows whose result_outcome / objective_result moved with the session outcome
     how: Counter[str] = field(default_factory=Counter)  # exact | snapped | unmatched | no-source
     # (source, writer ref, rule id, rule title, how, score) -> rows
     mapping: Counter[tuple[str, str, str | None, str | None, str, float]] = field(default_factory=Counter)
 
     def summary(self) -> str:
         text = (f"reref: rows={self.rows} exact={self.how['exact']} snapped={self.how['snapped']} "
-                f"unmatched={self.how['unmatched']} no_source={self.how[NO_SOURCE]} changed={self.changed}")
+                f"unmatched={self.how['unmatched']} no_source={self.how[NO_SOURCE]} changed={self.changed}"
+                + (f" objective={self.objective}" if self.objective else ""))
         return text + (" (dry run, nothing written)" if self.dry_run else "")
 
     def lines(self) -> list[str]:
@@ -1289,11 +1369,17 @@ def reref(*, dry_run: bool = False, db_url: str | None = None) -> RerefReport:
     cache: dict[tuple[str, tuple[Path, ...]], list[rule_catalog.Rule]] = {}
     cloud_cache: dict[str, dict[str, list[rule_catalog.Rule]]] = {}
     updates: list[tuple[str | None, str | None, Jsonb, Any]] = []
+    objective_updates: list[tuple[str | None, float | None, Any]] = []
     with store.connect(db_url) as conn, conn.cursor(row_factory=dict_row) as cur:
         cur.execute(_REREF_SQL)
         rows = cur.fetchall()
     for rec in rows:
         report.rows += 1
+        # The objective result follows the session outcome (docs/deviations.md, "Objective result").
+        obj = objective_result(rec["outcome"], rec["kind"], _agent_type(rec["meta"]))
+        if (rec["result_outcome"], rec["objective_result"]) != (rec["outcome"], obj):
+            report.objective += 1
+            objective_updates.append((rec["outcome"], obj, rec["id"]))
         source, ref = rec["instruction_source"], rec["instruction_ref"]
         row = _row({**rec, "instructions": [], "transcript_bytes": 0, "ended_at": None})
         if is_cloud(row):
@@ -1323,9 +1409,11 @@ def reref(*, dry_run: bool = False, db_url: str | None = None) -> RerefReport:
                 any(meta.get(k) != v for k, v in new_meta.items()):
             report.changed += 1
             updates.append((m.rule_id, m.rule_title, Jsonb(new_meta), rec["id"]))
-    if updates and not dry_run:
+    if (updates or objective_updates) and not dry_run:
         with store.connect(db_url) as conn:
             for u in updates:
                 conn.execute("update deviations set rule_id = %s, rule_title = %s, meta = meta || %s "
                              "where id = %s", u)
+            for o in objective_updates:
+                conn.execute("update deviations set result_outcome = %s, objective_result = %s where id = %s", o)
     return report

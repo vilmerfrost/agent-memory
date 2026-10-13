@@ -142,6 +142,74 @@ def summarize(rows: list[dict[str, Any]], *, days: int, repo: str | None = None,
     }
 
 
+# --------------------------------------------------------------------------- `amem sessions cost`
+# docs/sessions-live.md, "Cost of a window". The JSON shape is a contract: agent-config's
+# `improve` reads it to show the cost of each kept change. Keep its keys.
+
+_COST_SQL = """
+select coalesce(project, 'unknown') as project, tokens_input, tokens_output, tokens_cache_read,
+       tokens_cache_creation, active_seconds, api_seconds, tool_seconds
+from sessions
+where coalesce(started_at, created_at) >= %(since)s and coalesce(started_at, created_at) < %(until)s
+  and (%(category)s::text is null or category = %(category)s)
+  and (%(project)s::text is null or project = %(project)s)
+"""
+
+
+def _cost_bucket() -> dict[str, Any]:
+    return {"sessions": 0, "tokens": {**{f: 0 for f in FIELDS}, "total": 0},
+            "active_seconds": 0.0, "api_seconds": 0.0, "tool_seconds": 0.0}
+
+
+def _cost_add(b: dict[str, Any], rec: dict[str, Any]) -> None:
+    b["sessions"] += 1
+    for f in FIELDS:
+        n = int(rec.get(f"tokens_{f}") or 0)
+        b["tokens"][f] += n
+        b["tokens"]["total"] += n
+    for k in ("active_seconds", "api_seconds", "tool_seconds"):
+        b[k] = round(b[k] + float(rec.get(k) or 0), 3)
+
+
+def cost(*, since: datetime, until: datetime | None = None, category: str | None = None,
+         project: str | None = None, now: datetime | None = None, db_url: str | None = None) -> dict[str, Any]:
+    """Totals of the sessions that started in [since, until) (until: now), each row once
+    (subagents are their own rows; a parent's meta.subagent_tokens is never added).
+
+    {"sessions": n, "tokens": {"input", "output", "cache_read", "cache_creation", "total"},
+     "active_seconds", "api_seconds", "tool_seconds",
+     "by_project": {project: the same keys without by_project}}
+    Nothing matches: zeros and an empty by_project. Unmeasured columns count as 0."""
+    until = until or now or datetime.now(UTC)
+    with store.connect(db_url) as conn, conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(_COST_SQL, {"since": since, "until": until, "category": category, "project": project})
+        rows = cur.fetchall()
+    total = _cost_bucket()
+    by_project: dict[str, dict[str, Any]] = {}
+    for rec in rows:
+        _cost_add(total, rec)
+        _cost_add(by_project.setdefault(str(rec["project"]), _cost_bucket()), rec)
+    return {**total, "by_project": dict(sorted(by_project.items()))}
+
+
+def cost_lines(doc: dict[str, Any], *, since: datetime, until: datetime, category: str | None,
+               project: str | None) -> list[str]:
+    scope = [f"{since.isoformat()} .. {until.isoformat()}"]
+    if category:
+        scope.append(f"category {category}")
+    if project:
+        scope.append(f"project {project}")
+    t = doc["tokens"]
+    out = [f"cost: {', '.join(scope)}: {doc['sessions']} sessions, total {human(t['total'])}",
+           f"  input {human(t['input'])}  output {human(t['output'])}  cache read {human(t['cache_read'])}  "
+           f"cache write {human(t['cache_creation'])}  active {hms(doc['active_seconds'])}  "
+           f"api {hms(doc['api_seconds'])}  tool {hms(doc['tool_seconds'])}"]
+    for name, b in doc["by_project"].items():
+        out.append(f"  {name[:40]:<40}  {b['sessions']:>4} sessions  total {human(b['tokens']['total']):>7}  "
+                   f"active {hms(b['active_seconds'])}")
+    return out
+
+
 def median(values: list[float]) -> float:
     s = sorted(values)
     n = len(s)

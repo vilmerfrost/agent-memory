@@ -1,7 +1,7 @@
 """`amem edits run`: the edit step of the v2 loop (docs/edits.md, roadmap v2 E4).
 
 Per candidate from the deviations report (deviations.candidates, the `deviations report
---json` groups), most recurring first:
+--json` groups), highest Jev confidence tier first, then the most costly rule (`ordered`):
 
 1. Filter: Jev verdict edit_instruction or enforce, confidence >= --min-confidence, not a
    team repo (`team: true`), a real rule id, not already handled at this file version, not
@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import subprocess
@@ -49,6 +50,7 @@ from agent_memory import (
     rule_catalog,
     scoreboard,
     store,
+    tokens_report,
 )
 from agent_memory.sessions_ingest import agent_config_dir
 
@@ -160,6 +162,40 @@ def improve_rule_id(source: str, rule_id: str) -> str:
 
 def evidence(cand: dict[str, Any]) -> str:
     return f"dev:{cand.get('count', 0)} deviations, {cand.get('sessions', 0)} sessions"
+
+
+# --------------------------------------------------------------------------- order
+# docs/edits.md, "Order": Jev confidence tier first, then cost, then the report's own order.
+
+TIER_WIDTH = 0.1
+
+
+def confidence_tier(cand: dict[str, Any]) -> float:
+    """The mean Jev confidence rounded down to its 0.1 band (0.74 -> 0.7); -1 when unjudged."""
+    conf = (cand.get("jev") or {}).get("confidence_mean")
+    if conf is None:
+        return -1.0
+    return round(math.floor(round(float(conf) / TIER_WIDTH, 9)) * TIER_WIDTH, 1)
+
+
+def cost_score(cand: dict[str, Any]) -> float:
+    """deviations.cost_of: total tokens / 1M + active seconds / 60 of the deviating sessions."""
+    cost = cand.get("cost") if isinstance(cand.get("cost"), dict) else {}
+    return float(cost.get("score") or 0.0)
+
+
+def ordered(cands: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Highest confidence tier first; inside a tier, the most costly rule first. Ties keep the
+    report's order (most recurring first)."""
+    return sorted(cands, key=lambda c: (-confidence_tier(c), -cost_score(c)))
+
+
+def cost_text(cand: dict[str, Any]) -> str | None:
+    cost = cand.get("cost") if isinstance(cand.get("cost"), dict) else None
+    if cost is None:
+        return None
+    return (f"{tokens_report.human(int(cost.get('tokens') or 0))} tok/"
+            f"{tokens_report.hms(float(cost.get('active_seconds') or 0))}")
 
 
 # --------------------------------------------------------------------------- database
@@ -280,11 +316,14 @@ class Outcome:
     kind: str | None = None                               # contract | hop | prose (checked against the diff)
     kind_reason: str | None = None                        # the writer's reason, or the check's on a mismatch
     kind_writer: str | None = None                        # the writer's own label
+    cost: str | None = None                               # `<tokens> tok/<active time>` of the deviating sessions
 
     def line(self) -> str:
         rule = f"{self.source} {self.rule_id or '-'}"
         head = {"plan-edit": "plan edit", "plan-suggest": "plan suggest"}.get(self.status, self.status)
         text = f"{head} {rule} -> {self.target}"
+        if self.cost:
+            text += f" cost={self.cost}"
         if self.edit_id:
             text += f" edit={self.edit_id}"
         if self.improve_id:
@@ -513,29 +552,34 @@ def run(*, days: int = DEFAULT_DAYS, limit: int = DEFAULT_LIMIT, min_confidence:
     from agent_memory import edits_push  # edits_push imports daily, which imports this module lazily
 
     report = Report(dry_run=dry_run)
-    cands = deviations.candidates(days=days, now=now, db_url=db_url)
+    cands = ordered(deviations.candidates(days=days, now=now, db_url=db_url))
     acted = 0
+
+    def add(o: Outcome, cand: dict[str, Any]) -> None:
+        o.cost = cost_text(cand)
+        report.outcomes.append(o)
+
     with store.connect(db_url) as conn:
         for cand in cands:
             try:
                 p = plan_candidate(conn, cand, min_confidence=min_confidence, now=now)
             except Exception as exc:  # never block: this candidate's error
-                report.outcomes.append(Outcome(cand.get("instruction_source", "?"), cand.get("rule_id"), "error",
-                                               _one_line(f"plan: {type(exc).__name__}: {exc}")))
+                add(Outcome(cand.get("instruction_source", "?"), cand.get("rule_id"), "error",
+                            _one_line(f"plan: {type(exc).__name__}: {exc}")), cand)
                 continue
             if p is None:
                 continue
             if p.action == "skip":
-                report.outcomes.append(Outcome(cand["instruction_source"], cand.get("rule_id"), "skip", p.reason,
-                                               edits_targets.short(p.target)))
+                add(Outcome(cand["instruction_source"], cand.get("rule_id"), "skip", p.reason,
+                            edits_targets.short(p.target)), cand)
                 continue
             if acted >= limit:
                 report.deferred += 1
                 continue
             acted += 1
             if dry_run:
-                report.outcomes.append(Outcome(cand["instruction_source"], cand["rule_id"], f"plan-{p.action}",
-                                               p.reason, edits_targets.short(p.target)))
+                add(Outcome(cand["instruction_source"], cand["rule_id"], f"plan-{p.action}",
+                            p.reason, edits_targets.short(p.target)), cand)
                 continue
             try:
                 o = _suggest(conn, p) if p.action == "suggest" else _edit(conn, p, days=days, timeout=timeout)
@@ -554,5 +598,5 @@ def run(*, days: int = DEFAULT_DAYS, limit: int = DEFAULT_LIMIT, min_confidence:
                 except Exception as exc:  # a failed push never undoes the edit
                     o.push = "error"
                     o.reason = _one_line(f"{o.reason}; push: {type(exc).__name__}")
-            report.outcomes.append(o)
+            add(o, cand)
     return report

@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -89,6 +90,32 @@ def cmd_sessions_tokens(args: argparse.Namespace) -> int:
         print(json.dumps(doc, indent=1, sort_keys=True, default=str))
     else:
         for line in tokens_report.lines(doc, by=tuple(args.by) if args.by else tokens_report.DEFAULT_BY):
+            print(line)
+    return 0
+
+
+def _when(value: str) -> datetime:
+    """An ISO timestamp; no offset = UTC."""
+    try:
+        ts = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not an ISO timestamp: {value!r}") from None
+    return ts if ts.tzinfo is not None else ts.replace(tzinfo=UTC)
+
+
+def cmd_sessions_cost(args: argparse.Namespace) -> int:
+    if (code := _read_guard("sessions cost")) is not None:
+        return code
+    until = args.until or datetime.now(UTC)
+    try:
+        doc = tokens_report.cost(since=args.since, until=until, category=args.category, project=args.project)
+    except psycopg.Error as exc:
+        return _err("sessions cost", exc)
+    if args.json:
+        print(json.dumps(doc, sort_keys=True))
+    else:
+        for line in tokens_report.cost_lines(doc, since=args.since, until=until, category=args.category,
+                                             project=args.project):
             print(line)
     return 0
 
@@ -182,6 +209,15 @@ def register(sub: Any) -> None:
                    help="a section to show (repeatable; default: category with its projects, then model)")
     p.add_argument("--json", action="store_true", help="the report as JSON (every section)")
     p.set_defaults(func=cmd_sessions_tokens)
+
+    p = s_sub.add_parser("cost", help="tokens and active / api / tool time of the sessions that started in a "
+                                      "window (docs/sessions-live.md, \"Cost of a window\")")
+    p.add_argument("--since", type=_when, required=True, help="window start (ISO; no offset = UTC)")
+    p.add_argument("--until", type=_when, default=None, help="window end, exclusive (ISO; default now)")
+    p.add_argument("--category", choices=sessions_ingest.CATEGORIES, default=None, help="this category only")
+    p.add_argument("--project", default=None, help="this project only (the sessions.project value)")
+    p.add_argument("--json", action="store_true", help="the totals as one JSON object (the improve contract)")
+    p.set_defaults(func=cmd_sessions_cost)
 
     # Handled in cli.main before parsing (it must exit 0 even for bad arguments).
     s_sub.add_parser("ping", add_help=False,

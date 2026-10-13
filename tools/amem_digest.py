@@ -652,8 +652,10 @@ OUTCOMES = ("shipped", "pushed", "committed", "partial", "active", "abandoned", 
 
 
 def outcome(signals: dict[str, int], end: str | None, last_at: datetime | None,
-            now: datetime | None = None) -> tuple[str, dict[str, Any]]:
-    """(outcome, evidence). The most advanced state wins (docs/sessions-live.md, "Outcome")."""
+            now: datetime | None = None, kind: str | None = None) -> tuple[str, dict[str, Any]]:
+    """(outcome, evidence). The most advanced state wins (docs/sessions-live.md, "Outcome").
+    `kind` `worker` (a subagent or dispatch worker): a worker's transcript ends on its
+    hand-back (a tool result) or its final reply, so its end shape never makes it abandoned."""
     now = now or datetime.now(timezone.utc)
     s = {k: v for k, v in signals.items() if isinstance(v, int) and v > 0}
     evidence: dict[str, Any] = {**dict(sorted(s.items())), "end": end}
@@ -668,7 +670,15 @@ def outcome(signals: dict[str, int], end: str | None, last_at: datetime | None,
         return "partial", evidence
     if age_h is not None and age_h < ACTIVE_HOURS:
         return "active", evidence
-    dangling = end in ("user", "tool", "result")
+    if kind == "worker":
+        if s.get("edit"):
+            return "partial", evidence
+        if end in ("error", "interrupt") and not s.get("report_done"):
+            return "failed", evidence
+        return "no-change", evidence
+    # Unanswered: a prompt with no reply, or a tool call with no result. A session that ended
+    # on a tool result (`result`) got its answer; it is not abandoned for that.
+    dangling = end in ("user", "tool")
     if age_h is not None and age_h > ABANDONED_HOURS and (dangling or (s.get("edit") and not s.get("report_done"))):
         return "abandoned", evidence
     if s.get("edit"):
