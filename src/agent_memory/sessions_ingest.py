@@ -596,12 +596,16 @@ class IngestReport:
     kinds: dict[str, int] = field(default_factory=dict)
     tools: dict[str, int] = field(default_factory=dict)
     team: int = 0
+    cloud: int = 0      # cloud routine sessions ingested from cloud_digests in this run
+    cloud_bad: int = 0  # cloud_digests rows that could not be ingested
 
     def line(self) -> str:
         kinds = " ".join(f"{k}={self.kinds.get(k, 0)}" for k in KINDS)
         tools = " ".join(f"{t}={self.tools.get(t, 0)}" for t in TOOLS)
+        cloud = f" cloud={self.cloud}" if self.cloud or self.cloud_bad else ""
+        bad = f" cloud_bad={self.cloud_bad}" if self.cloud_bad else ""
         return (f"sessions: {self.files} files, {self.new} new, {self.updated} updated, "
-                f"{self.skipped} skipped ({kinds}) tools({tools}) team={self.team}")
+                f"{self.skipped} skipped ({kinds}) tools({tools}) team={self.team}{cloud}{bad}")
 
 
 def collect(root: Path | None, *, days: int = DEFAULT_DAYS, now: datetime | None = None,
@@ -664,14 +668,115 @@ def upsert(rows: list[SessionRow], *, db_url: str | None = None) -> tuple[int, i
     return new, updated
 
 
+# ---------------------------------------------------------------- cloud routines
+
+CLOUD_PREFIX = "cloud:"          # session ids of cloud routine sessions: cloud:<session id>
+CLOUD_PROJECT_DIR = "cloud"
+CLOUD_PROMPT = "prompt"          # the instruction named `prompt` is the routine prompt
+_CLOUD_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,60}")
+
+
+def cloud_source_name(routine: str, name: str) -> str | None:
+    """The instruction source of a stored cloud instruction: `routine:<routine>` for the
+    prompt, `cloud-file:<name>` for a file (NIGHTLY.md -> cloud-file:nightly-md)."""
+    if not _CLOUD_NAME_RE.fullmatch(name or ""):
+        return None
+    return f"routine:{routine}" if name == CLOUD_PROMPT else f"cloud-file:{name}"
+
+
+def _count(value: Any) -> int:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
+
+
+def cloud_row(rec: dict[str, Any]) -> SessionRow | None:
+    """One `cloud_digests` row to a `sessions` row (no database). None for a row with a bad
+    routine name or session id (it stays un-ingested and is reported)."""
+    key, routine = str(rec.get("source_key") or ""), str(rec.get("routine") or "")
+    if not key.startswith(CLOUD_PREFIX) or not _ROUTINE_NAME_RE.fullmatch(routine):
+        return None
+    src = rec.get("meta") if isinstance(rec.get("meta"), dict) else {}
+    names: list[str] = []
+    for item in rec.get("instructions") or []:
+        name = cloud_source_name(routine, str(item.get("name") or "")) if isinstance(item, dict) else None
+        if name and name not in names:
+            names.append(name)
+    skills = [s for s in (skill_name(x) for x in rec.get("skills") or []) if s]
+    repo = src.get("repo") if isinstance(src.get("repo"), str) and src.get("repo") else None
+    meta: dict[str, Any] = {
+        "cloud": True,
+        "routine": routine,
+        "prompts": _count(src.get("prompts")),
+        "tool_calls": _count(src.get("tool_calls")),
+        "script_version": str(src.get("script_version") or "") or None,
+        "digest_sha": rec.get("digest_sha"),
+    }
+    size = _count(src.get("transcript_bytes")) or len(rec.get("digest") or "")
+    return SessionRow(key, "routine", repo, CLOUD_PROJECT_DIR, rec.get("started_at"), rec.get("ended_at"),
+                      size, skills, names, meta)
+
+
+_CLOUD_PENDING_SQL = """
+select source_key, routine, session_id, started_at, ended_at, digest, digest_sha, instructions, skills, meta
+from cloud_digests where ingested_at is null
+order by created_at, source_key
+for update skip locked
+"""
+
+
+@dataclass
+class CloudReport:
+    rows: list[SessionRow] = field(default_factory=list)
+    new: int = 0
+    updated: int = 0
+    bad: int = 0      # rows left un-ingested (bad routine name or key)
+
+
+def ingest_cloud(*, db_url: str | None = None) -> CloudReport:
+    """Turn new `cloud_digests` rows into `sessions` rows and set `ingested_at`, in one
+    transaction. Idempotent: an ingested row is not read again, and the sessions upsert keeps
+    `scanned_at` and the scan keys."""
+    from psycopg.rows import dict_row
+
+    report = CloudReport()
+    with store.connect(db_url) as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(_CLOUD_PENDING_SQL)
+            recs = cur.fetchall()
+        for rec in recs:
+            row = cloud_row(rec)
+            if row is None:
+                report.bad += 1
+                continue
+            got = conn.execute(_UPSERT_SQL, (
+                row.session_id, row.tool, row.kind, row.repo, row.project_dir, row.started_at, row.ended_at,
+                row.transcript_bytes, Jsonb(row.skills), Jsonb(row.instructions), Jsonb(row.meta),
+            )).fetchone()
+            if got is not None:
+                if got[0]:
+                    report.new += 1
+                else:
+                    report.updated += 1
+            conn.execute("update cloud_digests set ingested_at = now() where source_key = %s", (row.session_id,))
+            report.rows.append(row)
+    return report
+
+
 def ingest(root: Path | None, *, days: int = DEFAULT_DAYS, now: datetime | None = None,
            db_url: str | None = None, codex: Path | None = None,
            tools: tuple[str, ...] = TOOLS) -> IngestReport:
     rows, skipped = collect(root, days=days, now=now, codex=codex, tools=tools)
     report = IngestReport(files=len(rows) + skipped, skipped=skipped)
+    report.new, report.updated = upsert(rows, db_url=db_url)
+    if "claude" in tools:  # cloud routine sessions are Claude Code sessions
+        cloud = ingest_cloud(db_url=db_url)
+        rows = rows + cloud.rows
+        report.files += len(cloud.rows)
+        report.new += cloud.new
+        report.updated += cloud.updated
+        report.cloud = len(cloud.rows)
+        report.cloud_bad = cloud.bad
     for r in rows:
         report.kinds[r.kind] = report.kinds.get(r.kind, 0) + 1
         report.tools[r.tool] = report.tools.get(r.tool, 0) + 1
         report.team += r.team
-    report.new, report.updated = upsert(rows, db_url=db_url)
     return report
