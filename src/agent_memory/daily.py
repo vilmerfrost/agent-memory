@@ -5,6 +5,9 @@ Steps, in order. A failed step is recorded and the next step still runs:
 1. ingest: the routines.log that cloud routines publish (`ingest git-ref` logic).
 2. score: every routine with a `questions/<routine>.toml`, one routine at a time.
    One routine's Jev error or crash never stops the others.
+2b. distill: `lessons distill` (docs/lessons.md) turns new dispatch runs into trial
+   lessons. Off unless AMEM_DISTILL_LIVE=1 (then not a failure, and the log line has no
+   distill fields). Any run that ends as `error` fails the step.
 3. escalations: open escalations are compared with the ids already pushed
    (state file). Only new ids trigger a push. Ids no longer open are pruned.
    An id is marked pushed only after ntfy answered 200.
@@ -33,7 +36,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from agent_memory import cli_cloud, config, jev, scoring, store
+from agent_memory import cli_cloud, config, distill, jev, scoring, store
 from agent_memory.questions import QuestionCache
 
 NAME = "amem-daily"
@@ -56,6 +59,7 @@ class DailyResult:
     escalations: int = 0
     new: int = 0
     push: str = "none"  # none | phone | mac
+    distilled: distill.Report | None = None  # None: the distill step was off or failed early
     failures: list[str] = field(default_factory=list)
     lines: list[str] = field(default_factory=list)  # what was appended to the routines log
 
@@ -269,6 +273,26 @@ def step_score(result: DailyResult, *, limit: int = SCORE_LIMIT) -> None:
             result.fail(f"score {routine}: {n} Jev error{'s' if n != 1 else ''}; first: {report.failed[0][2]}")
 
 
+def step_distill(result: DailyResult, *, limit: int = distill.DEFAULT_LIMIT) -> None:
+    """`lessons distill` for new dispatch runs. Off (not a failure) unless AMEM_DISTILL_LIVE=1."""
+    if not distill.live():
+        _err(f"distill: off ({distill.LIVE_ENV} is not 1)")
+        return
+    if not _postgres_guard("distill", result):
+        return
+    try:
+        report = distill.distill(limit=limit)
+    except Exception as exc:  # bad thresholds or DB error before the loop
+        result.fail(f"distill: {_exc(exc)}")
+        return
+    result.distilled = report
+    _err(f"distill: {report.summary()}")
+    if report.errors:
+        first = next(o for o in report.outcomes if o.decision == "error")
+        n = report.errors
+        result.fail(f"distill: {n} error{'s' if n != 1 else ''}; first: run {first.run_id}: {first.reason}")
+
+
 def step_escalations(
     result: DailyResult, *, push: bool, state_file: Path, now: datetime, notify: Mapping[str, str] | None
 ) -> None:
@@ -296,7 +320,12 @@ def step_escalations(
 
 def log_lines(ts: str, result: DailyResult, secs: int) -> list[str]:
     head = (f"{ts} {NAME} {result.verdict} scored={result.scored} escalations={result.escalations} "
-            f"new={result.new} push={result.push} {secs}s")
+            f"new={result.new} push={result.push} ")
+    if result.distilled is not None:  # only when the step ran, so the line stays the same when it is off
+        d = result.distilled
+        head += (f"distilled={len(d.outcomes)} lessons_new={d.new} lessons_merged={d.merged} "
+                 f"lessons_rejected={d.rejected} distill_errors={d.errors} ")
+    head += f"{secs}s"
     return [head, *(f"{ts} {NAME}-fail {reason}" for reason in result.failures)]
 
 
@@ -317,6 +346,7 @@ def run_daily(
     result = DailyResult()
     step_ingest(result)
     step_score(result)
+    step_distill(result)
     step_escalations(result, push=push, state_file=state_path(state), now=now, notify=notify)
     secs = int(time.monotonic() - start)
     result.lines = log_lines(now.strftime(TS_FORMAT), result, secs)

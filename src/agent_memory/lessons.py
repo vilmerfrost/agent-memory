@@ -405,6 +405,10 @@ PROPOSE_QUESTIONS = [
 ]
 FRICTION_QUESTIONS = [jev.noul("recurring", "Is this a recurring friction, not a one-off?")]
 
+# Write-gate thresholds, shared by `lesson propose` and `lessons distill`.
+PROPOSE_MIN_REUSABLE = 0.6
+PROPOSE_MIN_GENERALIZABLE = 0.5
+
 
 def env_float(name: str, default: float) -> float:
     raw = os.environ.get(name, "").strip()
@@ -414,6 +418,28 @@ def env_float(name: str, default: float) -> float:
         return float(raw)
     except ValueError:
         raise LessonsError(f"{name} must be a number, got {raw!r}") from None
+
+
+def propose_thresholds(min_reusable: float | None = None,
+                       min_generalizable: float | None = None) -> tuple[float, float]:
+    """(min P(reusable), min generalizable): the flag, else the env, else the default."""
+    reusable = (min_reusable if min_reusable is not None
+                else env_float("AMEM_PROPOSE_MIN_REUSABLE", PROPOSE_MIN_REUSABLE))
+    general = (min_generalizable if min_generalizable is not None
+               else env_float("AMEM_PROPOSE_MIN_GENERALIZABLE", PROPOSE_MIN_GENERALIZABLE))
+    return reusable, general
+
+
+def gate_decision(results: dict[str, jev.JevResult], min_reusable: float,
+                  min_generalizable: float) -> tuple[bool, str]:
+    """(accept, detail) for PROPOSE_QUESTIONS answers. Accept when both pass."""
+    reusable, general = results["reusable"], results["generalizable"]
+    p_reusable, g_score = float(reusable.value), float(general.value)
+    accept = p_reusable >= min_reusable and g_score >= min_generalizable
+    detail = (f"reusable={p_reusable:.2f} (min {min_reusable:.2f}) "
+              f"generalizable={g_score:.2f} (min {min_generalizable:.2f}, "
+              f"confidence {general.confidence or 0:.2f})")
+    return accept, detail
 
 
 def get_run(run_id: uuid.UUID, *, db_url: str | None = None) -> dict[str, Any] | None:
