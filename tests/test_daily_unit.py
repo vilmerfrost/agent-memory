@@ -95,7 +95,7 @@ def test_log_lines_house_format_and_parse_back() -> None:
     result.fail("score t-other: 1 Jev error; first: boom\nsecond line")
     lines = daily.log_lines(TS.strftime(daily.TS_FORMAT), result, 7)
     assert lines == [
-        "2026-10-13T09:20:04+0200 amem-daily FAIL scored=4 escalations=2 new=1 push=phone 7s",
+        "2026-10-13T09:20:04+0200 amem-daily FAIL scored=4 escalations=2 new=1 push=phone tasks=0 7s",
         "2026-10-13T09:20:04+0200 amem-daily-fail score t-other: 1 Jev error; first: boom second line",
     ]
     assert re.fullmatch(LOG_LINE_RE, lines[0])

@@ -52,7 +52,7 @@ def test_daily_distill_step_success(sdb: ScoringDb, daily_io: DailyIO, jev_dir: 
     assert r.verdict == "PASS", r.failures
     assert r.distilled is not None and (r.distilled.new, r.distilled.rejected) == (1, 1)
     (line,) = daily_io.log_lines()
-    assert " push=none distilled=2 lessons_new=1 lessons_merged=0 lessons_rejected=1 distill_errors=0 " in line
+    assert " push=none tasks=0 distilled=2 lessons_new=1 lessons_merged=0 lessons_rejected=1 distill_errors=0 " in line
     assert re.fullmatch(r"\S+ amem-daily PASS .* \d+s", line)
     assert _count(sdb.url, "lessons") == 1 and _count(sdb.url, "lesson_candidates") == 2
     assert daily_io.state.exists()  # the escalations step ran after distill

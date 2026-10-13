@@ -10,7 +10,7 @@ import pytest
 from agent_memory import jev, questions, scoring
 from agent_memory.questions import QuestionConfigError, load_file
 
-SHIPPED = ["canary-simplitics-selftest", "config-check", "evals-parent", "routine-audit"]
+SHIPPED = ["canary-simplitics-selftest", "config-check", "dispatch", "evals-parent", "routine-audit"]
 
 VALID = """
 threshold = 0.7

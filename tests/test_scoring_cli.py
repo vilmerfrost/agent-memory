@@ -424,6 +424,6 @@ def test_demo_flow_on_sample_log(sdb: ScoringDb, monkeypatch: pytest.MonkeyPatch
     assert len(_lines(run_amem("escalations", env=env).stdout)) == 1
 
     cal = {r["routine"]: r for r in _lines(run_amem("calibrate", env=env).stdout)}
-    assert sorted(cal) == ["canary-simplitics-selftest", "config-check", "evals-parent", "routine-audit"]
+    assert sorted(cal) == ["canary-simplitics-selftest", "config-check", "dispatch", "evals-parent", "routine-audit"]
     assert cal["config-check"]["labels"] == 1 and cal["config-check"]["agree"] == 1
     assert cal["config-check"]["note"] == "not enough labels (1 < 10)"

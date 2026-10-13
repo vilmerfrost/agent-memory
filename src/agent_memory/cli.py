@@ -16,6 +16,7 @@ from agent_memory import cli_ab
 from agent_memory import cli_daily
 from agent_memory import cli_lessons
 from agent_memory import cli_scoring
+from agent_memory import cli_tasks
 
 
 def _db_host(url: str) -> str:
@@ -172,6 +173,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_db_migrate)
 
     cli_cloud.register(sub, ingest_sub=ingest_sub)
+    cli_tasks.register(sub, ingest_sub=ingest_sub)
     cli_lessons.register(sub)
     cli_scoring.register(sub)
     cli_ab.register(sub)
