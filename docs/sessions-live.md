@@ -49,6 +49,7 @@ How the counts are made (`src/agent_memory/session_tokens.py`):
   `<session>/agent-<id>`). The parent row's `meta.subagent_tokens` holds their sum
   (`{input, output, cache_read, cache_creation, sessions}`). It is never added to a total,
   so nothing is counted twice. Codex subagent threads work the same way.
+- **Resumed sessions.** A resumed Claude Code session's transcript starts with a copy of the earlier session's lines (with the earlier `sessionId`), and its subagent files are copied whole; `sessions ingest` and the Stop ping count tokens, turns, time and outcome signals only from lines whose `sessionId` is the session's own (or missing), so the copy adds nothing (a copied title is kept as a fallback; kind and skills still read every line).
 - **Codex.** The `token_count` events hold the thread's running totals; the last one is
   the total. Codex counts cached input inside `input_tokens`, so it is split:
   `input = input_tokens - cached_input_tokens`. Each event's growth is credited to the

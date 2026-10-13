@@ -353,7 +353,7 @@ def _scan_subagents(p: Ping, entry: dict[str, Any]) -> dict[str, int] | None:
     subs = entry.setdefault("subs", {})
     total, n = session_tokens.Tokens(), 0
     for f in sorted(sub_dir.glob("agent-*.jsonl")):
-        sc = session_tokens.ClaudeScanner(subs.get(f.stem))
+        sc = session_tokens.ClaudeScanner(subs.get(f.stem), own_session=p.session_id)  # a copied file adds 0
         sc.scan_file(f)
         subs[f.stem] = sc.state()
         total.add(sc.summary.tokens)
@@ -386,7 +386,7 @@ def build_record(p: Ping, entry: dict[str, Any], now: datetime) -> dict[str, Any
         # A resumed session: the title the earlier scans saw (no transcript read here).
         rec["title"] = session_tokens.ClaudeScanner(entry.get("scan")).summary.title
         return rec
-    sc = session_tokens.ClaudeScanner(entry.get("scan"))
+    sc = session_tokens.ClaudeScanner(entry.get("scan"), own_session=p.session_id)  # resumed: own lines only
     if p.transcript is not None and p.transcript.is_file():
         sc.scan_file(p.transcript)
     entry["scan"] = sc.state()
