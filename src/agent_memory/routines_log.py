@@ -20,9 +20,17 @@ Mapping rules:
   never written. Blank lines are ignored.
 - `source = "cloud"` when the report path points into a cloud report folder
   (`.../reports/cloud/...` or `/root/...`), else `launchd`.
-- `source_key = sha256(routine + "\\n" + raw line)`. A byte-identical line that
-  appears again in the file gets `"\\n#<n>"` appended (n = 2, 3, ...), so true
-  repeats are kept and keys stay stable while the file only grows.
+- `source_key = sha256(routine + "\\n" + canonical line)`. The canonical line is
+  the raw line with every `report=<path>` token cut to `report=<basename>`.
+  Why: one run reaches the store by two paths. `ingest git-ref` reads the line
+  as published; `routine-sync` copies it into the local log with `report=`
+  rewritten to `~/.claude/parent/reports/cloud/<basename>`. Both copies get the
+  same key, so whichever ingest comes first wins and the other adds nothing.
+- A byte-identical raw line that appears again in the file gets `"\\n#<n>"`
+  appended (n = 2, 3, ...), so true repeats are kept and keys stay stable while
+  the file only grows. n counts raw lines, not canonical lines: a
+  routine-sync copy next to its original in the same file is the same run, so
+  it gets the same key and is dropped (counted in `ParseResult.duplicates`).
 - A last line without a trailing newline may still be mid-write. It is skipped
   and picked up by the next ingest.
 """
@@ -69,6 +77,7 @@ class ParseResult:
     details: int = 0  # detail lines attached to a summary
     orphan_details: int = 0  # detail lines with no summary (kept as orphan rows)
     incomplete_tail: bool = False  # last line had no newline and was skipped
+    duplicates: int = 0  # summary lines with the key of an earlier line (same run): dropped
 
 
 def parse_ts(value: str) -> datetime | None:
@@ -117,7 +126,25 @@ def _source(report: str | None) -> str:
     return "launchd"
 
 
-def _key(routine: str, line: str, occurrence: int) -> str:
+_REPORT_RE = re.compile(r"(?<!\S)report=(\S*)")
+
+
+def canonical_line(line: str) -> str:
+    """The line with each `report=<path>` cut to `report=<basename>` (the part routine-sync keeps)."""
+    return _REPORT_RE.sub(lambda m: "report=" + m.group(1).rsplit("/", 1)[-1], line)
+
+
+def source_key(routine: str, line: str, occurrence: int = 1) -> str:
+    """The dedupe key of a raw line: sha256(routine, canonical line, occurrence suffix)."""
+    material = f"{routine}\n{canonical_line(line)}"
+    if occurrence > 1:
+        material += f"\n#{occurrence}"
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+def legacy_source_key(routine: str, line: str, occurrence: int = 1) -> str:
+    """The key used before canonical lines: sha256 of the raw line. Only `amem db dedupe-runs`
+    needs it, to recognise rows stored with the old key."""
     material = f"{routine}\n{line}"
     if occurrence > 1:
         material += f"\n#{occurrence}"
@@ -127,12 +154,13 @@ def _key(routine: str, line: str, occurrence: int) -> str:
 def parse_lines(lines: list[str]) -> ParseResult:
     result = ParseResult()
     seen: Counter[tuple[str, str]] = Counter()
+    keys: dict[str, ParsedRun] = {}  # summary rows by source_key
     summaries: dict[tuple[str, str], ParsedRun] = {}
     orphans: dict[tuple[str, str], ParsedRun] = {}
 
     def key_for(routine: str, line: str) -> str:
         seen[(routine, line)] += 1
-        return _key(routine, line, seen[(routine, line)])
+        return source_key(routine, line, seen[(routine, line)])
 
     for line_no, raw in enumerate(lines, start=1):
         line = raw.rstrip("\r\n")
@@ -172,6 +200,14 @@ def parse_lines(lines: list[str]) -> ParseResult:
             result.unparsed.append(line_no)
             continue
 
+        key = key_for(token, line)
+        if key in keys:
+            # A routine-sync copy of an earlier line (same ts, routine, verdict and fields;
+            # only the report dir differs). Same run: details that follow attach to the
+            # earlier row.
+            summaries[(ts_raw, token)] = keys[key]
+            result.duplicates += 1
+            continue
         kv, report = parse_free_text(text)
         meta: dict[str, Any] = {**kv, "log_source": LOG_SOURCE, "failures": []}
         status = STATUS_MAP.get(third)
@@ -181,9 +217,9 @@ def parse_lines(lines: list[str]) -> ParseResult:
         run = ParsedRun(
             routine=token, status=status, started_at=ts, summary=text or None,
             report_path=report, source=_source(report), meta=meta,
-            source_key=key_for(token, line), line_no=line_no,
+            source_key=key, line_no=line_no,
         )
-        summaries[(ts_raw, token)] = run
+        summaries[(ts_raw, token)] = keys[key] = run
         result.runs.append(run)
     return result
 

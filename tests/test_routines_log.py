@@ -36,8 +36,9 @@ def test_fixture_every_line_accounted_for() -> None:
     assert result.unparsed == []
     assert result.orphan_details == 0
     assert result.incomplete_tail is False
-    assert len(result.runs) + result.details == len(lines)
-    assert (len(result.runs), result.details) == (223, 135)
+    # Lines 172/173 are routine-sync copies of 155/156 (report= rewritten): same runs, dropped.
+    assert len(result.runs) + result.details + result.duplicates == len(lines)
+    assert (len(result.runs), result.details, result.duplicates) == (221, 135, 2)
     assert len({r.source_key for r in result.runs}) == len(result.runs)
     # Every detail line landed in some row's failures.
     assert sum(len(r.meta["failures"]) for r in result.runs) == result.details
@@ -48,7 +49,7 @@ def test_fixture_status_mapping() -> None:
     by_status: dict[str, int] = {}
     for r in runs:
         by_status[r.status] = by_status.get(r.status, 0) + 1
-    assert by_status == {"pass": 145, "fail": 72, "error": 4, "skip": 2}
+    assert by_status == {"pass": 143, "fail": 72, "error": 4, "skip": 2}  # 172/173 = copies of 155/156
     raw = sorted(r.meta["raw_status"] for r in runs if "raw_status" in r.meta)
     assert raw == ["INCONCLUSIVE", "INCONCLUSIVE", "TIE", "WIN"]
     assert all(r.meta["log_source"] == "routines.log" for r in runs)
@@ -93,10 +94,12 @@ def test_detail_text_keeps_inner_spacing_and_odd_chars() -> None:
 
 def test_details_attach_to_latest_summary_with_same_ts_and_routine() -> None:
     # Lines 141/142 share a ts but are different routines; 155 and 172 share ts + routine.
+    # 172 is routine-sync's copy of 155 (only the report dir differs): one run, keyed by 155.
     runs = _by_line(routines_log.parse_file(FIXTURE))
     assert runs[141].routine == "improve-e2e" and runs[142].routine == "improve-selftest"
-    assert runs[155].started_at == runs[172].started_at
-    assert runs[155].source_key != runs[172].source_key
+    assert 172 not in runs and 173 not in runs
+    assert runs[155].started_at != runs[156].started_at  # different ts: still two runs
+    assert runs[155].source_key != runs[156].source_key
 
 
 def test_cloud_source_detection() -> None:
@@ -106,8 +109,7 @@ def test_cloud_source_detection() -> None:
     assert fresh.source == "cloud"  # /root/... report path
     assert fresh.started_at == datetime(2026, 10, 10, 23, 28, 30, tzinfo=timezone.utc)
     assert runs[132].source == "cloud"  # .../reports/cloud/...
-    assert runs[172].source == "cloud"
-    assert runs[155].source == "launchd"
+    assert runs[155].source == "launchd"  # first copy wins; its cloud copy (172) is the same run
     assert runs[128].source == "launchd"  # +0000 ts, but a local report path
 
 
@@ -135,7 +137,8 @@ def test_summary_without_report_or_duration() -> None:
 
 
 def test_source_key_is_sha256_of_routine_and_raw_line() -> None:
-    line = _fixture_lines()[342]
+    # Canonical line: report=<path> is cut to its basename (docs/cloud.md, "Dedupe keys").
+    line = _fixture_lines()[342].replace("report=~/.claude/parent/reports/", "report=")
     run = _by_line(routines_log.parse_file(FIXTURE))[343]
     assert run.source_key == hashlib.sha256(f"config-check\n{line}".encode()).hexdigest()
     again = _by_line(routines_log.parse_file(FIXTURE))[343]
@@ -236,14 +239,15 @@ def test_ingest_round_trip_and_reingest_inserts_nothing(db_env: dict[str, str], 
 
     first = run_amem("ingest", "routines-log", str(path), env=db_env)
     assert first.returncode == 0, first.stderr
-    assert first.stdout.strip() == "ingested 223 new, 0 already present, 0 unparsed"
+    # 221 = 223 summary lines minus 2 routine-sync copies (172/173 of 155/156).
+    assert first.stdout.strip() == "ingested 221 new, 0 already present, 0 unparsed"
 
     second = run_amem("ingest", "routines-log", str(path), env=db_env)
     assert second.returncode == 0, second.stderr
-    assert second.stdout.strip() == "ingested 0 new, 223 already present, 0 unparsed"
+    assert second.stdout.strip() == "ingested 0 new, 221 already present, 0 unparsed"
 
     rows = _rows(pg_url, tag)
-    assert len(rows) == 223
+    assert len(rows) == 221
     assert all(r["source_key"] for r in rows)
     row = next(r for r in rows if r["routine"] == f"{tag}-config-check"
                and r["started_at"] == datetime(2026, 10, 12, 7, 0, 14, tzinfo=timezone.utc))
@@ -255,7 +259,7 @@ def test_ingest_round_trip_and_reingest_inserts_nothing(db_env: dict[str, str], 
     assert row["meta"]["log_source"] == "routines.log"
     win = next(r for r in rows if r["meta"].get("raw_status") == "WIN")
     assert win["status"] == "error"
-    assert sum(r["source"] == "cloud" for r in rows) == 5
+    assert sum(r["source"] == "cloud" for r in rows) == 3  # 172/173 (cloud copies of 155/156) merged
 
 
 def test_ingest_picks_up_new_lines_and_late_details(db_env: dict[str, str], pg_url: str, tmp_path: Path) -> None:
