@@ -1,10 +1,34 @@
 # agent-memory
 
-Learning loop for Vilmer's agent setup. Routine runs get logged. Later, Jev
-(TypeSafe System One) scores outcomes and gates lessons.
+A setup that edits itself, for Vilmer only.
 
-Status: v0 foundation. Run log + Jev wrapper + local Postgres. Nothing here
-touches production routines or a hosted Supabase.
+## Vision (v2)
+
+A routine reads every session: chats, parent dispatches, workers and routines. It finds
+where an agent deviated from an instruction: a skill, a CLAUDE.md or PARENT.md rule, or a
+routine prompt. It works out why, when and how. It writes two raw grades: did the agent
+follow the instruction, and was the result good. Jev (TypeSafe System One) makes the final
+call: edit the instruction, enforce it, or leave it.
+
+Later, an agent edits the instruction itself via agent-config's `improve apply`. Each edit is
+one commit, `improve revert <id>` undoes it, and evals keep the edit or revert it
+automatically. Success: fewer repeated deviations, and agents improve the setup.
+
+```
+sessions ──scan──▶ deviations (what / why / how + 2 raw grades) ──Jev──▶ edit | enforce | leave
+                                                                           │
+                       improve apply (one commit, improve revert undoes) ◀─┘  (E4, later)
+```
+
+Status: the deviation finder (E1–E3) is built and read only: `sessions ingest`,
+`deviations scan`, `deviations report` ([docs/deviations.md](docs/deviations.md)). It never
+edits an instruction. The run log, Jev scoring and labels stay as they are.
+
+**Frozen:** the v1 lessons memory (`lessons import/export/for/score`, `lesson propose`,
+`lessons distill`, and `lessons for` injection into briefs). The code and tables are kept,
+but nothing new is wired to them: the output of the loop is now an edit to the instruction
+itself, via `improve`, not a separate lesson. `lessons distill` in `amem daily` stays off
+unless `AMEM_DISTILL_LIVE=1`.
 
 ## Setup
 
@@ -85,21 +109,27 @@ results = jev.ask(state, [jev.choice("outcome", "Did it work?", {"pass": None, "
 results["outcome"].value, results["outcome"].confidence   # noul has no confidence (None)
 ```
 
-## V1: the learning loop
+## Parts
 
 Each part has its own doc:
 
 | Part | Commands | Doc |
 |---|---|---|
+| Deviation finder (v2) | `sessions ingest`, `deviations scan`, `deviations report [--json]` | [docs/deviations.md](docs/deviations.md) |
+| Daily job | `daily` | [docs/daily.md](docs/daily.md) |
 | Dispatch tasks as runs | `ingest tasks` | [docs/tasks.md](docs/tasks.md) |
 | Cloud path (HTTPS, no raw Postgres) | `AMEM_BACKEND=rest`, `ingest git-ref`, `jev record` | [docs/cloud.md](docs/cloud.md) |
 | Jev scoring + human labels | `score`, `label`, `escalations`, `calibrate`, `drift` | [docs/scoring.md](docs/scoring.md) |
-| Lessons memory | `lessons import/export/for/score`, `lesson propose`, `gate friction` | [docs/lessons.md](docs/lessons.md) |
+| Lessons memory (frozen) | `lessons import/export/for/score/distill`, `lesson propose`, `gate friction` | [docs/lessons.md](docs/lessons.md) |
 | A/B proof | `ab report` | [docs/ab.md](docs/ab.md) |
 
-The loop: runs are logged → Jev scores outcomes (low confidence → you label 👍/👎) → Jev gates which runs become lessons → `lessons for` injects the top lessons into briefs (`AMEM_MEMORY=off` turns injection off) → `ab report` shows whether each lesson actually helps → losers retire.
+The v2 loop: `sessions ingest` indexes transcripts → `deviations scan` finds deviations, writes
+what/why/how and two raw grades, Jev gives a verdict → `deviations report --json` hands the
+candidates to the improve ACT step (later) → one commit per edit, `improve revert` undoes it.
 
-Scoring, lessons and A/B commands use the Postgres backend only in V1; the REST backend covers `runs` (`log-run`, `ingest`, `runs`).
+The v1 loop (frozen, kept for history): runs are logged → Jev scores outcomes (low confidence → you label 👍/👎) → Jev gates which runs become lessons → `lessons for` injects the top lessons into briefs (`AMEM_MEMORY=off` turns injection off) → `ab report` shows whether each lesson actually helps → losers retire.
+
+Scoring, lessons, A/B and deviation commands use the Postgres backend only; the REST backend covers `runs` (`log-run`, `ingest`, `runs`).
 
 ## Tests
 

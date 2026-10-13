@@ -44,6 +44,9 @@ from agent_memory import config, jev
 QUESTIONS_DIR = config.REPO_ROOT / "questions"
 MIN_QUESTIONS = 3
 MAX_QUESTIONS = 5
+# Question files Jev uses for something other than scoring routine runs. `amem score`
+# and `amem daily` never treat them as routines (docs/deviations.md).
+NOT_ROUTINES = frozenset({"deviation"})
 _ROUTINE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 _NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
@@ -234,7 +237,9 @@ class QuestionCache:
         return self._sets[routine]
 
     def routines(self) -> list[str]:
-        """Every routine with a question file, sorted."""
+        """Every routine with a question file, sorted. Question files that are not
+        about routine runs (`NOT_ROUTINES`, e.g. `deviation.toml`) are left out."""
         if not self.directory.is_dir():
             return []
-        return sorted(p.stem for p in self.directory.glob("*.toml") if p.is_file())
+        return sorted(p.stem for p in self.directory.glob("*.toml")
+                      if p.is_file() and p.stem not in NOT_ROUTINES)

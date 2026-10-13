@@ -12,6 +12,9 @@ Steps, in order. A failed step is recorded and the next step still runs:
 3. escalations: open escalations are compared with the ids already pushed
    (state file). Only new ids trigger a push. Ids no longer open are pruned.
    An id is marked pushed only after ntfy answered 200.
+3b. deviations (weekly): `sessions ingest` + `deviations scan` (docs/deviations.md) when the
+   last scan in the state file is >= 7 days old. Off unless AMEM_DEVIATIONS_LIVE=1 (then not
+   a failure, and the log line has no deviation fields). Any session error fails the step.
 4. log: one summary line plus one `amem-daily-fail <reason>` line per failed
    step, appended to the routines log in the house format.
 
@@ -33,11 +36,11 @@ import urllib.request
 from collections import Counter
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from agent_memory import cli_cloud, config, distill, jev, scoring, store, tasks_ingest
+from agent_memory import cli_cloud, config, deviations, distill, jev, scoring, sessions_ingest, store, tasks_ingest
 from agent_memory.questions import QuestionCache
 
 NAME = "amem-daily"
@@ -62,6 +65,7 @@ class DailyResult:
     new: int = 0
     push: str = "none"  # none | phone | mac
     distilled: distill.Report | None = None  # None: the distill step was off or failed early
+    deviations: deviations.ScanReport | None = None  # None: off, not due this week, or failed early
     failures: list[str] = field(default_factory=list)
     lines: list[str] = field(default_factory=list)  # what was appended to the routines log
 
@@ -189,13 +193,28 @@ def load_state(path: Path, result: DailyResult) -> set[str]:
         return set()
 
 
-def save_state(path: Path, pushed: set[str], now: datetime) -> None:
+def _state_dict(path: Path) -> dict[str, Any]:
+    """The whole state file as a dict; {} when missing or unreadable (never raises)."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _write_state(path: Path, data: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
-    data = {"pushed_run_ids": sorted(pushed), "updated_at": now.strftime(TS_FORMAT)}
     tmp.write_text(json.dumps(data, indent=1, sort_keys=True) + "\n", encoding="utf-8")
     os.chmod(tmp, 0o600)
     tmp.replace(path)
+
+
+def save_state(path: Path, pushed: set[str], now: datetime) -> None:
+    """Write the pushed ids. Other keys in the file (the deviations step's) are kept."""
+    data = _state_dict(path)
+    data.update({"pushed_run_ids": sorted(pushed), "updated_at": now.strftime(TS_FORMAT)})
+    _write_state(path, data)
 
 
 def plan_push(open_rows: list[dict[str, Any]], pushed_before: set[str]) -> tuple[list[dict[str, Any]], set[str]]:
@@ -317,6 +336,56 @@ def step_distill(result: DailyResult, *, limit: int = distill.DEFAULT_LIMIT) -> 
         result.fail(f"distill: {n} error{'s' if n != 1 else ''}; first: run {first.run_id}: {first.reason}")
 
 
+DEVIATIONS_KEY = "deviations_last_scan"
+DEVIATIONS_EVERY = timedelta(days=7)
+
+
+def step_deviations(result: DailyResult, *, state_file: Path, now: datetime) -> None:
+    """Weekly: `sessions ingest` + `deviations scan` (docs/deviations.md). Off (not a failure)
+    unless AMEM_DEVIATIONS_LIVE=1. Runs when the last scan in the state file is >= 7 days
+    old (or missing). The timestamp moves only when the scan finished; per-session errors
+    fail the step but still count as a finished scan (those sessions are retried next week)."""
+    if not deviations.live():
+        _err(f"deviations: off ({deviations.LIVE_ENV} is not 1)")
+        return
+    last_raw = _state_dict(state_file).get(DEVIATIONS_KEY)
+    last = None
+    if isinstance(last_raw, str):
+        try:
+            last = datetime.strptime(last_raw, TS_FORMAT)
+        except ValueError:
+            last = None
+    if last is not None and now - last < DEVIATIONS_EVERY:
+        _err(f"deviations: not due (last scan {last_raw}, every {DEVIATIONS_EVERY.days} days)")
+        return
+    if not _postgres_guard("deviations", result):
+        return
+    try:
+        root = sessions_ingest.projects_dir()
+        if not root.is_dir():
+            raise FileNotFoundError(f"no projects folder at {root}")
+        ingested = sessions_ingest.ingest(root, days=deviations.DEFAULT_DAYS, now=now)
+        _err(f"deviations: {ingested.line()}")
+        report = deviations.scan(days=deviations.DEFAULT_DAYS, limit=deviations.DEFAULT_LIMIT, now=now)
+    except Exception as exc:  # ingest, question file or DB error before the loop
+        result.fail(f"deviations: {_exc(exc)}")
+        return
+    result.deviations = report
+    _err(report.summary())
+    if report.errors:
+        first = next(o for o in report.outcomes if o.status == "error")
+        n = report.errors
+        result.fail(f"deviations: {n} error{'s' if n != 1 else ''}; first: session {first.session_id}: "
+                    f"{first.reason}")
+    data = _state_dict(state_file)
+    data[DEVIATIONS_KEY] = now.strftime(TS_FORMAT)
+    data.setdefault("pushed_run_ids", [])
+    try:
+        _write_state(state_file, data)
+    except OSError as exc:
+        result.fail(f"state: cannot write {state_file.name}: {_exc(exc)}")
+
+
 def step_escalations(
     result: DailyResult, *, push: bool, state_file: Path, now: datetime, notify: Mapping[str, str] | None
 ) -> None:
@@ -349,6 +418,12 @@ def log_lines(ts: str, result: DailyResult, secs: int) -> list[str]:
         d = result.distilled
         head += (f"distilled={len(d.outcomes)} lessons_new={d.new} lessons_merged={d.merged} "
                  f"lessons_rejected={d.rejected} distill_errors={d.errors} ")
+    if result.deviations is not None:  # only on the weekly run, so other days keep the same line
+        s = result.deviations
+        v = s.verdicts()
+        head += (f"deviations={s.found} deviation_sessions={len(s.outcomes)} "
+                 f"deviations_edit={v['edit_instruction']} deviations_enforce={v['enforce']} "
+                 f"deviations_leave={v['leave']} deviation_errors={s.errors} ")
     head += f"{secs}s"
     return [head, *(f"{ts} {NAME}-fail {reason}" for reason in result.failures)]
 
@@ -376,6 +451,7 @@ def run_daily(
     step_score(result)
     step_distill(result)
     step_escalations(result, push=push, state_file=state_path(state), now=now, notify=notify)
+    step_deviations(result, state_file=state_path(state), now=now)
     secs = int(time.monotonic() - start)
     result.lines = log_lines(now.strftime(TS_FORMAT), result, secs)
     log_file.parent.mkdir(parents=True, exist_ok=True)
