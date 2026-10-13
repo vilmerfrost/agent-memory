@@ -1,8 +1,9 @@
-"""`amem sessions ingest` and `amem deviations scan|report` (docs/deviations.md).
+"""`amem sessions ingest` and `amem deviations scan|report|reref|rules` (docs/deviations.md).
 
-Postgres only (like the lessons commands): on the REST backend they exit 1.
-Writes honour AMEM_REQUIRE_REMOTE=1 (exit 3). `deviations scan` without `--dry-run`
-calls the Claude Code CLI and needs AMEM_DEVIATIONS_LIVE=1 (else exit 2, nothing called).
+Postgres only (like the lessons commands): on the REST backend they exit 1 (`rules` needs
+no database). Writes honour AMEM_REQUIRE_REMOTE=1 (exit 3). `deviations scan` without
+`--dry-run` calls the Claude Code CLI and needs AMEM_DEVIATIONS_LIVE=1 (else exit 2,
+nothing called). `reref` never calls the writer or Jev.
 """
 
 from __future__ import annotations
@@ -109,6 +110,34 @@ def cmd_report(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_reref(args: argparse.Namespace) -> int:
+    guard = _read_guard if args.dry_run else _write_guard
+    if (code := guard("deviations reref")) is not None:
+        return code
+    try:
+        report = deviations.reref(dry_run=args.dry_run)
+    except psycopg.Error as exc:
+        return _err("deviations reref", exc)
+    for line in report.lines():
+        print(line)
+    print(report.summary())
+    return 0
+
+
+def cmd_rules(args: argparse.Namespace) -> int:
+    """The rule catalog of instruction files (read only, no database)."""
+    for path in args.files:
+        if path.name.lower().startswith(".env") or not path.is_file():
+            print(f"amem: deviations rules: not a readable instruction file: {path}", file=sys.stderr)
+            return 1
+    for path in args.files:
+        src = deviations.InstructionSource(path.name, [path])
+        print(f"--- {path} ---")
+        for i, rule in enumerate(deviations.source_catalog(src), 1):
+            print(f"{i}. {rule.id} — {rule.title}")
+    return 0
+
+
 def register(sub: Any) -> None:
     s = sub.add_parser("sessions", help="local Claude Code transcripts (docs/deviations.md)")
     s_sub = s.add_subparsers(dest="sessions_command", required=True)
@@ -135,3 +164,11 @@ def register(sub: Any) -> None:
     p.add_argument("--days", type=_positive, default=deviations.DEFAULT_DAYS)
     p.add_argument("--json", action="store_true", help="the candidates file for the improve ACT step")
     p.set_defaults(func=cmd_report)
+
+    p = d_sub.add_parser("reref", help="backfill rule ids: snap stored refs to the current rule catalog")
+    p.add_argument("--dry-run", action="store_true", help="print the mapping, write nothing")
+    p.set_defaults(func=cmd_reref)
+
+    p = d_sub.add_parser("rules", help="print the rule catalog (ids + titles) of instruction files")
+    p.add_argument("files", nargs="+", type=Path, help="markdown instruction files (read only)")
+    p.set_defaults(func=cmd_rules)

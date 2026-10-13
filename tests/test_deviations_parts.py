@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_memory import deviations, distill, questions
+from agent_memory import deviations, distill, questions, rule_catalog
 from agent_memory.deviations import FindingError, parse_findings
 from agent_memory.sessions_ingest import SessionRow
 from test_deviations_support import (  # noqa: F401
@@ -223,9 +223,14 @@ def test_source_key_is_stable_and_case_insensitive_on_ref() -> None:
 
 
 def test_jev_state_has_no_writer_text() -> None:
-    (f,) = parse_findings(_reply(finding()), OFFERED)
+    (raw,) = parse_findings(_reply(finding()), OFFERED)
+    (f,) = deviations.resolve([raw], [deviations.LoadedSource(
+        "claude-md:global", "", [rule_catalog.Rule("intro", "Global (intro)"),
+                                 rule_catalog.Rule("explaining", "Explaining")], "0" * 64)])
     state = deviations.jev_state(f, "worker", 2)
-    assert "instruction_source: claude-md:global" in state and "instruction_ref: Explaining" in state
+    assert "instruction_source: claude-md:global" in state and "instruction_rule: explaining" in state
+    assert "rule_title: Explaining" in state and "instruction_ref" not in state
+    assert "rule_title: Explaining (not in the rule list)" in deviations.jev_state(raw, "worker", 2)
     assert "followed_grade: 0.30" in state and "result_grade: 0.80" in state
     assert "session_kind: worker" in state and "recurrence: 2 other sessions" in state
     for word in ("recap", "habit", "harder to read"):

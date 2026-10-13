@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable, Iterator
+from dataclasses import replace
 from pathlib import Path
 
 import psycopg
@@ -109,8 +110,8 @@ def test_jev_state_never_holds_transcript_or_writer_text(setup_home: Home, db: s
                      "pytest"):
             assert text not in state, (text, state)
         assert set(ln.split(":", 1)[0] for ln in state.splitlines()[1:]) == {
-            "instruction_source", "instruction_ref", "session_kind", "followed_grade", "result_grade",
-            "recurrence"}
+            "instruction_source", "instruction_rule", "rule_title", "session_kind", "followed_grade",
+            "result_grade", "recurrence"}
 
 
 def test_recurrence_counts_other_sessions(setup_home: Home, db: str, writer: Writer,  # noqa: F811
@@ -198,6 +199,7 @@ def test_jev_fixture_mode_end_to_end(setup_home: Home, db: str, writer: Writer, 
     fixtures.mkdir()
     monkeypatch.setenv("AMEM_JEV_FIXTURES_DIR", str(fixtures))
     f = deviations.parse_findings(json.dumps({"deviations": [finding()]}), {"claude-md:global"})[0]
+    f = replace(f, rule_id="explaining", rule_title="Explaining")  # what the scan resolves it to
     key = jev.fixture_key(deviations.jev_state(f, "chat", 0), deviations.question_set().jev_questions())
     (fixtures / f"{key}.json").write_text(json.dumps({"model": "jev-latest", "usage": {}, "answers": {
         "verdict": {"type": "choice", "choice": "enforce", "confidence": 0.91,
@@ -275,20 +277,23 @@ def test_report_groups_and_json_candidates(setup_home: Home, db: str, writer: Wr
     assert top["verdict"] == "edit_instruction"
     assert top["target_paths"] == [str(setup_home.claude / "CLAUDE.md")]
     assert len(top["examples"]) == deviations.EXAMPLES_MAX and len(top["deviation_ids"]) == 5
+    assert (top["rule_id"], top["rule_title"], top["refs"]) == ("explaining", "Explaining", {"Explaining": 5})
+    assert len(top["instruction_shas"]) == 1 and len(top["instruction_shas"][0]) == 64
     lines = deviations.report_lines(cands, 7)
-    assert lines[0] == "deviations (last 7 days): 2 instructions, 6 deviations"
-    assert lines[1].startswith("claude-md:global / Explaining: count=5 sessions=5 followed=0.30 result=0.80 | ")
+    assert lines[0] == "deviations (last 7 days): 2 rules, 6 deviations"
+    assert lines[1].startswith("claude-md:global / Explaining [explaining]: count=5 sessions=5 followed=0.30 "
+                               "result=0.80 | ")
 
     env = base_env(AMEM_DB_URL=db, AMEM_CLAUDE_HOME=str(setup_home.claude),
                    AMEM_AGENT_CONFIG_DIR=str(setup_home.agent_config))
     res = run_amem("deviations", "report", "--json", "--days", "3650", env=env)
     assert res.returncode == 0, res.stderr
     doc = json.loads(res.stdout)
-    assert doc["version"] == 1 and doc["window_days"] == 3650
+    assert doc["version"] == 2 and doc["window_days"] == 3650
     assert set(doc["candidates"][0]) == {
-        "instruction_source", "instruction_ref", "target_paths", "count", "sessions", "kinds",
-        "followed_grade_mean", "result_grade_mean", "jev", "verdict", "session_ids", "deviation_ids",
-        "examples"}
+        "instruction_source", "rule_id", "rule_title", "instruction_ref", "refs", "instruction_shas",
+        "target_paths", "count", "sessions", "kinds", "followed_grade_mean", "result_grade_mean", "jev",
+        "verdict", "session_ids", "deviation_ids", "examples"}
 
 
 def test_rls_on_new_tables_and_api_roles_revoked(db: str) -> None:

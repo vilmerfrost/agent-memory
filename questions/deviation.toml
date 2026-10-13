@@ -1,8 +1,9 @@
 # Jev's call on one deviation found by `amem deviations scan` (docs/deviations.md).
 # Not a routine: `amem score` and `amem daily` skip this file (questions.NOT_ROUTINES).
 #
-# Jev's state holds only the instruction source and ref, the two raw grades, the session
-# kind and the recurrence count. Never transcript text and never the writer's what/why/how.
+# Jev's state holds only the instruction source, the rule id and heading title (the rule
+# catalog), the two raw grades, the session kind and the recurrence count. Never transcript
+# text and never the writer's what/why/how.
 
 threshold = 0.6
 pass_question = "verdict"
@@ -12,9 +13,9 @@ pass_options = ["leave"]
 name = "verdict"
 kind = "choice"
 prompt = """An agent deviated from one standing instruction. Decide what to do with that instruction.
-followed_grade is how well the agent followed it (1 = fully, 0 = ignored). result_grade is how good
-the result was anyway (1 = good, 0 = bad). recurrence counts other recent sessions that deviated
-from the same instruction."""
+instruction_rule and rule_title name the rule inside the instruction file. followed_grade is how well
+the agent followed it (1 = fully, 0 = ignored). result_grade is how good the result was anyway
+(1 = good, 0 = bad). recurrence counts other recent sessions that deviated from the same rule."""
 [questions.options]
 edit_instruction = "Change the instruction itself: it is unclear, wrong, outdated or fights another rule, so agents keep missing it or the result was fine without it."
 enforce = "Keep the instruction as written and make it stick (a hook, a check or a stronger trigger): it is right, and skipping it hurt the result."

@@ -20,6 +20,8 @@
 		<string>1</string>
 		<key>AMEM_JEV_LIVE</key>
 		<string>1</string>
+		<key>AMEM_DEVIATIONS_LIVE</key>
+		<string>1</string>
 		<key>PATH</key>
 		<string>/Users/vilmerfrost/.local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
 	</dict>

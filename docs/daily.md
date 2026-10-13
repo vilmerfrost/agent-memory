@@ -38,7 +38,7 @@ A failed step is recorded, and the next step still runs.
    - `--no-push` never pushes and never marks; it still prunes.
    Then **deviations** (weekly, docs/deviations.md): `sessions ingest` + `deviations scan`
    when `deviations_last_scan` in the state file is missing or at least 7 days old. Off (not a
-   failure) unless `AMEM_DEVIATIONS_LIVE=1`. A session error fails the step.
+   failure) unless `AMEM_DEVIATIONS_LIVE=1`; the launchd job sets it. A session error fails the step.
    (The `lessons distill` step after scoring is frozen: off unless `AMEM_DISTILL_LIVE=1`.)
 4. **log**: one line appended to the routines log.
 
@@ -100,9 +100,13 @@ An unreadable file is a failed step and is treated as empty (worst case: one rep
 `deploy/launchd/com.vilmerfrost.amem-daily.plist`:
 
 - Runs `/opt/homebrew/bin/uv run --directory /Users/vilmerfrost/Projects/agent-memory --quiet amem daily`.
-- Env: `AMEM_REQUIRE_REMOTE=1`, `AMEM_JEV_LIVE=1`, and `PATH` with
-  `~/.local/bin` (launchd's default PATH has no `gh`). The DB URL and the Jev key
-  come from the main checkout's env file, which `amem` loads itself.
+- Env: `AMEM_REQUIRE_REMOTE=1`, `AMEM_JEV_LIVE=1`, `AMEM_DEVIATIONS_LIVE=1` (the weekly
+  deviations step runs: one `claude -p` writer call per scanned session, at most 15 a week),
+  and `PATH` with `~/.local/bin` (launchd's default PATH has no `gh`; `claude` lives there
+  too). The DB URL and the Jev key come from the main checkout's env file, which `amem`
+  loads itself.
+- After installing a new copy, run `amem deviations reref` once if the database holds
+  deviations from before the rule catalog (docs/deviations.md).
 - Daily at 09:20 (`StartCalendarInterval`), `RunAtLoad` false.
 - stdout and stderr: `~/.claude/parent/reports/launchd.log`.
 
