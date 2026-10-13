@@ -89,7 +89,8 @@ def short_name(target: str | None) -> str:
 
 def edit_message(o: edits.Outcome, *, with_cli_undo: bool) -> tuple[str, str]:
     title = f"Agent edit: {o.rule_title or o.rule_id}"
-    lines = [o.summary or "", f"Why: {o.why}" if o.why else "", f"File: {short_name(o.target)}"]
+    kind = f"Kind: {o.kind}" + (f" ({o.kind_reason})" if o.kind_reason else "") if o.kind else ""
+    lines = [o.summary or "", f"Why: {o.why}" if o.why else "", kind, f"File: {short_name(o.target)}"]
     if o.status == "trial":
         lines.append("Trial: the evals could not prove it yet.")
     if with_cli_undo:

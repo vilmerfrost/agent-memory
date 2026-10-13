@@ -1,27 +1,35 @@
 """The edit writer: prompt and validation (docs/edits.md, "Writer").
 
-A headless `claude -p` (distill.writer_argv flags: no tools, no skills, no MCP) gets the
-current text of one rule section, its neighbours, the deviations' own-words summaries, the
-raw grades, Jev's verdict and confidence, the recurrence, and Vilmer's policy. It answers
-one JSON object {new_section, topic, why, summary}. `parse_proposal` validates it and
-splices it into the file text; anything off raises ProposalError (one candidate's error).
+A headless `claude -p` (distill.writer_argv flags: no tools, no skills, no MCP; the model is
+Opus unless AMEM_EDITS_MODEL says otherwise) gets the current text of one rule section, its
+neighbours, the deviations' own-words summaries, the raw grades, Jev's verdict and
+confidence, the recurrence, and Vilmer's policy. It is told to look for a contract fix
+first, then a hop fix, and only then to add or reword prose (docs/edits.md, "Design notes
+from MASS"). It answers one JSON object {new_section, topic, why, summary, kind,
+kind_reason}. `parse_proposal` validates it and splices it into the file text; anything
+off raises ProposalError (one candidate's error).
 """
 
 from __future__ import annotations
 
 import difflib
 import json
+import os
 import re
 from dataclasses import dataclass
 from typing import Any
 
-from agent_memory import deviations, distill, rule_catalog
+from agent_memory import config, deviations, distill, rule_catalog
 from agent_memory.edits_sections import Section, find, splice
 
 CLAUDE_ENV = "AMEM_EDITS_CLAUDE"
+MODEL_ENV = "AMEM_EDITS_MODEL"
+DEFAULT_MODEL = "opus"     # the optimizer matters more than the evaluator (MASS)
 DEFAULT_TIMEOUT = 300.0
 WHY_MAX = 200
 SUMMARY_MAX = 140
+KIND_REASON_MAX = 140
+KINDS = ("contract", "hop", "prose")
 TOPIC_MAX = 60
 NEW_MAX = 8_000
 ADDED_MAX = 1_500          # improve's content guard refuses more added text than this
@@ -46,11 +54,25 @@ POLICY = """Vilmer's policy for these edits (follow all of it):
   new topic or a new heading to this section.
 - No quotes, paths, ids, code or commands copied from the deviations. Write in your own words."""
 
+# What kind of change to look for, in this order. Gains in multi-agent workflows come mostly
+# from contracts (what a step must return, with checks) and hops (call order, loop-backs),
+# not from more prose (docs/edits.md, "Design notes from MASS").
+STRATEGY = """How to choose the change. Try these in order and take the first that fits:
+1. contract: make the step's required output explicit and checkable. Name what the agent
+   must produce or report before the step counts as done (a done-check, a report field,
+   a "returns X with Y checked" line), so a missing piece is visible, not a judgment call.
+2. hop: fix the order of steps. Move or reorder a step, or add an explicit "after X, then
+   Y" or a loop-back ("if the check fails, go back to X"), so the step cannot be skipped
+   or run too early.
+3. prose: only when neither a contract nor a hop fix fits, add or reword general guidance.
+Prefer changing an existing line over adding a new rule. Say which kind you made in "kind"."""
+
 PROMPT = """You edit one rule in an instruction file for AI coding agents. Agents keep deviating
 from this rule. Rewrite only this rule's section so they follow it next time.
 
 Reply with ONLY one JSON object. No prose, no code fence. Shape:
-{{"new_section": string, "topic": string, "why": string, "summary": string}}
+{{"new_section": string, "topic": string, "why": string, "summary": string, "kind": string,
+ "kind_reason": string}}
 
 - new_section: the full new text of the section below, starting with the same heading line
   {heading_note}. Markdown, same style as the file. At most {added_max} characters longer
@@ -58,6 +80,11 @@ Reply with ONLY one JSON object. No prose, no code fence. Shape:
 - topic: 2 to 5 words naming the rule's topic (e.g. "command substitution shell").
 - why: at most {why_max} characters: why this change makes agents follow the rule.
 - summary: at most {summary_max} characters: what changed, for a phone notification.
+- kind: "contract", "hop" or "prose" (see below): the kind of change you made.
+- kind_reason: at most {kind_reason_max} characters, one line: why this kind fits (for prose:
+  why no contract or hop fix fits).
+
+{strategy}
 
 {policy}
 
@@ -98,7 +125,7 @@ def writer_prompt(cand: dict[str, Any], *, target: str, section: Section, sectio
                     else "(this section has no heading of its own: keep it that way)")
     return PROMPT.format(
         heading_note=heading_note, added_max=ADDED_MAX, why_max=WHY_MAX, summary_max=SUMMARY_MAX,
-        policy=POLICY, target=target, source=cand["instruction_source"], rule_id=cand["rule_id"],
+        kind_reason_max=KIND_REASON_MAX, strategy=STRATEGY, policy=POLICY, target=target, source=cand["instruction_source"], rule_id=cand["rule_id"],
         rule_title=cand.get("rule_title") or cand["rule_id"], section=section_text, prev=prev or "(none)",
         next=nxt or "(none)", days=cand.get("_days", 7), verdict=cand.get("verdict") or "-",
         confidence=_fmt(j.get("confidence_mean")), count=cand.get("count", 0), sessions=cand.get("sessions", 0),
@@ -106,8 +133,21 @@ def writer_prompt(cand: dict[str, Any], *, target: str, section: Section, sectio
         examples="\n".join(ex) or "(none)")
 
 
+_MODEL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._\[\]-]{0,79}")
+
+
+def writer_model() -> str:
+    """AMEM_EDITS_MODEL (an alias like `opus` / `sonnet` or a full model id), else opus.
+    Anything that is not one plain token (e.g. a flag) falls back to the default."""
+    config.load_env()
+    value = os.environ.get(MODEL_ENV, "").strip()
+    return value if _MODEL_RE.fullmatch(value) else DEFAULT_MODEL
+
+
 def writer_argv() -> list[str]:
-    return distill.writer_argv(CLAUDE_ENV)
+    """distill's minimal flags (no tools, no slash commands, strict MCP, no session file;
+    never --bare) with the edit writer's own model."""
+    return distill.writer_argv(CLAUDE_ENV, model=writer_model())
 
 
 def call_writer(prompt: str, *, timeout: float = DEFAULT_TIMEOUT) -> str:
@@ -133,6 +173,8 @@ class Proposal:
     why: str
     summary: str
     new_text: str        # the whole file with the section spliced in
+    kind: str = "prose"  # contract | hop | prose
+    kind_reason: str = ""
 
 
 _FENCE_RE = re.compile(r"^```(?:json)?\s*\n(.*?)\n?```$", re.DOTALL)
@@ -221,6 +263,11 @@ def parse_proposal(reply: str, *, file_text: str, rule_id: str, cand: dict[str, 
     topic = " ".join(topic.split())
     why = _one_line_field(obj, "why", WHY_MAX)
     summary = _one_line_field(obj, "summary", SUMMARY_MAX)
+    kind = obj.get("kind")
+    kind = kind.strip().lower() if isinstance(kind, str) else kind
+    if kind not in KINDS:
+        raise ProposalError(f"kind must be one of {', '.join(KINDS)}, got {kind!r}"[:160])
+    kind_reason = _one_line_field(obj, "kind_reason", KIND_REASON_MAX)
 
     section = find(file_text, rule_id)
     old_section = "".join(file_text.splitlines(keepends=True)[section.start:section.end]).strip("\r\n")
@@ -258,4 +305,4 @@ def parse_proposal(reply: str, *, file_text: str, rule_id: str, cand: dict[str, 
     new_text = splice(file_text, rule_id, new_section)
     if rule_catalog.build([new_text]) != rule_catalog.build([file_text]):
         raise ProposalError("the edit changes the file's rule list (a new or renamed heading)")
-    return Proposal(new_section, topic, why, summary, new_text)
+    return Proposal(new_section, topic, why, summary, new_text, kind, kind_reason)

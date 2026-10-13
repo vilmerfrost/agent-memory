@@ -191,8 +191,10 @@ def envelope(reply: Any) -> str:
 
 def proposal(new_section: str, topic: str = "worker spawn brief", why: str = "Agents skipped the branch name; "
              "a concrete line makes it hard to miss.", summary: str = "Spawn rule now names the branch line "
-             "explicitly.") -> dict[str, str]:
-    return {"new_section": new_section, "topic": topic, "why": why, "summary": summary}
+             "explicitly.", kind: str = "contract",
+             kind_reason: str = "The brief must now carry the branch as a checkable first line.") -> dict[str, str]:
+    return {"new_section": new_section, "topic": topic, "why": why, "summary": summary, "kind": kind,
+            "kind_reason": kind_reason}
 
 
 SPAWN_NEW = ("## 4. Spawn\nSpawn one worker per task.\nEach brief names the branch on its first line, "
