@@ -74,7 +74,7 @@ Mapping to Jev: `jev.choice(name, prompt, options)`, `jev.score(name, prompt, le
 with the file name.
 
 Shipped files: `config-check`, `evals-parent`, `canary-simplitics-selftest`,
-`routine-audit` (has the `triage` choice: real_failure | environment_noise | unclear).
+`dispatch` (docs/tasks.md; own state shape), `routine-audit` (has the `triage` choice: real_failure | environment_noise | unclear).
 A routine without a file is never scored.
 
 ## State string (what Jev reads)
