@@ -184,10 +184,21 @@ def build_parser() -> argparse.ArgumentParser:
     cli_daily.register(sub)
     cli_deviations.register(sub)
     cli_edits.register(sub)
+
+    # Handled in main() before parsing: every argument goes to amem_digest as is.
+    sub.add_parser("digest-self", add_help=False,
+                   help="print this cloud session's digest row for cloud_digests (the package copy of "
+                        "tools/amem_digest.py; same arguments, see docs/cloud.md)")
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    if argv[:1] == ["digest-self"]:
+        # Stdlib only and no env: the same code the cloud routine runs as tools/amem_digest.py.
+        from agent_memory import amem_digest
+
+        return amem_digest.main(argv[1:])
     config.load_env()
     args = build_parser().parse_args(argv)
     return args.func(args)

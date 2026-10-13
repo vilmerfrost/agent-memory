@@ -104,6 +104,113 @@ db=reachable            # REST: the cheap GET above
 require_remote=on
 ```
 
+## Cloud digests: cloud routine sessions in the deviation scan
+
+A cloud routine (claude.ai/code: "Nightly Trials", "Fresh Install") runs in a Linux VM.
+Its transcript never reaches the Mac, so `sessions ingest` cannot read it. Instead the
+routine sends a digest of its own session as its last step.
+
+```
+cloud VM: tools/amem_digest.py ──JSON row──▶ curl POST /rest/v1/cloud_digests
+Mac:      amem sessions ingest ──▶ sessions (tool claude, kind routine, meta.cloud)
+          amem deviations scan ──▶ stored digest + stored instruction texts ──▶ writer, Jev
+```
+
+### `tools/amem_digest.py`
+
+One file, Python 3.10+, stdlib only, no `agent_memory` import. Vendor it into the routine's
+repo (`tools/amem_digest.py` in nightly-trials; in agent-config for Fresh Install). The
+package holds a byte-identical copy (`src/agent_memory/amem_digest.py`); `amem digest-self`
+runs it with the same arguments. Tests keep the two files equal and check that its digest
+equals `deviations.build_digest` (same lines, same redaction patterns, same 60k cap with
+40% head + 60% tail). After an edit: `cp src/agent_memory/amem_digest.py tools/`, bump
+`SCRIPT_VERSION`, and copy the file into the routine repos again.
+
+| Argument | Use |
+|---|---|
+| `--routine NAME` | Required. Slugged: `Nightly Trials` → `nightly-trials`. |
+| `--transcript PATH` | The transcript. Default: see below. |
+| `--projects-dir DIR` | Where to look (default `~/.claude/projects`). |
+| `--max-age-minutes N` | A newest transcript older than this is not this session (default 120, 0 = no limit). |
+| `--prompt-from-transcript` | The session's first user message (the routine prompt) is the `prompt` instruction. |
+| `--prompt PATH` | A file holding the routine prompt (wins over `--prompt-from-transcript`). |
+| `--instruction NAME=PATH` | Another instruction file, e.g. `nightly-md=NIGHTLY.md`. Repeatable, at most 12. |
+| `--repo NAME` | Repo name (default: the session's working folder name). |
+
+Which transcript: `--transcript`, else the newest `*.jsonl` (modification time) directly in a
+project folder of `~/.claude/projects`. Subagent transcripts (`<session>/subagents/...`) are
+never picked. The running session appends to its own transcript while the step runs, so
+the newest file is this session.
+
+It never fails the routine. No transcript, none recent enough, or any other error: one
+`amem_digest: ... Nothing to send.` line on stderr, nothing on stdout, exit 0. A missing
+or `.env*` instruction file is left out with a stderr line. It reads no environment
+value and prints none; it sends nothing itself.
+
+Output: one JSON object, the `cloud_digests` row.
+
+| Key | Value |
+|---|---|
+| `source_key` | `cloud:<session id>` |
+| `routine` | the slug |
+| `session_id` | the transcript's `sessionId` (else the file name) |
+| `started_at`, `ended_at` | first and last event time, ISO 8601 UTC |
+| `digest`, `digest_sha` | the redacted, capped digest and its sha256 |
+| `instructions` | `[{name, sha256, text}]`: text redacted, capped at 100k chars; sha256 of the text as read |
+| `skills` | `Skill` calls and slash commands, no built-ins |
+| `meta` | `{cloud: true, repo, script_version, transcript_bytes, tool_calls, prompts}` |
+
+### The routine's last step
+
+Put this at the end of the routine prompt. It needs no key in the session: the cloud
+network secret adds the `apikey` header for the Supabase host, as for the `runs` POST.
+
+````text
+## Last step: session digest (always run it, also after a failure; never let it block your reply)
+
+Run exactly this one Bash command from the repo root, then finish your reply. It prints
+only an HTTP status code (201 = sent, 000 = no network, "skipped" = nothing to send).
+Do not retry it and do not debug it.
+
+```bash
+python3 tools/amem_digest.py --routine nightly-trials --prompt-from-transcript --instruction nightly-md=NIGHTLY.md > /tmp/amem_digest.json 2>/dev/null; if [ -s /tmp/amem_digest.json ]; then curl -s -o /dev/null -w '%{http_code}\n' --max-time 20 -X POST "$AMEM_SUPABASE_URL/rest/v1/cloud_digests?on_conflict=source_key" -H 'Content-Type: application/json' -H 'Prefer: resolution=ignore-duplicates,return=minimal' --data @/tmp/amem_digest.json || echo 000; else echo skipped; fi; true
+```
+````
+
+For Fresh Install: `--routine fresh-install`, no `--instruction` (its only instruction is
+the prompt), and the path to the vendored script in agent-config.
+
+- `curl -s` without `-S`: an error message could name the host. Only the code is printed.
+- `--max-time 20` and `; true`: the step always ends, with exit 0.
+- `resolution=ignore-duplicates` (+ `on_conflict=source_key`, the primary key): a second
+  POST of the same session is ignored, not an error and not a second row.
+
+**The routine prompt as an instruction.** `--prompt-from-transcript` is the simplest
+reliable way: the routine prompt is the session's first user message, so the script takes
+it from the transcript. Nothing to write first, and the text is exact (a prompt the agent
+re-types into a file can drift, and then its sha changes every run). If a routine ever keeps
+its prompt in a file in its repo, pass `--prompt <file>` instead.
+
+### Table, ingest and scan
+
+`cloud_digests` (migration `20261017040000_cloud_digests.sql`): the row above plus
+`ingested_at` and `created_at`. `source_key` is the primary key. RLS on, no policies,
+`anon` / `authenticated` grants revoked (the POST uses the secret key, which bypasses RLS).
+
+- `amem sessions ingest` (Postgres backend) also reads every `cloud_digests` row with
+  `ingested_at` null: one `sessions` row each (id = `source_key`, `tool` claude, `kind`
+  routine, `project_dir` cloud, `meta.cloud` true, `meta.routine`, `repo`), then sets
+  `ingested_at`, in one transaction. Idempotent; a re-ingest keeps `scanned_at`. The summary
+  line ends with `cloud=N` when it ingested any (`cloud_bad=N`: rows it could not use).
+  `--tool codex` skips them.
+- `sessions.instructions`: `routine:<routine>` for the prompt, `cloud-file:<name>` for each
+  file (`cloud-file:nightly-md`).
+- `amem deviations scan` reads the stored digest and instruction texts for these sessions,
+  never a local transcript or a local file (the Mac's CLAUDE.md was not in force in the VM).
+  The rule catalog is built from the stored texts and `instruction_sha` is the stored sha256,
+  so snapping, recurrence, the report and `reref` work as for local sessions. The candidates
+  file has `target_paths: []` for these sources: the edit step has no local file to edit.
+
 ## `amem ingest git-ref`
 
 Cloud routines publish their `routines.log` to branch `claude/routine-reports`,

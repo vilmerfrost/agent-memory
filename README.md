@@ -123,7 +123,7 @@ Each part has its own doc:
 | Edits + proof (v2) | `edits run`, `edits list`, `edits undo`, `edits undo-poll`, `edits scoreboard` | [docs/edits.md](docs/edits.md) |
 | Daily job | `daily` | [docs/daily.md](docs/daily.md) |
 | Dispatch tasks as runs | `ingest tasks` | [docs/tasks.md](docs/tasks.md) |
-| Cloud path (HTTPS, no raw Postgres) | `AMEM_BACKEND=rest`, `ingest git-ref`, `jev record` | [docs/cloud.md](docs/cloud.md) |
+| Cloud path (HTTPS, no raw Postgres) | `AMEM_BACKEND=rest`, `ingest git-ref`, `jev record`, `tools/amem_digest.py` / `digest-self` (cloud routine sessions) | [docs/cloud.md](docs/cloud.md) |
 | Jev scoring + human labels | `score`, `label`, `escalations`, `calibrate`, `drift` | [docs/scoring.md](docs/scoring.md) |
 | Lessons memory (frozen) | `lessons import/export/for/score/distill`, `lesson propose`, `gate friction` | [docs/lessons.md](docs/lessons.md) |
 | A/B proof | `ab report` | [docs/ab.md](docs/ab.md) |

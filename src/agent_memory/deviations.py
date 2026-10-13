@@ -22,6 +22,11 @@ Per session (`scan`):
    count (same source + rule), never transcript text and never what/why/how (`jev_state`).
 5. store: deviations upserted by source_key, `sessions.scanned_at` set, in one transaction.
 
+Cloud routine sessions (`meta.cloud`, id `cloud:<session id>`, docs/cloud.md) have no
+transcript and no local instruction file here: the scan reads the stored digest and the
+instruction texts the routine sent (`cloud_digests`) as `routine:<name>` (the prompt) and
+`cloud-file:<name>` sources.
+
 A writer or Jev error on one session is recorded (`sessions.meta.scan_error`) and the
 scan goes on; the session stays unscanned and is retried (at most MAX_SCAN_ERRORS times).
 `call_writer` is a module attribute so tests replace it. Every writer call needs
@@ -44,7 +49,7 @@ import psycopg
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
-from agent_memory import codex_sessions, config, distill, jev, questions, rule_catalog, store, tasks_ingest
+from agent_memory import codex_sessions, config, distill, jev, questions, rule_catalog, sessions_ingest, store, tasks_ingest
 from agent_memory.codex_sessions import payload
 from agent_memory.sessions_ingest import (
     SessionRow,
@@ -177,6 +182,11 @@ def instruction_sources(row: SessionRow) -> list[InstructionSource]:
     def repo_name() -> str:
         return row.repo or Path(row.cwd).name
 
+    if is_cloud(row):
+        # A cloud routine ran in a VM: no file on this machine was in force. Its instructions
+        # are the texts it sent along (`cloud_sources`).
+        return out
+
     if row.tool == "codex":
         cx = codex_home()
         add_first("agents-md:global", cx / "AGENTS.override.md", cx / "AGENTS.md")
@@ -255,10 +265,15 @@ def load_instructions(sources: list[InstructionSource]) -> list[tuple[str, str]]
 def load_sources(sources: list[InstructionSource]) -> list[LoadedSource]:
     """Per source: the capped, redacted text, the rule catalog and the sha. Sources that
     read empty or do not fit the total cap are left out."""
+    return _load_texts([(src.name, _read_parts(src), None) for src in sources])
+
+
+def _load_texts(items: list[tuple[str, list[str], str | None]]) -> list[LoadedSource]:
+    """(name, file texts, sha or None) per source -> LoadedSource, with the per-source and
+    total caps. `sha` None: the sha256 of the texts (rule_catalog.sha)."""
     out: list[LoadedSource] = []
     total = 0
-    for src in sources:
-        parts = _read_parts(src)
+    for name, parts, sha in items:
         text = redact("\n\n".join(parts)).strip()
         if not text:
             continue
@@ -270,8 +285,45 @@ def load_sources(sources: list[InstructionSource]) -> list[LoadedSource]:
                 break
             text = text[:room].rstrip() + "\n[... cut ...]"
         total += len(text)
-        out.append(LoadedSource(src.name, text, _catalog(parts), rule_catalog.sha(parts)))
+        out.append(LoadedSource(name, text, _catalog(parts), sha or rule_catalog.sha(parts)))
     return out
+
+
+# --------------------------------------------------------------------------- cloud routines
+
+
+def is_cloud(row: SessionRow) -> bool:
+    """A cloud routine session (`cloud_digests` -> sessions, docs/cloud.md)."""
+    return row.meta.get("cloud") is True and row.session_id.startswith(sessions_ingest.CLOUD_PREFIX)
+
+
+_SHA_RE = re.compile(r"[0-9a-f]{64}")
+
+
+def cloud_loaded(rec: dict[str, Any]) -> tuple[str, list[LoadedSource]]:
+    """(digest, instruction sources) from a stored `cloud_digests` row. The prompt becomes
+    `routine:<routine>`, a file `cloud-file:<name>`. The digest is redacted again (it was
+    built by a script that may be older than this module's patterns)."""
+    routine = str(rec.get("routine") or "")
+    items: list[tuple[str, list[str], str | None]] = []
+    seen: set[str] = set()
+    for item in rec.get("instructions") or []:
+        if not isinstance(item, dict) or not isinstance(item.get("text"), str):
+            continue
+        name = sessions_ingest.cloud_source_name(routine, str(item.get("name") or ""))
+        if name is None or name in seen:
+            continue
+        seen.add(name)
+        sha = str(item.get("sha256") or "")
+        items.append((name, [item["text"]], sha if _SHA_RE.fullmatch(sha) else None))
+    return cap(redact(str(rec.get("digest") or ""))), _load_texts(items)
+
+
+def cloud_record(session_id: str, db_url: str | None = None) -> dict[str, Any] | None:
+    with store.connect(db_url) as conn, conn.cursor(row_factory=dict_row) as cur:
+        cur.execute("select routine, digest, instructions from cloud_digests where source_key = %s",
+                    (session_id,))
+        return cur.fetchone()
 
 
 # --------------------------------------------------------------------------- digest
@@ -986,20 +1038,33 @@ def _record_error(o: Outcome, db_url: str | None) -> None:
 
 
 def _scan_one(row: SessionRow, *, dry_run: bool, timeout: float, qset: questions.QuestionSet | None,
-              recurrence: _Recurrence | None) -> Outcome:
+              recurrence: _Recurrence | None, db_url: str | None = None) -> Outcome:
     out = Outcome.of(row, "dry-run" if dry_run else "ok")
-    path = transcript_path(row)
-    if not path.is_file():
-        out.status, out.reason = "error", "transcript file not found"
-        return out
-    digest = build_digest(load_events(path))
-    sources = instruction_sources(row)
-    out.digest_chars = len(digest)
-    out.instructions = [s.name for s in sources]
-    out.missing = [n for n in row.instructions if n not in out.instructions]
-    if dry_run:
-        return out
-    instructions = load_sources(sources)
+    if is_cloud(row):
+        # A cloud routine: the digest and the instruction texts it sent (cloud_digests).
+        rec = cloud_record(row.session_id, db_url)
+        if rec is None:
+            out.status, out.reason = "error", "cloud digest not found"
+            return out
+        digest, instructions = cloud_loaded(rec)
+        out.digest_chars = len(digest)
+        out.instructions = [s.name for s in instructions]
+        out.missing = [n for n in row.instructions if n not in out.instructions]
+        if dry_run:
+            return out
+    else:
+        path = transcript_path(row)
+        if not path.is_file():
+            out.status, out.reason = "error", "transcript file not found"
+            return out
+        digest = build_digest(load_events(path))
+        sources = instruction_sources(row)
+        out.digest_chars = len(digest)
+        out.instructions = [s.name for s in sources]
+        out.missing = [n for n in row.instructions if n not in out.instructions]
+        if dry_run:
+            return out
+        instructions = load_sources(sources)
     if not instructions:
         return out  # nothing in force that we can read: scanned, nothing found
     try:
@@ -1040,7 +1105,8 @@ def scan(*, days: int = DEFAULT_DAYS, limit: int = DEFAULT_LIMIT, session_id: st
     report = ScanReport(dry_run=dry_run)
     for row in pick_sessions(since=since, limit=limit, session_id=session_id, db_url=db_url):
         try:
-            o = _scan_one(row, dry_run=dry_run, timeout=timeout, qset=qset, recurrence=recurrence)
+            o = _scan_one(row, dry_run=dry_run, timeout=timeout, qset=qset, recurrence=recurrence,
+                          db_url=db_url)
         except Exception as exc:  # never block: one session's crash is that session's error
             o = Outcome.of(row, "error", _one_line(f"{type(exc).__name__}: {exc}", 300))
         if not dry_run:
@@ -1216,6 +1282,7 @@ def reref(*, dry_run: bool = False, db_url: str | None = None) -> RerefReport:
     are left alone. Idempotent: a second run changes nothing."""
     report = RerefReport(dry_run=dry_run)
     cache: dict[tuple[str, tuple[Path, ...]], list[rule_catalog.Rule]] = {}
+    cloud_cache: dict[str, dict[str, list[rule_catalog.Rule]]] = {}
     updates: list[tuple[str | None, str | None, Jsonb, Any]] = []
     with store.connect(db_url) as conn, conn.cursor(row_factory=dict_row) as cur:
         cur.execute(_REREF_SQL)
@@ -1224,15 +1291,25 @@ def reref(*, dry_run: bool = False, db_url: str | None = None) -> RerefReport:
         report.rows += 1
         source, ref = rec["instruction_source"], rec["instruction_ref"]
         row = _row({**rec, "instructions": [], "transcript_bytes": 0, "ended_at": None})
-        src = next((s for s in instruction_sources(row) if s.name == source), None)
-        if src is None:
+        if is_cloud(row):
+            # The catalog of the texts the cloud routine sent (cloud_digests), not of local files.
+            if row.session_id not in cloud_cache:
+                stored = cloud_record(row.session_id, db_url)
+                cloud_cache[row.session_id] = {s.name: s.rules for s in cloud_loaded(stored)[1]} if stored else {}
+            rules = cloud_cache[row.session_id].get(source)
+        else:
+            src = next((s for s in instruction_sources(row) if s.name == source), None)
+            rules = None
+            if src is not None:
+                key = (src.name, tuple(src.paths))
+                if key not in cache:
+                    cache[key] = source_catalog(src)
+                rules = cache[key]
+        if rules is None:
             report.how[NO_SOURCE] += 1
             report.mapping[(source, ref, rec["rule_id"], rec["rule_title"], NO_SOURCE, 0.0)] += 1
             continue
-        key = (src.name, tuple(src.paths))
-        if key not in cache:
-            cache[key] = source_catalog(src)
-        m = rule_catalog.snap(ref, cache[key])
+        m = rule_catalog.snap(ref, rules)
         report.how[m.how] += 1
         report.mapping[(source, ref, m.rule_id, m.rule_title, m.how, round(m.score, 3))] += 1
         meta = dict(rec["dev_meta"] or {})
