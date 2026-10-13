@@ -219,15 +219,36 @@ cloud chat gets a `sessions` row with its tokens, model, title and outcome. Only
 digest leaves the VM.
 
 ```
-claude.ai/code environment setup script (deploy/cloud/setup.sh, runs once per new session)
-   │ GET /rest/v1/amem_assets?name=eq.amem_digest.py   ──▶ ~/.claude/amem/amem_digest.py
-   │ merge Stop + SessionEnd hooks into ~/.claude/settings.json
+setup script (deploy/cloud/setup.sh v2, root, before Claude Code and before the proxy; no network)
+   │ write /opt/amem/hook.sh
+   │ register it (Stop + SessionEnd) in /etc/claude-code/managed-settings.json,
+   │   /etc/claude-code/managed-settings.d/50-amem.json and ~/.claude/settings.json
    ▼
-cloud session: Stop / SessionEnd ──▶ python3 ~/.claude/amem/amem_digest.py --hook
+cloud session: Stop / SessionEnd ──▶ /opt/amem/hook.sh
+   │ amem_digest.py missing or older than 24 h: GET /rest/v1/amem_assets?name=eq.amem_digest.py
+   │   ──▶ compiles? ──▶ /opt/amem/amem_digest.py (atomic replace; else the old copy stays)
+   │ python3 /opt/amem/amem_digest.py --hook
    │ POST /rest/v1/cloud_digests?on_conflict=source_key   (merge-duplicates, kind chat, ingested_at null)
    ▼
 Mac: amem sessions ingest ──▶ sessions (tool claude, kind chat, meta.cloud) ──▶ deviations scan, tokens
 ```
+
+### Why v2 (what real cloud sessions showed)
+
+v1 fetched the script in the setup script and wrote the hooks to `~/.claude/settings.json`.
+Neither works in a claude.ai/code VM:
+
+- The setup script runs before the agent proxy exists. Claude Code connects to the proxy
+  when it launches, after the setup script. So at setup time there is no network secret and
+  the Supabase fetch fails. The fetch now happens in the hook, when the proxy is up.
+- Claude Code rebuilds `/root/.claude` at launch (launcher settings, policy limits, skills,
+  projects). Anything written there before is gone, and there is no `settings.json`. So v2
+  registers the hook in the Linux managed settings (`/etc/claude-code/managed-settings.json`)
+  and in a `managed-settings.d/` drop-in (the installed Claude Code knows both). It also
+  writes `~/.claude/settings.json`, for platforms that keep it. Identical hook commands
+  from several settings files run once.
+- Whether a cloud VM reads the managed settings is not documented. Check it with `/hooks`
+  (see "Verify").
 
 ### What to paste where
 
@@ -236,21 +257,48 @@ Mac: amem sessions ingest ──▶ sessions (tool claude, kind chat, meta.cloud
    into `amem_assets`; prints `(new)`, `(updated)` or `(unchanged)`).
 2. Vilmer pastes `deploy/cloud/setup.sh` into the setup script field of the claude.ai/code
    environment that has `AMEM_SUPABASE_URL` and the Supabase network secret. It runs as root
-   before Claude Code starts, only when a new session starts.
+   before Claude Code starts, only when a new session starts (later sessions may reuse the
+   cached VM).
 
-`setup.sh` never fails a session: `set +e`, every path ends with `exit 0` and one status line:
+`setup.sh` never fails a session: `set +e`, every path ends with `exit 0` and one status line.
+Each step also goes to `/var/log/amem-setup.log`.
 
 | Line | Meaning |
 |---|---|
-| `amem: cloud digests on (Stop + SessionEnd hooks)` | script fetched (or an earlier copy kept), hooks merged |
-| `amem: AMEM_SUPABASE_URL not set, cloud digests off` | nothing done |
-| `amem: could not fetch amem_digest.py, cloud digests off` | no answer, not JSON, or the body does not compile (`python3 -m py_compile`) and no earlier copy exists |
-| `amem: settings.json not changed (...)` | settings.json is not a JSON object: left alone |
+| `amem: cloud chat hook on (N/3 settings files; amem_digest.py is fetched at hook time)` | hook written, registered in N files |
+| `amem: no settings file changed, cloud chat hook off` | none of the 3 files is usable (not a JSON object, not writable) |
+| `amem: cannot write /opt/amem/hook.sh, cloud chat hook off` | nothing registered |
+| `amem: no python3, cloud chat hook off` | nothing done |
 
-The merge keeps every other key and hook in `~/.claude/settings.json`. A second run adds
-nothing (the hook command is matched exactly). The hook entries:
-`{"type": "command", "command": "python3 \"$HOME/.claude/amem/amem_digest.py\" --hook", "timeout": 10}`
-under `Stop` and `SessionEnd`.
+It installs the hook even when `AMEM_SUPABASE_URL` is unset at setup time (the log says
+`set` or `not set`, never the value); the hook checks it again when it runs.
+
+The merge keeps every other key and hook in each file and leaves a file that is not a JSON
+object alone. A second run changes nothing (the command is matched exactly). It removes v1
+entries (`.../.claude/amem/amem_digest.py --hook`). The entry, under `Stop` and `SessionEnd`:
+`{"type": "command", "command": "/opt/amem/hook.sh", "timeout": 10}`.
+
+### `/opt/amem/hook.sh`
+
+Written by `setup.sh` (root-owned, mode 0755). On every Stop and SessionEnd:
+
+1. Copies the hook JSON from stdin to a temp file (removed on exit).
+2. No `AMEM_SUPABASE_URL`: logs it and stops.
+3. `/opt/amem/amem_digest.py` missing or older than 24 h: GETs
+   `$AMEM_SUPABASE_URL/rest/v1/amem_assets?name=eq.amem_digest.py&select=body`
+   (`curl -s --max-time 3`, no redirects; without curl, Python `urllib`, which honours
+   `HTTPS_PROXY`). It uses the body only on HTTP 200 when it compiles, then replaces the file
+   atomically. A failed fetch keeps the old copy and waits 5 min before the next try
+   (`/opt/amem/fetch-failed`).
+4. Runs `python3 -I /opt/amem/amem_digest.py --hook` on the saved stdin (under `timeout`,
+   when present, so fetch + digest stay under 9 s; the hook timeout is 10 s).
+
+It never fails and never prints. One short line per step goes to `/tmp/amem-hook.log`
+(`<time> <event> fetch ok`, `fetch failed http 401`, `no amem_digest.py`,
+`digest rc=0 2s`, ...): labels only, never a URL or a value.
+
+`AMEM_SETUP_ROOT` (tests only, default `/`) puts `/etc`, `/opt`, `/var/log` and `/tmp`
+under a temp root; `hook.sh` then holds those paths.
 
 ### Hook mode: `amem_digest.py --hook` (script version 3)
 
@@ -301,19 +349,30 @@ texts (never the Mac's files).
 
 ### Verify
 
-1. Start a new cloud session in the environment. The setup log shows the status line.
-2. In the session, run `/hooks`: Stop and SessionEnd list the `amem_digest.py --hook` command.
-3. Send a prompt, wait for the reply, then on the Mac: `uv run amem sessions ingest` and
-   `uv run amem sessions tokens --tool claude` lists the session under `chat` with project
-   = the repo (or `uv run amem sessions tokens --by category`).
-4. In the cloud session, `tail ~/.claude/amem/hook.log` shows `posted 201`.
+1. Start a new cloud session in the environment. The setup output shows the status line.
+2. In the session, run `/hooks`: Stop and SessionEnd list `/opt/amem/hook.sh`. If they do
+   not, the VM reads none of the settings files: report it (and keep the old routine step).
+3. Send a prompt and wait for the reply. Then, in the session:
+
+   ```bash
+   cat /var/log/amem-setup.log /tmp/amem-hook.log; ls /opt/amem
+   tail ~/.claude/amem/hook.log
+   ```
+
+   Expect `hooks merged` lines and the `on` line in the setup log, `fetch ok` and
+   `digest rc=0` in the hook log, `amem_digest.py  hook.sh` in `/opt/amem`, and
+   `posted 201` in the digest's own log.
+4. On the Mac: `uv run amem sessions ingest`, then `uv run amem sessions tokens --tool claude`
+   lists the session under `chat` with project = the repo (or `--by category`).
 
 ### Disable
 
-- Remove the lines from the environment's setup script. New sessions then get no hooks.
-- In a running session: delete the two entries from `~/.claude/settings.json`, or
-  `unset AMEM_SUPABASE_URL` before Claude Code starts (the hook then logs
-  `no AMEM_SUPABASE_URL` and sends nothing).
+- Remove the lines from the environment's setup script. New VMs then get no hooks (a cached
+  VM keeps `/opt/amem` and the `/etc/claude-code` entries until the cache is rebuilt).
+- In a running session: delete the entries from `/etc/claude-code/managed-settings.json`,
+  `/etc/claude-code/managed-settings.d/50-amem.json` and `~/.claude/settings.json` (settings
+  files reload live), or `unset AMEM_SUPABASE_URL` before Claude Code starts (the hook then
+  logs `no AMEM_SUPABASE_URL` and sends nothing).
 - Stored rows stay in `cloud_digests` and `sessions`.
 
 ### Privacy

@@ -1,6 +1,7 @@
 """Cloud chats (docs/cloud.md, "Cloud chats"): `amem_digest.py --hook` against a local fake
 PostgREST, the cloud_digests chat/routine triggers, `sessions ingest` refreshes, the
-amem_assets table + `amem cloud publish-script`, and deploy/cloud/setup.sh in a temp HOME.
+amem_assets table + `amem cloud publish-script`, and deploy/cloud/setup.sh (v2) plus the hook.sh
+it writes, under a temp AMEM_SETUP_ROOT and a temp HOME.
 Synthetic transcripts only; no request ever leaves 127.0.0.1."""
 
 from __future__ import annotations
@@ -8,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -41,10 +43,13 @@ PROXY_NAMES = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_pr
 
 
 class FakeServer:
-    """A local HTTP server that records every request and answers with `status` / `body`."""
+    """A local HTTP server that records every request and answers with `status` / `body`, or with
+    the `routes` entry (path prefix -> (status, body, delay)) the request path starts with."""
 
-    def __init__(self, status: int = 201, body: bytes = b"", delay: float = 0.0) -> None:
+    def __init__(self, status: int = 201, body: bytes = b"", delay: float = 0.0,
+                 routes: dict[str, tuple[int, bytes, float]] | None = None) -> None:
         self.status, self.body, self.delay = status, body, delay
+        self.routes = routes or {}
         self.requests: list[dict[str, Any]] = []
         outer = self
 
@@ -54,12 +59,19 @@ class FakeServer:
                 data = self.rfile.read(n) if n else b""
                 outer.requests.append({"method": self.command, "path": self.path,
                                        "headers": {k.lower(): v for k, v in self.headers.items()}, "body": data})
-                if outer.delay:
-                    time.sleep(outer.delay)
-                self.send_response(outer.status)
-                self.send_header("Content-Length", str(len(outer.body)))
+                status, body, delay = next((r for p, r in outer.routes.items() if self.path.startswith(p)),
+                                           (outer.status, outer.body, outer.delay))
+                if delay:
+                    time.sleep(delay)
+                self.send_response(status)
+                if status in (301, 302):
+                    self.send_header("Location", "http://127.0.0.1:9/elsewhere")
+                self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
-                self.wfile.write(outer.body)
+                try:
+                    self.wfile.write(body)
+                except OSError:  # the client gave up (timeout tests)
+                    pass
 
             do_GET = do_POST = do_CONNECT = _handle  # noqa: N815
 
@@ -443,107 +455,272 @@ def test_publish_script(db: str, tmp_path: Path) -> None:
 
 # --------------------------------------------------------------------------- setup.sh
 
+ASSET_PATH = "/rest/v1/amem_assets?name=eq.amem_digest.py&select=body"
+POST_PATH = "/rest/v1/cloud_digests?on_conflict=source_key"
+ON_LINE = "amem: cloud chat hook on (3/3 settings files; amem_digest.py is fetched at hook time)\n"
+HOOK_TOOLS = ("mktemp", "cat", "sed", "head", "find", "date", "rm", "touch", "chmod", "mv")
 
-def run_setup(home: Path, url: str | None) -> subprocess.CompletedProcess[str]:
-    extra = {} if url is None else {"AMEM_SUPABASE_URL": url}
-    return subprocess.run(["bash", str(SETUP)], env=clean_env(home, **extra), capture_output=True, text=True,
+
+def layout(root: Path, home: Path) -> dict[str, Path]:
+    etc, opt = root / "etc" / "claude-code", root / "opt" / "amem"
+    return {"hook": opt / "hook.sh", "script": opt / "amem_digest.py", "marker": opt / "fetch-failed",
+            "managed": etc / "managed-settings.json", "dropin": etc / "managed-settings.d" / "50-amem.json",
+            "user": home / ".claude" / "settings.json", "setup_log": root / "var" / "log" / "amem-setup.log",
+            "hook_log": root / "tmp" / "amem-hook.log"}
+
+
+def bin_dir(where: Path, tools: tuple[str, ...], python: bool = True) -> Path:
+    """A PATH dir holding only `tools` (+ python3 = this interpreter, Python 3.10+)."""
+    where.mkdir(parents=True, exist_ok=True)
+    for name in tools:
+        found = shutil.which(name)
+        assert found, name
+        (where / name).symlink_to(found)
+    if python:
+        (where / "python3").symlink_to(os.path.realpath(sys.executable))
+    return where
+
+
+@pytest.fixture
+def py_path(tmp_path: Path) -> str:
+    return f"{bin_dir(tmp_path / 'pybin', ())}{os.pathsep}{os.environ.get('PATH', '')}"
+
+
+def run_setup(root: Path, home: Path, url: str | None = None, **env: str) -> subprocess.CompletedProcess[str]:
+    extra = {"AMEM_SETUP_ROOT": str(root), **env}
+    if url is not None:
+        extra["AMEM_SUPABASE_URL"] = url
+    return subprocess.run(["/bin/bash", str(SETUP)], env=clean_env(home, **extra), capture_output=True, text=True,
                           timeout=60)
 
 
-def asset_server(body: str) -> FakeServer:
-    return FakeServer(status=200, body=json.dumps([{"body": body}]).encode())
+def setup_vm(vm: dict[str, Path], tmp_path: Path) -> dict[str, Path]:
+    p = layout(tmp_path / "sysroot", vm["home"])
+    res = run_setup(tmp_path / "sysroot", vm["home"])
+    assert res.returncode == 0 and res.stdout == ON_LINE and res.stderr == "", res
+    return p
 
 
-def test_setup_fetches_compiles_and_merges_hooks(vm: dict[str, Path]) -> None:
-    home = vm["home"]
-    settings = home / ".claude" / "settings.json"
+def run_installed_hook(p: dict[str, Path], vm: dict[str, Path], url: str | None, event: str = "Stop",
+                       path: str | None = None) -> subprocess.CompletedProcess[str]:
+    extra = {"PATH": path} if path else {}
+    if url is not None:
+        extra["AMEM_SUPABASE_URL"] = url
+    res = subprocess.run([str(p["hook"])], input=hook_payload(vm, event), env=clean_env(vm["home"], **extra),
+                         capture_output=True, text=True, timeout=30)
+    assert_silent(res)
+    return res
+
+
+def digest_server(asset: tuple[int, bytes, float] | None = None, body: str | None = None) -> FakeServer:
+    if asset is None:
+        asset = (200, json.dumps([{"body": body if body is not None else TOOL.read_text()}]).encode(), 0.0)
+    return FakeServer(routes={"/rest/v1/amem_assets": asset, "/rest/v1/cloud_digests": (201, b"", 0.0)})
+
+
+def calls(srv: FakeServer) -> list[tuple[str, str]]:
+    return [(r["method"], r["path"]) for r in srv.requests]
+
+
+def hook_log(p: dict[str, Path]) -> str:
+    return p["hook_log"].read_text() if p["hook_log"].exists() else ""
+
+
+def age(path: Path, hours: float) -> None:
+    t = time.time() - hours * 3600
+    os.utime(path, (t, t))
+
+
+def test_setup_writes_the_hook_and_registers_it(vm: dict[str, Path], tmp_path: Path) -> None:
+    root, home = tmp_path / "sysroot", vm["home"]
+    p = layout(root, home)
     mine = {"type": "command", "command": "echo mine", "timeout": 5}
-    settings.write_text(json.dumps({"model": "opus", "permissions": {"allow": ["Bash(ls)"]},
-                                    "hooks": {"Stop": [{"hooks": [mine]}]}}))
-    assets = asset_server(TOOL.read_text())
+    v1 = {"type": "command", "command": 'python3 "/root/.claude/amem/amem_digest.py" --hook', "timeout": 10}
+    p["managed"].parent.mkdir(parents=True)
+    p["managed"].write_text(json.dumps({"env": {"X": "1"}, "hooks": {"Stop": [{"hooks": [mine]}]}}))
+    p["user"].write_text(json.dumps({"model": "opus", "hooks": {"Stop": [{"hooks": [v1]}, {"hooks": [mine]}],
+                                                                "SessionEnd": [{"hooks": [mine, v1]}]}}))
+    srv = FakeServer(status=200)
     try:
-        res = run_setup(home, assets.url + "/")
-        assert res.returncode == 0 and res.stdout == "amem: cloud digests on (Stop + SessionEnd hooks)\n", res
-        (req,) = assets.requests
-        assert req["method"] == "GET" and req["path"] == "/rest/v1/amem_assets?name=eq.amem_digest.py&select=body"
-        script = home / ".claude" / "amem" / "amem_digest.py"
-        assert script.read_text() == TOOL.read_text()
-        data = json.loads(settings.read_text())
-        assert data["model"] == "opus" and data["permissions"] == {"allow": ["Bash(ls)"]}
-        command = f'python3 "{script}" --hook'
-        assert data["hooks"]["Stop"][0]["hooks"] == [mine]
-        assert data["hooks"]["Stop"][1]["hooks"] == [{"type": "command", "command": command, "timeout": 10}]
-        assert data["hooks"]["SessionEnd"] == [{"hooks": [{"type": "command", "command": command, "timeout": 10}]}]
-        before = settings.read_text()
-        again = run_setup(home, assets.url)
-        assert again.returncode == 0 and settings.read_text() == before  # idempotent
+        res = run_setup(root, home, srv.url)
+        assert res.returncode == 0 and res.stdout == ON_LINE and res.stderr == "", res
+        assert srv.requests == []  # v2 never touches the network at setup time
     finally:
-        assets.close()
-    # The installed hook works end to end: the command from settings.json posts to the fake server.
-    sink = FakeServer()
-    try:
-        res = subprocess.run(["bash", "-c", command], input=hook_payload(vm, "SessionEnd"),
-                             env=clean_env(home, AMEM_SUPABASE_URL=sink.url), capture_output=True, text=True,
-                             timeout=30)
-        assert_silent(res)
-        assert len(sink.requests) == 1 and json.loads(sink.requests[0]["body"])["kind"] == "chat"
-    finally:
-        sink.close()
+        srv.close()
+    hook = p["hook"]
+    assert hook.stat().st_mode & 0o777 == 0o755
+    assert hook.read_text().startswith("#!/bin/bash\n") and f"AMEM_DIR={root}/opt/amem\n" in hook.read_text()
+    entry = {"type": "command", "command": str(hook), "timeout": 10}
+    managed = json.loads(p["managed"].read_text())
+    assert managed["env"] == {"X": "1"} and p["managed"].stat().st_mode & 0o777 == 0o644
+    assert managed["hooks"] == {"Stop": [{"hooks": [mine]}, {"hooks": [entry]}], "SessionEnd": [{"hooks": [entry]}]}
+    assert json.loads(p["dropin"].read_text()) == {"hooks": {"Stop": [{"hooks": [entry]}],
+                                                             "SessionEnd": [{"hooks": [entry]}]}}
+    user = json.loads(p["user"].read_text())  # the v1 entries are gone, mine stays
+    assert user["model"] == "opus"
+    assert user["hooks"] == {"Stop": [{"hooks": [mine]}, {"hooks": [entry]}],
+                             "SessionEnd": [{"hooks": [mine]}, {"hooks": [entry]}]}
+    log = p["setup_log"].read_text()
+    assert "setup v2 start (AMEM_SUPABASE_URL set)" in log and "hooks merged" in log and ON_LINE.strip() in log
+    assert "127.0.0.1" not in log
+    files = [hook, p["managed"], p["dropin"], p["user"]]
+    before = [f.read_bytes() for f in files]
+    again = run_setup(root, home)
+    assert again.returncode == 0 and again.stdout == ON_LINE
+    assert [f.read_bytes() for f in files] == before  # idempotent
+    assert "AMEM_SUPABASE_URL not set" in p["setup_log"].read_text() and "unchanged" in p["setup_log"].read_text()
 
 
-def test_setup_creates_settings_when_missing(tmp_path: Path) -> None:
-    assets = asset_server(TOOL.read_text())
-    try:
-        res = run_setup(tmp_path, assets.url)
-    finally:
-        assets.close()
-    assert res.returncode == 0 and "cloud digests on" in res.stdout
-    data = json.loads((tmp_path / ".claude" / "settings.json").read_text())
-    assert set(data["hooks"]) == {"Stop", "SessionEnd"}
-
-
-@pytest.mark.parametrize("case", ["empty-url", "down", "invalid-script", "not-json", "settings-broken"])
+@pytest.mark.parametrize("case", ["managed-broken", "all-broken", "opt-is-a-file", "log-unwritable", "no-python3"])
 def test_setup_always_exits_0(tmp_path: Path, case: str) -> None:
-    settings = tmp_path / ".claude" / "settings.json"
-    srv: FakeServer | None = None
-    url: str | None = None
-    if case == "down":
-        url = dead_url()
-    elif case == "invalid-script":
-        srv = asset_server("def (:\n")
-    elif case == "not-json":
-        srv = FakeServer(status=401, body=b'{"message": "no"}')
-    elif case == "settings-broken":
-        srv = asset_server(TOOL.read_text())
-        settings.parent.mkdir(parents=True)
-        settings.write_text("{not json")
-    if srv is not None:
-        url = srv.url
+    root, home = tmp_path / "sysroot", tmp_path / "home"
+    p = layout(root, home)
+    env: dict[str, str] = {}
+    broken = {"managed": "{not json", "dropin": "[]", "user": '{"hooks": []}'}
+    if case in ("managed-broken", "all-broken"):
+        for key, text in broken.items():
+            if key == "managed" or case == "all-broken":
+                p[key].parent.mkdir(parents=True, exist_ok=True)
+                p[key].write_text(text)
+    elif case == "opt-is-a-file":
+        root.mkdir()
+        (root / "opt").write_text("x")
+    elif case == "log-unwritable":
+        root.mkdir()
+        (root / "var").write_text("x")
+    else:
+        env["PATH"] = str(bin_dir(tmp_path / "bin", ("date", "mkdir", "dirname"), python=False))
+    res = run_setup(root, home, **env)
+    assert res.returncode == 0 and res.stdout.count("\n") == 1 and res.stderr == "", res
+    expected = {"managed-broken": "amem: cloud chat hook on (2/3 settings files;",
+                "all-broken": "amem: no settings file changed, cloud chat hook off",
+                "opt-is-a-file": f"amem: cannot write {p['hook']}, cloud chat hook off",
+                "log-unwritable": ON_LINE.strip(),
+                "no-python3": "amem: no python3, cloud chat hook off"}[case]
+    assert res.stdout.startswith(expected)
+    if case in ("managed-broken", "all-broken"):
+        assert p["managed"].read_text() == "{not json"
+    if case == "all-broken":
+        assert p["dropin"].read_text() == "[]" and p["user"].read_text() == '{"hooks": []}'
+    if case in ("opt-is-a-file", "no-python3"):
+        assert not p["managed"].exists() and not p["user"].exists()
+
+
+def test_hook_fetches_compiles_and_posts(vm: dict[str, Path], tmp_path: Path, py_path: str) -> None:
+    p = setup_vm(vm, tmp_path)
+    assert "AMEM_SUPABASE_URL not set" in p["setup_log"].read_text()  # installed anyway; checked at hook time
+    command = json.loads(p["managed"].read_text())["hooks"]["SessionEnd"][0]["hooks"][0]["command"]
+    srv = digest_server()
     try:
-        res = run_setup(tmp_path, url)
+        # The registered command, as Claude Code runs it.
+        res = subprocess.run(["/bin/bash", "-c", command], input=hook_payload(vm, "SessionEnd"),
+                             env=clean_env(vm["home"], AMEM_SUPABASE_URL=srv.url + "/", PATH=py_path),
+                             capture_output=True, text=True, timeout=30)
+        assert_silent(res)
+        assert calls(srv) == [("GET", ASSET_PATH), ("POST", POST_PATH)]
+        assert p["script"].read_text() == TOOL.read_text() and p["script"].stat().st_mode & 0o777 == 0o644
+        row = json.loads(srv.requests[1]["body"])
+        assert row["kind"] == "chat" and row["meta"]["hook"] == "SessionEnd"
+        run_installed_hook(p, vm, srv.url, "SessionEnd", py_path)  # fresh copy: no second GET
+        assert calls(srv) == [("GET", ASSET_PATH), ("POST", POST_PATH), ("POST", POST_PATH)]
     finally:
-        if srv is not None:
-            srv.close()
-    assert res.returncode == 0 and res.stdout.count("\n") == 1, res
-    if case == "settings-broken":
-        assert settings.read_text() == "{not json" and "not changed" in res.stdout
-        return
-    assert not settings.exists()
-    assert not (tmp_path / ".claude" / "amem" / "amem_digest.py").exists()
-    assert ("not set" if case == "empty-url" else "could not fetch") in res.stdout
+        srv.close()
+    log = hook_log(p).splitlines()
+    assert len(log) == 3 and log[0].endswith(" SessionEnd fetch ok") and " SessionEnd digest rc=0 " in log[1]
+    assert "127.0.0.1" not in hook_log(p) and "http://" not in hook_log(p)
+    assert sorted(f.name for f in p["script"].parent.iterdir()) == ["amem_digest.py", "hook.sh"]
+    assert [f.name for f in p["hook_log"].parent.iterdir()] == ["amem-hook.log"]  # temp input removed
 
 
-def test_setup_keeps_an_earlier_copy_when_the_fetch_fails(tmp_path: Path) -> None:
-    assets = asset_server(TOOL.read_text())
+@pytest.mark.parametrize("hours,fetched", [(23, False), (25, True)])
+def test_hook_refetches_a_stale_script(vm: dict[str, Path], tmp_path: Path, py_path: str, hours: float,
+                                       fetched: bool) -> None:
+    p = setup_vm(vm, tmp_path)
+    old = TOOL.read_text() + "\n# old copy\n"
+    p["script"].write_text(old)
+    age(p["script"], hours)
+    srv = digest_server()
     try:
-        assert "cloud digests on" in run_setup(tmp_path, assets.url).stdout
+        run_installed_hook(p, vm, srv.url, "SessionEnd", py_path)
+        assert (("GET", ASSET_PATH) in calls(srv)) is fetched and ("POST", POST_PATH) in calls(srv)
     finally:
-        assets.close()
-    res = run_setup(tmp_path, dead_url())
-    assert res.returncode == 0 and "cloud digests on" in res.stdout
-    assert (tmp_path / ".claude" / "amem" / "amem_digest.py").read_text() == TOOL.read_text()
+        srv.close()
+    assert p["script"].read_text() == (TOOL.read_text() if fetched else old)
 
 
-def test_setup_script_is_valid_bash() -> None:
-    assert subprocess.run(["bash", "-n", str(SETUP)], capture_output=True, timeout=30).returncode == 0
-    assert os.access(SETUP, os.X_OK)
+@pytest.mark.parametrize("case", ["500", "not-json", "no-rows", "invalid-script", "redirect"])
+def test_broken_fetch_keeps_the_old_script(vm: dict[str, Path], tmp_path: Path, py_path: str, case: str) -> None:
+    p = setup_vm(vm, tmp_path)
+    old = TOOL.read_text() + "\n# old copy\n"
+    p["script"].write_text(old)
+    age(p["script"], 25)
+    asset = {"500": (500, b'{"message": "no"}', 0.0), "not-json": (200, b"<html>", 0.0), "no-rows": (200, b"[]", 0.0),
+             "invalid-script": (200, json.dumps([{"body": "def (:\n"}]).encode(), 0.0),
+             "redirect": (302, b"", 0.0)}[case]
+    srv = digest_server(asset)
+    try:
+        run_installed_hook(p, vm, srv.url, "SessionEnd", py_path)
+        assert calls(srv) == [("GET", ASSET_PATH), ("POST", POST_PATH)]  # the old copy still posts
+        assert p["script"].read_text() == old and p["marker"].exists()
+        reason = {"500": "http 500", "redirect": "http 302"}.get(case, "no script or it does not compile")
+        assert f" SessionEnd fetch failed: {reason}" in hook_log(p) or f" SessionEnd fetch failed {reason}" in hook_log(p)
+        run_installed_hook(p, vm, srv.url, "SessionEnd", py_path)  # < 5 min after a failure: no retry
+        assert [m for m, _ in calls(srv)] == ["GET", "POST", "POST"]
+        age(p["marker"], 0.1)  # 6 min later it tries again
+        run_installed_hook(p, vm, srv.url, "SessionEnd", py_path)
+        assert [m for m, _ in calls(srv)] == ["GET", "POST", "POST", "GET", "POST"]
+    finally:
+        srv.close()
+    assert p["script"].read_text() == old and "127.0.0.1" not in hook_log(p)
+
+
+def test_hook_without_url_or_network(vm: dict[str, Path], tmp_path: Path, py_path: str) -> None:
+    p = setup_vm(vm, tmp_path)
+    run_installed_hook(p, vm, None, "Stop", py_path)
+    assert hook_log(p).rstrip().endswith(" Stop no AMEM_SUPABASE_URL")
+    run_installed_hook(p, vm, dead_url(), "SessionEnd", py_path)
+    lines = hook_log(p).splitlines()
+    assert lines[-2].endswith(" SessionEnd fetch failed http 000") and lines[-1].endswith(" no amem_digest.py")
+    assert not p["script"].exists() and p["marker"].exists()
+
+
+def test_hook_fetch_is_bounded(vm: dict[str, Path], tmp_path: Path, py_path: str) -> None:
+    p = setup_vm(vm, tmp_path)
+    srv = digest_server((200, b"[]", 6.0))
+    try:
+        started = time.monotonic()
+        run_installed_hook(p, vm, srv.url, "Stop", py_path)
+        assert time.monotonic() - started < 5.5  # curl --max-time 3
+    finally:
+        srv.close()
+    assert "Stop fetch failed http 000" in hook_log(p) and not p["script"].exists()
+
+
+@pytest.mark.parametrize("case", ["ok", "redirect"])
+def test_hook_fetches_without_curl(vm: dict[str, Path], tmp_path: Path, case: str) -> None:
+    p = setup_vm(vm, tmp_path)
+    path = str(bin_dir(tmp_path / "nocurl", HOOK_TOOLS))
+    srv = digest_server((302, b"", 0.0) if case == "redirect" else None)
+    try:
+        run_installed_hook(p, vm, srv.url, "SessionEnd", path)
+        assert calls(srv)[0] == ("GET", ASSET_PATH)
+    finally:
+        srv.close()
+    if case == "ok":
+        assert p["script"].read_text() == TOOL.read_text() and calls(srv)[1:] == [("POST", POST_PATH)]
+    else:
+        assert not p["script"].exists() and "fetch failed http 302" in hook_log(p) and len(srv.requests) == 1
+
+
+def test_setup_and_hook_are_valid_bash(tmp_path: Path) -> None:
+    root = tmp_path / "sysroot"
+    assert run_setup(root, tmp_path / "home").stdout == ON_LINE
+    hook = layout(root, tmp_path)["hook"]
+    for script in (SETUP, hook):
+        assert subprocess.run(["bash", "-n", str(script)], capture_output=True, timeout=30).returncode == 0
+        assert os.access(script, os.X_OK)
+    shellcheck = shutil.which("shellcheck")
+    if shellcheck is None:
+        pytest.skip("shellcheck not installed")
+    res = subprocess.run([shellcheck, str(SETUP), str(hook)], capture_output=True, text=True, timeout=60)
+    assert res.returncode == 0, res.stdout
