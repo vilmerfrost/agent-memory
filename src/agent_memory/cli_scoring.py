@@ -109,7 +109,16 @@ def _rescore(args: argparse.Namespace) -> int:
     if cache.get(args.routine) is None:
         print(f"amem: score --rescore: no question file for routine {args.routine!r}", file=sys.stderr)
         return 1
-    report = scoring.rescore_runs(routine=args.routine, since=args.since, limit=args.limit, cache=cache)
+    mode = jev.mode()
+    hint = f" ({scoring.GO_LIVE_HINT})" if mode == "fixture" else ""
+    print(f"amem: score --rescore: jev mode {mode}{hint}"
+          + (", --allow-fixture set" if args.allow_fixture else ""), file=sys.stderr)
+    try:
+        report = scoring.rescore_runs(routine=args.routine, since=args.since, limit=args.limit,
+                                      cache=cache, allow_fixture=args.allow_fixture)
+    except scoring.RescoreRefused as exc:
+        print(f"amem: score --rescore: {exc}", file=sys.stderr)
+        return 1
     _emit(report.comparisons)
     for run_id, routine, msg in report.missing:
         print(f"amem: missing fixture: run {run_id} ({routine}): {msg}", file=sys.stderr)
@@ -213,6 +222,9 @@ def register(sub: argparse._SubParsersAction) -> None:
     p.add_argument("--rescore", action="store_true",
                    help="ask Jev again about already scored runs of --routine (newest first) and replace "
                         "their scores; prints a before/after JSON line per run")
+    p.add_argument("--allow-fixture", action="store_true",
+                   help="with --rescore in fixture mode: replace live Jev scores with fixture answers "
+                        "anyway (refused by default)")
     p.set_defaults(func=cmd_score)
 
     p = sub.add_parser("label", help="set the human label of a run (relabel overwrites)")

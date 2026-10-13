@@ -259,8 +259,9 @@ def step_ingest(result: DailyResult) -> None:
     repo, ref, path = cli_cloud.GIT_REF_REPO, cli_cloud.GIT_REF_BRANCH, cli_cloud.GIT_REF_PATH
     try:
         text = cli_cloud.fetch_gh(repo, ref, path)
-        if text is None:
-            _err(f"ingest: no routines.log published at {repo}@{ref}:{path} yet")
+        if text is None:  # 404: lost repo access or a deleted/renamed branch must not go silent
+            result.fail(f"ingest: routines.log not found at {repo}@{ref}:{path} "
+                        "(404: branch/file missing or no access)")
             return
         parsed = cli_cloud.parse_published(text)
         new, present = store.ingest_runs(parsed.runs)

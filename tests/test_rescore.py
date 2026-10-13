@@ -20,6 +20,7 @@ from test_scoring_support import (  # noqa: F401
     ScoringDb,
     add_label,
     add_run,
+    live_jev,
     sdb,
     t_routine_fixture_path,
 )
@@ -122,6 +123,68 @@ def test_rescore_needs_a_routine_with_a_question_file(sdb: ScoringDb) -> None:
     unknown = run_amem("score", "--rescore", "--routine", "t-noq", env=sdb.env)
     assert unknown.returncode == 1
     assert "no question file for routine 't-noq'" in unknown.stderr
+
+
+def _mark_live(url: str, run_id: uuid.UUID) -> None:
+    with psycopg.connect(url) as conn:
+        conn.execute("update scores set jev_mode = 'live' where run_id = %s", (run_id,))
+
+
+def _modes(url: str) -> list[tuple]:
+    with psycopg.connect(url) as conn:
+        return conn.execute("select run_id, question, jev_mode, confidence from scores "
+                            "order by run_id, question").fetchall()
+
+
+def test_rescore_in_fixture_mode_refuses_to_replace_live_scores(sdb: ScoringDb, tmp_path: Path) -> None:
+    """swarm #16: a plain-shell rescore (fixture mode) must not overwrite live Jev rows."""
+    runs = _runs(sdb.url)
+    assert run_amem("score", env=sdb.env).returncode == 0
+    _mark_live(sdb.url, runs["edge below"])
+    before = _modes(sdb.url)
+
+    env = dict(sdb.env, AMEM_JEV_FIXTURES_DIR=str(_confident_edge_below(tmp_path)))
+    result = run_amem("score", "--rescore", "--routine", "t-routine", env=env)
+    assert result.returncode == 1
+    assert result.stdout == ""
+    assert "amem: score --rescore: jev mode fixture (set TYPESAFE_API_KEY and AMEM_JEV_LIVE=1" in result.stderr
+    assert "refusing to rescore 't-routine' in jev mode fixture: 1 run(s) hold live Jev scores" in result.stderr
+    assert str(runs["edge below"]) in result.stderr and "--allow-fixture" in result.stderr
+    assert _modes(sdb.url) == before  # nothing touched, not even the fixture-only runs
+
+    # Runs outside the selection do not block: --since past the live run rescoring the newer ones.
+    newer = run_amem("score", "--rescore", "--routine", "t-routine", "--since",
+                     (T0 + timedelta(minutes=90)).isoformat(), env=env)
+    assert newer.returncode == 0, newer.stderr
+    assert len(_lines(newer.stdout)) == 2
+    live_rows = [r for r in _modes(sdb.url) if r[0] == runs["edge below"]]
+    assert live_rows == [r for r in before if r[0] == runs["edge below"]]
+
+    # --allow-fixture: proceeds and replaces the live rows with fixture answers.
+    forced = run_amem("score", "--rescore", "--routine", "t-routine", "--allow-fixture", env=env)
+    assert forced.returncode == 0, forced.stderr
+    assert "jev mode fixture" in forced.stderr and "--allow-fixture set" in forced.stderr
+    assert len(_lines(forced.stdout)) == 4
+    after = _modes(sdb.url)
+    assert {r[2] for r in after} == {"fixture"}
+    assert (runs["edge below"], "verdict", "fixture", 0.96) in after
+
+
+def test_rescore_in_live_mode_replaces_live_scores(sdb: ScoringDb, live_jev) -> None:  # noqa: F811
+    """Live mode is not guarded: live answers replace live rows as before."""
+    from agent_memory import scoring
+
+    runs = _runs(sdb.url)
+    report = scoring.score_runs(db_url=sdb.url)
+    assert report.scored == 4
+    with psycopg.connect(sdb.url) as conn:
+        conn.execute("update scores set confidence = 0.01 where run_id = %s and question = 'verdict'",
+                     (runs["edge below"],))
+    rescored = scoring.rescore_runs(routine="t-routine", db_url=sdb.url)
+    assert rescored.scored == 4 and not rescored.failed
+    rows = _modes(sdb.url)
+    assert {r[2] for r in rows} == {"live"} and len(rows) == 12
+    assert (runs["edge below"], "verdict", "live", 0.69) in rows  # replaced by the live answer
 
 
 def test_rescore_honors_require_remote(sdb: ScoringDb) -> None:
