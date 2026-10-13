@@ -1,43 +1,45 @@
 # Jev questions for dispatch tasks: one finished parent dispatch (`amem ingest tasks`).
-# State: repo, status (pass/fail/error), the raw final status (DONE/PARTIAL/BLOCKED),
-# the summary line, the task signals (dod_first_pass, denials, nudges, ...) and one
-# entry per worker with its reasons, denied command shapes, brief gaps and a
-# checkpoint excerpt. Format: docs/scoring.md; state shape: docs/tasks.md.
+# State (agent_memory/states.py, format_dispatch_state): repo, status (pass/fail/error),
+# the raw final status (DONE/PARTIAL/BLOCKED), the summary line, the task signals, a
+# derived `friction` line (the signals that cost extra rounds), one entry per worker with
+# its checkpoint excerpt, and a fixed legend that explains every signal name.
+# Format: docs/scoring.md; state shape: docs/tasks.md.
+#
+# Only the verdict escalates. main_cause is a secondary label for lessons and stats:
+# a thumbs up/down on the run cannot settle it, so it never pushes.
 
 threshold = 0.7
 pass_question = "verdict"
 pass_options = ["clean"]
+escalate_on = ["verdict"]
 
 [[questions]]
 name = "verdict"
 kind = "choice"
-prompt = "How did this dispatch go overall?"
+prompt = "How did this dispatch go overall? Use final_status, the friction line and the checkpoints. Tool errors in a worker's normal edit-test loop are not friction."
 [questions.options]
-clean = "Done on the first pass: no denials that cost retries, no nudges or follow-ups, DoD met first time."
-struggled = "Done in the end, but with friction: denied commands, retries, nudges, follow-ups or a failed first DoD check."
-failed = "Not done: a worker or the task ended BLOCKED or PARTIAL, or the result was unusable."
-
-[[questions]]
-name = "brief_quality"
-kind = "score"
-prompt = "How good was the brief the workers got, judged by brief gaps, clarifying questions and what the checkpoints say?"
-levels = [
-    "Poor: key facts were missing, so a worker guessed wrong or got stuck.",
-    "Weak: gaps cost retries or questions.",
-    "Adequate: minor gaps with no real cost.",
-    "Complete: the workers had everything they needed.",
-]
+clean = "final_status is DONE and the friction line is (none): done on the first pass with no extra rounds."
+struggled = "final_status is DONE, but the friction line lists at least one signal (denials, nudges, follow-ups, a failed first DoD or integration check, escalations or merge conflicts)."
+failed = "final_status is BLOCKED, PARTIAL or not DONE, or a checkpoint says the result is unusable."
 
 [[questions]]
 name = "main_cause"
 kind = "choice"
-prompt = "What was the main cause of any friction or failure in this dispatch?"
+prompt = "What caused the friction or failure in this dispatch? If several apply, pick the one that cost the most rounds."
 [questions.options]
-brief_gap = "The brief lacked a fact, rule or DoD detail the worker needed."
-tool_denial = "Commands were denied (command shape, hook or permission) and cost retries."
-test_failure = "Tests or checks failed and needed fixing."
-scope = "The task was too big, unclear or changed scope mid-way."
-none = "There was no notable friction."
+brief_gap = "A worker lacked a fact, rule or DoD detail: a BLOCKED/PARTIAL reason, an escalation, a follow-up or a checkpoint says information was missing. Missing template sections (brief_gaps) alone are not enough."
+tool_denial = "Commands were denied (denials above 0) and had to be retried in another form."
+test_failure = "Tests or checks failed after a worker reported: dod_first_pass=false, integration_first_pass=false, or a follow-up about failing tests. Failing tests inside a worker's own edit-test loop do not count."
+scope = "The task was too big, unclear or changed mid-way: follow-ups or nudges that change the task, or a PARTIAL with a scope reason."
+none = "The friction line is (none), or the only friction has none of the causes above (for example one nudge to a slow worker)."
+
+[[questions]]
+name = "brief_missing_fact"
+kind = "noul"
+prompt = "Did a worker lack a fact the brief should have given?"
+[questions.criteria]
+true = "A checkpoint, BLOCKED/PARTIAL reason, escalation or follow-up shows a worker missed or guessed a fact, rule or DoD detail."
+false = "No such sign. Missing template sections (brief_gaps) alone do not count when the worker finished DONE."
 
 [[questions]]
 name = "lesson_worthy"

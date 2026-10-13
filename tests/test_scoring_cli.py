@@ -251,12 +251,14 @@ def test_escalations_threshold_edge_and_labels(sdb: ScoringDb) -> None:
     assert [r["run_id"] for r in rows] == [str(runs["edge score low"]), str(runs["edge below"])]
     by_id = {r["run_id"]: r for r in rows}
     low = by_id[str(runs["edge below"])]
-    assert low["low"] == [{"question": "verdict", "kind": "choice", "value": "needs_action", "confidence": 0.69}]
+    assert low["low"] == [{"question": "verdict", "kind": "choice", "value": "needs_action", "confidence": 0.69,
+                           "jev_confidence": 0.69}]
     assert low["threshold"] == 0.7
     assert low["jev_verdict"] == "down"
     assert low["routine"] == "t-routine" and low["summary"] == "edge below"
     score_low = by_id[str(runs["edge score low"])]
-    assert [x["question"] for x in score_low["low"]] == ["severity"]  # a score question escalates too
+    # A score question escalates too when the file lists it in escalate_on (t-routine does).
+    assert [x["question"] for x in score_low["low"]] == ["severity"]
     assert score_low["jev_verdict"] == "up"
 
     # A labeled run is no longer an escalation.
@@ -416,12 +418,12 @@ def test_demo_flow_on_sample_log(sdb: ScoringDb, monkeypatch: pytest.MonkeyPatch
     assert scored.stdout.strip() == "scored 5 runs, skipped 0 (no questions), 0 missing fixtures"
 
     esc = _lines(run_amem("escalations", env=env).stdout)
+    # config-check escalates on the verdict only: the 2026-10-12 run's low urgency (0.66) no longer pushes.
     assert [(r["started_at"], [x["question"] for x in r["low"]]) for r in esc] == [
-        ("2026-10-12T07:00:14+00:00", ["urgency"]),
         ("2026-10-11T13:48:26+00:00", ["verdict"]),
     ]
     assert run_amem("label", esc[0]["run_id"], "down", "--note", "LAN exposure is real", env=env).returncode == 0
-    assert len(_lines(run_amem("escalations", env=env).stdout)) == 1
+    assert len(_lines(run_amem("escalations", env=env).stdout)) == 0
 
     cal = {r["routine"]: r for r in _lines(run_amem("calibrate", env=env).stdout)}
     assert sorted(cal) == ["canary-simplitics-selftest", "config-check", "dispatch", "evals-parent", "routine-audit"]

@@ -2,10 +2,13 @@
 # Summary looks like `pass=36 fail=5 info=0 10s report=...`; each failure is one finding,
 # e.g. "Orca LAN reach: answers on 192.168.50.152:6768" or "repos in iCloud: 1: ~/...".
 # Format: docs/scoring.md.
+#
+# Only the verdict escalates. urgency is a secondary label for stats.
 
 threshold = 0.7
 pass_question = "verdict"
 pass_options = ["ok"]
+escalate_on = ["verdict"]
 
 [[questions]]
 name = "verdict"
@@ -29,10 +32,10 @@ prompt = "Could any finding lose work or data (unpushed commits, repos in iCloud
 [[questions]]
 name = "urgency"
 kind = "score"
-prompt = "How soon should the worst finding be fixed?"
+prompt = "How soon should the worst finding be fixed? Pick the level of the single worst finding."
 levels = [
-    "No action needed.",
-    "Can wait: tidy up some time.",
-    "Fix this week.",
-    "Fix today: exposure or data loss is possible now.",
+    "No action: no findings, or only informational ones.",
+    "Tidy-up: cosmetic drift, an orphaned worktree, stale files; nothing is exposed, at risk or broken.",
+    "This week: broken setup that can cause trouble later (a failing LaunchAgent, hook or settings drift, unpushed commits, tracked setup files).",
+    "Today: a service, port or secret is reachable beyond this machine (a LAN or wildcard listener, a secret in a tracked file), or work can be lost now (a repo in iCloud sync).",
 ]
