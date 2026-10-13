@@ -259,14 +259,32 @@ def _total(alias: str) -> str:
 # existing row stay (ingest is the full read); meta is merged.
 _NEWER = f"(excluded.tokens_input is not null and {_total('excluded')} >= coalesce({_total('sessions')}, -1))"
 
+# Title, profile and outcome follow the token rule (a newer ping wins, a late spooled one only
+# fills what is empty); category and project of an existing row stay (ingest knows the real kind).
+_PROFILE = ("title", *sessions_ingest.PROFILE_COLS, "outcome", "outcome_evidence")
+_PROFILE_SET = ",\n        ".join(
+    f"{c} = case when {_NEWER} then coalesce(excluded.{c}, sessions.{c}) else coalesce(sessions.{c}, excluded.{c}) end"
+    for c in _PROFILE)
+
 PING_SQL = f"""
 insert into sessions (session_id, tool, kind, repo, project_dir, started_at, ended_at, meta,
                       tokens_input, tokens_output, tokens_cache_read, tokens_cache_creation, models, turns,
-                      last_activity_at, tokens_updated_at)
+                      last_activity_at, tokens_updated_at, category, project, {', '.join(_PROFILE)},
+                      title_updated_at, outcome_at)
 values (%s, 'claude', %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-        case when %s::bigint is null then null else now() end)
+        case when %s::bigint is null then null else now() end, %s, %s, {', '.join(['%s'] * len(_PROFILE))},
+        case when %s::text is null then null else now() end, case when %s::text is null then null else now() end)
 on conflict (session_id) do update
-    set repo = coalesce(sessions.repo, excluded.repo),
+    set category = coalesce(sessions.category, excluded.category),
+        project = coalesce(sessions.project, excluded.project),
+        title_updated_at = case when {_NEWER} and excluded.title is not null
+                                     and excluded.title is distinct from sessions.title
+                                then now() else sessions.title_updated_at end,
+        outcome_at = case when {_NEWER} and excluded.outcome is not null
+                               and excluded.outcome is distinct from sessions.outcome
+                          then now() else sessions.outcome_at end,
+        {_PROFILE_SET},
+        repo = coalesce(sessions.repo, excluded.repo),
         started_at = least(sessions.started_at, excluded.started_at),
         ended_at = greatest(sessions.ended_at, excluded.ended_at),
         meta = sessions.meta || excluded.meta,
@@ -295,9 +313,18 @@ def record_params(r: dict[str, Any]) -> tuple[Any, ...]:
     turns = r.get("turns") if isinstance(r.get("turns"), int) and tokens is not None else None
     meta = r.get("meta") if isinstance(r.get("meta"), dict) else {}
     repo = r.get("repo") if isinstance(r.get("repo"), str) else None
+    category = r.get("category") if r.get("category") in sessions_ingest.CATEGORIES else None
+    project = r.get("project") if isinstance(r.get("project"), str) and r.get("project") else None
+    title = session_tokens.clean_title(r.get("title"))
+    prof = sessions_ingest.profile_values(sessions_ingest.cloud_profile(r["profile"])
+                                          if isinstance(r.get("profile"), dict) else None)
+    out = r.get("outcome") if isinstance(r.get("outcome"), dict) else {}
+    name = out.get("name") if out.get("name") in session_tokens.OUTCOMES else None
+    evidence = Jsonb(out["evidence"]) if name and isinstance(out.get("evidence"), dict) else None
     return (r["session_id"], r["kind"], repo, r["project_dir"], _ts(r.get("started_at")), _ts(r.get("ended_at")),
             Jsonb(meta), *t, Jsonb(models) if models is not None else None, turns,
-            _ts(r.get("last_activity_at")), t[0])
+            _ts(r.get("last_activity_at")), t[0], category, project, title,
+            *(prof[c] for c in sessions_ingest.PROFILE_COLS), name, evidence, title, name)
 
 
 def best_kind(project_dir: str, cwd: str) -> str:
@@ -343,15 +370,21 @@ def build_record(p: Ping, entry: dict[str, Any], now: datetime) -> dict[str, Any
     meta.update(sessions_ingest.team_info(cwd, repo))
     if p.agent_type:
         meta["agent_type"] = p.agent_type
+    kind = best_kind(project_dir, cwd)
     rec: dict[str, Any] = {"v": RECORD_VERSION, "event": p.event, "session_id": p.session_id,
-                           "kind": best_kind(project_dir, cwd), "repo": repo, "project_dir": project_dir,
+                           "kind": kind, "repo": repo, "project_dir": project_dir,
                            "started_at": _iso(now), "ended_at": None, "last_activity_at": _iso(now),
-                           "tokens": None, "models": None, "turns": None, "meta": meta}
+                           "tokens": None, "models": None, "turns": None, "meta": meta,
+                           "category": sessions_ingest.category_of(kind),
+                           "project": sessions_ingest.project_of(cwd, kind=kind, scratch_only=_scratch,
+                                                                 project_dir=project_dir, repo=repo)}
     if p.event == "SessionStart":
         if p.source:
             meta["start_source"] = p.source
         if p.model:
             meta["model"] = p.model
+        # A resumed session: the title the earlier scans saw (no transcript read here).
+        rec["title"] = session_tokens.ClaudeScanner(entry.get("scan")).summary.title
         return rec
     sc = session_tokens.ClaudeScanner(entry.get("scan"))
     if p.transcript is not None and p.transcript.is_file():
@@ -359,9 +392,11 @@ def build_record(p: Ping, entry: dict[str, Any], now: datetime) -> dict[str, Any
     entry["scan"] = sc.state()
     s = sc.summary
     last = max(s.last_at, now) if s.last_at else now
+    name, evidence = s.outcome(now)
     rec.update(started_at=_iso(s.first_at or now), ended_at=_iso(s.last_at), last_activity_at=_iso(last),
                tokens=s.tokens.as_list(), turns=s.turns,
-               models={k: dict(v) for k, v in sorted(s.models.items())})
+               models={k: dict(v) for k, v in sorted(s.models.items())},
+               title=s.title, profile=s.profile(), outcome={"name": name, "evidence": evidence})
     subs = _scan_subagents(p, entry)
     if subs is not None:
         meta["subagent_tokens"] = subs

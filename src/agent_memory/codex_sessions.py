@@ -192,6 +192,58 @@ def thread_id_of(meta: dict[str, Any], file_stem: str) -> str | None:
     return m.group(1) if m else None
 
 
+def outcome_signals(events: list[dict[str, Any]]) -> tuple[dict[str, int], str | None]:
+    """(signals, end) of a Codex rollout, the same names as amem_digest.SignalTracker: shell
+    commands (CommandExecution items, else shell function calls), file changes (FileChange
+    items, apply_patch), report lines in assistant messages. `end`: reply | user | tool |
+    result | error | interrupt. Names and counts only."""
+    from agent_memory.amem_digest import REPORT_RE, command_signals
+
+    signals: dict[str, int] = {}
+    end: str | None = None
+
+    def add(names: list[str]) -> None:
+        for n in names:
+            signals[n] = signals.get(n, 0) + 1
+
+    own = own_events(events)
+    has_items = any(e.get("type") == "event_msg" and payload(e).get("type") == "item_completed" for e in own)
+    for e in own:
+        t, p = e.get("type"), payload(e)
+        pt = p.get("type")
+        if t == "response_item" and pt == "message":
+            text = message_text(p.get("content"))
+            if p.get("role") == "assistant":
+                add([f"report_{m.lower()}" for m in REPORT_RE.findall(text)])
+                end = "reply"
+            elif p.get("role") == "user" and is_prompt(text):
+                end = "user"
+        elif t == "response_item" and pt in ("function_call", "custom_tool_call", "local_shell_call"):
+            end = "tool"
+            if has_items:
+                continue
+            name = str(p.get("name") or "")
+            if name == "apply_patch":
+                add(["edit"])
+            elif name in SHELL_TOOLS or pt == "local_shell_call":
+                args = args_of(p)
+                action = p.get("action") if isinstance(p.get("action"), dict) else {}
+                add(command_signals(command_text(args.get("command", args.get("cmd", action.get("command"))))))
+        elif t == "response_item" and pt in ("function_call_output", "custom_tool_call_output"):
+            end = "result"
+        elif t == "event_msg" and pt == "item_completed":
+            item = p.get("item") if isinstance(p.get("item"), dict) else {}
+            if item.get("type") == "CommandExecution":
+                add(command_signals(command_text(item.get("command"))))
+            elif item.get("type") == "FileChange":
+                add(["edit"])
+        elif t == "event_msg" and pt == "turn_aborted":
+            end = "interrupt"
+        elif t == "event_msg" and pt in ("error", "stream_error"):
+            end = "error"
+    return dict(sorted(signals.items())), end
+
+
 def scan_facts(events: list[dict[str, Any]], file_stem: str = "") -> CodexFacts:
     meta = meta_of(events)
     f = CodexFacts(thread_id=thread_id_of(meta, file_stem))

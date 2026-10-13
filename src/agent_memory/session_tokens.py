@@ -22,21 +22,55 @@ are kept. No transcript text.
 from __future__ import annotations
 
 import json
+import re
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-FIELDS = ("input", "output", "cache_read", "cache_creation")
+# The stdlib-only digest module holds the shared rules (one implementation for the Mac and the cloud):
+# title redaction + cap, the outcome signal tracker and the outcome rules.
+from agent_memory.amem_digest import OUTCOMES, SignalTracker, clean_title  # noqa: F401
+from agent_memory.amem_digest import outcome as outcome_of
+
+FIELDS =("input", "output", "cache_read", "cache_creation")
 SYNTHETIC_MODEL = "<synthetic>"
 UNKNOWN_MODEL = "unknown"
 RECENT_IDS = 64          # message ids remembered for the latest-line-wins rule (lines of one id are adjacent)
-STATE_VERSION = 1
+STATE_VERSION = 2       # 2: title, profile (model, effort, time), outcome signals
+
+
+IDLE_GAP_SECONDS = 600   # a gap between two events longer than this is idle time, not active time
+_EFFORT_RE = re.compile(r"[a-z][a-z0-9_-]{0,30}")
 
 
 def _int(value: Any) -> int:
     return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else 0
+
+
+def _count(value: Any) -> int | None:
+    """A non-negative number as an int, None when missing or not a number."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+        return None
+    return int(value)
+
+
+def is_model(name: Any) -> bool:
+    """A real model name: not `<synthetic>`, not the `unknown` placeholder."""
+    return isinstance(name, str) and bool(name) and name != UNKNOWN_MODEL and not name.startswith("<")
+
+
+def effort_of(value: Any) -> str | None:
+    """An effort level (`high`, `medium`, ...), else None. Never guessed."""
+    if isinstance(value, str) and _EFFORT_RE.fullmatch(value.strip().lower()):
+        return value.strip().lower()
+    return None
+
+
+def claude_effort(e: dict[str, Any]) -> str | None:
+    """The effort of one Claude Code assistant line: `perTurnEffort`, else `effort`."""
+    return effort_of(e.get("perTurnEffort")) or effort_of(e.get("effort"))
 
 
 def _model(value: Any) -> str:
@@ -109,10 +143,95 @@ class Summary:
     turns: int = 0
     first_at: datetime | None = None
     last_at: datetime | None = None
+    title: str | None = None   # the session's name (Claude Code `custom-title`, the last one wins)
+    # Model and effort per reply (docs/sessions-live.md, "Model, effort, duration").
+    model_last: str | None = None            # the model of the latest reply
+    model_seen: dict[str, int] = field(default_factory=dict)   # model -> sequence number of its latest reply
+    efforts: dict[str, int] = field(default_factory=dict)      # effort level -> replies
+    effort_last: str | None = None
+    effort_seen: dict[str, int] = field(default_factory=dict)
+    seq: int = 0
+    # Time. active: the sum of the gaps between consecutive events, gaps over IDLE_GAP left out.
+    prev_at: datetime | None = None
+    active_seconds: float = 0.0
+    # Claude Code `cost-state` lines (the last one wins); None: no such line.
+    api_ms: int | None = None
+    tool_ms: int | None = None
+    lines_added: int | None = None
+    lines_removed: int | None = None
+    # Outcome signals (amem_digest.SignalTracker): names and counts, and how the session stands.
+    signals: dict[str, int] = field(default_factory=dict)
+    end: str | None = None
+
+    def outcome(self, now: datetime | None = None) -> tuple[str, dict[str, Any]]:
+        """(outcome, evidence) as of `now` (docs/sessions-live.md, "Outcome")."""
+        return outcome_of(self.signals, self.end, self.last_at, now)
 
     @property
     def calls(self) -> int:
         return sum(m.get("calls", 0) for m in self.models.values())
+
+    @property
+    def model(self) -> str | None:
+        """The main model: the most output tokens; a tie goes to the most recent one."""
+        named = [m for m in self.models if is_model(m)]
+        if not named:
+            return None
+        return max(named, key=lambda m: (self.models[m].get("output", 0), self.model_seen.get(m, -1), m))
+
+    @property
+    def effort(self) -> str | None:
+        """The main effort: the level on the most replies; a tie goes to the most recent one."""
+        if not self.efforts:
+            return None
+        return max(self.efforts, key=lambda e: (self.efforts[e], self.effort_seen.get(e, -1), e))
+
+    @property
+    def duration_seconds(self) -> float | None:
+        if self.first_at is None or self.last_at is None:
+            return None
+        return round((self.last_at - self.first_at).total_seconds(), 3)
+
+    def reply(self, model: str | None, effort: str | None) -> None:
+        """One reply (an API response) with its model and effort level."""
+        self.seq += 1
+        if model is not None and is_model(model):
+            self.model_last = model
+            self.model_seen[model] = self.seq
+        if effort is not None:
+            self.efforts[effort] = self.efforts.get(effort, 0) + 1
+            self.effort_last = effort
+            self.effort_seen[effort] = self.seq
+
+    def tick(self, ts: datetime | None) -> None:
+        """An event time in file order: first/last and the active time."""
+        if ts is None:
+            return
+        self.seen(ts)
+        if self.prev_at is not None:
+            gap = (ts - self.prev_at).total_seconds()
+            if 0 < gap <= IDLE_GAP_SECONDS:
+                self.active_seconds += gap
+        if self.prev_at is None or ts > self.prev_at:
+            self.prev_at = ts
+
+    def cost_state(self, e: dict[str, Any]) -> None:
+        self.api_ms = _count(e.get("totalAPIDuration"))
+        self.tool_ms = _count(e.get("totalToolDuration"))
+        self.lines_added = _count(e.get("totalLinesAdded"))
+        self.lines_removed = _count(e.get("totalLinesRemoved"))
+
+    def profile(self) -> dict[str, Any]:
+        """Model, effort and time facts (the sessions columns of the same names)."""
+        return {
+            "model": self.model, "model_last": self.model_last,
+            "effort": self.effort, "effort_last": self.effort_last, "efforts": dict(sorted(self.efforts.items())),
+            "duration_seconds": self.duration_seconds,
+            "active_seconds": round(self.active_seconds, 3) if self.first_at is not None else None,
+            "api_seconds": None if self.api_ms is None else round(self.api_ms / 1000, 3),
+            "tool_seconds": None if self.tool_ms is None else round(self.tool_ms / 1000, 3),
+            "lines_added": self.lines_added, "lines_removed": self.lines_removed,
+        }
 
     def credit(self, model: str, t: Tokens, sign: int = 1, calls: int = 0) -> None:
         self.tokens.add(t, sign)
@@ -157,6 +276,8 @@ class ClaudeScanner:
         self.offset = 0
         self.size_seen = 0
         self.recent: OrderedDict[str, tuple[str, Tokens]] = OrderedDict()
+        self.tracker = SignalTracker()
+        self.summary.signals = self.tracker.signals
 
     # -------------------------------------------------------------- state
 
@@ -172,6 +293,21 @@ class ClaudeScanner:
         self.summary.turns = _int(s.get("turns"))
         self.summary.first_at = _ts(s.get("first_at"))
         self.summary.last_at = _ts(s.get("last_at"))
+        self.summary.title = clean_title(s.get("title"))
+        p = s.get("profile") if isinstance(s.get("profile"), dict) else {}
+        sm = self.summary
+        sm.model_last = p.get("model_last") if is_model(p.get("model_last")) else None
+        sm.model_seen = {str(k): _int(v) for k, v in (p.get("model_seen") or {}).items() if is_model(k)}
+        sm.efforts = {e: _int(v) for k, v in (p.get("efforts") or {}).items() if (e := effort_of(k))}
+        sm.effort_last = effort_of(p.get("effort_last"))
+        sm.effort_seen = {e: _int(v) for k, v in (p.get("effort_seen") or {}).items() if (e := effort_of(k))}
+        sm.seq = _int(p.get("seq"))
+        sm.prev_at = _ts(p.get("prev_at"))
+        sm.active_seconds = float(p.get("active") or 0) if isinstance(p.get("active"), (int, float)) else 0.0
+        for name in ("api_ms", "tool_ms", "lines_added", "lines_removed"):
+            setattr(sm, name, _count(p.get(name)))
+        self.tracker = SignalTracker(s.get("outcome"))
+        sm.signals, sm.end = self.tracker.signals, self.tracker.end
         for item in s.get("recent") or []:
             if isinstance(item, list) and len(item) == 3 and isinstance(item[0], str):
                 self.recent[item[0]] = (_model(item[1]), Tokens.of(item[2]))
@@ -185,6 +321,13 @@ class ClaudeScanner:
             "turns": s.turns,
             "first_at": s.first_at.isoformat() if s.first_at else None,
             "last_at": s.last_at.isoformat() if s.last_at else None,
+            "title": s.title,
+            "profile": {"model_last": s.model_last, "model_seen": dict(s.model_seen), "efforts": dict(s.efforts),
+                        "effort_last": s.effort_last, "effort_seen": dict(s.effort_seen), "seq": s.seq,
+                        "prev_at": s.prev_at.isoformat() if s.prev_at else None, "active": s.active_seconds,
+                        "api_ms": s.api_ms, "tool_ms": s.tool_ms, "lines_added": s.lines_added,
+                        "lines_removed": s.lines_removed},
+            "outcome": self.tracker.state(),
             "recent": [[mid, model, t.as_list()] for mid, (model, t) in self.recent.items()],
         }
 
@@ -192,8 +335,14 @@ class ClaudeScanner:
 
     def feed(self, e: dict[str, Any]) -> None:
         s = self.summary
-        s.seen(_ts(e.get("timestamp")))
-        if e.get("type") == "assistant":
+        s.tick(_ts(e.get("timestamp")))
+        self.tracker.feed(e)
+        s.signals, s.end = self.tracker.signals, self.tracker.end
+        if e.get("type") == "custom-title":
+            s.title = clean_title(e.get("customTitle")) or s.title
+        elif e.get("type") == "cost-state":
+            s.cost_state(e)
+        elif e.get("type") == "assistant":
             m = e.get("message") if isinstance(e.get("message"), dict) else {}
             if not isinstance(m.get("usage"), dict):
                 return
@@ -205,6 +354,8 @@ class ClaudeScanner:
             if mid is not None and mid in self.recent:
                 old_model, old = self.recent.pop(mid)
                 s.credit(old_model, old, -1, calls=-1)
+            else:
+                s.reply(model, claude_effort(e))  # a new response (later lines of one id are the same reply)
             s.credit(model, t, calls=1)
             if mid is not None:
                 self.recent[mid] = (model, t)
@@ -264,11 +415,14 @@ def codex_summary(events: list[dict[str, Any]]) -> Summary:
     if isinstance(meta.get("model"), str):
         model = _model(meta["model"])
     prev = Tokens()
+    effort: str | None = None
     for e in codex_sessions.own_events(events):
-        s.seen(_ts(e.get("timestamp")))
+        s.tick(_ts(e.get("timestamp")))
         p = codex_sessions.payload(e)
-        if e.get("type") == "turn_context" and isinstance(p.get("model"), str):
-            model = _model(p["model"])
+        if e.get("type") == "turn_context":
+            if isinstance(p.get("model"), str):
+                model = _model(p["model"])
+            effort = effort_of(p.get("effort")) or effort_of(p.get("reasoning_effort")) or effort
         elif e.get("type") == "event_msg" and p.get("type") == "token_count":
             info = p.get("info") if isinstance(p.get("info"), dict) else {}
             if not isinstance(info.get("total_token_usage"), dict):
@@ -278,6 +432,8 @@ def codex_summary(events: list[dict[str, Any]]) -> Summary:
             if min(delta.as_list()) < 0:  # the counter started over: all of it is new
                 delta = now
             if delta.total:
+                s.reply(model, effort)
                 s.credit(model, delta, calls=1)
             prev = now
+    s.signals, s.end = codex_sessions.outcome_signals(events)
     return s
