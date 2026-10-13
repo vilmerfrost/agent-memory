@@ -168,7 +168,7 @@ Exit 0, or 1 when E > 0. `--dry-run` runs the gate and the writer but writes not
 
 **Table** `lesson_candidates` (migration `20261015020000_lesson_candidates.sql`): `run_id` (pk, cascades with the run), `decision` (`accept`, `reject`, `error`), `reason`, `lesson_id` (accept only), `considered_at`. RLS on, no grants for `anon`/`authenticated`.
 
-**Daily.** `amem daily` runs distill after the scoring step (limit 10). With the live flag off the step is off: not a failure, and the log line is unchanged. When it ran, the line adds `distilled=N lessons_new=A lessons_merged=M lessons_rejected=R distill_errors=E`. Any `error` run fails the step (`amem-daily-fail distill: ...`); later steps still run.
+**Daily.** `amem daily` runs distill after the scoring step (limit 10). With the live flag off the step is off: not a failure, and the log line is unchanged. When it ran, the line adds `distilled=N lessons_new=A lessons_merged=M lessons_rejected=R distill_errors=E` (after `tasks=N`, before the duration). Any `error` run fails the step (`amem-daily-fail distill: ...`); later steps still run.
 
 ## Improver gate: `gate friction`
 

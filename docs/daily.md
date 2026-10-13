@@ -67,7 +67,9 @@ overrides it. House format (`%Y-%m-%dT%H:%M:%S%z`):
 2026-10-13T09:20:04+0200 amem-daily-fail score t-other: 1 Jev error; first: upstream 500
 ```
 
-- `push=none|phone|mac`. `tasks=N` = new dispatch tasks ingested. One `amem-daily-fail <reason>` line per failed step.
+- `push=none|phone|mac`. `tasks=N` = new dispatch tasks ingested (always present). When the
+  distill step ran, `distilled=N lessons_new=A lessons_merged=M lessons_rejected=R distill_errors=E`
+  follows `tasks=N` (docs/lessons.md). One `amem-daily-fail <reason>` line per failed step.
 - `amem ingest routines-log` reads these back as routine `amem-daily`
   (`meta.scored`, `meta.escalations`, `meta.new`, `meta.push`, `meta.tasks`, `meta.duration_s`,
   `meta.failures`).
