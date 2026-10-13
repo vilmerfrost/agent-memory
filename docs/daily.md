@@ -20,6 +20,8 @@ A failed step is recorded, and the next step still runs.
 1. **ingest**: the `ingest git-ref` logic (docs/cloud.md): `gh api` GET of
    `reports/routines.log` on `vilmerfrost/agent-config@claude/routine-reports`.
    Called in-process, not as a subprocess. Nothing published yet is not a failure.
+   Then **tasks**: the `ingest tasks` logic (docs/tasks.md) over the routines log's
+   folder (`~/.claude/parent`). No `*/tasks.jsonl` is not a failure.
 2. **score**: the `score` logic for each `questions/<routine>.toml`, one routine
    at a time (at most 100 runs per routine). A Jev error or a crash in one
    routine is a failed step for that routine only; the others still run.
@@ -61,13 +63,13 @@ Default `~/.claude/parent/routines.log`; `--routines-log` or `AMEM_ROUTINES_LOG`
 overrides it. House format (`%Y-%m-%dT%H:%M:%S%z`):
 
 ```
-2026-10-13T09:20:04+0200 amem-daily FAIL scored=4 escalations=2 new=2 push=phone 3s
+2026-10-13T09:20:04+0200 amem-daily FAIL scored=4 escalations=2 new=2 push=phone tasks=3 3s
 2026-10-13T09:20:04+0200 amem-daily-fail score t-other: 1 Jev error; first: upstream 500
 ```
 
-- `push=none|phone|mac`. One `amem-daily-fail <reason>` line per failed step.
+- `push=none|phone|mac`. `tasks=N` = new dispatch tasks ingested. One `amem-daily-fail <reason>` line per failed step.
 - `amem ingest routines-log` reads these back as routine `amem-daily`
-  (`meta.scored`, `meta.escalations`, `meta.new`, `meta.push`, `meta.duration_s`,
+  (`meta.scored`, `meta.escalations`, `meta.new`, `meta.push`, `meta.tasks`, `meta.duration_s`,
   `meta.failures`).
 - stdout repeats the appended lines. Exit 0 on PASS, 1 on FAIL.
 

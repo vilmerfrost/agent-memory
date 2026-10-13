@@ -256,7 +256,7 @@ def test_ingest_failure_logs_and_parses_back(sdb: ScoringDb, daily_io: DailyIO) 
     r = daily.run_daily(push=False, now=NOW)
     assert r.verdict == "FAIL" and r.scored == 4  # scoring still ran
     assert daily_io.log_lines() == [
-        f"{STAMP} amem-daily FAIL scored=4 escalations=2 new=2 push=none {daily_io.log_lines()[0].split()[-1]}",
+        f"{STAMP} amem-daily FAIL scored=4 escalations=2 new=2 push=none tasks=0 {daily_io.log_lines()[0].split()[-1]}",
         f"{STAMP} amem-daily-fail ingest: FetchError: gh api failed: gh: Bad credentials (HTTP 401)",
     ]
 

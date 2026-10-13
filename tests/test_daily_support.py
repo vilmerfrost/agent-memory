@@ -30,7 +30,7 @@ CLOUD_LOG = (
 # routines.log house format, as written by agent-config lib/routine.py and amem daily.
 LOG_LINE_RE = (
     r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{4} amem-daily (PASS|FAIL) "
-    r"scored=\d+ escalations=\d+ new=\d+ push=(none|phone|mac) \d+s"
+    r"scored=\d+ escalations=\d+ new=\d+ push=(none|phone|mac) tasks=\d+ \d+s"
 )
 
 

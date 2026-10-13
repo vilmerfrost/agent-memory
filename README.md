@@ -35,6 +35,7 @@ so tests and worktrees stay local. `amem doctor` prints `require_remote=on|off`.
 | `amem log-run --routine NAME --status pass\|fail\|skip\|error [--source launchd\|scheduled-task\|cloud\|manual] [--summary ..] [--failure-reason ..] [--report-path ..] [--started-at ISO] [--finished-at ISO]` | Inserts one run, prints its id. |
 | `amem runs --routine NAME [--limit N]` | Prints recent runs, newest first, as JSON lines. |
 | `amem ingest routines-log PATH` | Ingests a `routines.log` into `runs`. Idempotent: prints `ingested N new, M already present, K unparsed`. Safe to run on a schedule. |
+| `amem ingest tasks [--parent-dir PATH]` | Ingests dispatch tasks (`<parent>/<repo>/tasks.jsonl` + checkpoints) as `dispatch` runs. Idempotent. See [docs/tasks.md](docs/tasks.md). |
 | `amem db migrate` | Applies new migration files in name order. Tracks them in `schema_migrations`. Safe to rerun. |
 
 ## Ingesting routines.log
@@ -87,6 +88,7 @@ Each part has its own doc:
 
 | Part | Commands | Doc |
 |---|---|---|
+| Dispatch tasks as runs | `ingest tasks` | [docs/tasks.md](docs/tasks.md) |
 | Cloud path (HTTPS, no raw Postgres) | `AMEM_BACKEND=rest`, `ingest git-ref`, `jev record` | [docs/cloud.md](docs/cloud.md) |
 | Jev scoring + human labels | `score`, `label`, `escalations`, `calibrate`, `drift` | [docs/scoring.md](docs/scoring.md) |
 | Lessons memory | `lessons import/export/for/score`, `lesson propose`, `gate friction` | [docs/lessons.md](docs/lessons.md) |
