@@ -1,0 +1,45 @@
+# Jev questions for dispatch tasks: one finished parent dispatch (`amem ingest tasks`).
+# State: repo, status (pass/fail/error), the raw final status (DONE/PARTIAL/BLOCKED),
+# the summary line, the task signals (dod_first_pass, denials, nudges, ...) and one
+# entry per worker with its reasons, denied command shapes, brief gaps and a
+# checkpoint excerpt. Format: docs/scoring.md; state shape: docs/tasks.md.
+
+threshold = 0.7
+pass_question = "verdict"
+pass_options = ["clean"]
+
+[[questions]]
+name = "verdict"
+kind = "choice"
+prompt = "How did this dispatch go overall?"
+[questions.options]
+clean = "Done on the first pass: no denials that cost retries, no nudges or follow-ups, DoD met first time."
+struggled = "Done in the end, but with friction: denied commands, retries, nudges, follow-ups or a failed first DoD check."
+failed = "Not done: a worker or the task ended BLOCKED or PARTIAL, or the result was unusable."
+
+[[questions]]
+name = "brief_quality"
+kind = "score"
+prompt = "How good was the brief the workers got, judged by brief gaps, clarifying questions and what the checkpoints say?"
+levels = [
+    "Poor: key facts were missing, so a worker guessed wrong or got stuck.",
+    "Weak: gaps cost retries or questions.",
+    "Adequate: minor gaps with no real cost.",
+    "Complete: the workers had everything they needed.",
+]
+
+[[questions]]
+name = "main_cause"
+kind = "choice"
+prompt = "What was the main cause of any friction or failure in this dispatch?"
+[questions.options]
+brief_gap = "The brief lacked a fact, rule or DoD detail the worker needed."
+tool_denial = "Commands were denied (command shape, hook or permission) and cost retries."
+test_failure = "Tests or checks failed and needed fixing."
+scope = "The task was too big, unclear or changed scope mid-way."
+none = "There was no notable friction."
+
+[[questions]]
+name = "lesson_worthy"
+kind = "noul"
+prompt = "Does this dispatch show a reusable lesson that would help future briefs or workers?"

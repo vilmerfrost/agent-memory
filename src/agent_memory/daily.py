@@ -3,6 +3,7 @@
 Steps, in order. A failed step is recorded and the next step still runs:
 
 1. ingest: the routines.log that cloud routines publish (`ingest git-ref` logic).
+1b. tasks: dispatch tasks from `<parent dir>/*/tasks.jsonl` (`ingest tasks` logic).
 2. score: every routine with a `questions/<routine>.toml`, one routine at a time.
    One routine's Jev error or crash never stops the others.
 3. escalations: open escalations are compared with the ids already pushed
@@ -33,7 +34,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from agent_memory import cli_cloud, config, jev, scoring, store
+from agent_memory import cli_cloud, config, jev, scoring, store, tasks_ingest
 from agent_memory.questions import QuestionCache
 
 NAME = "amem-daily"
@@ -53,6 +54,7 @@ class DailyResult:
     scored: int = 0
     missing: int = 0  # fixture mode only: runs left unscored for lack of a fixture
     ingested: int = 0
+    tasks: int = 0  # new dispatch tasks ingested (tasks.jsonl)
     escalations: int = 0
     new: int = 0
     push: str = "none"  # none | phone | mac
@@ -242,6 +244,28 @@ def step_ingest(result: DailyResult) -> None:
     _err(f"ingest: {new} new, {present} already present, {len(parsed.unparsed)} unparsed")
 
 
+def step_tasks(result: DailyResult, parent_dir: Path) -> None:
+    """`amem ingest tasks` over parent_dir (docs/tasks.md). No tasks.jsonl at all is
+    not a failure and touches no database."""
+    try:
+        if not tasks_ingest.discover(parent_dir):
+            _err(f"tasks: no */tasks.jsonl under {parent_dir}; nothing to ingest")
+            return
+    except OSError as exc:
+        result.fail(f"tasks: {_exc(exc)}")
+        return
+    if not _postgres_guard("tasks", result):
+        return
+    try:
+        parsed = tasks_ingest.parse_parent(parent_dir)
+        report = tasks_ingest.ingest(parsed.runs)
+    except Exception as exc:  # read, parse or DB error: record it, keep going
+        result.fail(f"tasks: {_exc(exc)}")
+        return
+    result.tasks = report.new
+    _err(f"tasks: {tasks_ingest.report_line(parsed, report)}")
+
+
 def step_score(result: DailyResult, *, limit: int = SCORE_LIMIT) -> None:
     if not _postgres_guard("score", result):
         return
@@ -296,7 +320,7 @@ def step_escalations(
 
 def log_lines(ts: str, result: DailyResult, secs: int) -> list[str]:
     head = (f"{ts} {NAME} {result.verdict} scored={result.scored} escalations={result.escalations} "
-            f"new={result.new} push={result.push} {secs}s")
+            f"new={result.new} push={result.push} tasks={result.tasks} {secs}s")
     return [head, *(f"{ts} {NAME}-fail {reason}" for reason in result.failures)]
 
 
@@ -307,20 +331,23 @@ def run_daily(
     state: Path | None = None,
     now: datetime | None = None,
     notify: Mapping[str, str] | None = None,
+    parent_dir: Path | None = None,
 ) -> DailyResult:
-    """Run the four steps. Appends to the routines log; raises OSError only when that
-    append fails. `notify` replaces notify.env (tests)."""
+    """Run the steps. Appends to the routines log; raises OSError only when that
+    append fails. `notify` replaces notify.env (tests). `parent_dir` (tasks.jsonl
+    folders) defaults to the routines log's folder, i.e. ~/.claude/parent."""
     start = time.monotonic()
     now = now or datetime.now().astimezone()
     if now.tzinfo is None:  # the house format needs an offset
         now = now.astimezone()
     result = DailyResult()
+    log_file = routines_log_path(routines_log)
     step_ingest(result)
+    step_tasks(result, (parent_dir or log_file.parent).expanduser())
     step_score(result)
     step_escalations(result, push=push, state_file=state_path(state), now=now, notify=notify)
     secs = int(time.monotonic() - start)
     result.lines = log_lines(now.strftime(TS_FORMAT), result, secs)
-    log_file = routines_log_path(routines_log)
     log_file.parent.mkdir(parents=True, exist_ok=True)
     with open(log_file, "a", encoding="utf-8") as fh:
         fh.write("".join(line + "\n" for line in result.lines))

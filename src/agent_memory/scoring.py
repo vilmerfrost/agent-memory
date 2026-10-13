@@ -42,8 +42,55 @@ def _clean(value: Any) -> str:
     return text or "(none)"
 
 
+DISPATCH_ROUTINE = "dispatch"
+_DISPATCH_SIGNALS = ("dod_first_pass", "integration_first_pass", "follow_ups", "nudges", "denials",
+                     "escalations", "merge_conflicts", "clarifying_questions")
+_WORKER_SIGNALS = ("final_status", "first_status", "denials", "denied_shapes", "errors", "tool_errors",
+                   "repeat_cmds", "reasons", "brief_gaps", "lessons_read_first")
+
+
+def _dispatch_value(value: Any) -> str:
+    """One compact token: bools as true/false, lists comma-joined, maps as sorted k:v."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, dict):
+        return ",".join(f"{_clean(k)}:{_clean(v)}" for k, v in sorted(value.items())) or "(none)"
+    if isinstance(value, list):
+        return ",".join(_clean(v) for v in value) or "(none)"
+    return _clean(value)
+
+
+def format_dispatch_state(run: dict[str, Any]) -> str:
+    """State for a dispatch task (docs/tasks.md): repo, status, summary, signals,
+    then one entry per worker with its reasons, denials, brief gaps and checkpoint
+    excerpt. No ids, timestamps, tokens or durations."""
+    meta = run.get("meta") or {}
+    lines = [
+        f"routine: {_clean(run.get('routine'))}",
+        f"repo: {_clean(meta.get('repo'))}",
+        f"status: {_clean(run.get('status'))}",
+        f"final_status: {_clean(meta.get('final_status'))}",
+        f"summary: {_clean(run.get('summary'))}",
+        f"failure_reason: {_clean(run.get('failure_reason'))}",
+        "signals: " + " ".join(f"{k}={_dispatch_value(meta.get(k))}" for k in _DISPATCH_SIGNALS),
+    ]
+    workers = [w for w in meta.get("workers") or [] if isinstance(w, dict)]
+    if not workers:
+        lines.append("workers: (none)")
+    else:
+        lines.append("workers:")
+        for w in workers:
+            signals = " ".join(f"{k}={_dispatch_value(w.get(k))}" for k in _WORKER_SIGNALS)
+            lines.append(f"- {_clean(w.get('name'))}: {signals}")
+            lines.append(f"  checkpoint: {_clean(w.get('checkpoint_excerpt'))}")
+    return "\n".join(lines)
+
+
 def format_state(run: dict[str, Any]) -> str:
-    """The deterministic text Jev scores for one run (see module docstring)."""
+    """The deterministic text Jev scores for one run (see module docstring).
+    Dispatch tasks get their own shape (`format_dispatch_state`)."""
+    if run.get("routine") == DISPATCH_ROUTINE:
+        return format_dispatch_state(run)
     meta = run.get("meta") or {}
     failures = meta.get("failures") or []
     lines = [
