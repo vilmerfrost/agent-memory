@@ -3,7 +3,8 @@
 Exit codes:
 - 0 success (for `lesson propose`: a decision was made, accept or reject).
 - 1 a database, file or input error; for `gate friction`: reject.
-- 2 `gate friction` could not decide (Jev error); argparse usage errors.
+- 2 `gate friction` could not decide (Jev error); argparse usage errors; for
+  `lessons score`: AMEM_SCORE_MIN_USES is not a positive integer (nothing is read or written).
 - 3 AMEM_REQUIRE_REMOTE=1 refused a write (same as the other write commands).
 """
 
@@ -11,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import uuid
 from pathlib import Path
@@ -20,6 +22,7 @@ import psycopg
 from agent_memory import config, jev, lessons
 
 REMOTE_REQUIRED_EXIT = 3
+USAGE_EXIT = 2
 
 DEFAULT_MIN_REUSABLE = 0.6
 DEFAULT_MIN_GENERALIZABLE = 0.5
@@ -70,10 +73,27 @@ def _uuid(value: str) -> uuid.UUID:
 
 
 def _positive(value: str) -> int:
-    n = int(value)
+    try:
+        n = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"must be a positive integer, got {value!r}") from None
     if n < 1:
-        raise argparse.ArgumentTypeError("must be >= 1")
+        raise argparse.ArgumentTypeError(f"must be a positive integer (>= 1), got {value!r}")
     return n
+
+
+def _min_uses(flag: int | None) -> int:
+    """--min-uses, else AMEM_SCORE_MIN_USES, else the default. The env value gets the
+    same check as the flag (a positive integer); LessonsError when it fails."""
+    if flag is not None:
+        return flag
+    raw = os.environ.get("AMEM_SCORE_MIN_USES", "").strip()
+    if not raw:
+        return DEFAULT_MIN_USES
+    try:
+        return _positive(raw)
+    except argparse.ArgumentTypeError as exc:
+        raise lessons.LessonsError(f"AMEM_SCORE_MIN_USES {exc}") from None
 
 
 # --- lessons import / export -----------------------------------------------------------
@@ -130,10 +150,14 @@ def cmd_for(args: argparse.Namespace) -> int:
 
 
 def cmd_score(args: argparse.Namespace) -> int:
+    try:
+        min_uses = _min_uses(args.min_uses)
+    except lessons.LessonsError as exc:
+        print(f"amem: lessons score: {exc}", file=sys.stderr)
+        return USAGE_EXIT  # like a bad --min-uses; checked before any database access
     if (code := (_remote_guard() if args.apply else _read_guard())) is not None:
         return code
     try:
-        min_uses = args.min_uses or int(lessons.env_float("AMEM_SCORE_MIN_USES", DEFAULT_MIN_USES))
         rows = lessons.score(min_uses, apply=args.apply, repo=args.repo)
     except (lessons.LessonsError, psycopg.Error) as exc:
         return _err("lessons score", exc)
