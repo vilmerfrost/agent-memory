@@ -148,6 +148,35 @@ class RescoreReport(ScoreReport):
     comparisons: list[dict[str, Any]] = field(default_factory=list)  # one per rescored run
 
 
+GO_LIVE_HINT = "set TYPESAFE_API_KEY and AMEM_JEV_LIVE=1 to rescore with live Jev"
+
+
+class RescoreRefused(Exception):
+    """Fixture-mode rescore would replace live Jev scores. Nothing was changed."""
+
+    def __init__(self, routine: str, mode: str, live_run_ids: list[str]) -> None:
+        self.routine = routine
+        self.mode = mode
+        self.live_run_ids = live_run_ids
+        super().__init__(
+            f"refusing to rescore {routine!r} in jev mode {mode}: {len(live_run_ids)} run(s) hold "
+            f"live Jev scores that fixture answers would replace ({', '.join(live_run_ids[:5])}"
+            f"{', ...' if len(live_run_ids) > 5 else ''}); {GO_LIVE_HINT}, or pass --allow-fixture "
+            "to replace them anyway")
+
+
+def _runs_with_live_scores(run_ids: list[Any], *, db_url: str | None = None) -> list[str]:
+    if not run_ids:
+        return []
+    with store.connect(db_url) as conn:
+        rows = conn.execute(
+            "select distinct run_id from scores where jev_mode = 'live' and run_id = any(%s)",
+            (list(run_ids),),
+        ).fetchall()
+    live = {r[0] for r in rows}
+    return [str(rid) for rid in run_ids if rid in live]  # keep the newest-first order
+
+
 def _answer_view(scores: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     return {s["question"]: {"value": s["value"], "confidence": s["confidence"]} for s in scores}
 
@@ -172,8 +201,13 @@ def rescore_runs(
     limit: int = 100,
     cache: QuestionCache | None = None,
     db_url: str | None = None,
+    allow_fixture: bool = False,
 ) -> RescoreReport:
     """Ask Jev again about already scored runs of one routine and replace their scores.
+
+    Guard: in fixture mode, when any selected run holds a score row with
+    jev_mode='live', raise `RescoreRefused` before any change (fixture answers must
+    never silently replace live ones), unless `allow_fixture` is set.
 
     The runs: the routine's scored runs (labeled or not), newest first, started at or
     after `since`, at most `limit`. Each run's new answers replace all its old score
@@ -194,7 +228,12 @@ def rescore_runs(
     mode = jev.mode()
     runs = [r for r in scored_runs(routine=routine, db_url=db_url)
             if since is None or (r["started_at"] is not None and r["started_at"] >= as_utc(since))]
-    for run in runs[:limit]:
+    runs = runs[:limit]
+    if mode == "fixture" and not allow_fixture:
+        live = _runs_with_live_scores([r["id"] for r in runs], db_url=db_url)
+        if live:
+            raise RescoreRefused(routine, mode, live)
+    for run in runs:
         try:
             results = jev.ask(format_state(run), qset.jev_questions())
         except jev.JevFixtureMissing as exc:

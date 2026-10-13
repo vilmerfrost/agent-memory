@@ -212,6 +212,9 @@ already have scores, for example after a state or question change.
   answers, ignoring labels), `low_after` (the escalating answers now).
 - stderr summary: `amem: rescored N runs (R), M missing fixtures; escalated before (old rule) B, before C, after A`.
 - `--rescore` needs `--routine` (it never touches other routines). `AMEM_REQUIRE_REMOTE=1` applies.
+- **Live rows are guarded.** stderr first prints the Jev mode. In fixture mode (no
+  `TYPESAFE_API_KEY` + `AMEM_JEV_LIVE=1`), when any selected run holds a `jev_mode='live'`
+  row, rescore refuses (exit 1) and changes nothing; `--allow-fixture` overrides that.
 - Rescoring changes past `jev_pass` values, so `amem drift` compares the new answers.
 
 Measuring a change with live Jev on the same runs (no double counting, because the

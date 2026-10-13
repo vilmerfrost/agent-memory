@@ -19,7 +19,8 @@ A failed step is recorded, and the next step still runs.
 
 1. **ingest**: the `ingest git-ref` logic (docs/cloud.md): `gh api` GET of
    `reports/routines.log` on `vilmerfrost/agent-config@claude/routine-reports`.
-   Called in-process, not as a subprocess. Nothing published yet is not a failure.
+   Called in-process, not as a subprocess. A 404 (branch or file missing, or no
+   access to the private repo) **is** a failure: `ingest: routines.log not found at ...`.
    Then **tasks**: the `ingest tasks` logic (docs/tasks.md) over the routines log's
    folder (`~/.claude/parent`). No `*/tasks.jsonl` is not a failure.
 2. **score**: the `score` logic for each `questions/<routine>.toml`, one routine

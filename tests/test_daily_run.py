@@ -22,6 +22,7 @@ from conftest import run_amem
 from test_daily_support import (  # noqa: F401
     CLOUD_LOG,
     LOG_LINE_RE,
+    NOT_FOUND,
     DailyIO,
     FakeGh,
     Push,
@@ -272,6 +273,21 @@ def test_ingest_failure_logs_and_parses_back(sdb: ScoringDb, daily_io: DailyIO) 
     assert meta["scored"] == 4 and meta["escalations"] == 2 and meta["new"] == 2 and meta["push"] == "none"
     assert isinstance(meta["duration_s"], int)
     assert meta["failures"] == ["ingest: FetchError: gh api failed: gh: Bad credentials (HTTP 401)"]
+
+
+def test_ingest_404_is_a_daily_failure(sdb: ScoringDb, daily_io: DailyIO) -> None:  # noqa: F811
+    """swarm #22: lost repo access or a deleted/renamed branch (gh 404) must not go silent."""
+    gh = daily_io.use_gh(NOT_FOUND())
+    _edge_runs(sdb.url)
+    r = daily.run_daily(push=False, now=NOW)
+    assert gh.calls  # it did ask
+    assert r.verdict == "FAIL" and r.scored == 4  # scoring still ran
+    expected = ("ingest: routines.log not found at vilmerfrost/agent-config@claude/routine-reports:"
+                "reports/routines.log (404: branch/file missing or no access)")
+    assert r.failures == [expected]
+    lines = daily_io.log_lines()
+    assert " amem-daily FAIL scored=4 " in lines[0]
+    assert lines[1:] == [f"{STAMP} amem-daily-fail {expected}"]
 
 
 def test_require_remote_refuses_every_step(sdb: ScoringDb, daily_io: DailyIO,  # noqa: F811
