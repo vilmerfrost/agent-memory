@@ -143,6 +143,7 @@ def test_plist_content() -> None:
     ]
     env = data["EnvironmentVariables"]
     assert env["AMEM_REQUIRE_REMOTE"] == "1" and env["AMEM_JEV_LIVE"] == "1"
+    assert env["AMEM_DEVIATIONS_LIVE"] == "1"  # the weekly deviations step runs
     assert "/Users/vilmerfrost/.local/bin" in env["PATH"].split(":")  # gh lives there; launchd's PATH lacks it
     assert data["StartCalendarInterval"] == {"Hour": 9, "Minute": 20}
     assert data["StandardOutPath"] == data["StandardErrorPath"] == "/Users/vilmerfrost/.claude/parent/reports/launchd.log"
