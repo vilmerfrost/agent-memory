@@ -185,16 +185,22 @@ def writer_prompt(state: str, repo: str, close: list[dict[str, Any]]) -> str:
                          evidence_max=EVIDENCE_MAX, repo=repo, state=state, close=block)
 
 
-def writer_argv() -> list[str]:
+WRITER_MODEL = "sonnet"
+
+
+def writer_argv(exe_env: str = CLAUDE_ENV, model: str = WRITER_MODEL) -> list[str]:
     """The headless CLI call. No tools (the prompt holds untrusted run text), no session file.
 
     No skills and no MCP servers either: a plain `claude -p` loads the user's whole setup
     (every skill, plugin and MCP tool listing), which measured ~1.27M tokens and failed with
     "Prompt is too long". With both off the call is ~8.5k tokens. `--bare` is not an option:
     it disables OAuth, and the daily job runs on the user's subscription login.
+
+    `exe_env` names the env var that may point at another executable (tests, demos):
+    `AMEM_DISTILL_CLAUDE` here, `AMEM_DEVIATIONS_CLAUDE` for the deviation writer.
     """
-    exe = os.environ.get(CLAUDE_ENV, "").strip() or "claude"
-    return [exe, "-p", "--model", "sonnet", "--output-format", "json",
+    exe = os.environ.get(exe_env, "").strip() or "claude"
+    return [exe, "-p", "--model", model, "--output-format", "json",
             "--tools", "", "--disable-slash-commands", "--strict-mcp-config",
             "--no-session-persistence"]
 
@@ -205,7 +211,11 @@ def call_writer(prompt: str, *, timeout: float = DEFAULT_TIMEOUT) -> str:
     Raises WriterError on a missing executable, a timeout (the child is killed) or a
     non-zero exit. Tests replace this function.
     """
-    argv = writer_argv()
+    return run_cli(writer_argv(), prompt, timeout=timeout)
+
+
+def run_cli(argv: list[str], prompt: str, *, timeout: float = DEFAULT_TIMEOUT) -> str:
+    """Run a headless CLI argv with the prompt on stdin; return stdout. Raises WriterError."""
     try:
         proc = subprocess.run(argv, input=prompt, capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
