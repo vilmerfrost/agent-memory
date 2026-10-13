@@ -36,6 +36,10 @@ A failed step is recorded, and the next step still runs.
    - An id is marked as pushed only after ntfy answers 200. The Mac fallback
      does not mark it, so it is pushed again the next day.
    - `--no-push` never pushes and never marks; it still prunes.
+   Then **deviations** (weekly, docs/deviations.md): `sessions ingest` + `deviations scan`
+   when `deviations_last_scan` in the state file is missing or at least 7 days old. Off (not a
+   failure) unless `AMEM_DEVIATIONS_LIVE=1`. A session error fails the step.
+   (The `lessons distill` step after scoring is frozen: off unless `AMEM_DISTILL_LIVE=1`.)
 4. **log**: one line appended to the routines log.
 
 Scoring and escalations need the Postgres backend (V1). `AMEM_REQUIRE_REMOTE=1`
@@ -69,7 +73,9 @@ overrides it. House format (`%Y-%m-%dT%H:%M:%S%z`):
 
 - `push=none|phone|mac`. `tasks=N` = new dispatch tasks ingested (always present). When the
   distill step ran, `distilled=N lessons_new=A lessons_merged=M lessons_rejected=R distill_errors=E`
-  follows `tasks=N` (docs/lessons.md). One `amem-daily-fail <reason>` line per failed step.
+  follows `tasks=N` (docs/lessons.md). When the weekly deviations step ran,
+  `deviations=D deviation_sessions=N deviations_edit=E deviations_enforce=F deviations_leave=L
+  deviation_errors=X` follows (docs/deviations.md). One `amem-daily-fail <reason>` line per failed step.
 - `amem ingest routines-log` reads these back as routine `amem-daily`
   (`meta.scored`, `meta.escalations`, `meta.new`, `meta.push`, `meta.tasks`, `meta.duration_s`,
   `meta.failures`).
@@ -81,8 +87,11 @@ Default `~/.claude/parent/amem-daily-state.json`; `--state` or `AMEM_DAILY_STATE
 overrides it. Written atomically, mode 600:
 
 ```json
-{"pushed_run_ids": ["<uuid>", "..."], "updated_at": "2026-10-13T09:20:04+0200"}
+{"pushed_run_ids": ["<uuid>", "..."], "updated_at": "2026-10-13T09:20:04+0200",
+ "deviations_last_scan": "2026-10-13T09:20:04+0200"}
 ```
+
+Each step keeps the other keys when it writes.
 
 An unreadable file is a failed step and is treated as empty (worst case: one repeat push).
 

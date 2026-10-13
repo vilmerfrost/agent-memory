@@ -14,6 +14,7 @@ from psycopg.conninfo import conninfo_to_dict
 from agent_memory import cli_cloud, config, jev, routines_log, store
 from agent_memory import cli_ab
 from agent_memory import cli_daily
+from agent_memory import cli_deviations
 from agent_memory import dedupe
 from agent_memory import cli_lessons
 from agent_memory import cli_scoring
@@ -180,6 +181,7 @@ def build_parser() -> argparse.ArgumentParser:
     cli_scoring.register(sub)
     cli_ab.register(sub)
     cli_daily.register(sub)
+    cli_deviations.register(sub)
     return parser
 
 
