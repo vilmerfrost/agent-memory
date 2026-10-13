@@ -102,9 +102,37 @@ def _guarded(name: str, fn) -> int:
     return 1
 
 
+def _rescore(args: argparse.Namespace) -> int:
+    """`amem score --rescore --routine R`: JSON line per rescored run on stdout, the
+    summary on stderr (so stdout stays pure JSON lines)."""
+    cache = QuestionCache()
+    if cache.get(args.routine) is None:
+        print(f"amem: score --rescore: no question file for routine {args.routine!r}", file=sys.stderr)
+        return 1
+    report = scoring.rescore_runs(routine=args.routine, since=args.since, limit=args.limit, cache=cache)
+    _emit(report.comparisons)
+    for run_id, routine, msg in report.missing:
+        print(f"amem: missing fixture: run {run_id} ({routine}): {msg}", file=sys.stderr)
+    for run_id, routine, msg in report.failed:
+        print(f"amem: jev error: run {run_id} ({routine}): {msg}", file=sys.stderr)
+    c = report.comparisons
+    line = (f"rescored {report.scored} runs ({args.routine}), {len(report.missing)} missing fixtures"
+            + (f", {len(report.failed)} failed" if report.failed else "")
+            + f"; escalated before (old rule) {sum(x['escalated_before_old_rule'] for x in c)}"
+            + f", before {sum(x['escalates_before'] for x in c)}, after {sum(x['escalates_after'] for x in c)}")
+    print(f"amem: {line}", file=sys.stderr)
+    return 1 if report.failed else 0
+
+
 def cmd_score(args: argparse.Namespace) -> int:
     if (code := _remote_guard("score")) is not None:
         return code
+    if args.rescore:
+        if args.routine is None:
+            print("amem: score --rescore needs --routine (it replaces scores of one routine only)",
+                  file=sys.stderr)
+            return 1
+        return _guarded("score", lambda: _rescore(args))
 
     def body() -> int:
         report = scoring.score_runs(routine=args.routine, since=args.since, limit=args.limit)
@@ -182,6 +210,9 @@ def register(sub: argparse._SubParsersAction) -> None:
     p.add_argument("--routine")
     p.add_argument("--since", type=_iso, help="only runs started at or after this ISO time (no offset = UTC)")
     p.add_argument("--limit", type=_positive_int, default=100, help="max runs to send to Jev (default 100)")
+    p.add_argument("--rescore", action="store_true",
+                   help="ask Jev again about already scored runs of --routine (newest first) and replace "
+                        "their scores; prints a before/after JSON line per run")
     p.set_defaults(func=cmd_score)
 
     p = sub.add_parser("label", help="set the human label of a run (relabel overwrites)")

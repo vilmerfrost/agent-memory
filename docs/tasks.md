@@ -102,11 +102,15 @@ later steps still run. The house line gets `tasks=N` (new tasks ingested).
 ## Jev state and questions
 
 `questions/dispatch.toml`: `verdict` (choice clean | struggled | failed; pass = clean),
-`brief_quality` (score 0..3), `main_cause` (choice brief_gap | tool_denial |
-test_failure | scope | none), `lesson_worthy` (noul). Threshold 0.7.
+`main_cause` (choice brief_gap | tool_denial | test_failure | scope | none),
+`brief_missing_fact` (noul), `lesson_worthy` (noul). Threshold 0.7, `escalate_on = ["verdict"]`.
+The options name state fields: clean = DONE with `friction: (none)`, struggled = DONE
+with friction, failed = BLOCKED/PARTIAL/not DONE. (`brief_quality`, a 0..3 score, was
+dropped on 2026-10-13: the brief text is not in the state, so Jev split between levels
+on most runs, and `main_cause = brief_gap` already covers it.)
 
-`scoring.format_state` has a dispatch branch (routine `dispatch` only; every other
-routine's state is byte-identical, so recorded fixture keys do not change):
+`scoring.format_state` has a dispatch branch (routine `dispatch` only; built in
+`agent_memory/states.py`, `format_dispatch_state`):
 
 ```
 routine: dispatch
@@ -116,13 +120,22 @@ final_status: BLOCKED
 summary: junk-orchestra: BLOCKED, 1 worker, dod_first_pass=false, denials=1 (heredoc), reasons=denied-command
 failure_reason: denied-command
 signals: dod_first_pass=false integration_first_pass=(none) follow_ups=0 nudges=0 denials=1 escalations=1 merge_conflicts=0 clarifying_questions=0
+friction: dod_first_pass=false denials=1 escalations=1
 workers:
 - worker-d: final_status=BLOCKED first_status=BLOCKED denials=1 denied_shapes=heredoc:1 errors=isolation-refusal:1 tool_errors=1 repeat_cmds=0 reasons=denied-command brief_gaps=vilmer-words,dod,siblings,skills,standing-rules lessons_read_first=false
   checkpoint: (none)
+legend: friction lists the signals that cost extra rounds: ... (fixed text, states.DISPATCH_LEGEND)
 ```
 
 No ids, timestamps, tokens or durations. Lists are comma-joined, maps are sorted
 `k:v`, an excerpt is collapsed to one line.
+
+- `friction`: the signals that cost extra rounds, in this order: `dod_first_pass=false`,
+  `integration_first_pass=false`, then `denials`, `nudges`, `follow_ups`, `escalations`,
+  `merge_conflicts` when above 0; `(none)` otherwise. `clarifying_questions` (asked before
+  the work started) and worker tool errors (the edit-test loop) are not friction.
+- `legend`: one fixed line that explains every signal name, so Jev never guesses what
+  `brief_gaps` (missing template sections), `escalations` or `nudges` mean.
 
 ## Tests
 

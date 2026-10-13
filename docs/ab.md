@@ -54,7 +54,7 @@ Then:
 The first source that applies decides. Each run records its source.
 
 1. **label**: the human label. `up` = pass, `down` = fail.
-2. **jev**: the Jev answer to the routine's `pass_question` (docs/scoring.md), when its confidence is **at or above** the routine's `threshold`. Jev's up = pass, down = fail.
+2. **jev**: the Jev answer to the routine's `pass_question` (docs/scoring.md), when its verdict confidence (up vs down, docs/scoring.md "Escalation rule") is **at or above** the routine's `threshold`. Jev's up = pass, down = fail.
 3. **status**: `runs.status`. `pass` = pass, `fail` and `error` = fail.
 
 A Jev answer below the threshold is not trusted: `status` decides that run. This is the same line `amem escalations` draws (strictly below the threshold escalates). Scores of a routine with no question file are ignored.

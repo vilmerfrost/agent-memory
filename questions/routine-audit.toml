@@ -2,10 +2,13 @@
 # Summary looks like `problems=3 push=new via=phone 1s report=...`; each failure is
 # `<routine>: <problem>`, e.g. "config-check: last run FAIL".
 # Format: docs/scoring.md.
+#
+# Only the verdict escalates. triage is a secondary label for stats.
 
 threshold = 0.7
 pass_question = "verdict"
 pass_options = ["ok"]
+escalate_on = ["verdict"]
 
 [[questions]]
 name = "verdict"
@@ -18,24 +21,13 @@ needs_action = "At least one routine has a problem that needs a human."
 [[questions]]
 name = "triage"
 kind = "choice"
-prompt = "Classify the problems the audit reported. If there are none, answer environment_noise."
+prompt = "Classify the problems the audit reported, judged from the problem lines only. If there are none, answer environment_noise."
 [questions.options]
-real_failure = "A routine is really broken or found a real issue."
-environment_noise = "Problems come from the environment: the machine was asleep or offline, a known recurring finding, a flaky dependency."
-unclear = "The audit line does not give enough detail to tell."
+real_failure = "At least one line says a routine's last run FAILed, never ran, crashed, or is missing from the registry. A FAIL of a routine that reports findings (config-check, evals-*) counts: it found a real issue."
+environment_noise = "Every line is about timing or the environment: a run is late or was skipped while the machine slept or was offline, or a flaky dependency."
+unclear = "The lines contradict each other or name no routine and no problem."
 
 [[questions]]
 name = "push_justified"
 kind = "noul"
 prompt = "Was the notification decision right? push=new means a new phone push was sent; push=none means no push. Answer yes if the push decision fits the problems."
-
-[[questions]]
-name = "breadth"
-kind = "score"
-prompt = "How widespread are the problems?"
-levels = [
-    "No problems.",
-    "One routine affected.",
-    "Several routines affected.",
-    "Most routines affected: a systemic problem.",
-]
