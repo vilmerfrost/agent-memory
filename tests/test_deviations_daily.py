@@ -1,5 +1,5 @@
-"""The weekly `amem daily` deviations step: off unless AMEM_DEVIATIONS_LIVE=1, runs when the
-last scan is >= 7 days old, adds `deviations=...` to the log line only when it ran."""
+"""The daily `amem daily` deviations step: off unless AMEM_DEVIATIONS_LIVE=1, runs when the
+last scan is >= 20 hours old (AMEM_DEVIATIONS_EVERY_HOURS), adds `deviations=...` to the log line only when it ran."""
 
 from __future__ import annotations
 
@@ -54,7 +54,7 @@ def test_off_without_live_flag(sdb: ScoringDb, daily_io: DailyIO, setup_home: Ho
     assert daily.DEVIATIONS_KEY not in _state(daily_io)
 
 
-def test_weekly_gating(live: ScoringDb, daily_io: DailyIO, setup_home: Home,  # noqa: F811
+def test_daily_gating(live: ScoringDb, daily_io: DailyIO, setup_home: Home,  # noqa: F811
                        writer: Writer, fake_jev: FakeJev, capsys: pytest.CaptureFixture[str]) -> None:  # noqa: F811
     make_all_kinds(setup_home)
     w = writer(default=envelope({"deviations": [finding()]}))
@@ -69,18 +69,18 @@ def test_weekly_gating(live: ScoringDb, daily_io: DailyIO, setup_home: Home,  # 
     assert state[daily.DEVIATIONS_KEY] == "2026-10-15T09:20:00+0200" and state["pushed_run_ids"] == []
     assert len(w.prompts) == 5
 
-    # Six days later: not due. The escalations step's save_state kept the timestamp.
-    r = daily.run_daily(push=False, now=NOW + timedelta(days=6))
+    # 19 hours later: not due. The escalations step's save_state kept the timestamp.
+    r = daily.run_daily(push=False, now=NOW + timedelta(hours=19))
     assert r.verdict == "PASS" and r.deviations is None
     assert not FIELDS.search(daily_io.log_lines()[-1])
-    assert "deviations: not due (last scan 2026-10-15T09:20:00+0200, every 7 days)" in capsys.readouterr().err
+    assert "deviations: not due (last scan 2026-10-15T09:20:00+0200, every 20 hours)" in capsys.readouterr().err
     assert len(w.prompts) == 5
 
-    # Seven days later: due again (nothing new to scan in these fixtures).
-    r = daily.run_daily(push=False, now=NOW + timedelta(days=7))
+    # The next morning (24 hours later): due again (nothing new to scan in these fixtures).
+    r = daily.run_daily(push=False, now=NOW + timedelta(hours=24))
     assert r.verdict == "PASS" and r.deviations is not None and r.deviations.outcomes == []
     assert FIELDS.search(daily_io.log_lines()[-1])
-    assert _state(daily_io)[daily.DEVIATIONS_KEY] == "2026-10-22T09:20:00+0200"
+    assert _state(daily_io)[daily.DEVIATIONS_KEY] == "2026-10-16T09:20:00+0200"
 
 
 def test_session_errors_fail_the_step_only(live: ScoringDb, daily_io: DailyIO, setup_home: Home,  # noqa: F811

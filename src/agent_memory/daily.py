@@ -12,8 +12,8 @@ Steps, in order. A failed step is recorded and the next step still runs:
 3. escalations: open escalations are compared with the ids already pushed
    (state file). Only new ids trigger a push. Ids no longer open are pruned.
    An id is marked pushed only after ntfy answered 200.
-3b. deviations (weekly): `sessions ingest` + `deviations scan` (docs/deviations.md) when the
-   last scan in the state file is >= 7 days old. Off unless AMEM_DEVIATIONS_LIVE=1 (then not
+3b. deviations (daily): `sessions ingest` + `deviations scan` (docs/deviations.md) when the
+   last scan in the state file is >= 20 hours old (AMEM_DEVIATIONS_EVERY_HOURS). Off unless AMEM_DEVIATIONS_LIVE=1 (then not
    a failure, and the log line has no deviation fields). Any session error fails the step.
 4. log: one summary line plus one `amem-daily-fail <reason>` line per failed
    step, appended to the routines log in the house format.
@@ -337,14 +337,27 @@ def step_distill(result: DailyResult, *, limit: int = distill.DEFAULT_LIMIT) -> 
 
 
 DEVIATIONS_KEY = "deviations_last_scan"
-DEVIATIONS_EVERY = timedelta(days=7)
+DEVIATIONS_EVERY_ENV = "AMEM_DEVIATIONS_EVERY_HOURS"
+DEVIATIONS_EVERY_DEFAULT_HOURS = 20  # daily at 09:20, with slack so launchd jitter never skips a day
+
+
+def deviations_every() -> timedelta:
+    """AMEM_DEVIATIONS_EVERY_HOURS (a positive number), else 20 hours."""
+    raw = os.environ.get(DEVIATIONS_EVERY_ENV, "").strip()
+    try:
+        hours = float(raw) if raw else DEVIATIONS_EVERY_DEFAULT_HOURS
+    except ValueError:
+        hours = DEVIATIONS_EVERY_DEFAULT_HOURS
+    if hours <= 0:
+        hours = DEVIATIONS_EVERY_DEFAULT_HOURS
+    return timedelta(hours=hours)
 
 
 def step_deviations(result: DailyResult, *, state_file: Path, now: datetime) -> None:
-    """Weekly: `sessions ingest` + `deviations scan` (docs/deviations.md). Off (not a failure)
-    unless AMEM_DEVIATIONS_LIVE=1. Runs when the last scan in the state file is >= 7 days
-    old (or missing). The timestamp moves only when the scan finished; per-session errors
-    fail the step but still count as a finished scan (those sessions are retried next week)."""
+    """Daily: `sessions ingest` + `deviations scan` (docs/deviations.md). Off (not a failure)
+    unless AMEM_DEVIATIONS_LIVE=1. Runs when the last scan in the state file is at least
+    `deviations_every()` old (or missing). The timestamp moves only when the scan finished; per-session errors
+    fail the step but still count as a finished scan (those sessions are retried on the next run)."""
     if not deviations.live():
         _err(f"deviations: off ({deviations.LIVE_ENV} is not 1)")
         return
@@ -355,8 +368,9 @@ def step_deviations(result: DailyResult, *, state_file: Path, now: datetime) -> 
             last = datetime.strptime(last_raw, TS_FORMAT)
         except ValueError:
             last = None
-    if last is not None and now - last < DEVIATIONS_EVERY:
-        _err(f"deviations: not due (last scan {last_raw}, every {DEVIATIONS_EVERY.days} days)")
+    every = deviations_every()
+    if last is not None and now - last < every:
+        _err(f"deviations: not due (last scan {last_raw}, every {every.total_seconds() / 3600:g} hours)")
         return
     if not _postgres_guard("deviations", result):
         return
@@ -418,7 +432,7 @@ def log_lines(ts: str, result: DailyResult, secs: int) -> list[str]:
         d = result.distilled
         head += (f"distilled={len(d.outcomes)} lessons_new={d.new} lessons_merged={d.merged} "
                  f"lessons_rejected={d.rejected} distill_errors={d.errors} ")
-    if result.deviations is not None:  # only on the weekly run, so other days keep the same line
+    if result.deviations is not None:  # only when the step ran, so other runs keep the same line
         s = result.deviations
         v = s.verdicts()
         head += (f"deviations={s.found} deviation_sessions={len(s.outcomes)} "
