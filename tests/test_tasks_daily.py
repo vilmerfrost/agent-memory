@@ -52,7 +52,7 @@ def test_tasks_step_ingests_and_logs_tasks_count(sdb: ScoringDb, daily_io: Daily
     err = capsys.readouterr().err
     assert "tasks: ingested 41 new, 0 already present, 0 unparsed (3 repos)" in err
     # The step sits right after the git-ref ingest and before scoring.
-    assert err.index("daily: ingest: no routines.log published") < err.index("daily: tasks: ")
+    assert err.index("daily: ingest: 0 new, 0 already present") < err.index("daily: tasks: ")
 
     r = daily.run_daily(push=False, now=NOW)
     assert (r.verdict, r.tasks) == ("PASS", 0)

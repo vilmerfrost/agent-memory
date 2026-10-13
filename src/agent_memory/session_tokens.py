@@ -17,6 +17,13 @@ subagent's copy of the parent history is skipped (codex_sessions.own_events).
 `ClaudeScanner` is incremental: it remembers the byte offset it read up to and its running
 totals, so a hook ping reads only the new lines of a transcript. Only labels and numbers
 are kept. No transcript text.
+
+A resumed Claude Code session writes a new transcript that starts with a copy of the earlier
+session's lines. Those lines keep the earlier `sessionId` (a resumed session's subagent files
+are copied whole the same way). Given `own_session`, the scanner counts only lines whose
+`sessionId` is that id or missing: the copied lines add no tokens, turns, time, model/effort
+profile or outcome signals (the earlier session's row has them). Only a copied `custom-title`
+still names the session, as a fallback until the session sets its own.
 """
 
 from __future__ import annotations
@@ -38,7 +45,7 @@ FIELDS =("input", "output", "cache_read", "cache_creation")
 SYNTHETIC_MODEL = "<synthetic>"
 UNKNOWN_MODEL = "unknown"
 RECENT_IDS = 64          # message ids remembered for the latest-line-wins rule (lines of one id are adjacent)
-STATE_VERSION = 2       # 2: title, profile (model, effort, time), outcome signals
+STATE_VERSION = 3       # 2: title, profile (model, effort, time), outcome signals; 3: copied lines of a resumed session left out
 
 
 IDLE_GAP_SECONDS = 600   # a gap between two events longer than this is idle time, not active time
@@ -267,7 +274,8 @@ def _is_prompt(e: dict[str, Any]) -> bool:
 class ClaudeScanner:
     """Running token totals of one Claude Code transcript, fed line by line or incrementally from a file."""
 
-    def __init__(self, state: dict[str, Any] | None = None) -> None:
+    def __init__(self, state: dict[str, Any] | None = None, *, own_session: str | None = None) -> None:
+        self.own_session = own_session  # None: count every line
         self._reset()
         if state:
             self._load(state)
@@ -334,8 +342,17 @@ class ClaudeScanner:
 
     # -------------------------------------------------------------- feeding
 
+    def copied(self, e: dict[str, Any]) -> bool:
+        """A line of another session (the copied history of a resumed session)."""
+        sid = e.get("sessionId")
+        return self.own_session is not None and isinstance(sid, str) and bool(sid) and sid != self.own_session
+
     def feed(self, e: dict[str, Any]) -> None:
         s = self.summary
+        if self.copied(e):
+            if e.get("type") == "custom-title":
+                s.title = clean_title(e.get("customTitle")) or s.title
+            return
         s.tick(_ts(e.get("timestamp")))
         self.tracker.feed(e)
         s.signals, s.end = self.tracker.signals, self.tracker.end
@@ -392,16 +409,17 @@ class ClaudeScanner:
         return read
 
 
-def claude_summary(events: list[dict[str, Any]]) -> Summary:
-    """Token totals of a whole Claude Code transcript (already loaded)."""
-    sc = ClaudeScanner()
+def claude_summary(events: list[dict[str, Any]], *, own_session: str | None = None) -> Summary:
+    """Token totals of a whole Claude Code transcript (already loaded). `own_session`: count
+    only that session's lines (see the module doc on resumed sessions)."""
+    sc = ClaudeScanner(own_session=own_session)
     for e in events:
         sc.feed(e)
     return sc.summary
 
 
-def scan_claude_file(path: Path) -> Summary:
-    sc = ClaudeScanner()
+def scan_claude_file(path: Path, *, own_session: str | None = None) -> Summary:
+    sc = ClaudeScanner(own_session=own_session)
     sc.scan_file(path)
     return sc.summary
 

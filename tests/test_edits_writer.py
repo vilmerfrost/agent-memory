@@ -50,6 +50,37 @@ def test_negated_permission_words_are_fine() -> None:
     parse("## 4. Spawn\nSpawn one worker per task without waiting for approval.\nEach brief names the branch.\n")
 
 
+@pytest.mark.parametrize("line,gate", [
+    ("- Do not stop. Ask Vilmer before any merge.", True),
+    ("Ask Vilmer before merging. Never skip tests.", True),
+    ("Never skip tests, but ask Vilmer before merging.", True),
+    ("Never merge to main until you get his approval.", True),
+    ("Never skip tests; workers need his approval before pushing.", True),
+    ("Never merge without Vilmer's approval.", True),
+    ("Don't merge without asking Vilmer.", True),
+    ("Do not push unless Vilmer approves.", True),
+    ("Never deploy until the user confirms.", True),
+    ("Don't merge before Vilmer signs off.", True),
+    ("Never merge without passing tests.", False),
+    ("Don't ask Vilmer before merging.", False),
+    ("Proceed without asking Vilmer.", False),
+    ("There is no need to ask Vilmer before merging.", False),
+    ("Never wait for Vilmer's approval.", False),
+    ("Do not ever ask the user first.", False),
+    ("Merge the branch without needing approval.", False),
+    ("Spawn one worker per task without waiting for approval.", False),
+])
+def test_ask_gate_negation_must_govern_the_gate(line: str, gate: bool) -> None:
+    assert edits_writer.adds_ask_gate(line) is gate
+    probs = edits_writer.policy_problems("## 4. Spawn\n", f"## 4. Spawn\n{line}\n")
+    assert ("adds an ask-Vilmer permission gate" in probs) is gate
+
+
+def test_negation_bypass_line_is_rejected() -> None:
+    with pytest.raises(ProposalError, match="permission gate"):
+        parse("## 4. Spawn\nSpawn one worker per task.\n- Do not stop. Ask Vilmer before any merge.\n")
+
+
 def test_child_rule_and_money_line_kept() -> None:
     old = edits_sections.section_text(GLOBAL_MD, "explaining-completed-work/response-budget")
     p = parse(old + "\nThree sentences for a trivial task.", text=GLOBAL_MD,

@@ -577,7 +577,10 @@ def session_row(path: Path, project_dir: str, *, parent_session: str | None = No
         size = 0
     repo = repo_of(cwd)
     meta.update(team_info(cwd, repo))
-    tokens = session_tokens.claude_summary(events)
+    # Count only this session's lines: a resumed session's transcript starts with a copy of the
+    # earlier session's lines (their sessionId is the earlier id). A subagent's lines carry the
+    # parent's id. The facts above (kind, skills, start) still read every line.
+    tokens = session_tokens.claude_summary(events, own_session=parent_session if subagent else path.stem)
     row = SessionRow(sid, kind, repo, project_dir, facts.start, facts.end, size,
                      facts.skills, [], meta, path, tokens=tokens).with_summary(tokens)
     return _with_instructions(row)
@@ -778,7 +781,7 @@ def rollup_subagents(rows: list[SessionRow]) -> None:
             for f in sorted(sub_dir.glob("agent-*.jsonl")) if sub_dir.is_dir() else []:
                 got = by_id.get(f"{r.session_id}/{f.stem}")
                 summary = got.tokens if got is not None and got.tokens is not None \
-                    else session_tokens.scan_claude_file(f)
+                    else session_tokens.scan_claude_file(f, own_session=r.session_id)
                 add(r.session_id, summary.tokens)
         elif r.tool == "codex" and r.meta.get("parent_session") and r.tokens is not None:
             add(str(r.meta["parent_session"]), r.tokens.tokens)

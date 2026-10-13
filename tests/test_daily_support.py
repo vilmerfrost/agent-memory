@@ -1,7 +1,8 @@
 """Shared helpers for tests/test_daily_*.py. Holds no tests.
 
 `daily_io` (autouse in each daily test file) makes `amem daily` offline and local:
-- `gh` is never run: `cli_cloud.run_command` answers 404 unless a test sets a fake.
+- `gh` is never run: `cli_cloud.run_command` answers an empty published routines.log
+  unless a test sets a fake (`NOT_FOUND()` gives the 404).
 - ntfy and osascript never run: `daily.http_post` / `daily.mac_notify` record any
   unexpected call, and the test fails at teardown if one happened.
 - notify.env, the routines log and the state file all point into tmp_path.
@@ -55,6 +56,11 @@ class FakeGh:
         assert "-X" not in argv and "--method" not in argv
         self.calls.append(argv)
         return _done(argv, *self.answer)
+
+
+def NOT_FOUND() -> FakeGh:  # noqa: N802  (reads like a constant at the call site)
+    """`gh api` 404: branch or file missing, or no access to the private repo."""
+    return FakeGh(1, '{"message":"Not Found"}', "gh: Not Found (HTTP 404)")
 
 
 @dataclass
@@ -113,6 +119,8 @@ def daily_io(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[DailyI
     monkeypatch.setattr(daily, "NOTIFY_ENV", notify_env)
     monkeypatch.setattr(daily, "http_post", lambda *a, **k: unexpected.append("http_post") or 599)
     monkeypatch.setattr(daily, "mac_notify", lambda *a, **k: unexpected.append("mac_notify"))
-    monkeypatch.setattr(cli_cloud, "run_command", FakeGh(1, '{"message":"Not Found"}', "gh: Not Found (HTTP 404)"))
+    # Default: the branch exists but its routines.log is empty (nothing new). A 404 is a
+    # daily FAIL since swarm #22, so tests that want it set it with `use_gh(NOT_FOUND)`.
+    monkeypatch.setattr(cli_cloud, "run_command", FakeGh(0, gh_contents("")))
     yield DailyIO(tmp_path, routines_log, state, notify_env, unexpected, monkeypatch)
     assert unexpected == [], f"unexpected push calls: {unexpected}"

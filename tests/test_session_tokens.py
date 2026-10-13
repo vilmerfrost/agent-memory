@@ -191,7 +191,7 @@ def test_digest_row_carries_tokens_and_ingest_reads_them(tmp_path: Path) -> None
         e["sessionId"] = "cloud-sess-1"
     t = write_transcript(tmp_path / "cloud-sess-1.jsonl", events)
     row = amem_digest.build_row(t, routine="nightly-trials", instructions=[])
-    assert row["meta"]["script_version"] == amem_digest.SCRIPT_VERSION == "3"
+    assert row["meta"]["script_version"] == amem_digest.SCRIPT_VERSION and int(amem_digest.SCRIPT_VERSION) >= 3  # tokens since v3
     assert row["meta"]["tokens"] == {**EXPECTED.as_dict(), "models": session_tokens.claude_summary(events).models}
     sr = sessions_ingest.cloud_row({**row, "started_at": None, "ended_at": NOW})
     assert sr is not None and sr.tokens is not None

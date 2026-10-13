@@ -212,6 +212,14 @@ _ASK_GATE_RES = (
     re.compile(r"\b(confirm|check) with (vilmer|the user|him)\b", re.I),
 )
 _NEGATED_RE = re.compile(r"\b(never|don't|do not|without|no need|not needed|no longer)\b", re.I)
+# A negation exempts a gate only when it governs it: same clause, and at most this many
+# words between the negation and the gate phrase ("no need to ask", "don't ever ask").
+_NEGATION_GAP_WORDS = 2
+# Double negation is a gate: "never merge without Vilmer's approval" = "get approval first".
+_DOUBLE_NEG_GATE_RE = re.compile(
+    r"\b(never|don't|do not)\b.{0,60}?\b(without|unless|until|before)\b.{0,30}?"
+    r"\b(vilmer|the user|him|his|approv\w*|permission|confirm\w*|sign-?off|go-ahead|consent|ask\w*)\b", re.I)
+_CLAUSE_SPLIT_RE =re.compile(r"[.;:,!?—–]|\s-\s|\bbut\b", re.I)
 MONEY_RE = re.compile(r"\b(spend\w*|spent|money|pay|paid|payment\w*|purchas\w*|costs?|billing|budget\w*|"
                       r"subscription\w*|credit card|invoice\w*|pricing|price\w*)\b", re.I)
 
@@ -248,13 +256,33 @@ def added_lines(old: str, new: str) -> list[str]:
             if ln.startswith("+") and not ln.startswith("+++")]
 
 
+def _negation_governs(before: str) -> bool:
+    """True when the text right before a gate phrase ends in a negation that governs it."""
+    for neg in _NEGATED_RE.finditer(before):
+        if len(_WORD_RE.findall(before[neg.end():])) <= _NEGATION_GAP_WORDS:
+            return True
+    return False
+
+
+def adds_ask_gate(line: str) -> bool:
+    """True when a line holds an ask-Vilmer gate that no negation in its clause governs.
+    "Don't ask Vilmer" passes; "Do not stop. Ask Vilmer before any merge." does not."""
+    for clause in _CLAUSE_SPLIT_RE.split(line):
+        if _DOUBLE_NEG_GATE_RE.search(clause):
+            return True
+        for rx in _ASK_GATE_RES:
+            for m in rx.finditer(clause):
+                # A negation inside the match also governs it: "get it merged without approval".
+                if not (_negation_governs(clause[:m.start()]) or _NEGATED_RE.search(m.group(0))):
+                    return True
+    return False
+
+
 def policy_problems(old_section: str, new_section: str) -> list[str]:
     """Vilmer's hard rules, checked on the text: no new ask-gates, money lines kept."""
     probs = []
     for line in added_lines(old_section, new_section):
-        if _NEGATED_RE.search(line):
-            continue
-        if any(rx.search(line) for rx in _ASK_GATE_RES):
+        if adds_ask_gate(line):
             probs.append("adds an ask-Vilmer permission gate")
             break
     new_lines = {ln.strip() for ln in new_section.splitlines()}

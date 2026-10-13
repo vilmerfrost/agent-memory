@@ -109,7 +109,8 @@ cooldown until <date> (last edit <status> <date>, scoreboard: <verdict>)`, even 
 deviations arrive on the edited text. One exception: when the scoreboard verdict for that
 edit (default 28-day window) is `more`, the edit made things worse, so the rule may be
 re-edited now (the plan line says `cooldown lifted: scoreboard says more`). Reverted,
-refused, auto-reverted, suggested, skipped and proposed edits start no cooldown. The newest
+refused, auto-reverted, suggested and skipped edits start no cooldown; a failed improve apply
+(`meta.apply_failed`, below) starts one with no exception (`improve apply failed <date>`). The newest
 kept / trial edit on the rule decides. `edits scoreboard` shows `; cooldown until <date>`
 or `; cooldown lifted (more)` per edit and `N in cooldown` in its head line.
 
@@ -242,8 +243,12 @@ improve apply --target <file> --rule-id <id> --new-file <tmp> --topic ... --why 
   repeat across files.
 - No JSON line, an unknown status, a status/exit mismatch, kept/trial without an id, or a
   missing executable: an error. The row was written as `proposed` before improve ran, so
-  it stays `proposed` with `meta.error`, and the rule is not retried at that version
-  (improve may have touched the file).
+  it stays `proposed` with `meta.error`, and the rule is not retried at that version.
+- Any failed apply (timeout, kill, garbage): the run restores the original text if the file holds
+  exactly the proposal (`meta.restore`; other text is never overwritten), sets `meta.apply_failed`,
+  fails the step and starts the rule's cooldown. The result update survives a dead connection
+  (fresh one, retried); if not, the error names `improve revert <id>` for a manual undo.
+  On a timeout improve's whole process group (its eval children too) gets SIGTERM, then SIGKILL 10 s later.
 - `improve revert <id> --reason "..."` exit 0 = reverted. `improve suggest --title --why
   --evidence [--target]` exit 0 = logged.
 - `AMEM_IMPROVE_BIN` points at another executable (tests); default `~/agent-config/bin/improve`.
@@ -268,15 +273,20 @@ For each kept or trial edit:
 body at most 2 kB, `edit_id` a uuid, `token` 16-200 chars, else 400. It reads the edit with
 the service role (`SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` from the function env),
 compares `sha256(token)` in constant time (mismatch or unknown edit: 403 `Not allowed`,
-nothing else), inserts `undo_requests` with `on_conflict=edit_id` + ignore-duplicates (a
-second tap does nothing) and answers 200 `text/plain` "Undo queued — reverts within 15
-minutes". It never reverts anything itself. `verify_jwt = false` (supabase/config.toml):
+nothing else), then calls the SQL function `amem_request_undo` (rpc, migration
+`20261019020000_request_undo_fn.sql`; `amem edits undo` uses the same function). It inserts
+the edit's one `undo_requests` row, or reopens a closed one that did not revert (failed 3
+times, nothing to revert: `handled_at`, `attempts`, `result` reset), and leaves a reverted
+one alone. The 200 `text/plain` reply says what will happen: "Undo queued — reverts within
+15 minutes", "Already undone — nothing to do", or "Nothing to undo — this edit is no longer
+active". It never reverts anything itself. `verify_jwt = false` (supabase/config.toml):
 the button sends no JWT; the token is the auth.
 
 - Tests: `supabase/functions/amem-undo/handler_test.ts` runs under `deno test` and
   `node --test` (pytest runs it with node when node is installed). `deno check` was not run
   where deno is missing.
-- Deploy (the parent, never a worker): `supabase functions deploy amem-undo --no-verify-jwt`.
+- Deploy (the parent, never a worker): apply the migrations first (`amem db migrate`), then
+  `supabase functions deploy amem-undo --no-verify-jwt`.
 - Manual test after deploy: `amem edits list` → take an edit id; a wrong token must give
   403: `curl -s -o /dev/null -w '%{http_code}' -X POST <project URL>/functions/v1/amem-undo
   -H 'Content-Type: application/json' -d '{"edit_id":"<id>","token":"wrong-token-0123456789"}'`
@@ -289,7 +299,10 @@ each pending request whose edit is kept / trial → `improve revert <improve id>
 (`result = reverted`), edit `status = reverted`, `reverted_at` set, a short "Agent edit
 undone" push. A failed revert is recorded (`attempts`, `result = failed (attempt N): ...`)
 and retried on the next poll; after 3 attempts the request is closed and an "undo failed"
-push goes out. An edit with nothing to revert (auto-reverted, refused, already reverted)
+push goes out. A busy revert (improve's write lock held by an apply's evals: exit 75 or
+"busy" on stderr) is not an attempt: `result = busy, retrying: ...`, the request stays open
+for the next poll. The poll runs `improve revert` with `IMPROVE_REVERT_WAIT=60` and kills it
+after 100 s, both under amem-ingest's 120 s `AMEM_UNDO_POLL_TIMEOUT`. An edit with nothing to revert (auto-reverted, refused, already reverted)
 closes the request with `nothing to revert (status ...)`.
 
 ## Scoreboard (E5)

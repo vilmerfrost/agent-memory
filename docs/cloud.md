@@ -404,7 +404,7 @@ amem ingest git-ref --git-dir ~/clone --ref origin/claude/routine-reports   # gi
 - Same parser and dedupe keys as `ingest routines-log` (see "Dedupe keys"
   below). Every row gets `source=cloud` and `meta.log_source="routine-reports"`.
 - Branch or file missing: prints `no routines.log published at ... yet` and
-  exits 0.
+  exits 0. (`amem daily` treats the same 404 as a failure; see docs/daily.md.)
 - Options: `--repo`, `--ref`, `--path`, `--git-dir`.
 
 ## Dedupe keys
