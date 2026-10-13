@@ -215,7 +215,11 @@ _NEGATED_RE = re.compile(r"\b(never|don't|do not|without|no need|not needed|no l
 # A negation exempts a gate only when it governs it: same clause, and at most this many
 # words between the negation and the gate phrase ("no need to ask", "don't ever ask").
 _NEGATION_GAP_WORDS = 2
-_CLAUSE_SPLIT_RE = re.compile(r"[.;:,!?—–]|\s-\s|\bbut\b", re.I)
+# Double negation is a gate: "never merge without Vilmer's approval" = "get approval first".
+_DOUBLE_NEG_GATE_RE = re.compile(
+    r"\b(never|don't|do not)\b.{0,60}?\b(without|unless|until|before)\b.{0,30}?"
+    r"\b(vilmer|the user|him|his|approv\w*|permission|confirm\w*|sign-?off|go-ahead|consent|ask\w*)\b", re.I)
+_CLAUSE_SPLIT_RE =re.compile(r"[.;:,!?—–]|\s-\s|\bbut\b", re.I)
 MONEY_RE = re.compile(r"\b(spend\w*|spent|money|pay|paid|payment\w*|purchas\w*|costs?|billing|budget\w*|"
                       r"subscription\w*|credit card|invoice\w*|pricing|price\w*)\b", re.I)
 
@@ -264,6 +268,8 @@ def adds_ask_gate(line: str) -> bool:
     """True when a line holds an ask-Vilmer gate that no negation in its clause governs.
     "Don't ask Vilmer" passes; "Do not stop. Ask Vilmer before any merge." does not."""
     for clause in _CLAUSE_SPLIT_RE.split(line):
+        if _DOUBLE_NEG_GATE_RE.search(clause):
+            return True
         for rx in _ASK_GATE_RES:
             for m in rx.finditer(clause):
                 # A negation inside the match also governs it: "get it merged without approval".
