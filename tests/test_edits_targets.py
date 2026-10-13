@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 
 import pytest
@@ -81,6 +82,64 @@ def test_repo_files_are_never_edited(ehome: EHome, source: str) -> None:  # noqa
     # Even when the repo sits inside an allowed folder, it is still a suggestion.
     ehome.allow(["~/"])
     assert edits_targets.resolve(source).action == SUGGEST
+
+
+def test_fence_mirrors_improve_scope(ehome: EHome) -> None:  # noqa: F811
+    """A fenced file is in scope only when an entry names it or names a fenced folder holding it."""
+    hooks = ehome.agent_config / "hooks"
+    hooks.mkdir()
+    (hooks / "improver-fence.sh").write_text("#!/bin/sh\n")
+    (hooks / "stall-scan.sh").write_text("#!/bin/sh\n")
+    ehome.allow([*ALLOWED, "~/.claude/scheduled-tasks/"])
+    routine = ehome.claude / "scheduled-tasks" / "nightly-check" / "SKILL.md"
+    # No fence.txt: plain allowed_targets.
+    assert edits_targets.is_allowed(hooks / "improver-fence.sh")
+    (ehome.agent_config / "improve" / "fence.txt").write_text(
+        "# comment\n@/hooks/improver-fence.sh\n~/.claude/scheduled-tasks/**\n@/improve/**\n")
+    assert edits_targets.fenced(hooks / "improver-fence.sh") and edits_targets.fenced(routine)
+    assert not edits_targets.fenced(hooks / "stall-scan.sh")
+    assert not edits_targets.is_allowed(hooks / "improver-fence.sh")      # fenced, @/hooks/ is not fenced
+    assert edits_targets.is_allowed(hooks / "stall-scan.sh")
+    assert edits_targets.is_allowed(routine)                              # fenced folder named by an entry
+    assert edits_targets.resolve("routine:nightly-check").action == EDIT
+    assert not edits_targets.is_allowed(ehome.agent_config / "improve" / "criteria.json")
+
+
+def write_pins(ehome: EHome, files: dict[str, str] | None = None, rules: dict[str, str] | None = None) -> None:  # noqa: F811
+    data = {"files": {k: {"reason": v, "since": "2026-10-13T00:00:00+0200"} for k, v in (files or {}).items()},
+            "rules": {k: {"reason": v} for k, v in (rules or {}).items()}}
+    (ehome.agent_config / "improve" / "pins.json").write_text(json.dumps(data))
+
+
+def test_pinned_file_matches_tilde_and_absolute_keys(ehome: EHome) -> None:  # noqa: F811
+    routine = ehome.claude / "scheduled-tasks" / "nightly-check" / "SKILL.md"
+    assert edits_targets.pinned_file(routine) is None                     # no pins.json
+    write_pins(ehome, {"~/.claude/scheduled-tasks/nightly-check/SKILL.md": "judge prompt"})
+    assert edits_targets.pinned_file(routine) == "judge prompt"
+    assert edits_targets.pinned_file(ehome.skill) is None
+    write_pins(ehome, {str(ehome.skill.resolve()): "hand edited"})
+    assert edits_targets.pinned_file(ehome.claude / "skills" / "dispatch" / "SKILL.md") == "hand edited"  # via symlink
+    assert edits_targets.pinned_file(None) is None
+
+
+@pytest.mark.parametrize("content", ["not json", "[1, 2]", '{"files": [], "rules": "x"}'])
+def test_unreadable_pins_mean_no_pins(ehome: EHome, content: str) -> None:  # noqa: F811
+    (ehome.agent_config / "improve" / "pins.json").write_text(content)
+    assert edits_targets.pins() == edits_targets.Pins({}, {})
+    assert edits_targets.pinned_file(ehome.skill) is None
+    assert edits_targets.pinned_rule("skill-dispatch--spawn", "Id: x") is None
+
+
+def test_pinned_rule_uses_improve_namespacing_and_markers(ehome: EHome) -> None:  # noqa: F811
+    write_pins(ehome, rules={"skill-dispatch--spawn": "keep", "spawn": "raw id", "no-compound-cmds": "lesson"})
+    rid = edits.improve_rule_id("skill:dispatch", "spawn")
+    assert edits_targets.pinned_rule(rid) == ("skill-dispatch--spawn", "keep")
+    # A catalog id alone is not improve's id: `spawn` in another skill is not pinned by it.
+    assert edits_targets.pinned_rule(edits.improve_rule_id("skill:other", "track")) is None
+    # Markers inside the section: improve's content guard keeps their paragraphs.
+    assert edits_targets.pinned_rule("", "Some text <!-- improve:spawn -->") == ("spawn", "raw id")
+    assert edits_targets.pinned_rule("", "### Lesson\nId: no-compound-cmds\nEvidence: x") == ("no-compound-cmds", "lesson")
+    assert edits_targets.pinned_rule("", "Id: no-compound-cmds-v2\nidea: spawn later") is None
 
 
 def test_improve_rule_id_is_kebab_and_namespaced() -> None:

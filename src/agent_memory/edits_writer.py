@@ -7,7 +7,8 @@ confidence, the recurrence, and Vilmer's policy. It is told to look for a contra
 first, then a hop fix, and only then to add or reword prose (docs/edits.md, "Design notes
 from MASS"). It answers one JSON object {new_section, topic, why, summary, kind,
 kind_reason}. `parse_proposal` validates it and splices it into the file text; anything
-off raises ProposalError (one candidate's error).
+off raises ProposalError (one candidate's error). The writer's `kind` is then checked
+against the section's real diff (edits_kind.classify); the checked label wins.
 """
 
 from __future__ import annotations
@@ -19,7 +20,7 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
-from agent_memory import config, deviations, distill, rule_catalog
+from agent_memory import config, deviations, distill, edits_kind, rule_catalog
 from agent_memory.edits_sections import Section, find, splice
 
 CLAUDE_ENV = "AMEM_EDITS_CLAUDE"
@@ -58,14 +59,23 @@ POLICY = """Vilmer's policy for these edits (follow all of it):
 # from contracts (what a step must return, with checks) and hops (call order, loop-backs),
 # not from more prose (docs/edits.md, "Design notes from MASS").
 STRATEGY = """How to choose the change. Try these in order and take the first that fits:
-1. contract: make the step's required output explicit and checkable. Name what the agent
-   must produce or report before the step counts as done (a done-check, a report field,
-   a "returns X with Y checked" line), so a missing piece is visible, not a judgment call.
-2. hop: fix the order of steps. Move or reorder a step, or add an explicit "after X, then
-   Y" or a loop-back ("if the check fails, go back to X"), so the step cannot be skipped
-   or run too early.
-3. prose: only when neither a contract nor a hop fix fits, add or reword general guidance.
-Prefer changing an existing line over adding a new rule. Say which kind you made in "kind"."""
+1. contract: what a step must output or check, made explicit and checkable. Make the step's
+   required output explicit and checkable: name what the agent must produce, report or
+   check before the step counts as done (a done-check, a report field, a "returns X with Y
+   checked" line), so a missing piece is visible, not a judgment call.
+   Example: "The report must include the test command and its exit code."
+2. hop: the order of steps. Move or reorder existing steps, or add an explicit "after X, then
+   Y" or a loop-back ("if the check fails, go back to X"), so the step cannot be skipped or
+   run too early.
+   Example: "After the tests pass, then merge; if they fail, go back to step 2."
+3. prose: general wording, scope or explanation. Use it
+   only when neither a contract nor a hop fix fits: reword a line, widen or narrow a scope
+   list, add a reason or a reminder.
+   Example: adding "this also covers polling loops" to an existing bullet.
+Prefer changing an existing line over adding a new rule.
+Label the change you actually made, not the one you aimed for. A longer bullet, a wider list
+or a "read X before you start" reminder is prose unless it adds a required output or check
+(contract) or really moves or sequences steps (hop). Your label is checked against the diff."""
 
 PROMPT = """You edit one rule in an instruction file for AI coding agents. Agents keep deviating
 from this rule. Rewrite only this rule's section so they follow it next time.
@@ -173,8 +183,22 @@ class Proposal:
     why: str
     summary: str
     new_text: str        # the whole file with the section spliced in
-    kind: str = "prose"  # contract | hop | prose
-    kind_reason: str = ""
+    kind: str = "prose"  # contract | hop | prose: the checked label (edits_kind.classify)
+    kind_reason: str = ""          # the writer's own reason for its label
+    kind_writer: str = "prose"     # the writer's label
+    kind_check: str = ""           # what in the diff decided the checked label
+
+    @property
+    def kind_mismatch(self) -> bool:
+        return self.kind != self.kind_writer
+
+    @property
+    def kind_shown(self) -> str:
+        """The reason shown next to the checked kind: the writer's when it agrees, else the
+        check's, naming the writer's label."""
+        if not self.kind_mismatch:
+            return self.kind_reason
+        return f"{self.kind_check}; writer said {self.kind_writer}"
 
 
 _FENCE_RE = re.compile(r"^```(?:json)?\s*\n(.*?)\n?```$", re.DOTALL)
@@ -305,4 +329,5 @@ def parse_proposal(reply: str, *, file_text: str, rule_id: str, cand: dict[str, 
     new_text = splice(file_text, rule_id, new_section)
     if rule_catalog.build([new_text]) != rule_catalog.build([file_text]):
         raise ProposalError("the edit changes the file's rule list (a new or renamed heading)")
-    return Proposal(new_section, topic, why, summary, new_text, kind, kind_reason)
+    check = edits_kind.classify(old_section, new_section, kind)
+    return Proposal(new_section, topic, why, summary, new_text, check.kind, kind_reason, kind, check.reason)

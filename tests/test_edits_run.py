@@ -335,16 +335,125 @@ def test_cli_list(live: ScoringDb, ehome: EHome, ewriter: Any) -> None:  # noqa:
     assert res.returncode == 0 and "edits (last 2 days): 1" in res.stdout and " kind=contract" in res.stdout
 
 
+SPAWN_PROSE = "## 4. Spawn\nSpawn one worker per task, and keep each task small.\nEach brief names the branch.\n"
+
+
 def test_prose_kind_is_allowed_and_shown(live: ScoringDb, ehome: EHome, ewriter: Any) -> None:  # noqa: F811
     seed_spawn(live.url, ehome)
-    ewriter(envelope(proposal(SPAWN_NEW, kind="prose", kind_reason="No output or order to tighten here.")))
+    ewriter(envelope(proposal(SPAWN_PROSE, kind="prose", kind_reason="No output or order to tighten here.")))
     ehome.improve.queue("apply", apply_answer("trial", "c-12"))
     (o,) = edits.run(db_url=live.url, push=False).outcomes
-    assert o.status == "trial" and o.kind == "prose"
+    assert o.status == "trial" and o.kind == "prose" and "writer_kind" not in o.line()
     (row,) = edit_rows(live.url)
-    assert row["meta"]["kind"] == "prose"
+    assert row["meta"]["kind"] == row["meta"]["kind_writer"] == "prose" and row["meta"]["kind_mismatch"] is False
     title, body = edits_push.edit_message(o, with_cli_undo=False)
     assert "Kind: prose (No output or order to tighten here.)" in body
+
+
+def test_kind_mismatch_uses_the_checked_label(live: ScoringDb, ehome: EHome, ewriter: Any) -> None:  # noqa: F811
+    """The writer says hop; the diff only adds prose. The checked label wins everywhere."""
+    seed_spawn(live.url, ehome)
+    ewriter(envelope(proposal(SPAWN_PROSE, kind="hop", kind_reason="Puts the task size step first.")))
+    ehome.improve.queue("apply", apply_answer("kept", "c-13"))
+    (o,) = edits.run(db_url=live.url, push=False).outcomes
+    assert o.status == "kept" and o.kind == "prose" and o.kind_writer == "hop"
+    assert " kind=prose writer_kind=hop" in o.line()
+    (row,) = edit_rows(live.url)
+    meta = row["meta"]
+    assert meta["kind"] == "prose" and meta["kind_writer"] == "hop" and meta["kind_mismatch"] is True
+    assert meta["kind_check"] == "no step-order change and no new output or check clause"
+    assert meta["kind_reason"] == "Puts the task size step first."
+    _, body = edits_push.edit_message(o, with_cli_undo=False)
+    assert "Kind: prose (no step-order change and no new output or check clause; writer said hop)" in body
+    rows = edits.list_edits(days=1, now=datetime.now(UTC) + timedelta(minutes=1), db_url=live.url)
+    (line,) = [edits.list_line(r) for r in rows]
+    assert "kind=prose writer_kind=hop" in line
+    assert line.endswith("(prose: no step-order change and no new output or check clause; writer said hop)")
+
+
+# --------------------------------------------------------------------------- pins
+
+
+def write_pins(ehome: EHome, files: dict[str, str] | None = None, rules: dict[str, str] | None = None) -> None:  # noqa: F811
+    data = {"files": {k: {"reason": v, "since": "2026-10-13T00:00:00+0200"} for k, v in (files or {}).items()},
+            "rules": {k: {"reason": v, "since": "2026-10-13T00:00:00+0200"} for k, v in (rules or {}).items()}}
+    (ehome.agent_config / "improve" / "pins.json").write_text(json.dumps(data))
+
+
+JUDGE = "judge prompt: the measuring stick is never changed by the loop (Vilmer, 2026-10-13)"
+
+
+def test_pinned_file_is_skipped_before_the_writer(live: ScoringDb, ehome: EHome, ewriter: Any) -> None:  # noqa: F811
+    """The live-run shape: a routine prompt in scope, pinned as a judge prompt."""
+    ehome.allow(["~/.agents/skills/", "~/.claude/scheduled-tasks/"])
+    write_pins(ehome, {"~/.claude/scheduled-tasks/nightly-check/SKILL.md": JUDGE})
+    routine = ehome.claude / "scheduled-tasks" / "nightly-check" / "SKILL.md"
+    seed(live.url, "routine:nightly-check", "whole", "Nightly check", n=3, sha=sha_of(routine))
+    w = ewriter(default=envelope(proposal("# Nightly check\nRun the suite twice.\n")))
+    r = edits.run(db_url=live.url, push=False)
+    (o,) = r.outcomes
+    assert o.status == "skip" and o.reason == f"file pinned ({JUDGE})", o.line()
+    assert o.line().startswith("skip routine:nightly-check whole -> ") and "nightly-check/SKILL.md" in o.line()
+    assert w.prompts == [] and ehome.improve.calls() == [] and edit_rows(live.url) == []
+    assert r.errors == 0 and routine.read_text() == "# Nightly check\nRun the suite.\n"
+    # The dry run says the same.
+    (o,) = edits.run(dry_run=True, db_url=live.url).outcomes
+    assert o.status == "skip" and "pinned (judge prompt" in o.reason
+
+
+def test_pinned_absolute_file_key_is_skipped(sdb: ScoringDb, ehome: EHome) -> None:  # noqa: F811
+    write_pins(ehome, {str(ehome.skill.resolve()): "edited by hand"})
+    seed_spawn(sdb.url, ehome)
+    (o,) = edits.run(dry_run=True, db_url=sdb.url).outcomes
+    assert o.status == "skip" and o.reason == "file pinned (edited by hand)"
+
+
+def test_pinned_rule_id_is_skipped(live: ScoringDb, ehome: EHome, ewriter: Any) -> None:  # noqa: F811
+    write_pins(ehome, rules={"skill-dispatch--spawn": "Vilmer keeps this wording"})
+    seed_spawn(live.url, ehome)
+    w = ewriter(default=envelope(proposal(SPAWN_NEW)))
+    (o,) = edits.run(db_url=live.url, push=False).outcomes
+    assert o.status == "skip" and o.reason == "rule skill-dispatch--spawn pinned (Vilmer keeps this wording)"
+    assert w.prompts == [] and ehome.improve.calls() == [] and edit_rows(live.url) == []
+    # improve's ids are namespaced: the bare catalog id `spawn` pins nothing here.
+    write_pins(ehome, rules={"spawn": "some other file's rule"})
+    (o,) = edits.run(dry_run=True, db_url=live.url).outcomes
+    assert o.status == "plan-edit"
+
+
+def test_pinned_marker_in_the_section_is_skipped(live: ScoringDb, ehome: EHome, ewriter: Any) -> None:  # noqa: F811
+    ehome.skill.write_text(SKILL_MD.replace("Each brief names the branch.\n",
+                                            "Each brief names the branch. <!-- improve:brief-branch -->\n"))
+    write_pins(ehome, rules={"brief-branch": "kept by hand"})
+    seed_spawn(live.url, ehome)
+    w = ewriter(default=envelope(proposal(SPAWN_NEW)))
+    (o,) = edits.run(db_url=live.url, push=False).outcomes
+    assert o.status == "skip" and o.reason == "rule brief-branch pinned (kept by hand)"
+    assert w.prompts == [] and edit_rows(live.url) == []
+
+
+@pytest.mark.parametrize("pins", [None, "not json {", '{"files": {"~/elsewhere.md": {"reason": "x"}}, "rules": {}}'])
+def test_missing_or_unrelated_pins_are_harmless(sdb: ScoringDb, ehome: EHome, pins: str | None) -> None:  # noqa: F811
+    if pins is not None:
+        (ehome.agent_config / "improve" / "pins.json").write_text(pins)
+    seed_spawn(sdb.url, ehome)
+    (o,) = edits.run(dry_run=True, db_url=sdb.url).outcomes
+    assert o.status == "plan-edit", o.line()
+
+
+def test_improve_pin_refusal_is_still_the_backstop(live: ScoringDb, ehome: EHome, ewriter: Any,  # noqa: F811
+                                                   daily_io: DailyIO) -> None:  # noqa: F811
+    """No pins.json here (or a pin added after the plan): improve refuses, and the run records it."""
+    push = daily_io.use_push(Push(status=200))
+    seed_spawn(live.url, ehome)
+    ewriter(envelope(proposal(SPAWN_NEW)))
+    ehome.improve.queue("apply", apply_answer("refused", None, reason=f"file pinned ({JUDGE})"))
+    r = edits.run(db_url=live.url, notify=NOTIFY)
+    (o,) = r.outcomes
+    assert o.status == "refused" and o.reason == f"file pinned ({JUDGE})" and r.errors == 0
+    (row,) = edit_rows(live.url)
+    assert row["status"] == "refused" and row["meta"]["improve"]["reason"] == f"file pinned ({JUDGE})"
+    assert push.posts == [] and ehome.skill.read_text() == SKILL_MD
 
 
 # --------------------------------------------------------------------------- cooldown

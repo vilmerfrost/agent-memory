@@ -8,9 +8,11 @@ Per candidate from the deviations report (deviations.candidates, the `deviations
    in cooldown (a kept/trial edit in the last AMEM_EDITS_COOLDOWN_DAYS, unless the
    scoreboard says `more`; scoreboard.active_cooldown).
 2. Target (edits_targets.resolve): edit the real file, suggest (`improve suggest`) for repo
-   files and files outside improve's allowed targets, or skip.
+   files and files outside improve's allowed targets, or skip. A file or rule pinned in
+   improve's pins.json is skipped here, before any writer call or row (improve would refuse it).
 3. Edit: the writer (edits_writer) rewrites the one rule section, it is validated and
-   spliced into a temp copy, and `improve apply --json` decides: kept, trial,
+   spliced into a temp copy, its kind label is checked against the diff (edits_kind), and
+   `improve apply --json` decides: kept, trial,
    auto-reverted or refused. One `edits` row records it; kept/trial edits get an undo
    token (only its sha256 is stored) and a push with an Undo button (edits_push).
 
@@ -228,7 +230,8 @@ def update_edit(conn: psycopg.Connection, edit_id: uuid.UUID, *, meta: dict[str,
 
 _LIST_SQL = """
 select id, created_at, status, instruction_source, rule_id, rule_title, target_path, improve_id, summary,
-       pushed_at, undo_requested_at, reverted_at, meta->>'kind' as kind, meta->>'kind_reason' as kind_reason
+       pushed_at, undo_requested_at, reverted_at, meta->>'kind' as kind, meta->>'kind_reason' as kind_reason,
+       meta->>'kind_writer' as kind_writer, meta->>'kind_check' as kind_check
 from edits where created_at >= %s order by created_at desc, id
 """
 
@@ -244,12 +247,15 @@ def list_line(r: dict[str, Any]) -> str:
     when = r["created_at"].astimezone().strftime("%Y-%m-%d %H:%M")
     rule = f"{r['instruction_source']} / {r['rule_title'] or r['rule_id']} [{r['rule_id']}]"
     extra = f" improve={r['improve_id']}" if r["improve_id"] else ""
-    if r.get("kind"):
-        extra += f" kind={r['kind']}"
+    kind, writer = r.get("kind"), r.get("kind_writer")
+    mismatch = bool(kind and writer and writer != kind)
+    if kind:
+        extra += f" kind={kind}" + (f" writer_kind={writer}" if mismatch else "")
     text = (f"{r['id']} {when} {r['status']} {rule} -> {r['target_path'] or '-'}{extra}"
             + (f": {r['summary']}" if r["summary"] else ""))
-    if r.get("kind") and r.get("kind_reason"):
-        text += f" ({r['kind']}: {r['kind_reason']})"
+    reason = f"{r.get('kind_check')}; writer said {writer}" if mismatch and r.get("kind_check") else r.get("kind_reason")
+    if kind and reason:
+        text += f" ({kind}: {reason})"
     return text
 
 
@@ -271,8 +277,9 @@ class Outcome:
     why: str | None = None
     token: str | None = field(default=None, repr=False)   # kept/trial only; never stored, never printed
     push: str | None = None                               # phone | mac | off
-    kind: str | None = None                               # contract | hop | prose (the writer's own label)
-    kind_reason: str | None = None
+    kind: str | None = None                               # contract | hop | prose (checked against the diff)
+    kind_reason: str | None = None                        # the writer's reason, or the check's on a mismatch
+    kind_writer: str | None = None                        # the writer's own label
 
     def line(self) -> str:
         rule = f"{self.source} {self.rule_id or '-'}"
@@ -284,6 +291,8 @@ class Outcome:
             text += f" improve={self.improve_id}"
         if self.kind:
             text += f" kind={self.kind}"
+            if self.kind_writer and self.kind_writer != self.kind:
+                text += f" writer_kind={self.kind_writer}"
         if self.push:
             text += f" push={self.push}"
         return text + (f": {self.reason}" if self.reason else "")
@@ -361,6 +370,14 @@ def plan_candidate(conn: psycopg.Connection, cand: dict[str, Any], *, min_confid
     t = edits_targets.resolve(cand["instruction_source"], cand.get("target_paths"))
     if t.action == edits_targets.SKIP:
         return _Plan(cand, "skip", t.reason)
+    # improve refuses pinned files and rules; skip them here, before any writer call or row.
+    pins = edits_targets.pins()
+    pin_reason = edits_targets.pinned_file(t.path, pins)
+    if pin_reason is not None:
+        return _Plan(cand, "skip", f"file pinned ({pin_reason})", t.path)
+    rule_pin = edits_targets.pinned_rule(improve_rule_id(cand["instruction_source"], rule_id), p=pins)
+    if rule_pin is not None:
+        return _Plan(cand, "skip", f"rule {rule_pin[0]} pinned ({rule_pin[1]})", t.path)
     text = sha = None
     if t.path is not None and t.path.is_file() and not t.path.name.lower().startswith(".env"):
         try:
@@ -385,6 +402,9 @@ def plan_candidate(conn: psycopg.Connection, cand: dict[str, Any], *, min_confid
         section = edits_sections.section_text(text, rule_id)
     except edits_sections.SectionError as exc:
         return _Plan(cand, "skip", f"{exc} (the file changed since the scan)", t.path)
+    rule_pin = edits_targets.pinned_rule("", section, pins)
+    if rule_pin is not None:
+        return _Plan(cand, "skip", f"rule {rule_pin[0]} pinned ({rule_pin[1]})", t.path)
     if deviations.redact(section) != section:
         return _Plan(cand, "skip", "the rule holds secret-shaped text: not sent to the writer", t.path)
     return _Plan(cand, "edit", f"{cand['verdict']} {conf:.2f}, {evidence(cand)}{lifted}", t.path, text, sha)
@@ -449,11 +469,12 @@ def _edit(conn: psycopg.Connection, p: _Plan, *, days: int, timeout: float) -> O
         out.reason = f"target unreadable: {exc}"
         return out
     out.why, out.summary = proposal.why, proposal.summary
-    out.kind, out.kind_reason = proposal.kind, proposal.kind_reason
+    out.kind, out.kind_reason, out.kind_writer = proposal.kind, proposal.kind_shown, proposal.kind_writer
     edit_id = insert_edit(conn, c, status="proposed", target=p.target, sha_before=p.sha, why=proposal.why,
                           summary=proposal.summary,
                           meta={"topic": proposal.topic, "kind": proposal.kind, "kind_reason": proposal.kind_reason,
-                                "writer_model": edits_writer.writer_model()})
+                                "kind_writer": proposal.kind_writer, "kind_check": proposal.kind_check,
+                                "kind_mismatch": proposal.kind_mismatch, "writer_model": edits_writer.writer_model()})
     conn.commit()   # crash-safe: the row exists before improve touches the file
     out.edit_id = edit_id
     fd, tmp = tempfile.mkstemp(prefix="amem-edit-", suffix=p.target.suffix or ".md")
