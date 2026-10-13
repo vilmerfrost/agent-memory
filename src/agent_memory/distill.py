@@ -186,10 +186,17 @@ def writer_prompt(state: str, repo: str, close: list[dict[str, Any]]) -> str:
 
 
 def writer_argv() -> list[str]:
-    """The headless CLI call. No tools (the prompt holds untrusted run text), no session file."""
+    """The headless CLI call. No tools (the prompt holds untrusted run text), no session file.
+
+    No skills and no MCP servers either: a plain `claude -p` loads the user's whole setup
+    (every skill, plugin and MCP tool listing), which measured ~1.27M tokens and failed with
+    "Prompt is too long". With both off the call is ~8.5k tokens. `--bare` is not an option:
+    it disables OAuth, and the daily job runs on the user's subscription login.
+    """
     exe = os.environ.get(CLAUDE_ENV, "").strip() or "claude"
     return [exe, "-p", "--model", "sonnet", "--output-format", "json",
-            "--tools", "", "--no-session-persistence"]
+            "--tools", "", "--disable-slash-commands", "--strict-mcp-config",
+            "--no-session-persistence"]
 
 
 def call_writer(prompt: str, *, timeout: float = DEFAULT_TIMEOUT) -> str:

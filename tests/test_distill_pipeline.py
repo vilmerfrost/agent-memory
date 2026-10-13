@@ -273,7 +273,8 @@ def test_real_writer_times_out_and_reports_exit_codes(tmp_path: Path, monkeypatc
 def test_writer_argv_uses_headless_json_without_tools(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv(distill.CLAUDE_ENV)
     assert distill.writer_argv() == ["claude", "-p", "--model", "sonnet", "--output-format", "json",
-                                     "--tools", "", "--no-session-persistence"]
+                                     "--tools", "", "--disable-slash-commands", "--strict-mcp-config",
+                                     "--no-session-persistence"]
 
 
 # ---------------------------------------------------------------- idempotency, limit, scope
