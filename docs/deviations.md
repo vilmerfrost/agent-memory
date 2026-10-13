@@ -9,7 +9,8 @@ Editing is step E4, `amem edits run` (docs/edits.md), through agent-config's `im
 
 ```
 ~/.claude/projects/*.jsonl ─┐
-~/.codex/sessions/**/rollout-*.jsonl ─┴─sessions ingest──▶ sessions (tool = claude | codex)
+~/.codex/sessions/**/rollout-*.jsonl ─┤
+cloud_digests (cloud routines) ─┴─sessions ingest──▶ sessions (tool = claude | codex)
                                                    │ deviations scan (daily) 
                                                    ▼
             digest (redacted, capped) + instructions in force + rule catalog
@@ -64,6 +65,8 @@ id `<parent session>/agent-<id>`.
 - `skills`: `Skill` tool calls plus slash commands, without Claude Code built-ins.
 - `instructions`: the instruction sources in force whose file exists (see below).
 - `tool`: `claude` or `codex` (see Codex below).
+- Cloud routine sessions come from the `cloud_digests` table, not a transcript file: id
+  `cloud:<session id>`, kind `routine`, `project_dir` `cloud`, `meta.cloud` true (docs/cloud.md).
 - `meta.team`: true for a team repo's session (see Team repos below).
 - A re-ingest refreshes the facts and keeps `scanned_at` and the scan keys in `meta`.
 
@@ -135,6 +138,14 @@ Codex sessions have their own sources (Codex reads no CLAUDE.md):
 | `agents-md:global` | `~/.codex/AGENTS.override.md`, else `~/.codex/AGENTS.md` |
 | `skill:<name>` | the first of `~/.claude/skills/<name>/SKILL.md` (the shared `~/.agents/skills`), `~/.codex/skills/<name>/SKILL.md`, `~/.codex/skills/.system/<name>/SKILL.md` |
 | `agents-md:<repo>` | as above |
+
+Cloud routine sessions (`meta.cloud`, id `cloud:<session id>`) have no local files in force.
+Their sources are the texts the routine sent ([cloud.md](cloud.md#cloud-digests-cloud-routine-sessions-in-the-deviation-scan)):
+
+| Source | Text |
+|---|---|
+| `routine:<name>` | the routine prompt (`cloud_digests.instructions`, name `prompt`) |
+| `cloud-file:<name>` | an instruction file of the routine's repo (`nightly-md` = NIGHTLY.md) |
 
 A file that two sources name (a `CLAUDE.md` symlinked to `AGENTS.md`) is read once, by the
 first. The rule catalog treats AGENTS.md like any other markdown source.
