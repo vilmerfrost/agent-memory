@@ -6,7 +6,8 @@ Per candidate from the deviations report (deviations.candidates, the `deviations
 1. Filter: Jev verdict edit_instruction or enforce, confidence >= --min-confidence, not a
    team repo (`team: true`), a real rule id, not already handled at this file version, not
    in cooldown (a kept/trial edit in the last AMEM_EDITS_COOLDOWN_DAYS, unless the
-   scoreboard says `more`; scoreboard.active_cooldown).
+   scoreboard says `more`; scoreboard.active_cooldown), and no failed `improve apply` in that
+   window (recent_failed_apply; a failed apply restores the original file, restore_target).
 2. Target (edits_targets.resolve): edit the real file, suggest (`improve suggest`) for repo
    files and files outside improve's allowed targets, or skip. A file or rule pinned in
    improve's pins.json is skipped here, before any writer call or row (improve would refuse it).
@@ -29,7 +30,9 @@ import math
 import os
 import re
 import subprocess
+import sys
 import tempfile
+import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -433,6 +436,11 @@ def plan_candidate(conn: psycopg.Connection, cand: dict[str, Any], *, min_confid
             return _Plan(cand, "skip", f"cooldown until {cd.cooldown_until[:10]} (last edit {cd.status} "
                                        f"{cd.edited_at[:10]}, scoreboard: {cd.verdict})", t.path)
         lifted = f"; cooldown lifted: scoreboard says more since the {cd.edited_at[:10]} edit"
+    failed = recent_failed_apply(conn, cand["instruction_source"], rule_id, now=now)
+    if failed is not None:
+        until = (failed[0] + timedelta(days=scoreboard.cooldown_days())).astimezone(UTC).date().isoformat()
+        return _Plan(cand, "skip", f"cooldown until {until} (improve apply failed {failed[0].date().isoformat()}: "
+                                   f"{_one_line(failed[1], 120)})", t.path)
     if t.action == edits_targets.SUGGEST:
         return _Plan(cand, "suggest", t.reason + lifted, t.path, text, sha)
     if text is None:
@@ -474,8 +482,8 @@ def _suggest(conn: psycopg.Connection, p: _Plan) -> Outcome:
     return out
 
 
-def _edit(conn: psycopg.Connection, p: _Plan, *, days: int, timeout: float) -> Outcome:
-    c = p.cand
+def _edit(db: _Db, p: _Plan, *, days: int, timeout: float) -> Outcome:
+    c, conn = p.cand, db.conn
     assert p.target is not None and p.text is not None
     out = Outcome(c["instruction_source"], c["rule_id"], "error", target=edits_targets.short(p.target),
                   rule_title=c.get("rule_title"))
@@ -524,9 +532,21 @@ def _edit(conn: psycopg.Connection, p: _Plan, *, days: int, timeout: float) -> O
                          c["rule_id"]), "--new-file", tmp, "--topic", proposal.topic, "--why", proposal.why,
                          "--evidence", evidence(c), "--json"])
         result = parse_apply(proc)
-    except ImproveError as exc:
-        update_edit(conn, edit_id, meta={"error": _one_line(str(exc))})
-        out.status, out.reason = "proposed", _one_line(f"improve: {exc}")
+    except Exception as exc:  # timeout, kill, garbage reply: improve may have written the target already
+        err = str(exc) if isinstance(exc, ImproveError) else f"{type(exc).__name__}: {exc}"
+        restore, restore_note = restore_target(p.target, p.text, proposal.new_text)
+        meta: dict[str, Any] = {"error": _one_line(err), "apply_failed": True, "restore": restore}
+        if restore_note:
+            meta["restore_note"] = _one_line(restore_note)
+        out.status = "proposed"     # counts as an error (Report.errors), so the daily step fails
+        out.reason = _one_line(f"improve: {err}; target {restore}" + (f" ({restore_note})" if restore_note else ""))
+        if restore == RESTORE_FAILED:
+            _loud(f"edits: {edit_id} {out.target}: improve apply failed and the target was NOT restored: "
+                  f"{restore_note}. Check the file by hand.")
+        db_err = _persist(db, lambda conn: update_edit(conn, edit_id, meta=meta))
+        if db_err:
+            out.reason = _one_line(f"{out.reason}; edit row not updated: {db_err}")
+            _loud(f"edits: {edit_id}: could not record the failed apply: {db_err}")
         return out
     finally:
         try:
@@ -539,16 +559,117 @@ def _edit(conn: psycopg.Connection, p: _Plan, *, days: int, timeout: float) -> O
             fields["instruction_sha_after"] = file_sha(p.target.read_text(encoding="utf-8"))
         except OSError:
             fields["instruction_sha_after"] = file_sha(proposal.new_text)
-    update_edit(conn, edit_id, meta={"improve": {"reason": result.reason, "revert": result.revert}}, **fields)
+    upd_meta = {"improve": {"reason": result.reason, "revert": result.revert}}
+    # improve may have run for an hour: the connection can be dead by now. The result must survive.
+    db_err = _persist(db, lambda conn: update_edit(conn, edit_id, meta=upd_meta, **fields))
+    if db_err:
+        undo = result.revert or (f"improve revert {result.id}" if result.id else "nothing to revert")
+        out.status, out.improve_id = "error", result.id
+        out.reason = _one_line(f"improve {result.id} {result.status} but edit row {edit_id} not updated "
+                               f"({db_err}); no undo button: undo by hand with `{undo}`")
+        _loud(f"edits: {out.reason}")
+        return out
     out.status, out.improve_id, out.reason = result.status, result.id, result.reason or proposal.summary
     return out
+
+
+RESTORED = "restored"
+RESTORE_UNCHANGED = "unchanged"
+RESTORE_FAILED = "restore_failed"
+PERSIST_TRIES = 3
+PERSIST_DELAY = 2.0     # seconds, times the attempt number; tests set 0
+
+
+def _loud(msg: str) -> None:
+    print(msg, file=sys.stderr, flush=True)
+
+
+def restore_target(target: Path, original: str, new_text: str) -> tuple[str, str]:
+    """After a failed `improve apply`: put the original text back. Only overwrite the file when
+    it holds exactly the original (nothing to do) or the proposed text (improve's own write),
+    so a concurrent edit by someone else is never clobbered. (status, note)."""
+    try:
+        now_text = target.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        return RESTORE_FAILED, f"target unreadable: {type(exc).__name__}: {exc}"
+    if now_text == original:
+        return RESTORE_UNCHANGED, ""
+    if now_text != new_text:
+        return RESTORE_FAILED, "target holds text that is neither the original nor the proposal"
+    try:
+        target.write_text(original, encoding="utf-8")
+        back = target.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        return RESTORE_FAILED, f"write failed: {type(exc).__name__}: {exc}"
+    if back != original:
+        return RESTORE_FAILED, "the restored file does not read back as the original"
+    return RESTORED, ""
+
+
+class _Db:
+    """The run's connection, replaceable: a long improve call can outlive it (pooler idle timeout)."""
+
+    def __init__(self, db_url: str | None) -> None:
+        self.url = db_url
+        self.conn = store.connect(db_url)
+
+    def reconnect(self) -> None:
+        self.close()
+        self.conn = store.connect(self.url)
+
+    def ensure(self) -> None:
+        if self.conn.closed or self.conn.broken:
+            self.reconnect()
+
+    def close(self) -> None:
+        try:
+            self.conn.close()
+        except Exception:  # noqa: BLE001 - a dead connection may fail to close
+            pass
+
+
+def _persist(db: _Db, write: Any) -> str | None:
+    """Run `write(conn)` and commit, reconnecting and retrying on a database error. None on
+    success, else the last error (the caller logs it loudly)."""
+    last: Exception | None = None
+    for attempt in range(PERSIST_TRIES):
+        try:
+            if attempt:
+                time.sleep(PERSIST_DELAY * attempt)
+                db.reconnect()
+            else:
+                db.ensure()
+            write(db.conn)
+            db.conn.commit()
+            return None
+        except psycopg.Error as exc:
+            last = exc
+            try:
+                db.conn.rollback()
+            except psycopg.Error:
+                pass
+    return _one_line(f"{type(last).__name__}: {last}", 160)
+
+
+def recent_failed_apply(conn: psycopg.Connection, source: str, rule_id: str, *,
+                        now: datetime | None = None) -> tuple[datetime, str] | None:
+    """The newest failed `improve apply` on this rule inside the cooldown window: (when, error)."""
+    days = scoreboard.cooldown_days()
+    if days <= 0:
+        return None
+    now = now or datetime.now(UTC)
+    row = conn.execute("select created_at, meta->>'error' from edits where instruction_source = %s and rule_id = %s "
+                       "and status = 'proposed' and meta->>'apply_failed' = 'true' and created_at > %s "
+                       "order by created_at desc limit 1", (source, rule_id, now - timedelta(days=days))).fetchone()
+    return None if row is None else (row[0], row[1] or "")
 
 
 def run(*, days: int = DEFAULT_DAYS, limit: int = DEFAULT_LIMIT, min_confidence: float = DEFAULT_MIN_CONFIDENCE,
         dry_run: bool = False, push: bool = True, timeout: float = edits_writer.DEFAULT_TIMEOUT,
         now: datetime | None = None, notify: dict[str, str] | None = None, db_url: str | None = None) -> Report:
     """Plan and (unless dry_run) apply edits. Raises only before the loop (the candidate
-    query). Each candidate's failure is that candidate's `error` outcome."""
+    query). Each candidate's failure is that candidate's `error` outcome. The connection is
+    replaced when it dies (a long improve call can outlive it), so later candidates still run."""
     from agent_memory import edits_push  # edits_push imports daily, which imports this module lazily
 
     report = Report(dry_run=dry_run)
@@ -559,13 +680,16 @@ def run(*, days: int = DEFAULT_DAYS, limit: int = DEFAULT_LIMIT, min_confidence:
         o.cost = cost_text(cand)
         report.outcomes.append(o)
 
-    with store.connect(db_url) as conn:
+    db = _Db(db_url)
+    try:
         for cand in cands:
             try:
-                p = plan_candidate(conn, cand, min_confidence=min_confidence, now=now)
+                db.ensure()
+                p = plan_candidate(db.conn, cand, min_confidence=min_confidence, now=now)
             except Exception as exc:  # never block: this candidate's error
                 add(Outcome(cand.get("instruction_source", "?"), cand.get("rule_id"), "error",
                             _one_line(f"plan: {type(exc).__name__}: {exc}")), cand)
+                _rollback(db)
                 continue
             if p is None:
                 continue
@@ -582,21 +706,29 @@ def run(*, days: int = DEFAULT_DAYS, limit: int = DEFAULT_LIMIT, min_confidence:
                             p.reason, edits_targets.short(p.target)), cand)
                 continue
             try:
-                o = _suggest(conn, p) if p.action == "suggest" else _edit(conn, p, days=days, timeout=timeout)
-                conn.commit()
+                o = _suggest(db.conn, p) if p.action == "suggest" else _edit(db, p, days=days, timeout=timeout)
+                if not (db.conn.closed or db.conn.broken):   # else _edit already said loudly what was lost
+                    db.conn.commit()
             except Exception as exc:  # DB or anything unexpected: this candidate only
-                try:
-                    conn.rollback()
-                except psycopg.Error:
-                    pass
+                _rollback(db)
                 o = Outcome(cand["instruction_source"], cand["rule_id"], "error",
                             _one_line(f"{type(exc).__name__}: {exc}"), edits_targets.short(p.target))
             if o.status in ("kept", "trial") and o.edit_id is not None:
                 try:
-                    o.push = edits_push.push_new_edit(conn, o, push=push, notify=notify)
-                    conn.commit()
+                    o.push = edits_push.push_new_edit(db.conn, o, push=push, notify=notify)
+                    db.conn.commit()
                 except Exception as exc:  # a failed push never undoes the edit
+                    _rollback(db)
                     o.push = "error"
                     o.reason = _one_line(f"{o.reason}; push: {type(exc).__name__}")
             add(o, cand)
+    finally:
+        db.close()
     return report
+
+
+def _rollback(db: _Db) -> None:
+    try:
+        db.conn.rollback()
+    except psycopg.Error:
+        pass

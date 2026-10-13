@@ -109,7 +109,8 @@ cooldown until <date> (last edit <status> <date>, scoreboard: <verdict>)`, even 
 deviations arrive on the edited text. One exception: when the scoreboard verdict for that
 edit (default 28-day window) is `more`, the edit made things worse, so the rule may be
 re-edited now (the plan line says `cooldown lifted: scoreboard says more`). Reverted,
-refused, auto-reverted, suggested, skipped and proposed edits start no cooldown. The newest
+refused, auto-reverted, suggested and skipped edits start no cooldown; a failed improve apply
+(`meta.apply_failed`, below) starts one with no exception (`improve apply failed <date>`). The newest
 kept / trial edit on the rule decides. `edits scoreboard` shows `; cooldown until <date>`
 or `; cooldown lifted (more)` per edit and `N in cooldown` in its head line.
 
@@ -242,8 +243,11 @@ improve apply --target <file> --rule-id <id> --new-file <tmp> --topic ... --why 
   repeat across files.
 - No JSON line, an unknown status, a status/exit mismatch, kept/trial without an id, or a
   missing executable: an error. The row was written as `proposed` before improve ran, so
-  it stays `proposed` with `meta.error`, and the rule is not retried at that version
-  (improve may have touched the file).
+  it stays `proposed` with `meta.error`, and the rule is not retried at that version.
+- Any failed apply (timeout, kill, garbage): the run restores the original text if the file holds
+  exactly the proposal (`meta.restore`; other text is never overwritten), sets `meta.apply_failed`,
+  fails the step and starts the rule's cooldown. The result update survives a dead connection
+  (fresh one, retried); if not, the error names `improve revert <id>` for a manual undo.
 - `improve revert <id> --reason "..."` exit 0 = reverted. `improve suggest --title --why
   --evidence [--target]` exit 0 = logged.
 - `AMEM_IMPROVE_BIN` points at another executable (tests); default `~/agent-config/bin/improve`.
