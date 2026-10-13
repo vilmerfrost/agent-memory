@@ -4,6 +4,7 @@
 threshold = 0.7
 pass_question = "verdict"
 pass_options = ["ok"]
+escalate_on = ["verdict", "severity"]   # both escalate here (tests a secondary question in the list)
 
 [[questions]]
 name = "verdict"

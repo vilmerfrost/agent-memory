@@ -2,10 +2,11 @@
 
 File format (full reference in docs/scoring.md):
 
-    threshold = 0.7              # choice/score confidence below this escalates the run
+    threshold = 0.7              # an escalate_on confidence below this escalates the run
     pass_question = "verdict"    # a choice or score question; maps Jev's answer to up/down
     pass_options = ["ok"]        # choice pass_question: these labels mean "up"
     # pass_min = 2.0             # score pass_question: score >= pass_min means "up"
+    escalate_on = ["verdict"]    # optional; choice/score questions that escalate (default: the pass_question)
 
     [[questions]]                # 3 to 5 entries, in the order Jev gets them
     name = "verdict"
@@ -81,6 +82,8 @@ class QuestionSet:
     questions: list[QuestionSpec]
     pass_options: list[str] = field(default_factory=list)
     pass_min: float | None = None
+    # Choice/score questions whose low confidence escalates a run. Default: the pass_question.
+    escalate_on: list[str] = field(default_factory=list)
 
     def jev_questions(self) -> list[jev.Question]:
         return [q.to_jev() for q in self.questions]
@@ -111,6 +114,55 @@ class QuestionSet:
         if value_num is None:
             return None
         return float(value_num) / (len(spec.levels) - 1)
+
+    def _is_up_option(self, key: str) -> bool:
+        """A probabilities key on the up side: a pass option (choice) or a level >= pass_min (score)."""
+        if self.spec(self.pass_question).kind == "choice":
+            return key in self.pass_options
+        try:
+            return float(key) >= float(self.pass_min)  # type: ignore[arg-type]
+        except ValueError:
+            return False
+
+    def verdict_confidence(self, value: str, value_num: float | None, confidence: float | None,
+                           probabilities: dict[str, Any] | None) -> float | None:
+        """How sure Jev is of its up/down verdict on the pass_question, on Jev's own scale.
+
+        Jev's `confidence` is for the exact label: (n * p_top - 1) / (n - 1) over n options.
+        Two labels on the same side (e.g. `regression` vs `harness_problem`, both "down")
+        split p_top and drag it down, although up vs down is clear. So the verdict
+        confidence is max(Jev's confidence, 2 * p_side - 1), where p_side is the summed
+        probability of the side Jev's answer is on: the same formula for a two-way
+        up/down question. With two options it equals Jev's confidence. Without
+        probabilities it is Jev's confidence. Rounded to 6 places.
+        """
+        if not probabilities:
+            return confidence
+        up = self.jev_verdict(value, value_num) == "up"
+        p_side = sum(float(p) for k, p in probabilities.items() if self._is_up_option(str(k)) == up)
+        binary = max(0.0, min(1.0, 2 * p_side - 1))
+        return round(binary if confidence is None else max(float(confidence), binary), 6)
+
+    def answer_confidence(self, score: dict[str, Any]) -> float | None:
+        """The confidence escalation compares with `threshold` for one stored score row
+        (`question`, `kind`, `value`, `value_num`, `confidence`, `probabilities`):
+        the verdict confidence for the pass_question, Jev's confidence otherwise."""
+        if score["question"] == self.pass_question:
+            return self.verdict_confidence(score["value"], score.get("value_num"), score["confidence"],
+                                           score.get("probabilities"))
+        return score["confidence"]
+
+    def low_answers(self, scores: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """The `escalate_on` answers whose confidence is strictly below `threshold`."""
+        low = []
+        for s in scores:
+            if s["question"] not in self.escalate_on or s["kind"] not in ("choice", "score"):
+                continue
+            conf = self.answer_confidence(s)
+            if conf is not None and conf < self.threshold:
+                low.append({"question": s["question"], "kind": s["kind"], "value": s["value"],
+                            "confidence": conf, "jev_confidence": s["confidence"]})
+        return low
 
 
 def questions_dir() -> Path:
@@ -160,7 +212,7 @@ def load_file(path: Path, routine: str | None = None) -> QuestionSet:
         data = tomllib.loads(path.read_text(encoding="utf-8"))
     except tomllib.TOMLDecodeError as exc:
         raise _fail(path, f"invalid TOML: {exc}") from None
-    allowed = {"threshold", "pass_question", "pass_options", "pass_min", "questions"}
+    allowed = {"threshold", "pass_question", "pass_options", "pass_min", "escalate_on", "questions"}
     extra = sorted(set(data) - allowed)
     if extra:
         raise _fail(path, f"unknown top-level keys: {extra}")
@@ -205,6 +257,16 @@ def load_file(path: Path, routine: str | None = None) -> QuestionSet:
     else:
         raise _fail(path, "pass_question must be a choice or score question (noul has no confidence)")
 
+    escalate_on = data.get("escalate_on", [pass_question])
+    if (not isinstance(escalate_on, list) or not escalate_on
+            or any(not isinstance(n, str) or n not in by_name for n in escalate_on)):
+        raise _fail(path, f"escalate_on must be a non-empty list of question names {names}, got {escalate_on!r}")
+    noul = [n for n in escalate_on if by_name[n].kind == "noul"]
+    if noul:
+        raise _fail(path, f"escalate_on may only name choice or score questions (noul has no confidence): {noul}")
+    if len(set(escalate_on)) != len(escalate_on):
+        raise _fail(path, f"escalate_on names a question twice: {escalate_on}")
+
     return QuestionSet(
         routine=routine or path.stem,
         path=path,
@@ -213,6 +275,7 @@ def load_file(path: Path, routine: str | None = None) -> QuestionSet:
         questions=specs,
         pass_options=pass_options,
         pass_min=pass_min,
+        escalate_on=list(escalate_on),
     )
 
 

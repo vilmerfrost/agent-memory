@@ -1,38 +1,36 @@
 # Jev questions for canary-simplitics-selftest: the canary's own selftest. It runs the
-# simplitics canary against planted scenarios. The scenario is the report file name:
-# report-clean.md must PASS; report-fake-real-host, -env-local, -dirty-tree,
-# -setup-log-missing, -setup-log-noport, -setup-log-secret-* must FAIL on the planted check.
-# So a FAIL row is often the correct result. Format: docs/scoring.md.
+# simplitics canary against planted scenarios. So a FAIL row is often the correct result.
+# Jev's state (agent_memory/states.py, format_canary_state) names the scenario (from the
+# report file name), what it must produce, and tags each failure [planted] or [other]
+# from the planted-check list `states.CANARY_PLANTED`. Format: docs/scoring.md.
+#
+# Only the verdict escalates: crash and extra_findings are yes/no (no confidence).
 
 threshold = 0.75
 pass_question = "verdict"
 pass_options = ["expected"]
+escalate_on = ["verdict"]
 
 [[questions]]
 name = "verdict"
 kind = "choice"
-prompt = "Does the canary result match the planted scenario named in the report path? The clean scenario should pass; every other scenario should fail on its planted problem."
+prompt = """Does the canary result match the planted scenario? Use the scenario, expected and planted_failed lines
+and the [planted] / [other] tag on each failure line. A planted scenario is supposed to FAIL: a FAIL row where
+every failure is [planted] is the correct, expected result."""
 [questions.options]
-expected = "The result matches the scenario: clean passed, or a planted scenario failed on the planted problem."
-missed = "A planted scenario passed or was not caught: the canary would miss a real problem."
-unexpected_failure = "The canary failed on something that was not planted (a crash, a wrong finding, a failing clean run)."
+expected = "The result matches: the clean scenario (or an aggregate run) passed with no failures, or a planted scenario failed and every failure line is tagged [planted]."
+missed = "A planted scenario passed, or none of its failure lines is tagged [planted]: the canary would miss a real problem."
+unexpected_failure = "At least one failure line is tagged [other] (a crash, an error or a finding that was not planted), or the clean scenario failed."
 
 [[questions]]
 name = "crash"
 kind = "noul"
 prompt = "Did a check crash or error (exception, permission denied, non-zero exit) instead of giving a judgment?"
+[questions.criteria]
+true = "A failure line shows a crash, an exception, permission denied or a non-zero exit."
+false = "Every failure line is a judgment about the planted problem, or there are no failures."
 
 [[questions]]
 name = "extra_findings"
 kind = "noul"
-prompt = "Did the canary report failures beyond what the scenario planted?"
-
-[[questions]]
-name = "canary_trust"
-kind = "score"
-prompt = "How much does this run let us trust the canary to catch real leaks of hosts or secrets?"
-levels = [
-    "Not at all: it missed or crashed.",
-    "Somewhat: right outcome with noise or crashes.",
-    "Fully: exactly the planted problems, nothing else.",
-]
+prompt = "Did the canary report a real finding beyond what the scenario planted (a failure tagged [other] that is not a crash)?"

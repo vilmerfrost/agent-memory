@@ -39,7 +39,8 @@ class AbError(RuntimeError):
 _RUNS_SQL = f"""
 select r.id, r.routine, r.status, r.started_at, l.verdict as label,
        (select json_agg(json_build_object('question', s.question, 'value', s.value,
-                                          'value_num', s.value_num, 'confidence', s.confidence))
+                                          'value_num', s.value_num, 'confidence', s.confidence,
+                                          'probabilities', s.probabilities))
           from scores s where s.run_id = r.id) as scores
 from runs r
 left join labels l on l.run_id = r.id
@@ -67,7 +68,9 @@ def resolve(run: dict[str, Any], cache: QuestionCache) -> Outcome:
     """Decide one run's outcome: label > confident Jev grade > status."""
     qset = cache.get(run["routine"])
     answer = scoring._pass_answer(run, qset) if qset is not None and run.get("scores") else None
-    confidence = None if answer is None or answer["confidence"] is None else float(answer["confidence"])
+    # The verdict confidence (up vs down), the same number escalations compare with the threshold.
+    raw = qset.answer_confidence(answer) if qset is not None and answer is not None else None
+    confidence = None if raw is None else float(raw)
     threshold = qset.threshold if qset is not None else None
 
     def out(passed: bool, source: str, low: bool = False) -> Outcome:

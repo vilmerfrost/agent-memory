@@ -2,20 +2,14 @@
 
 See docs/scoring.md for the rules. Postgres only (psycopg) in V1.
 
-State string (what Jev reads for one run), built by `format_state`:
+The state string Jev reads for one run is built by `states.format_state` (re-exported
+here): a generic shape for most routines and own shapes for dispatch, the canary
+selftest and evals-parent. See agent_memory/states.py and docs/scoring.md.
 
-    routine: <routine>
-    status: <status>
-    summary: <summary or (none)>
-    failure_reason: <failure_reason or (none)>
-    failures:
-    - <meta.failures[0]>
-    - <meta.failures[1]>
-
-`failures: (none)` when the list is empty. Values are taken verbatim, except that
-any run of whitespace (newlines included) collapses to one space, so a value
-can never break the line format. Nothing else of the run (ids, timestamps,
-other meta keys) is included, so identical outcomes share one fixture key.
+Escalation rule (per question file, `escalate_on`): a run escalates when a listed
+question's confidence is strictly below `threshold`. For the pass_question the
+confidence is the *verdict confidence* (`QuestionSet.verdict_confidence`): how sure
+Jev is of up vs down, not of the exact label.
 """
 
 from __future__ import annotations
@@ -31,80 +25,13 @@ from psycopg.types.json import Jsonb
 
 from agent_memory import jev, store
 from agent_memory.questions import QuestionCache, QuestionSet
-
-_WS_RE = re.compile(r"\s+")
-
-
-def _clean(value: Any) -> str:
-    if value is None:
-        return "(none)"
-    text = _WS_RE.sub(" ", str(value)).strip()
-    return text or "(none)"
+from agent_memory.states import (  # noqa: F401  (re-exported: callers use scoring.format_state)
+    DISPATCH_ROUTINE,
+    format_dispatch_state,
+    format_state,
+)
 
 
-DISPATCH_ROUTINE = "dispatch"
-_DISPATCH_SIGNALS = ("dod_first_pass", "integration_first_pass", "follow_ups", "nudges", "denials",
-                     "escalations", "merge_conflicts", "clarifying_questions")
-_WORKER_SIGNALS = ("final_status", "first_status", "denials", "denied_shapes", "errors", "tool_errors",
-                   "repeat_cmds", "reasons", "brief_gaps", "lessons_read_first")
-
-
-def _dispatch_value(value: Any) -> str:
-    """One compact token: bools as true/false, lists comma-joined, maps as sorted k:v."""
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    if isinstance(value, dict):
-        return ",".join(f"{_clean(k)}:{_clean(v)}" for k, v in sorted(value.items())) or "(none)"
-    if isinstance(value, list):
-        return ",".join(_clean(v) for v in value) or "(none)"
-    return _clean(value)
-
-
-def format_dispatch_state(run: dict[str, Any]) -> str:
-    """State for a dispatch task (docs/tasks.md): repo, status, summary, signals,
-    then one entry per worker with its reasons, denials, brief gaps and checkpoint
-    excerpt. No ids, timestamps, tokens or durations."""
-    meta = run.get("meta") or {}
-    lines = [
-        f"routine: {_clean(run.get('routine'))}",
-        f"repo: {_clean(meta.get('repo'))}",
-        f"status: {_clean(run.get('status'))}",
-        f"final_status: {_clean(meta.get('final_status'))}",
-        f"summary: {_clean(run.get('summary'))}",
-        f"failure_reason: {_clean(run.get('failure_reason'))}",
-        "signals: " + " ".join(f"{k}={_dispatch_value(meta.get(k))}" for k in _DISPATCH_SIGNALS),
-    ]
-    workers = [w for w in meta.get("workers") or [] if isinstance(w, dict)]
-    if not workers:
-        lines.append("workers: (none)")
-    else:
-        lines.append("workers:")
-        for w in workers:
-            signals = " ".join(f"{k}={_dispatch_value(w.get(k))}" for k in _WORKER_SIGNALS)
-            lines.append(f"- {_clean(w.get('name'))}: {signals}")
-            lines.append(f"  checkpoint: {_clean(w.get('checkpoint_excerpt'))}")
-    return "\n".join(lines)
-
-
-def format_state(run: dict[str, Any]) -> str:
-    """The deterministic text Jev scores for one run (see module docstring).
-    Dispatch tasks get their own shape (`format_dispatch_state`)."""
-    if run.get("routine") == DISPATCH_ROUTINE:
-        return format_dispatch_state(run)
-    meta = run.get("meta") or {}
-    failures = meta.get("failures") or []
-    lines = [
-        f"routine: {_clean(run.get('routine'))}",
-        f"status: {_clean(run.get('status'))}",
-        f"summary: {_clean(run.get('summary'))}",
-        f"failure_reason: {_clean(run.get('failure_reason'))}",
-    ]
-    if failures:
-        lines.append("failures:")
-        lines.extend(f"- {_clean(f)}" for f in failures)
-    else:
-        lines.append("failures: (none)")
-    return "\n".join(lines)
 
 
 # --------------------------------------------------------------------------- score
@@ -152,8 +79,14 @@ def _score_rows(results: dict[str, jev.JevResult]) -> list[tuple[Any, ...]]:
     return rows
 
 
-def save_scores(run_id: Any, results: dict[str, jev.JevResult], mode: str, *, db_url: str | None = None) -> None:
+def save_scores(run_id: Any, results: dict[str, jev.JevResult], mode: str, *, db_url: str | None = None,
+                replace: bool = False) -> None:
+    """Write one run's scores in one transaction. `replace` (rescoring) first deletes
+    every score row of the run, so a run never holds old and new rows side by side and
+    questions dropped from the file disappear too."""
     with store.connect(db_url) as conn:
+        if replace:
+            conn.execute("delete from scores where run_id = %s", (run_id,))
         for name, kind, value, value_num, confidence, probs in _score_rows(results):
             conn.execute(
                 """
@@ -204,6 +137,86 @@ def score_runs(
             continue
         save_scores(run["id"], results, mode, db_url=db_url)
         report.scored += 1
+    return report
+
+
+# --------------------------------------------------------------------------- rescore
+
+
+@dataclass
+class RescoreReport(ScoreReport):
+    comparisons: list[dict[str, Any]] = field(default_factory=list)  # one per rescored run
+
+
+def _answer_view(scores: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    return {s["question"]: {"value": s["value"], "confidence": s["confidence"]} for s in scores}
+
+
+def _any_low(qset: QuestionSet, scores: list[dict[str, Any]]) -> list[str]:
+    """The old (V1) rule: every choice/score question whose raw Jev confidence is below threshold."""
+    return sorted(s["question"] for s in scores if s["kind"] in ("choice", "score")
+                  and s["confidence"] is not None and s["confidence"] < qset.threshold)
+
+
+def _stored_view(results: dict[str, jev.JevResult]) -> list[dict[str, Any]]:
+    """Jev results in the shape `scored_runs` returns for stored rows."""
+    return [{"question": name, "kind": kind, "value": value, "value_num": value_num,
+             "confidence": confidence, "probabilities": dict(probs.obj)}
+            for name, kind, value, value_num, confidence, probs in _score_rows(results)]
+
+
+def rescore_runs(
+    *,
+    routine: str,
+    since: datetime | None = None,
+    limit: int = 100,
+    cache: QuestionCache | None = None,
+    db_url: str | None = None,
+) -> RescoreReport:
+    """Ask Jev again about already scored runs of one routine and replace their scores.
+
+    The runs: the routine's scored runs (labeled or not), newest first, started at or
+    after `since`, at most `limit`. Each run's new answers replace all its old score
+    rows in one transaction (`save_scores(replace=True)`), so a run never has duplicate
+    or mixed rows. A missing fixture or a Jev error keeps the old rows untouched.
+
+    `comparisons` holds, per rescored run, the old and new answers and three
+    escalation flags, so the same runs can be compared before and after a state or
+    question change: `escalated_before_old_rule` (V1: any choice/score raw confidence
+    under threshold, on the old answers), `escalates_before` and `escalates_after`
+    (the current `escalate_on` rule on the old and the new answers).
+    """
+    cache = cache or QuestionCache()
+    report = RescoreReport()
+    qset = cache.get(routine)
+    if qset is None:
+        return report
+    mode = jev.mode()
+    runs = [r for r in scored_runs(routine=routine, db_url=db_url)
+            if since is None or (r["started_at"] is not None and r["started_at"] >= as_utc(since))]
+    for run in runs[:limit]:
+        try:
+            results = jev.ask(format_state(run), qset.jev_questions())
+        except jev.JevFixtureMissing as exc:
+            report.missing.append((str(run["id"]), routine, str(exc)))
+            continue
+        except jev.JevError as exc:
+            report.failed.append((str(run["id"]), routine, str(exc)))
+            continue
+        save_scores(run["id"], results, mode, db_url=db_url, replace=True)
+        report.scored += 1
+        new = _stored_view(results)
+        report.comparisons.append({
+            "run_id": str(run["id"]),
+            "routine": routine,
+            "started_at": run["started_at"].isoformat() if run["started_at"] else None,
+            "before": _answer_view(run["scores"]),
+            "after": _answer_view(new),
+            "escalated_before_old_rule": bool(_any_low(qset, run["scores"])),
+            "escalates_before": bool(qset.low_answers(run["scores"])),
+            "escalates_after": bool(qset.low_answers(new)),
+            "low_after": qset.low_answers(new),
+        })
     return report
 
 
@@ -270,9 +283,9 @@ def _pass_answer(run: dict[str, Any], qset: QuestionSet) -> dict[str, Any] | Non
 def escalations(
     *, routine: str | None = None, cache: QuestionCache | None = None, db_url: str | None = None
 ) -> list[dict[str, Any]]:
-    """Unlabeled scored runs where any choice/score confidence is below the routine's threshold.
-
-    Strictly below: a confidence equal to the threshold does not escalate.
+    """Unlabeled scored runs where an `escalate_on` question's confidence is below the
+    routine's threshold (`QuestionSet.low_answers`; the pass_question uses its verdict
+    confidence). Strictly below: a confidence equal to the threshold does not escalate.
     """
     cache = cache or QuestionCache()
     out = []
@@ -282,12 +295,7 @@ def escalations(
         qset = cache.get(run["routine"])
         if qset is None:
             continue
-        low = [
-            {"question": s["question"], "kind": s["kind"], "value": s["value"], "confidence": s["confidence"]}
-            for s in run["scores"]
-            if s["kind"] in ("choice", "score") and s["confidence"] is not None
-            and s["confidence"] < qset.threshold
-        ]
+        low = qset.low_answers(run["scores"])
         if not low:
             continue
         pa = _pass_answer(run, qset)
@@ -354,11 +362,12 @@ def calibrate(
             if run["routine"] != name or run["label"] is None:
                 continue
             pa = _pass_answer(run, qset)
-            if pa is None or pa["confidence"] is None:
+            conf = qset.answer_confidence(pa) if pa is not None else None
+            if pa is None or conf is None:
                 continue
             jv = qset.jev_verdict(pa["value"], pa["value_num"])
             counts[f"jev_{jv}_label_{run['label']}"] += 1
-            pairs.append((float(pa["confidence"]), jv == run["label"]))
+            pairs.append((float(conf), jv == run["label"]))
         agree = sum(a for _, a in pairs)
         suggested, note = suggest_threshold(pairs, min_labels=min_labels, target=target)
         out.append({

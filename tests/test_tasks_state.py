@@ -1,5 +1,6 @@
-"""`scoring.format_state`: the dispatch branch, and proof that every other routine's
-state (and so every recorded Jev fixture key) is byte-identical to before."""
+"""`scoring.format_state`: the dispatch branch, and proof that every generic routine's
+state (and so every recorded Jev fixture key) is byte-identical to before. The canary
+selftest and evals-parent have their own shapes (tests/test_states.py)."""
 
 from __future__ import annotations
 
@@ -9,7 +10,7 @@ from typing import Any
 
 import pytest
 
-from agent_memory import jev, routines_log, scoring
+from agent_memory import jev, routines_log, scoring, states
 from agent_memory.questions import QUESTIONS_DIR, QuestionCache
 from agent_memory.tasks_ingest import parse_parent
 
@@ -94,8 +95,12 @@ def _non_dispatch_runs() -> list[dict[str, Any]]:
     return runs
 
 
+# Routines with their own state shape (agent_memory/states.py); tested in test_states.py.
+OWN_SHAPES = {"dispatch", "canary-simplitics-selftest", "evals-parent"}
+
+
 def test_generic_state_is_byte_identical_to_the_frozen_copy() -> None:
-    runs = _non_dispatch_runs()
+    runs = [r for r in _non_dispatch_runs() if r.get("routine") not in OWN_SHAPES]
     assert len(runs) > 10
     for run in runs:
         assert scoring.format_state(run) == _frozen_format_state(run)
@@ -124,11 +129,13 @@ def test_dispatch_state_for_a_blocked_task() -> None:
         "failure_reason: denied-command",
         "signals: dod_first_pass=false integration_first_pass=(none) follow_ups=0 nudges=0 denials=1 "
         "escalations=1 merge_conflicts=0 clarifying_questions=0",
+        "friction: dod_first_pass=false denials=1 escalations=1",
         "workers:",
         "- worker-d: final_status=BLOCKED first_status=BLOCKED denials=1 denied_shapes=heredoc:1 "
         "errors=isolation-refusal:1 tool_errors=1 repeat_cmds=0 reasons=denied-command "
         "brief_gaps=vilmer-words,dod,siblings,skills,standing-rules lessons_read_first=false",
         "  checkpoint: (none)",
+        f"legend: {states.DISPATCH_LEGEND}",
     ])
 
 
@@ -152,18 +159,20 @@ def test_dispatch_state_carries_excerpts_and_no_ids() -> None:
 
 def test_dispatch_state_without_workers() -> None:
     state = scoring.format_state({"routine": "dispatch", "status": "error", "summary": None, "meta": {}})
-    assert state.split("\n")[-1] == "workers: (none)"
+    assert state.split("\n")[-3:-1] == ["friction: (none)", "workers: (none)"]
+    assert state.split("\n")[-1].startswith("legend: friction lists the signals")
     assert "repo: (none)" in state
 
 
 def test_dispatch_questions_build_a_fixture_key() -> None:
     qset = QuestionCache(QUESTIONS_DIR).get("dispatch")
     assert qset is not None
-    assert [q.name for q in qset.questions] == ["verdict", "brief_quality", "main_cause", "lesson_worthy"]
+    assert [q.name for q in qset.questions] == ["verdict", "main_cause", "brief_missing_fact", "lesson_worthy"]
     assert qset.threshold == 0.7 and qset.pass_question == "verdict" and qset.pass_options == ["clean"]
+    assert qset.escalate_on == ["verdict"]  # main_cause never escalates a run
     assert list(qset.spec("verdict").options) == ["clean", "struggled", "failed"]
     assert list(qset.spec("main_cause").options) == ["brief_gap", "tool_denial", "test_failure", "scope", "none"]
-    assert qset.spec("brief_quality").kind == "score"
+    assert qset.spec("brief_missing_fact").kind == "noul"
     key = jev.fixture_key(scoring.format_state(_dispatch_run("t-d2dce9a006")), qset.jev_questions())
     assert len(key) == 32
 
