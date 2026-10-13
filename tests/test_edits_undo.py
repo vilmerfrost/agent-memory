@@ -87,12 +87,11 @@ def live(sdb: ScoringDb, monkeypatch: pytest.MonkeyPatch) -> ScoringDb:  # noqa:
     return sdb
 
 
-def phone_request(url: str, edit_id: uuid.UUID) -> None:
-    """What the edge function inserts (idempotent per edit)."""
+def phone_request(url: str, edit_id: uuid.UUID) -> str:
+    """What the edge function calls (rpc amem_request_undo). Returns its state."""
     with psycopg.connect(url) as conn:
-        for _ in range(2):
-            conn.execute("insert into undo_requests (edit_id, source) values (%s, 'phone') "
-                         "on conflict (edit_id) do nothing", (edit_id,))
+        (state,) = conn.execute("select amem_request_undo(%s, 'phone')", (edit_id,)).fetchone()
+        return state
 
 
 def requests(url: str) -> list[dict[str, Any]]:
@@ -119,7 +118,9 @@ def test_undo_poll_reverts_and_is_idempotent(live: ScoringDb, ehome: EHome, ewri
     push = daily_io.use_push(Push(status=200))
     edit_id = make_kept(live.url, ehome, ewriter)
     assert edits_push.undo_poll(notify=NOTIFY, db_url=live.url).outcomes == []   # nothing pending
-    phone_request(live.url, edit_id)
+    assert phone_request(live.url, edit_id) == "queued"
+    assert phone_request(live.url, edit_id) == "queued"   # a double tap: still one request
+    assert len(requests(live.url)) == 1
     ehome.improve.queue("revert", {"stdout": "improve revert: c-0042 reverted\n", "exit": 0})
     r = edits_push.undo_poll(notify=NOTIFY, db_url=live.url)
     assert [o.result for o in r.outcomes] == ["reverted"] and r.summary().startswith("undo-poll: requests=1 reverted=1")
@@ -134,7 +135,10 @@ def test_undo_poll_reverts_and_is_idempotent(live: ScoringDb, ehome: EHome, ewri
     # Again: nothing to do, improve not called again.
     n = len(ehome.improve.calls())
     assert edits_push.undo_poll(notify=NOTIFY, db_url=live.url).outcomes == []
-    phone_request(live.url, edit_id)   # a second tap: the row exists, nothing new
+    # A re-tap after the revert: honest "reverted", the row stays closed, no new work.
+    assert phone_request(live.url, edit_id) == "reverted"
+    (req2,) = requests(live.url)
+    assert req2 == req
     assert edits_push.undo_poll(notify=NOTIFY, db_url=live.url).outcomes == [] and len(ehome.improve.calls()) == n
     # The reverted rule is not edited again at the old version.
     assert edits.run(dry_run=True, db_url=live.url).outcomes[0].status == "skip"
@@ -159,6 +163,31 @@ def test_revert_failure_is_recorded_retried_and_closed(live: ScoringDb, ehome: E
     assert req["handled_at"] is not None and req["attempts"] == 3
     assert edit_rows(live.url)[0]["status"] == "kept"
     assert json.loads(push.posts[0]["body"])["title"] == "Agent edit undo failed: 4. Spawn"
+    # Closed: the poll leaves it alone until someone taps again.
+    assert edits_push.undo_poll(notify=NOTIFY, db_url=live.url).outcomes == []
+    # A phone re-tap reopens it (same as `amem edits undo`) and the next poll reverts.
+    assert phone_request(live.url, edit_id) == "queued"
+    (req,) = requests(live.url)
+    assert req["handled_at"] is None and req["attempts"] == 0 and req["result"] is None and req["source"] == "phone"
+    ehome.improve.queue("revert", {"stdout": "ok\n", "exit": 0})
+    (o,) = edits_push.undo_poll(notify=NOTIFY, db_url=live.url).outcomes
+    assert o.result == "reverted"
+    assert edit_rows(live.url)[0]["status"] == "reverted"
+    (req,) = requests(live.url)
+    assert req["result"] == "reverted" and req["attempts"] == 1
+
+
+def test_request_undo_states(live: ScoringDb, ehome: EHome, ewriter: Any) -> None:  # noqa: F811
+    assert phone_request(live.url, uuid.uuid4()) == "missing"
+    assert requests(live.url) == []
+    edit_id = make_kept(live.url, ehome, ewriter, status="auto-reverted")
+    assert phone_request(live.url, edit_id) == "nothing"   # queued, but the poll will find nothing
+
+
+def test_function_is_not_public_api(live: ScoringDb) -> None:
+    with psycopg.connect(live.url) as conn:
+        (acl,) = conn.execute("select proacl::text[] from pg_proc where proname = 'amem_request_undo'").fetchone()
+    assert acl is not None and not any(a.startswith("=") for a in acl)   # no EXECUTE for PUBLIC
 
 
 def test_nothing_to_revert_for_an_auto_reverted_edit(live: ScoringDb, ehome: EHome, ewriter: Any) -> None:  # noqa: F811

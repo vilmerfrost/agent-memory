@@ -268,15 +268,20 @@ For each kept or trial edit:
 body at most 2 kB, `edit_id` a uuid, `token` 16-200 chars, else 400. It reads the edit with
 the service role (`SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` from the function env),
 compares `sha256(token)` in constant time (mismatch or unknown edit: 403 `Not allowed`,
-nothing else), inserts `undo_requests` with `on_conflict=edit_id` + ignore-duplicates (a
-second tap does nothing) and answers 200 `text/plain` "Undo queued — reverts within 15
-minutes". It never reverts anything itself. `verify_jwt = false` (supabase/config.toml):
+nothing else), then calls the SQL function `amem_request_undo` (rpc, migration
+`20261019020000_request_undo_fn.sql`; `amem edits undo` uses the same function). It inserts
+the edit's one `undo_requests` row, or reopens a closed one that did not revert (failed 3
+times, nothing to revert: `handled_at`, `attempts`, `result` reset), and leaves a reverted
+one alone. The 200 `text/plain` reply says what will happen: "Undo queued — reverts within
+15 minutes", "Already undone — nothing to do", or "Nothing to undo — this edit is no longer
+active". It never reverts anything itself. `verify_jwt = false` (supabase/config.toml):
 the button sends no JWT; the token is the auth.
 
 - Tests: `supabase/functions/amem-undo/handler_test.ts` runs under `deno test` and
   `node --test` (pytest runs it with node when node is installed). `deno check` was not run
   where deno is missing.
-- Deploy (the parent, never a worker): `supabase functions deploy amem-undo --no-verify-jwt`.
+- Deploy (the parent, never a worker): apply the migrations first (`amem db migrate`), then
+  `supabase functions deploy amem-undo --no-verify-jwt`.
 - Manual test after deploy: `amem edits list` → take an edit id; a wrong token must give
   403: `curl -s -o /dev/null -w '%{http_code}' -X POST <project URL>/functions/v1/amem-undo
   -H 'Content-Type: application/json' -d '{"edit_id":"<id>","token":"wrong-token-0123456789"}'`

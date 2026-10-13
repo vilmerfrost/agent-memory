@@ -251,11 +251,9 @@ class UndoError(RuntimeError):
 
 
 def request_undo(edit_id: uuid.UUID, *, db_url: str | None = None) -> None:
-    """Queue a local (cli) undo. A request that is closed without a revert is reopened."""
+    """Queue a local (cli) undo. A request that is closed without a revert is reopened.
+    Same SQL function as the phone's edge function (amem_request_undo)."""
     with store.connect(db_url) as conn:
-        if conn.execute("select 1 from edits where id = %s", (edit_id,)).fetchone() is None:
+        (state,) = conn.execute("select amem_request_undo(%s, 'cli')", (edit_id,)).fetchone()
+        if state == "missing":
             raise UndoError(f"no edit {edit_id}")
-        conn.execute(
-            "insert into undo_requests (edit_id, source) values (%s, 'cli') on conflict (edit_id) do update "
-            "set handled_at = null, attempts = 0, source = 'cli', result = null, requested_at = now() "
-            "where undo_requests.result is distinct from 'reverted'", (edit_id,))
