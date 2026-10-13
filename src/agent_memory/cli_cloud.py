@@ -7,7 +7,9 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import json
+import re
 import subprocess
 import sys
 import tomllib
@@ -251,6 +253,59 @@ def cmd_jev_record(args: argparse.Namespace) -> int:
     return 0
 
 
+# ---------------------------------------------------------------- cloud publish-script
+
+ASSET_NAME = "amem_digest.py"
+DEFAULT_SCRIPT = config.REPO_ROOT / "tools" / "amem_digest.py"
+_SCRIPT_VERSION_RE = re.compile(r'^SCRIPT_VERSION = "([^"]{1,20})"', re.M)
+
+_ASSET_UPSERT_SQL = """
+insert into amem_assets (name, body, sha256, version) values (%s, %s, %s, %s)
+on conflict (name) do update
+    set body = excluded.body, sha256 = excluded.sha256, version = excluded.version, updated_at = now()
+    where amem_assets.sha256 is distinct from excluded.sha256 or amem_assets.version is distinct from excluded.version
+returning (xmax = 0) as inserted
+"""
+
+
+def cmd_publish_script(args: argparse.Namespace) -> int:
+    """Upsert tools/amem_digest.py into amem_assets (docs/cloud.md, "Cloud chats"): the cloud
+    setup script downloads it from there. Postgres backend only."""
+    try:
+        backend = config.backend()
+    except config.BackendError as exc:
+        print(f"amem: cloud publish-script: {exc}", file=sys.stderr)
+        return 1
+    if backend != "postgres":
+        print("amem: cloud publish-script needs the Postgres backend (AMEM_DB_URL); REST is not supported.",
+              file=sys.stderr)
+        return 1
+    error = config.remote_write_error("postgres")
+    if error is not None:
+        print(error, file=sys.stderr)
+        return REMOTE_REQUIRED_EXIT
+    path: Path = args.file.expanduser()
+    try:
+        body = path.read_text(encoding="utf-8")
+        compile(body, str(path), "exec")
+    except (OSError, SyntaxError, ValueError) as exc:
+        print(f"amem: cloud publish-script: {path} is not a readable Python file ({type(exc).__name__})",
+              file=sys.stderr)
+        return 1
+    version_match = _SCRIPT_VERSION_RE.search(body)
+    version = version_match.group(1) if version_match else None
+    sha = hashlib.sha256(body.encode("utf-8")).hexdigest()
+    try:
+        with store.connect() as conn:
+            got = conn.execute(_ASSET_UPSERT_SQL, (ASSET_NAME, body, sha, version)).fetchone()
+    except psycopg.Error as exc:
+        print(f"amem: cloud publish-script failed: {type(exc).__name__}: {exc}".strip(), file=sys.stderr)
+        return 1
+    state = "unchanged" if got is None else ("new" if got[0] else "updated")
+    print(f"published {ASSET_NAME} version {version or '-'} sha256 {sha[:12]} ({state})")
+    return 0
+
+
 # ---------------------------------------------------------------- registration
 
 
@@ -266,6 +321,13 @@ def register(sub: Any, ingest_sub: Any = None) -> None:
         p.add_argument("--git-dir", type=Path, default=None,
                        help="read with `git show <ref>:<path>` in this clone instead of `gh api`")
         p.set_defaults(func=cmd_ingest_git_ref)
+
+    cloud = sub.add_parser("cloud", help="cloud session helpers (docs/cloud.md)")
+    cloud_sub = cloud.add_subparsers(dest="cloud_command", required=True)
+    p = cloud_sub.add_parser("publish-script",
+                             help="upsert tools/amem_digest.py into amem_assets (the cloud setup script fetches it)")
+    p.add_argument("--file", type=Path, default=DEFAULT_SCRIPT, help="the script (default tools/amem_digest.py)")
+    p.set_defaults(func=cmd_publish_script)
 
     jev_parser = sub.add_parser("jev", help="Jev helpers")
     jev_sub = jev_parser.add_subparsers(dest="jev_command", required=True)

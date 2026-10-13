@@ -320,6 +320,83 @@ def repo_of(cwd: str) -> str | None:
     return path.name
 
 
+# ---------------------------------------------------------------- project and category
+# docs/sessions-live.md, "Project and category".
+
+CATEGORIES = KINDS   # routine | chat | parent | worker | eval | headless: the session kind
+UNKNOWN_PROJECT = "unknown"
+_EVAL_PATH_RE = re.compile(r"/\.cache/(?:agent|skill)-evals(?:/|$)|/\.cache/sbx|(?:^|/)eval-jo-[^/]*(?:/|$)"
+                           r"|(?:^|/)[^/]*junk-orchestra[^/]*-eval[^/]*(?:/|$)|(?:^|/)eval-[^/]*junk-orchestra")
+_SCRATCH_PATH_RE = re.compile(r"/scratch-workspaces/|/Library/Application Support/Claude/"
+                              r"|/Documents/Codex/\d{4}-\d{2}-\d{2}(?:/|$)|(?:^|/)scratchpad(?:/|$)"
+                              r"|^/(?:private/)?tmp/claude-\d+/")
+_SLUG_RE = re.compile(r"[^a-z0-9._-]+")
+
+
+def category_of(kind: str) -> str:
+    return kind if kind in CATEGORIES else "chat"
+
+
+def _git_root(path: Path) -> Path | None:
+    """The nearest folder (path or a parent, below the home folder) holding `.git`."""
+    home = Path.home()
+    for d in [path, *path.parents]:
+        if d == home or d.parent == d:
+            return None
+        try:
+            if (d / ".git").exists():
+                return d
+        except OSError:
+            return None
+    return None
+
+
+def project_of(cwd: str, *, kind: str, routine: str | None = None, scratch_only: bool = False,
+               project_dir: str = "", repo: str | None = None) -> str:
+    """Where the work happened, normalized. First match wins:
+    routine -> `routine:<name>`; eval clone -> `evals`; Desktop / Codex scratch folder ->
+    `scratch`; a worktree (`<repo>/.claude/worktrees/<x>`, `~/worktrees/<repo>/<x>`, a git
+    worktree checkout) -> its main repo; a git repo -> its folder name; the home folder ->
+    `home`; else the folder's basename; never empty (`unknown`)."""
+    path = cwd or ""
+    if kind == "routine":
+        name = routine or repo or (Path(path).name if path else "") or UNKNOWN_PROJECT
+        return "routine:" + (_SLUG_RE.sub("-", name.strip().lower()).strip("-._") or UNKNOWN_PROJECT)
+    if kind == "eval" or _EVAL_PATH_RE.search(path) or SKIP_PROJECT_RE.search(project_dir):
+        return "evals"
+    if scratch_only or _SCRATCH_PATH_RE.search(path) or "-scratch-workspaces-" in project_dir:
+        return "scratch"
+    if not path:
+        return repo or UNKNOWN_PROJECT
+    p = Path(path)
+    parts = p.parts
+    for i in range(len(parts) - 2, 0, -1):
+        if parts[i] == "worktrees" and parts[i - 1] == ".claude" and i >= 2:
+            return parts[i - 2]
+    if "worktrees" in parts:
+        i = len(parts) - 1 - parts[::-1].index("worktrees")
+        if i + 1 < len(parts) and parts[i - 1] != ".codex":
+            return parts[i + 1]
+    main = main_checkout(p)
+    if main is not None:
+        return main.name
+    root = _git_root(p)
+    if root is not None:
+        main = main_checkout(root)
+        return (main or root).name
+    if p == Path.home():
+        return "home"
+    return p.name or UNKNOWN_PROJECT
+
+
+def place(row: SessionRow) -> tuple[str, str]:
+    """(category, project) of a row."""
+    routine = row.meta.get("routine") if isinstance(row.meta.get("routine"), str) else None
+    return category_of(row.kind), project_of(row.cwd, kind=row.kind, routine=routine,
+                                             scratch_only=row.meta.get("scratch_only") is True,
+                                             project_dir=row.project_dir, repo=row.repo)
+
+
 def skill_name(raw: Any) -> str | None:
     name = str(raw or "").strip().lstrip("/")
     return name if re.fullmatch(r"[\w.-]+(:[\w.-]+)?", name) else None
@@ -343,6 +420,17 @@ class SessionRow:
     path: Path | None = None
     tool: str = "claude"   # claude | codex
     tokens: session_tokens.Summary | None = None  # None: not measured (the token columns stay as they are)
+    title: str | None = None   # the session's name; None: not known (the stored title stays)
+    profile: dict[str, Any] | None = None   # Summary.profile(): model, effort, time (None: not known)
+    signals: dict[str, int] | None = None   # outcome signals (None: not known, the stored outcome stays)
+    end: str | None = None
+
+    def with_summary(self, s: session_tokens.Summary) -> SessionRow:
+        """Title, profile and outcome signals from a full read."""
+        self.title = self.title or s.title
+        self.profile = s.profile()
+        self.signals, self.end = dict(s.signals), s.end
+        return self
 
     @property
     def cwd(self) -> str:
@@ -488,8 +576,9 @@ def session_row(path: Path, project_dir: str, *, parent_session: str | None = No
         size = 0
     repo = repo_of(cwd)
     meta.update(team_info(cwd, repo))
+    tokens = session_tokens.claude_summary(events)
     row = SessionRow(sid, kind, repo, project_dir, facts.start, facts.end, size,
-                     facts.skills, [], meta, path, tokens=session_tokens.claude_summary(events))
+                     facts.skills, [], meta, path, tokens=tokens).with_summary(tokens)
     return _with_instructions(row)
 
 
@@ -512,9 +601,28 @@ def classify_codex(f: codex_sessions.CodexFacts, cwd: str) -> str:
     return "chat"
 
 
-def codex_row(path: Path, rel_dir: str) -> SessionRow:
+CODEX_INDEX = "session_index.jsonl"
+
+
+def codex_titles(home: Path) -> dict[str, str]:
+    """Thread id -> title from `<codex home>/session_index.jsonl` lines
+    `{id, thread_name, updated_at}`. The line with the latest `updated_at` wins (the file
+    order breaks ties: a later line wins). Titles redacted and capped."""
+    best: dict[str, tuple[datetime | None, str]] = {}
+    for rec in load_events(home / CODEX_INDEX):
+        tid, title = rec.get("id"), session_tokens.clean_title(rec.get("thread_name"))
+        if not isinstance(tid, str) or not tid or not title:
+            continue
+        ts = parse_ts(rec.get("updated_at"))
+        old = best.get(tid)
+        if old is None or old[0] is None or (ts is not None and ts >= old[0]):
+            best[tid] = (ts, title)
+    return {tid: title for tid, (_ts, title) in best.items()}
+
+
+def codex_row(path: Path, rel_dir: str, titles: dict[str, str] | None = None) -> SessionRow:
     """One Codex rollout file to a row (no database). `rel_dir`: its folder relative to the
-    Codex home."""
+    Codex home. `titles`: codex_titles() of that home."""
     events = load_events(path)
     f = codex_sessions.scan_facts(events, path.stem)
     cwd, scratch_only = work_cwd(f.cwds, "")
@@ -545,8 +653,9 @@ def codex_row(path: Path, rel_dir: str) -> SessionRow:
     sid = codex_sessions.PREFIX + (f.thread_id or path.stem)
     tokens = session_tokens.codex_summary(events)
     tokens.turns = f.prompts
+    title = (titles or {}).get(f.thread_id or path.stem)
     row = SessionRow(sid, kind, repo, rel_dir, f.start, f.end, size, f.skills, [], meta, path, tool="codex",
-                     tokens=tokens)
+                     tokens=tokens, title=title).with_summary(tokens)
     return _with_instructions(row)
 
 
@@ -629,7 +738,9 @@ def collect(root: Path | None, *, days: int = DEFAULT_DAYS, now: datetime | None
         found += [session_row(path, project, parent_session=parent)
                   for path, project, parent in transcripts(root, since)]
     if "codex" in tools:
-        found += [codex_row(path, rel) for path, rel in codex_transcripts(codex_home(codex), since)]
+        home = codex_home(codex)
+        titles = codex_titles(home)
+        found += [codex_row(path, rel, titles) for path, rel in codex_transcripts(home, since)]
     rows: list[SessionRow] = []
     skipped = 0
     for row in found:
@@ -679,45 +790,42 @@ def rollup_subagents(rows: list[SessionRow]) -> None:
 # (a hook ping may have stored a newer time).
 _TOKEN_COLS = ("tokens_input", "tokens_output", "tokens_cache_read", "tokens_cache_creation", "models", "turns")
 
-_UPSERT_SQL = """
-insert into sessions (session_id, tool, kind, repo, project_dir, started_at, ended_at, transcript_bytes,
-                      skills, instructions, meta,
-                      tokens_input, tokens_output, tokens_cache_read, tokens_cache_creation, models, turns,
-                      last_activity_at, tokens_updated_at)
-values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-        case when %s::bigint is null then null else now() end)
+# Profile columns (docs/sessions-live.md): a full read wins when it knows the value; a None
+# keeps what is stored. category and project are always known and always overwritten.
+PROFILE_COLS = ("model", "model_last", "effort", "effort_last", "efforts", "duration_seconds", "active_seconds",
+                "api_seconds", "tool_seconds", "lines_added", "lines_removed")
+_KEEP_COLS = ("title", *PROFILE_COLS, "outcome", "outcome_evidence")
+_ALL_COLS = ("session_id", "tool", "kind", "repo", "project_dir", "started_at", "ended_at", "transcript_bytes",
+             "skills", "instructions", "meta", *_TOKEN_COLS, "last_activity_at", "category", "project", *_KEEP_COLS)
+_FACT_COLS = ("tool", "kind", "repo", "project_dir", "started_at", "ended_at", "transcript_bytes", "skills",
+              "instructions", "category", "project")
+_TOKENS_DIFFER = (f"({', '.join('sessions.' + c for c in _TOKEN_COLS)}) is distinct from "
+                  f"({', '.join('excluded.' + c for c in _TOKEN_COLS)})")
+_KEPT_DIFFER = (f"({', '.join(f'coalesce(excluded.{c}, sessions.{c})' for c in _KEEP_COLS)}) is distinct from "
+                f"({', '.join('sessions.' + c for c in _KEEP_COLS)})")
+
+_UPSERT_SQL = f"""
+insert into sessions ({', '.join(_ALL_COLS)}, tokens_updated_at, title_updated_at, outcome_at)
+values ({', '.join(f'%({c})s' for c in _ALL_COLS)},
+        case when %(tokens_input)s::bigint is null then null else now() end,
+        case when %(title)s::text is null then null else now() end,
+        case when %(outcome)s::text is null then null else now() end)
 on conflict (session_id) do update
-    set tool = excluded.tool, kind = excluded.kind, repo = excluded.repo, project_dir = excluded.project_dir,
-        started_at = excluded.started_at, ended_at = excluded.ended_at,
-        transcript_bytes = excluded.transcript_bytes, skills = excluded.skills,
-        instructions = excluded.instructions, meta = sessions.meta || excluded.meta,
-        tokens_input = coalesce(excluded.tokens_input, sessions.tokens_input),
-        tokens_output = coalesce(excluded.tokens_output, sessions.tokens_output),
-        tokens_cache_read = coalesce(excluded.tokens_cache_read, sessions.tokens_cache_read),
-        tokens_cache_creation = coalesce(excluded.tokens_cache_creation, sessions.tokens_cache_creation),
-        models = coalesce(excluded.models, sessions.models),
-        turns = coalesce(excluded.turns, sessions.turns),
+    set {', '.join(f'{c} = excluded.{c}' for c in _FACT_COLS)},
+        meta = sessions.meta || excluded.meta,
+        {', '.join(f'{c} = coalesce(excluded.{c}, sessions.{c})' for c in (*_TOKEN_COLS, *_KEEP_COLS))},
         last_activity_at = greatest(sessions.last_activity_at, excluded.last_activity_at),
-        tokens_updated_at = case
-            when excluded.tokens_input is not null
-                 and (sessions.tokens_input, sessions.tokens_output, sessions.tokens_cache_read,
-                      sessions.tokens_cache_creation, sessions.models, sessions.turns)
-                     is distinct from
-                     (excluded.tokens_input, excluded.tokens_output, excluded.tokens_cache_read,
-                      excluded.tokens_cache_creation, excluded.models, excluded.turns)
-            then now() else sessions.tokens_updated_at end
-    where (sessions.tool, sessions.kind, sessions.repo, sessions.project_dir, sessions.started_at,
-           sessions.ended_at, sessions.transcript_bytes, sessions.skills, sessions.instructions)
-          is distinct from
-          (excluded.tool, excluded.kind, excluded.repo, excluded.project_dir, excluded.started_at,
-           excluded.ended_at, excluded.transcript_bytes, excluded.skills, excluded.instructions)
+        tokens_updated_at = case when excluded.tokens_input is not null and {_TOKENS_DIFFER}
+                                 then now() else sessions.tokens_updated_at end,
+        title_updated_at = case when excluded.title is not null and excluded.title is distinct from sessions.title
+                                then now() else sessions.title_updated_at end,
+        outcome_at = case when excluded.outcome is not null and excluded.outcome is distinct from sessions.outcome
+                          then now() else sessions.outcome_at end
+    where ({', '.join('sessions.' + c for c in _FACT_COLS)})
+          is distinct from ({', '.join('excluded.' + c for c in _FACT_COLS)})
        or not (sessions.meta @> excluded.meta)
-       or (excluded.tokens_input is not null
-           and (sessions.tokens_input, sessions.tokens_output, sessions.tokens_cache_read,
-                sessions.tokens_cache_creation, sessions.models, sessions.turns)
-               is distinct from
-               (excluded.tokens_input, excluded.tokens_output, excluded.tokens_cache_read,
-                excluded.tokens_cache_creation, excluded.models, excluded.turns))
+       or (excluded.tokens_input is not null and {_TOKENS_DIFFER})
+       or {_KEPT_DIFFER}
        or excluded.last_activity_at > coalesce(sessions.last_activity_at, '-infinity'::timestamptz)
 returning (xmax = 0) as inserted
 """
@@ -732,19 +840,45 @@ def token_values(t: session_tokens.Summary | None) -> tuple[Any, ...]:
     return (*t.tokens.as_list(), Jsonb(models), t.turns)
 
 
-def _params(r: SessionRow) -> tuple[Any, ...]:
-    tv = token_values(r.tokens)
+def _last_activity(r: SessionRow) -> datetime | None:
     last = (r.tokens.last_at if r.tokens is not None else None) or r.ended_at
-    return (r.session_id, r.tool, r.kind, r.repo, r.project_dir, r.started_at, r.ended_at,
-            r.transcript_bytes, Jsonb(r.skills), Jsonb(r.instructions), Jsonb(r.meta), *tv, last, tv[0])
+    return last if isinstance(last, datetime) else None
 
 
-def upsert(rows: list[SessionRow], *, db_url: str | None = None) -> tuple[int, int]:
+def profile_values(profile: dict[str, Any] | None) -> dict[str, Any]:
+    """The profile columns (None when not known); `efforts` as Jsonb."""
+    p = profile or {}
+    out = {c: p.get(c) for c in PROFILE_COLS}
+    out["efforts"] = Jsonb(p["efforts"]) if isinstance(p.get("efforts"), dict) and p["efforts"] else None
+    return out
+
+
+def outcome_values(signals: dict[str, int] | None, end: str | None, last: datetime | None,
+                   now: datetime | None) -> dict[str, Any]:
+    if signals is None:
+        return {"outcome": None, "outcome_evidence": None}
+    name, evidence = session_tokens.outcome_of(signals, end, last, now)
+    return {"outcome": name, "outcome_evidence": Jsonb(evidence)}
+
+
+def _params(r: SessionRow, now: datetime | None = None) -> dict[str, Any]:
+    tv = token_values(r.tokens)
+    last = _last_activity(r)
+    category, project = place(r)
+    return {"session_id": r.session_id, "tool": r.tool, "kind": r.kind, "repo": r.repo,
+            "project_dir": r.project_dir, "started_at": r.started_at, "ended_at": r.ended_at,
+            "transcript_bytes": r.transcript_bytes, "skills": Jsonb(r.skills),
+            "instructions": Jsonb(r.instructions), "meta": Jsonb(r.meta), **dict(zip(_TOKEN_COLS, tv)),
+            "last_activity_at": last, "category": category, "project": project, "title": r.title,
+            **profile_values(r.profile), **outcome_values(r.signals, r.end, last, now)}
+
+
+def upsert(rows: list[SessionRow], *, db_url: str | None = None, now: datetime | None = None) -> tuple[int, int]:
     """(new, updated). Unchanged rows are not touched. One transaction."""
     new = updated = 0
     with store.connect(db_url) as conn:
         for r in rows:
-            got = conn.execute(_UPSERT_SQL, _params(r)).fetchone()
+            got = conn.execute(_UPSERT_SQL, _params(r, now)).fetchone()
             if got is None:
                 continue
             if got[0]:
@@ -767,18 +901,27 @@ def cloud_source_name(routine: str, name: str) -> str | None:
     prompt, `cloud-file:<name>` for a file (NIGHTLY.md -> cloud-file:nightly-md)."""
     if not _CLOUD_NAME_RE.fullmatch(name or ""):
         return None
-    return f"routine:{routine}" if name == CLOUD_PROMPT else f"cloud-file:{name}"
+    if name == CLOUD_PROMPT:
+        return f"routine:{routine}" if routine else None   # a chat has no routine prompt
+    return f"cloud-file:{name}"
 
 
 def _count(value: Any) -> int:
     return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
 
 
+CLOUD_KINDS = ("routine", "chat")
+
+
 def cloud_row(rec: dict[str, Any]) -> SessionRow | None:
-    """One `cloud_digests` row to a `sessions` row (no database). None for a row with a bad
-    routine name or session id (it stays un-ingested and is reported)."""
+    """One `cloud_digests` row to a `sessions` row (no database). Kind `routine` (a routine's
+    own last step) or `chat` (the Stop / SessionEnd hook, docs/cloud.md "Cloud chats"). None
+    for a row with a bad routine name or session id (it stays un-ingested and is reported)."""
     key, routine = str(rec.get("source_key") or ""), str(rec.get("routine") or "")
-    if not key.startswith(CLOUD_PREFIX) or not _ROUTINE_NAME_RE.fullmatch(routine):
+    kind = rec.get("kind") if rec.get("kind") in CLOUD_KINDS else "routine"
+    if kind == "chat" and routine:
+        kind = "routine"   # a routine name always makes it a routine session
+    if not key.startswith(CLOUD_PREFIX) or (kind == "routine" and not _ROUTINE_NAME_RE.fullmatch(routine)):
         return None
     src = rec.get("meta") if isinstance(rec.get("meta"), dict) else {}
     names: list[str] = []
@@ -790,15 +933,46 @@ def cloud_row(rec: dict[str, Any]) -> SessionRow | None:
     repo = src.get("repo") if isinstance(src.get("repo"), str) and src.get("repo") else None
     meta: dict[str, Any] = {
         "cloud": True,
-        "routine": routine,
         "prompts": _count(src.get("prompts")),
         "tool_calls": _count(src.get("tool_calls")),
         "script_version": str(src.get("script_version") or "") or None,
         "digest_sha": rec.get("digest_sha"),
     }
+    if kind == "routine":
+        meta["routine"] = routine
     size = _count(src.get("transcript_bytes")) or len(rec.get("digest") or "")
-    return SessionRow(key, "routine", repo, CLOUD_PROJECT_DIR, rec.get("started_at"), rec.get("ended_at"),
-                      size, skills, names, meta, tokens=cloud_tokens(src, rec.get("ended_at")))
+    row = SessionRow(key, kind, repo, CLOUD_PROJECT_DIR, rec.get("started_at"), rec.get("ended_at"),
+                     size, skills, names, meta, tokens=cloud_tokens(src, rec.get("ended_at")),
+                     title=session_tokens.clean_title(src.get("title")))
+    prof = src.get("profile") if isinstance(src.get("profile"), dict) else None
+    if prof is not None:
+        row.profile = cloud_profile(prof)
+    out = src.get("outcome") if isinstance(src.get("outcome"), dict) else None
+    if out is not None and isinstance(out.get("signals"), dict):
+        row.signals = {str(k): v for k, v in out["signals"].items()
+                       if isinstance(v, int) and not isinstance(v, bool) and v > 0 and re.fullmatch(r"[a-z_]{1,30}", str(k))}
+        row.end = out.get("end") if out.get("end") in ("reply", "user", "tool", "result", "error", "interrupt") else None
+    return row
+
+
+def _num(value: Any) -> float | None:
+    return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0 else None
+
+
+def cloud_profile(p: dict[str, Any]) -> dict[str, Any]:
+    """The profile a digest carries (script_version 3+), validated: labels and numbers only."""
+    def model(v: Any) -> str | None:
+        return v.strip() if session_tokens.is_model(v) and len(v) <= 100 else None
+
+    efforts = p.get("efforts") if isinstance(p.get("efforts"), dict) else {}
+    lines = {k: (int(v) if (v := _num(p.get(k))) is not None else None) for k in ("lines_added", "lines_removed")}
+    return {"model": model(p.get("model")), "model_last": model(p.get("model_last")),
+            "effort": session_tokens.effort_of(p.get("effort")),
+            "effort_last": session_tokens.effort_of(p.get("effort_last")),
+            "efforts": {e: int(n) for k, n in efforts.items()
+                        if (e := session_tokens.effort_of(k)) and _num(n) is not None},
+            **{k: _num(p.get(k)) for k in ("duration_seconds", "active_seconds", "api_seconds", "tool_seconds")},
+            **lines}
 
 
 def cloud_tokens(src: dict[str, Any], ended_at: Any) -> session_tokens.Summary | None:
@@ -817,7 +991,7 @@ def cloud_tokens(src: dict[str, Any], ended_at: Any) -> session_tokens.Summary |
 
 
 _CLOUD_PENDING_SQL = """
-select source_key, routine, session_id, started_at, ended_at, digest, digest_sha, instructions, skills, meta
+select source_key, kind, routine, session_id, started_at, ended_at, digest, digest_sha, instructions, skills, meta
 from cloud_digests where ingested_at is null
 order by created_at, source_key
 for update skip locked
@@ -832,10 +1006,11 @@ class CloudReport:
     bad: int = 0      # rows left un-ingested (bad routine name or key)
 
 
-def ingest_cloud(*, db_url: str | None = None) -> CloudReport:
-    """Turn new `cloud_digests` rows into `sessions` rows and set `ingested_at`, in one
-    transaction. Idempotent: an ingested row is not read again, and the sessions upsert keeps
-    `scanned_at` and the scan keys."""
+def ingest_cloud(*, db_url: str | None = None, now: datetime | None = None) -> CloudReport:
+    """Turn new or updated `cloud_digests` rows (ingested_at null: a hook POST resets it) into
+    `sessions` rows and set `ingested_at`, in one transaction. An updated row refreshes the
+    existing sessions row (tokens, times, profile, outcome). A session stored as a routine is
+    never turned into a chat. Idempotent; the sessions upsert keeps `scanned_at` and the scan keys."""
     from psycopg.rows import dict_row
 
     report = CloudReport()
@@ -848,7 +1023,14 @@ def ingest_cloud(*, db_url: str | None = None) -> CloudReport:
             if row is None:
                 report.bad += 1
                 continue
-            got = conn.execute(_UPSERT_SQL, _params(row)).fetchone()
+            if row.kind == "chat":
+                stored = conn.execute("select kind, meta ->> 'routine', instructions from sessions "
+                                      "where session_id = %s", (row.session_id,)).fetchone()
+                if stored is not None and stored[0] == "routine" and stored[1]:
+                    row.kind = "routine"
+                    row.meta["routine"] = stored[1]
+                    row.instructions = list(stored[2] or [])
+            got = conn.execute(_UPSERT_SQL, _params(row, now)).fetchone()
             if got is not None:
                 if got[0]:
                     report.new += 1
@@ -868,9 +1050,9 @@ def ingest(root: Path | None, *, days: int = DEFAULT_DAYS, now: datetime | None 
     report = IngestReport(files=len(rows) + skipped, skipped=skipped)
     # Pings spooled while the database was unreachable go first: the full read below wins.
     report.spool = session_live.flush_spool(db_url=db_url)
-    report.new, report.updated = upsert(rows, db_url=db_url)
-    if "claude" in tools:  # cloud routine sessions are Claude Code sessions
-        cloud = ingest_cloud(db_url=db_url)
+    report.new, report.updated = upsert(rows, db_url=db_url, now=now)
+    if "claude" in tools:  # cloud sessions (routines and chats) are Claude Code sessions
+        cloud = ingest_cloud(db_url=db_url, now=now)
         rows = rows + cloud.rows
         report.files += len(cloud.rows)
         report.new += cloud.new

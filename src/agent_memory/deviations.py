@@ -866,17 +866,19 @@ class Outcome:
     judged: list[Judged] = field(default_factory=list)
     tool: str = "claude"
     team: bool = False           # a team repo's session: the edit step never edits its repo files
+    title: str | None = None     # the session's name, shown when known
 
     @classmethod
     def of(cls, row: SessionRow, status: str, reason: str = "") -> Outcome:
-        return cls(row.session_id, row.kind, status, reason, tool=row.tool, team=row.team)
+        return cls(row.session_id, row.kind, status, reason, tool=row.tool, team=row.team, title=row.title)
 
     def counts(self) -> Counter[str]:
         return Counter(j.verdict or "unjudged" for j in self.judged)
 
     def line(self) -> str:
         head = (f"{self.status} {self.session_id} kind={self.kind}"
-                + (f" tool={self.tool}" if self.tool != "claude" else "") + (" team=1" if self.team else ""))
+                + (f" tool={self.tool}" if self.tool != "claude" else "") + (" team=1" if self.team else "")
+                + (f" title={json.dumps(self.title, ensure_ascii=False)}" if self.title else ""))
         if self.status == "dry-run":
             miss = f" missing={','.join(self.missing)}" if self.missing else ""
             return (f"{head} digest_chars={self.digest_chars} "
@@ -941,7 +943,8 @@ limit %(limit)s
 def _row(rec: dict[str, Any]) -> SessionRow:
     return SessionRow(rec["session_id"], rec["kind"], rec["repo"], rec["project_dir"], rec["started_at"],
                       rec["ended_at"], int(rec["transcript_bytes"] or 0), list(rec["skills"] or []),
-                      list(rec["instructions"] or []), dict(rec["meta"] or {}), tool=rec.get("tool") or "claude")
+                      list(rec["instructions"] or []), dict(rec["meta"] or {}), tool=rec.get("tool") or "claude",
+                      title=rec.get("title"))
 
 
 def pick_sessions(*, since: datetime, limit: int, session_id: str | None = None,
@@ -1128,7 +1131,7 @@ _REPORT_SQL = """
 select d.id, d.session_id, d.instruction_source, d.instruction_ref, d.turn, d.what, d.why, d.how,
        d.followed_grade, d.result_grade, d.jev_verdict, d.jev_confidence, d.created_at,
        d.rule_id, d.rule_title, d.instruction_sha,
-       s.tool, s.kind, s.repo, s.project_dir, s.skills, s.meta, s.started_at
+       s.tool, s.kind, s.repo, s.project_dir, s.skills, s.meta, s.started_at, s.title
 from deviations d join sessions s using (session_id)
 where coalesce(s.started_at, s.created_at) >= %s
 order by s.started_at desc nulls last, d.created_at desc
@@ -1206,8 +1209,10 @@ def candidates(*, days: int = DEFAULT_DAYS, now: datetime | None = None,
             "verdict": top,
             "session_ids": sorted({r["session_id"] for r in recs}),
             "deviation_ids": [str(r["id"]) for r in recs],
-            "examples": [{"session_id": r["session_id"], "turn": r["turn"], "what": r["what"], "why": r["why"],
-                          "how": r["how"], "team": _is_team(r)} for r in recs[:EXAMPLES_MAX]],
+            "session_titles": {r["session_id"]: r["title"] for r in recs if r.get("title")},
+            "examples": [{"session_id": r["session_id"], "title": r.get("title"), "turn": r["turn"],
+                          "what": r["what"], "why": r["why"], "how": r["how"], "team": _is_team(r)}
+                         for r in recs[:EXAMPLES_MAX]],
         })
     out.sort(key=lambda c: (-c["sessions"], -c["count"], c["followed_grade_mean"] or 0,
                             c["instruction_source"], c["rule_id"] or "", c["instruction_ref"]))

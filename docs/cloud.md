@@ -144,8 +144,8 @@ the newest file is this session.
 
 It never fails the routine. No transcript, none recent enough, or any other error: one
 `amem_digest: ... Nothing to send.` line on stderr, nothing on stdout, exit 0. A missing
-or `.env*` instruction file is left out with a stderr line. It reads no environment
-value and prints none; it sends nothing itself.
+or `.env*` instruction file is left out with a stderr line. In routine mode it reads no
+environment value and prints none; it sends nothing itself (hook mode does: see "Cloud chats").
 
 Output: one JSON object, the `cloud_digests` row.
 
@@ -158,7 +158,7 @@ Output: one JSON object, the `cloud_digests` row.
 | `digest`, `digest_sha` | the redacted, capped digest and its sha256 |
 | `instructions` | `[{name, sha256, text}]`: text redacted, capped at 100k chars; sha256 of the text as read |
 | `skills` | `Skill` calls and slash commands, no built-ins |
-| `meta` | `{cloud: true, repo, script_version, transcript_bytes, tool_calls, prompts, tokens}`; `tokens` (script version 2+) = `{input, output, cache_read, cache_creation, models}`, the session's token totals (docs/sessions-live.md) |
+| `meta` | `{cloud: true, repo, script_version, transcript_bytes, tool_calls, prompts, tokens}`; `tokens` (script version 2+) = `{input, output, cache_read, cache_creation, models}`, the session's token totals (docs/sessions-live.md). Script version 3+ adds `title` (when named), `profile` (model, effort, duration) and `outcome` (`{signals, end}`: signal names and counts only) |
 
 ### The routine's last step
 
@@ -211,6 +211,123 @@ its prompt in a file in its repo, pass `--prompt <file>` instead.
   The rule catalog is built from the stored texts and `instruction_sha` is the stored sha256,
   so snapping, recurrence, the report and `reref` work as for local sessions. The candidates
   file has `target_paths: []` for these sources: the edit step has no local file to edit.
+
+## Cloud chats
+
+Interactive claude.ai/code sessions (not only routines) send their digest too: every new
+cloud chat gets a `sessions` row with its tokens, model, title and outcome. Only the redacted
+digest leaves the VM.
+
+```
+claude.ai/code environment setup script (deploy/cloud/setup.sh, runs once per new session)
+   │ GET /rest/v1/amem_assets?name=eq.amem_digest.py   ──▶ ~/.claude/amem/amem_digest.py
+   │ merge Stop + SessionEnd hooks into ~/.claude/settings.json
+   ▼
+cloud session: Stop / SessionEnd ──▶ python3 ~/.claude/amem/amem_digest.py --hook
+   │ POST /rest/v1/cloud_digests?on_conflict=source_key   (merge-duplicates, kind chat, ingested_at null)
+   ▼
+Mac: amem sessions ingest ──▶ sessions (tool claude, kind chat, meta.cloud) ──▶ deviations scan, tokens
+```
+
+### What to paste where
+
+1. The parent publishes the script once per change, on the hosted DB:
+   `uv run amem cloud publish-script` (Postgres backend; upserts `tools/amem_digest.py`
+   into `amem_assets`; prints `(new)`, `(updated)` or `(unchanged)`).
+2. Vilmer pastes `deploy/cloud/setup.sh` into the setup script field of the claude.ai/code
+   environment that has `AMEM_SUPABASE_URL` and the Supabase network secret. It runs as root
+   before Claude Code starts, only when a new session starts.
+
+`setup.sh` never fails a session: `set +e`, every path ends with `exit 0` and one status line:
+
+| Line | Meaning |
+|---|---|
+| `amem: cloud digests on (Stop + SessionEnd hooks)` | script fetched (or an earlier copy kept), hooks merged |
+| `amem: AMEM_SUPABASE_URL not set, cloud digests off` | nothing done |
+| `amem: could not fetch amem_digest.py, cloud digests off` | no answer, not JSON, or the body does not compile (`python3 -m py_compile`) and no earlier copy exists |
+| `amem: settings.json not changed (...)` | settings.json is not a JSON object: left alone |
+
+The merge keeps every other key and hook in `~/.claude/settings.json`. A second run adds
+nothing (the hook command is matched exactly). The hook entries:
+`{"type": "command", "command": "python3 \"$HOME/.claude/amem/amem_digest.py\" --hook", "timeout": 10}`
+under `Stop` and `SessionEnd`.
+
+### Hook mode: `amem_digest.py --hook` (script version 3)
+
+- Reads the hook JSON on stdin (`session_id`, `transcript_path`, `cwd`,
+  `hook_event_name`). Other events and subagent payloads (`agent_id`) are ignored.
+- Builds the same redacted, capped digest and token totals as routine mode, plus
+  `kind: chat`, no `routine`, `ingested_at: null`, `meta.hook` (the event), and as
+  instructions the `CLAUDE.md` (`claude-md`) and `AGENTS.md` (`agents-md`) of the hook's
+  cwd (else of the git root above it): redacted, capped at 100k chars each.
+- POSTs it itself with stdlib `urllib` (no curl), which honours `HTTPS_PROXY` / `NO_PROXY`:
+  `$AMEM_SUPABASE_URL/rest/v1/cloud_digests?on_conflict=source_key`,
+  `Prefer: resolution=merge-duplicates,return=minimal`. Redirects are refused. Only
+  `https://`, or `http://` to a local host (tests). No key is sent: the network secret adds it.
+  CA bundles named by `REQUESTS_CA_BUNDLE` / `CURL_CA_BUNDLE` / `NODE_EXTRA_CA_CERTS` are
+  trusted too (a TLS-inspecting proxy's CA is often only there).
+- Debounce: a Stop less than 60 s after the last successful POST of the same session is
+  skipped (state: `~/.claude/amem/hook-state.json`). SessionEnd is never skipped. A failed
+  POST does not count, so the next Stop tries again.
+- Never blocks or fails the session: hard timeout 8 s (HTTP timeout 5 s), always exit 0,
+  nothing on stdout or stderr. One log line per run in `~/.claude/amem/hook.log`
+  (`amem-digest <time> <event> <session id prefix> <status> <seconds>`; status `posted 201`,
+  `debounced`, `failed 500`, `failed 000` = no answer, `no AMEM_SUPABASE_URL`, ...). The log
+  never holds the URL or any text.
+
+Limits: the transcript can lag the current turn, and a chat's last Stop may fall in the
+60 s debounce. SessionEnd (when Claude Code sends it) or the next Stop catches up. A session
+that just goes idle keeps the digest of its last successful POST.
+
+### Chat or routine
+
+`cloud_digests.kind` is `chat` (hook) or `routine` (a routine's own last step); `routine` is
+null for a chat (migration `20261018030000_cloud_chats.sql`). One cloud session can send
+both. The routine's step is authoritative for kind, routine name and instructions, in either
+order (two triggers):
+
+- hook after routine: the merge keeps kind, routine and instructions; digest, times, skills
+  and meta (tokens) come from the hook, which read more of the session.
+- routine after hook: the routine's ignore-duplicates POST folds the chat row into a routine
+  row (the newer digest of the two stays) and resets `ingested_at`.
+
+`amem sessions ingest` reads every row with `ingested_at` null, so each hook POST refreshes
+the `sessions` row (tokens, last activity, title, model, outcome; `scanned_at` stays).
+Kind `chat` or `routine` comes from the row; a session already stored as a routine is never
+turned into a chat. Chats get `tool` claude, `meta.cloud` true, `project_dir` cloud and the
+repo from the session's cwd. `amem deviations scan` treats a cloud chat like a chat: it
+reads the stored digest and the stored `cloud-file:claude-md` / `cloud-file:agents-md`
+texts (never the Mac's files).
+
+### Verify
+
+1. Start a new cloud session in the environment. The setup log shows the status line.
+2. In the session, run `/hooks`: Stop and SessionEnd list the `amem_digest.py --hook` command.
+3. Send a prompt, wait for the reply, then on the Mac: `uv run amem sessions ingest` and
+   `uv run amem sessions tokens --tool claude` lists the session under `chat` with project
+   = the repo (or `uv run amem sessions tokens --by category`).
+4. In the cloud session, `tail ~/.claude/amem/hook.log` shows `posted 201`.
+
+### Disable
+
+- Remove the lines from the environment's setup script. New sessions then get no hooks.
+- In a running session: delete the two entries from `~/.claude/settings.json`, or
+  `unset AMEM_SUPABASE_URL` before Claude Code starts (the hook then logs
+  `no AMEM_SUPABASE_URL` and sends nothing).
+- Stored rows stay in `cloud_digests` and `sessions`.
+
+### Privacy
+
+Same rules as routine digests: the digest is redacted (credential shapes, URL passwords,
+private keys) before the 60k cap, instruction texts are redacted and capped, no environment
+value is read except the URL, HOME, proxy and CA-bundle variables, no `.env*` file is read,
+and the log holds labels only. The full transcript never leaves the VM.
+
+### Table `amem_assets`
+
+Migration `20261018020000_amem_assets.sql`: `name` (pk), `body`, `sha256`, `version`,
+`updated_at`. RLS on, no policies, `anon` / `authenticated` revoked; the cloud fetch uses the
+secret key through the network secret.
 
 ## `amem ingest git-ref`
 

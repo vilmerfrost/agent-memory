@@ -88,7 +88,7 @@ def cmd_sessions_tokens(args: argparse.Namespace) -> int:
     if args.json:
         print(json.dumps(doc, indent=1, sort_keys=True, default=str))
     else:
-        for line in tokens_report.lines(doc):
+        for line in tokens_report.lines(doc, by=tuple(args.by) if args.by else tokens_report.DEFAULT_BY):
             print(line)
     return 0
 
@@ -171,14 +171,16 @@ def register(sub: Any) -> None:
                    help="which transcripts to index (default all)")
     p.set_defaults(func=cmd_sessions_ingest)
 
-    p = s_sub.add_parser("tokens", help="token totals per repo / tool / kind / model and the top sessions "
-                                        "(docs/sessions-live.md)")
+    p = s_sub.add_parser("tokens", help="token totals per category / project, model, effort, outcome, ... and "
+                                        "the top sessions (docs/sessions-live.md)")
     p.add_argument("--days", type=_positive, default=tokens_report.DEFAULT_DAYS,
                    help="sessions active in the last N days (default 7)")
     p.add_argument("--repo", default=None, help="this repo only")
     p.add_argument("--tool", choices=sessions_ingest.TOOLS, default=None, help="this tool only")
     p.add_argument("--top", type=_positive, default=tokens_report.TOP, help="top sessions to list (default 10)")
-    p.add_argument("--json", action="store_true", help="the report as JSON")
+    p.add_argument("--by", action="append", choices=tokens_report.DIMS, default=None,
+                   help="a section to show (repeatable; default: category with its projects, then model)")
+    p.add_argument("--json", action="store_true", help="the report as JSON (every section)")
     p.set_defaults(func=cmd_sessions_tokens)
 
     # Handled in cli.main before parsing (it must exit 0 even for bad arguments).
