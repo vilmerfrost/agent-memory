@@ -15,6 +15,9 @@ Steps, in order. A failed step is recorded and the next step still runs:
 3b. deviations (daily): `sessions ingest` + `deviations scan` (docs/deviations.md) when the
    last scan in the state file is >= 20 hours old (AMEM_DEVIATIONS_EVERY_HOURS). Off unless AMEM_DEVIATIONS_LIVE=1 (then not
    a failure, and the log line has no deviation fields). Any session error fails the step.
+3c. edits: `edits run` (docs/edits.md) after the deviations step. Off unless AMEM_EDITS_LIVE=1
+   (then not a failure, and the log line has no edit fields). Kept edits are pushed with an
+   Undo button (not with --no-push). Any candidate error fails the step; the others still run.
 4. log: one summary line plus one `amem-daily-fail <reason>` line per failed
    step, appended to the routines log in the house format.
 
@@ -66,6 +69,7 @@ class DailyResult:
     push: str = "none"  # none | phone | mac
     distilled: distill.Report | None = None  # None: the distill step was off or failed early
     deviations: deviations.ScanReport | None = None  # None: off, not due this week, or failed early
+    edits: Any = None  # edits.Report; None: the edits step was off or failed early
     failures: list[str] = field(default_factory=list)
     lines: list[str] = field(default_factory=list)  # what was appended to the routines log
 
@@ -400,6 +404,32 @@ def step_deviations(result: DailyResult, *, state_file: Path, now: datetime) -> 
         result.fail(f"state: cannot write {state_file.name}: {_exc(exc)}")
 
 
+def step_edits(result: DailyResult, *, push: bool, notify: Mapping[str, str] | None) -> None:
+    """`amem edits run` (docs/edits.md): edit the rules Jev flagged, push each kept edit with
+    an Undo button. Off (not a failure) unless AMEM_EDITS_LIVE=1. One candidate's writer or
+    improve error never stops the others; any error fails the step."""
+    from agent_memory import edits  # lazy: edits_push imports this module
+
+    if not edits.live():
+        _err(f"edits: off ({edits.LIVE_ENV} is not 1)")
+        return
+    if not _postgres_guard("edits", result):
+        return
+    try:
+        report = edits.run(push=push, notify=dict(notify) if notify is not None else None)
+    except Exception as exc:  # the candidate query failed before the loop
+        result.fail(f"edits: {_exc(exc)}")
+        return
+    result.edits = report
+    for o in report.outcomes:
+        _err(f"edits: {o.line()}")
+    _err(report.summary())
+    if report.errors:
+        first = next(o for o in report.outcomes if o.status in ("error", "proposed"))
+        n = report.errors
+        result.fail(f"edits: {n} error{'s' if n != 1 else ''}; first: {first.source} {first.rule_id}: {first.reason}")
+
+
 def step_escalations(
     result: DailyResult, *, push: bool, state_file: Path, now: datetime, notify: Mapping[str, str] | None
 ) -> None:
@@ -438,6 +468,10 @@ def log_lines(ts: str, result: DailyResult, secs: int) -> list[str]:
         head += (f"deviations={s.found} deviation_sessions={len(s.outcomes)} "
                  f"deviations_edit={v['edit_instruction']} deviations_enforce={v['enforce']} "
                  f"deviations_leave={v['leave']} deviation_errors={s.errors} ")
+    if result.edits is not None:  # only when the step ran
+        e = result.edits
+        head += (f"edits={e.edits} edits_kept={e.kept} edits_reverted={e.reverted} "
+                 f"edits_suggested={e.suggested} edit_errors={e.errors} ")
     head += f"{secs}s"
     return [head, *(f"{ts} {NAME}-fail {reason}" for reason in result.failures)]
 
@@ -466,6 +500,7 @@ def run_daily(
     step_distill(result)
     step_escalations(result, push=push, state_file=state_path(state), now=now, notify=notify)
     step_deviations(result, state_file=state_path(state), now=now)
+    step_edits(result, push=push, notify=notify)
     secs = int(time.monotonic() - start)
     result.lines = log_lines(now.strftime(TS_FORMAT), result, secs)
     log_file.parent.mkdir(parents=True, exist_ok=True)

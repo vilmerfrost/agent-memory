@@ -17,12 +17,16 @@ automatically. Success: fewer repeated deviations, and agents improve the setup.
 ```
 sessions ──scan──▶ deviations (what / why / how + 2 raw grades) ──Jev──▶ edit | enforce | leave
                                                                            │
-                       improve apply (one commit, improve revert undoes) ◀─┘  (E4, later)
+                       improve apply (one commit, improve revert undoes) ◀─┘  (E4: amem edits)
 ```
 
 Status: the deviation finder (E1–E3) is built and read only: `sessions ingest`,
-`deviations scan`, `deviations report` ([docs/deviations.md](docs/deviations.md)). It never
-edits an instruction. The run log, Jev scoring and labels stay as they are.
+`deviations scan`, `deviations report` ([docs/deviations.md](docs/deviations.md)). The edit
+step (E4) and the proof (E5) are `amem edits run|undo|undo-poll|scoreboard`
+([docs/edits.md](docs/edits.md)): it rewrites one flagged rule per edit via `improve apply`,
+pushes each kept edit with an Undo button, and the scoreboard shows whether the rule now sees
+fewer deviations. Live only with `AMEM_EDITS_LIVE=1`. The run log, Jev scoring and labels stay
+as they are.
 
 **Frozen:** the v1 lessons memory (`lessons import/export/for/score`, `lesson propose`,
 `lessons distill`, and `lessons for` injection into briefs). The code and tables are kept,
@@ -116,6 +120,7 @@ Each part has its own doc:
 | Part | Commands | Doc |
 |---|---|---|
 | Deviation finder (v2) | `sessions ingest`, `deviations scan`, `deviations report [--json]` | [docs/deviations.md](docs/deviations.md) |
+| Edits + proof (v2) | `edits run`, `edits list`, `edits undo`, `edits undo-poll`, `edits scoreboard` | [docs/edits.md](docs/edits.md) |
 | Daily job | `daily` | [docs/daily.md](docs/daily.md) |
 | Dispatch tasks as runs | `ingest tasks` | [docs/tasks.md](docs/tasks.md) |
 | Cloud path (HTTPS, no raw Postgres) | `AMEM_BACKEND=rest`, `ingest git-ref`, `jev record` | [docs/cloud.md](docs/cloud.md) |
@@ -125,7 +130,8 @@ Each part has its own doc:
 
 The v2 loop: `sessions ingest` indexes transcripts → `deviations scan` finds deviations, writes
 what/why/how and two raw grades, Jev gives a verdict → `deviations report --json` hands the
-candidates to the improve ACT step (later) → one commit per edit, `improve revert` undoes it.
+candidates to `edits run` → one commit per edit (`improve apply`), a push with an Undo button,
+`improve revert` undoes it → `edits scoreboard` shows fewer / same / more deviations per edited rule.
 
 The v1 loop (frozen, kept for history): runs are logged → Jev scores outcomes (low confidence → you label 👍/👎) → Jev gates which runs become lessons → `lessons for` injects the top lessons into briefs (`AMEM_MEMORY=off` turns injection off) → `ab report` shows whether each lesson actually helps → losers retire.
 

@@ -5,7 +5,7 @@ follow a skill, a CLAUDE.md or PARENT.md rule, an agent definition or a routine 
 writes down why, when and how, gives two raw grades, and Jev makes the call.
 
 It is **read only** toward the setup. It never edits a skill or any instruction file.
-Editing comes later (step E4), through agent-config's `improve apply` / `improve revert`.
+Editing is step E4, `amem edits run` (docs/edits.md), through agent-config's `improve apply` / `improve revert`.
 
 ```
 ~/.claude/projects/*.jsonl ──sessions ingest──▶ sessions
@@ -20,7 +20,7 @@ Editing comes later (step E4), through agent-config's `improve apply` / `improve
             jev_verdict: edit_instruction | enforce | leave
                                                    │ deviations report --json
                                                    ▼
-            candidates file ──(E4, later)──▶ improve apply → one commit per edit
+            candidates file ──amem edits run──▶ improve apply → one commit per edit
 ```
 
 ## Commands
@@ -185,7 +185,7 @@ claude-md:global / A rule nobody wrote [unmatched]: count=1 sessions=1 ...
 
 Rows without a rule id yet show `[no rule id]`; run `amem deviations reref`.
 
-`--json` prints the candidates file, the input for the future improve ACT step (E4):
+`--json` prints the candidates file, the input for the edit step (E4, `amem edits run`, docs/edits.md):
 
 ```json
 {
