@@ -51,7 +51,8 @@ import psycopg
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
-from agent_memory import codex_sessions, config, distill, jev, questions, rule_catalog, sessions_ingest, store, tasks_ingest
+from agent_memory import codex_sessions, config, distill, jev, questions, rule_catalog, sessions_ingest, store
+from agent_memory import redact as _redact
 from agent_memory.codex_sessions import payload
 from agent_memory.sessions_ingest import (
     SessionRow,
@@ -105,20 +106,9 @@ def _one_line(text: Any, limit: int) -> str:
 
 # --------------------------------------------------------------------------- redaction
 
-_EXTRA_REDACT_RES = (
-    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
-    re.compile(r"\bsk-ant-[A-Za-z0-9_-]{8,}"),
-    re.compile(r"(?i)\b(api[_-]?key|secret|password|passwd|token|bearer)(\s*[:=]\s*|\s+)['\"]?[A-Za-z0-9_\-./+=]{12,}"),
-    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(-----END [A-Z ]*PRIVATE KEY-----|$)", re.S),
-)
-
-
 def redact(text: str) -> str:
-    """The tasks_ingest credential redaction plus a few more key shapes."""
-    text = tasks_ingest.redact(text)
-    for pattern in _EXTRA_REDACT_RES:
-        text = pattern.sub("[redacted]", text)
-    return text
+    """The shared credential redaction (agent_memory.redact)."""
+    return _redact.redact(text)
 
 
 # --------------------------------------------------------------------------- instructions

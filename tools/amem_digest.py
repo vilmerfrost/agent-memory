@@ -106,15 +106,23 @@ HOOK_LOG_MAX = 1_000_000
 HOOK_INSTRUCTIONS = (("claude-md", "CLAUDE.md"), ("agents-md", "AGENTS.md"))
 CA_BUNDLE_ENVS = ("REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE", "NODE_EXTRA_CA_CERTS")
 
-# The redaction of deviations.redact: tasks_ingest's patterns, then the extra key shapes.
+# A copy of agent_memory/redact.py (this script stays standalone). tests/test_redact.py
+# checks that the patterns and the results are the same. A `keep` group stays; the rest
+# of the match becomes [redacted].
+_KEY_NAMES = (r"(?:api[_-]?key|secret|password|passwd|pwd|token|auth[_-]?token|access[_-]?key"
+              r"|private[_-]?key|service[_-]?role[_-]?key|authorization|credentials?)")
 REDACT_RES = (
-    re.compile(r"\b(?:sk-|sk_|ghp_|gho_|ghs_|github_pat_|xox[abposr]-)[A-Za-z0-9_-]{8,}"),
+    re.compile(r"\b(?:sk-|sk_|ghp_|gho_|ghs_|ghu_|ghr_|github_pat_|glpat-|xox[abposr]-|sb_secret_)[A-Za-z0-9_-]{8,}"),
     re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]+"),
     re.compile(r"(?<=://)[^/\s:@]+:[^/\s@]+(?=@)"),
-    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
-    re.compile(r"\bsk-ant-[A-Za-z0-9_-]{8,}"),
-    re.compile(r"(?i)\b(api[_-]?key|secret|password|passwd|token|bearer)(\s*[:=]\s*|\s+)['\"]?[A-Za-z0-9_\-./+=]{12,}"),
-    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(-----END [A-Z ]*PRIVATE KEY-----|$)", re.S),
+    re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"),
+    re.compile(r"\bAIza[0-9A-Za-z_-]{30,}"),
+    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(?:-----END [A-Z ]*PRIVATE KEY-----|$)", re.S),
+    re.compile(r"(?i)(?P<keep>\b(?:bearer|basic)\s+)(?=[A-Za-z0-9_\-.~+/=]*\d)[A-Za-z0-9_\-.~+/=]{12,}"),
+    re.compile(r"(?i)(?P<keep>\b[\w-]*?" + _KEY_NAMES + r"(?:[_-]?(?:key|value|id))?['\"]?\s*[:=]\s*['\"]?)"
+               r"[^\s'\"`,;(){}\[\]<>]{8,}"),
+    re.compile(r"(?i)(?P<keep>\b(?:api[_-]?key|secret|password|passwd|token)\s+)"
+               r"(?=[A-Za-z0-9_\-./+=]*\d)(?=[A-Za-z0-9_\-./+=]*[A-Za-z])[A-Za-z0-9_\-./+=]{16,}"),
 )
 
 # Slash commands that are Claude Code built-ins, not skills (sessions_ingest.BUILTIN_COMMANDS).
@@ -189,9 +197,14 @@ def parse_ts(value: Any) -> datetime | None:
 # --------------------------------------------------------------------------- digest
 
 
+def _redact_match(m: "re.Match[str]") -> str:
+    keep = m.group("keep") if "keep" in m.re.groupindex else None
+    return (keep or "") + "[redacted]"
+
+
 def redact(text: str) -> str:
     for pattern in REDACT_RES:
-        text = pattern.sub("[redacted]", text)
+        text = pattern.sub(_redact_match, text)
     return text
 
 

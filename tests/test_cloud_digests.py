@@ -19,7 +19,7 @@ import psycopg
 import pytest
 from psycopg.types.json import Jsonb
 
-from agent_memory import amem_digest, deviations, sessions_ingest, tasks_ingest
+from agent_memory import amem_digest, deviations, redact, sessions_ingest
 from conftest import base_env, run_amem
 from test_deviations_support import (  # noqa: F401
     NOW,
@@ -148,8 +148,8 @@ def test_digest_equals_deviations_build_digest() -> None:
 
 
 def test_copied_rules_match_the_package() -> None:
-    theirs = [*tasks_ingest._REDACT_RES, *deviations._EXTRA_REDACT_RES]
-    assert [(p.pattern, p.flags) for p in amem_digest.REDACT_RES] == [(p.pattern, p.flags) for p in theirs]
+    assert ([(p.pattern, p.flags) for p in amem_digest.REDACT_RES]
+            == [(p.pattern, p.flags) for p in redact.REDACT_RES])
     assert amem_digest.BUILTIN_COMMANDS == sessions_ingest.BUILTIN_COMMANDS
     assert amem_digest.SHORT_ARG_KEYS == deviations._SHORT_ARG_KEYS
     for name in ("DIGEST_MAX", "HEAD_SHARE", "FIRST_USER_MAX", "USER_MAX", "ASSISTANT_MAX", "ARGS_MAX",

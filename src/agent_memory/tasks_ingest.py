@@ -36,6 +36,7 @@ from typing import Any
 
 from psycopg.types.json import Jsonb
 
+from agent_memory import redact as _redact
 from agent_memory import store
 
 ROUTINE = "dispatch"
@@ -64,12 +65,6 @@ _WS_RE = re.compile(r"\s+")
 _SAFE_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._ -]{0,127}")
 _FIELD_RE = re.compile(r"([A-Z][A-Za-z /+-]{0,30}):(?:\s|$)")
 _BLOCK_SPLIT_RE = re.compile(r"(?m)^(?=#{1,6} )")
-# Credential-shaped strings never leave this machine in an excerpt.
-_REDACT_RES = (
-    re.compile(r"\b(?:sk-|sk_|ghp_|gho_|ghs_|github_pat_|xox[abposr]-)[A-Za-z0-9_-]{8,}"),
-    re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]+"),
-    re.compile(r"(?<=://)[^/\s:@]+:[^/\s@]+(?=@)"),
-)
 
 
 @dataclass
@@ -159,10 +154,9 @@ def _flag(value: bool | None) -> str:
 # ---------------------------------------------------------------- checkpoint excerpt
 
 
-def redact(text: str) -> str:
-    for pattern in _REDACT_RES:
-        text = pattern.sub("[redacted]", text)
-    return text
+# Excerpts are stored in runs.meta in the hosted database, so credential-shaped strings
+# are redacted before an excerpt is built (agent_memory.redact).
+redact = _redact.redact
 
 
 def _clip(text: str, limit: int) -> str:
