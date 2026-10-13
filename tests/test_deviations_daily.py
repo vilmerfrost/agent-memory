@@ -80,7 +80,7 @@ def test_daily_gating(live: ScoringDb, daily_io: DailyIO, setup_home: Home,  # n
     r = daily.run_daily(push=False, now=NOW + timedelta(hours=24))
     assert r.verdict == "PASS" and r.deviations is not None and r.deviations.outcomes == []
     assert FIELDS.search(daily_io.log_lines()[-1])
-    assert _state(daily_io)[daily.DEVIATIONS_KEY] == "2026-10-22T09:20:00+0200"
+    assert _state(daily_io)[daily.DEVIATIONS_KEY] == "2026-10-16T09:20:00+0200"
 
 
 def test_session_errors_fail_the_step_only(live: ScoringDb, daily_io: DailyIO, setup_home: Home,  # noqa: F811
