@@ -242,13 +242,14 @@ class Draft:
 _FENCE_RE = re.compile(r"^```(?:json)?\s*\n(.*?)\n?```$", re.DOTALL)
 
 
-def _text(obj: dict[str, Any], name: str, limit: int, *, required: bool, one_line: bool = True) -> str:
+def _text(obj: dict[str, Any], name: str, limit: int, *, required: bool) -> str:
+    """One line (whitespace collapsed), so model text can never start a lessons.md key line."""
     value = obj.get(name)
     if value is None:
         value = ""
     if not isinstance(value, str):
         raise DraftError(f"{name} must be a string, got {type(value).__name__}")
-    value = " ".join(value.split()) if one_line else value.strip()
+    value = " ".join(value.split())
     if required and not value:
         raise DraftError(f"{name} is empty")
     if len(value) > limit:
@@ -274,7 +275,7 @@ def parse_draft(text: str, offered: set[str]) -> Draft:
     if action == "skip":
         reason = _text(obj, "evidence", EVIDENCE_MAX, required=False) or "no reason given"
         return Draft("skip", evidence=reason)
-    evidence = _text(obj, "evidence", EVIDENCE_MAX, required=True, one_line=False)
+    evidence = _text(obj, "evidence", EVIDENCE_MAX, required=True)
     if action == "merge":
         slug = _text(obj, "merge_slug", 200, required=True)
         if slug not in offered:
