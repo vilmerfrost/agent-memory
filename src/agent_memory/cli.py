@@ -199,6 +199,11 @@ def main(argv: list[str] | None = None) -> int:
         from agent_memory import amem_digest
 
         return amem_digest.main(argv[1:])
+    if argv[:2] == ["sessions", "ping"]:
+        # A Claude Code hook: always exit 0, even for bad arguments (docs/sessions-live.md).
+        from agent_memory import session_live
+
+        return session_live.main(argv[2:])
     config.load_env()
     args = build_parser().parse_args(argv)
     return args.func(args)
