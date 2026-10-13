@@ -248,6 +248,7 @@ improve apply --target <file> --rule-id <id> --new-file <tmp> --topic ... --why 
   exactly the proposal (`meta.restore`; other text is never overwritten), sets `meta.apply_failed`,
   fails the step and starts the rule's cooldown. The result update survives a dead connection
   (fresh one, retried); if not, the error names `improve revert <id>` for a manual undo.
+  On a timeout improve's whole process group (its eval children too) gets SIGTERM, then SIGKILL 10 s later.
 - `improve revert <id> --reason "..."` exit 0 = reverted. `improve suggest --title --why
   --evidence [--target]` exit 0 = logged.
 - `AMEM_IMPROVE_BIN` points at another executable (tests); default `~/agent-config/bin/improve`.

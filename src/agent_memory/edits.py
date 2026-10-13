@@ -29,6 +29,7 @@ import json
 import math
 import os
 import re
+import signal
 import subprocess
 import sys
 import tempfile
@@ -95,9 +96,39 @@ def improve_bin() -> str:
     return env or str(agent_config_dir() / "bin" / "improve")
 
 
+KILL_GRACE = 10.0   # seconds between SIGTERM and SIGKILL to improve's process group
+
+
 def run_command(argv: list[str], timeout: float = IMPROVE_TIMEOUT) -> subprocess.CompletedProcess[str]:
-    """Run improve. Tests replace this (or point AMEM_IMPROVE_BIN at a fake)."""
-    return subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+    """Run improve in its own session. On a timeout the whole process group gets SIGTERM
+    (improve's finally can release its eval lock), then SIGKILL after KILL_GRACE, so eval
+    children never outlive it; then TimeoutExpired. Tests replace this (or AMEM_IMPROVE_BIN)."""
+    proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, start_new_session=True)
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _kill_group(proc)
+        raise subprocess.TimeoutExpired(argv, timeout) from None
+    return subprocess.CompletedProcess(argv, proc.returncode, out, err)
+
+
+def _kill_group(proc: subprocess.Popen[str]) -> None:
+    for sig, grace in ((signal.SIGTERM, KILL_GRACE), (signal.SIGKILL, 5.0)):
+        try:
+            os.killpg(proc.pid, sig)
+        except (ProcessLookupError, PermissionError):
+            break
+        try:
+            proc.communicate(timeout=grace)   # drains the pipes; returns once improve itself exits
+        except subprocess.TimeoutExpired:
+            continue
+        if sig == signal.SIGTERM:             # improve exited; its children may not have: kill what is left
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+        break
 
 
 class ImproveError(RuntimeError):
