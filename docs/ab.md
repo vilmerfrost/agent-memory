@@ -8,7 +8,7 @@ shaky to trust, so Vilmer can label them and make the verdict solid.
 ```
 runs in the lesson's scope ──┬── had the lesson injected (lesson_uses.run_id) ──▶ arm "with"  (A)
                              └── did not                                      ──▶ arm "without" (B)
-each run ──▶ outcome: label > confident Jev grade > runs.status
+each run ──▶ outcome: label > confident Jev grade > session outcome > runs.status
 both arms ──▶ pass rates, Wilson 95% CI, z ──▶ verdict: insufficient | WIN | LOSS | TIE
 ```
 
@@ -55,9 +55,15 @@ The first source that applies decides. Each run records its source.
 
 1. **label**: the human label. `up` = pass, `down` = fail.
 2. **jev**: the Jev answer to the routine's `pass_question` (docs/scoring.md), when its verdict confidence (up vs down, docs/scoring.md "Escalation rule") is **at or above** the routine's `threshold`. Jev's up = pass, down = fail.
-3. **status**: `runs.status`. `pass` = pass, `fail` and `error` = fail.
+3. **session**: the outcome of the run's session (docs/sessions-live.md, "Outcome"). The run maps
+   to a session through `runs.meta.session` (a dispatch task's parent session id, docs/tasks.md),
+   else `runs.meta.session_id`, when that session is stored. `shipped`, `pushed`, `committed` =
+   pass; `partial`, `abandoned`, `failed` = fail; `active`, `no-change` or no stored session
+   decide nothing. Limit: a dispatch task gets the outcome of its whole parent session, which can
+   hold several tasks.
+4. **status**: `runs.status`. `pass` = pass, `fail` and `error` = fail.
 
-A Jev answer below the threshold is not trusted: `status` decides that run. This is the same line `amem escalations` draws (strictly below the threshold escalates). Scores of a routine with no question file are ignored.
+A Jev answer below the threshold is not trusted: `session` or `status` decides that run. This is the same line `amem escalations` draws (strictly below the threshold escalates). Scores of a routine with no question file are ignored.
 
 ## Verdict
 
@@ -75,7 +81,7 @@ Two indicators. Neither changes the verdict.
 
 ## Low confidence: what to label
 
-`low_confidence` lists the runs, in either arm, whose Jev grade was below the threshold and that have no label. `status` decided them. These are the runs to 👍/👎 with `amem label <run_id> up|down`. Once labeled, the label decides the run and it leaves the list.
+`low_confidence` lists the runs, in either arm, whose Jev grade was below the threshold and that have no label. `session` or `status` decided them. These are the runs to 👍/👎 with `amem label <run_id> up|down`. Once labeled, the label decides the run and it leaves the list.
 
 Each item: `run_id`, `routine`, `arm`, `status`, `confidence`, `threshold`. Sorted by arm (`with` first), then lowest confidence first.
 
@@ -85,17 +91,17 @@ Text, one block per lesson:
 
 ```
 cli-lesson  [trial, scope: cli-repo]  verdict WIN  (n>=3, margin 0.10)
-  arm       runs  pass  rate  95% CI      label  jev status
-  with         3     3  1.00  0.44-1.00       0    0      3
-  without      3     1  0.33  0.06-0.79       0    0      3
+  arm       runs  pass  rate  95% CI      label  jev session status
+  with         3     3  1.00  0.44-1.00       0    0       0      3
+  without      3     1  0.33  0.06-0.79       0    0       0      3
   diff +0.67  z +1.73
   low confidence, label these (amem label <run_id> up|down):
     9f0c…  t-routine  conf 0.50 < 0.7  with  status pass
 ```
 
-`label`, `jev` and `status` count the runs each source decided.
+`label`, `jev`, `session` and `status` count the runs each source decided (the source per arm row).
 
-JSON, one line per lesson: `slug`, `status`, `scope_repo`, `since`, `n`, `margin`, `verdict`, `with` and `without` (each: `runs`, `pass`, `pass_rate`, `ci95`, `sources`), `diff`, `z`, `low_confidence`. With `--runs` also `runs` (every run: `run_id`, `routine`, `arm`, `outcome`, `source`).
+JSON, one line per lesson: `slug`, `status`, `scope_repo`, `since`, `n`, `margin`, `verdict`, `with` and `without` (each: `runs`, `pass`, `pass_rate`, `ci95`, `sources`), `diff`, `z`, `low_confidence`. `sources` has `label`, `jev`, `session`, `status`. With `--runs` also `runs` (every run: `run_id`, `routine`, `arm`, `outcome`, `source`, `session_id`, `session_outcome`).
 
 No lesson to report: nothing on stdout, a note on stderr, exit 0.
 

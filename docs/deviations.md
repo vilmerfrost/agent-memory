@@ -31,6 +31,7 @@ cloud_digests (cloud routines) ─┴─sessions ingest──▶ sessions (tool 
 |---|---|
 | `amem sessions ingest [--days 7] [--projects-dir DIR] [--codex-home DIR] [--tool all\|claude\|codex]` | Indexes Claude Code and Codex transcripts touched in the last N days into `sessions`, with token totals per session (docs/sessions-live.md). Flushes the hook spool first. Prints `sessions: ... (kinds) tools(claude=N codex=M) team=T` (`spool=N` when it flushed any). Idempotent. |
 | `amem sessions tokens [--days 7] [--repo R] [--tool claude\|codex] [--json]` | Token totals per repo / tool / kind / model and the top sessions (docs/sessions-live.md). Read only. |
+| `amem sessions cost --since ISO [--until ISO] [--category C] [--project P] [--json]` | Tokens and active / api / tool time of the sessions that started in a window, per project (docs/sessions-live.md, "Cost of a window"). Read only. |
 | `amem sessions ping` | Claude Code hook (SessionStart / Stop): the live row of the running session (docs/sessions-live.md). Always exits 0. |
 | `amem deviations scan [--days 7] [--limit 15] [--session ID] [--dry-run] [--timeout 300]` | Scans unscanned sessions. Prints one line per session and `deviations: sessions=N found=D edit=E enforce=F leave=L errors=X`. Exit 1 when a session failed. |
 | `amem deviations report [--days 7] [--json]` | Groups deviations by instruction source + rule id, most recurring first. `--json` prints the candidates file. |
@@ -230,8 +231,9 @@ Per session:
 5. **Jev** (`questions/deviation.toml`): one ask per deviation. The state holds only
    `instruction_source`, `instruction_rule` (the id), `rule_title` (the heading; for an
    unmatched ref the writer's ref plus `(not in the rule list)`), `session_kind`, the two
-   grades and `recurrence` (other sessions in the window with a deviation on the same source
-   + rule). Never transcript text and never what/why/how. Questions: `verdict`
+   raw grades, `objective_result` (see "Objective result"; `unknown` while the session is
+   active or has no outcome) and `recurrence` (other sessions in the window with a deviation
+   on the same source + rule). Never transcript text and never what/why/how. Questions: `verdict`
    (edit_instruction / enforce / leave), `urgency` (score), `systemic` (noul). All answers go
    to `jev_answers`.
 6. **Store**: deviations upsert on `source_key = dev:<session_id>:<hash of source + ref + turn>`
@@ -243,6 +245,37 @@ recorded in `sessions.meta.scan_error` (and `scan_errors` counts up), nothing is
 it, and the scan goes on. The session is retried on the next scan. A missing Jev fixture
 (fixture mode) is not an error: the deviation is stored with `jev_verdict = null` and
 `jev_mode = fixture-missing`.
+
+## Objective result
+
+The writer's `result_grade` is its own reading of the digest. `objective_result` is the
+same question answered from facts: the session's `outcome` (docs/sessions-live.md, "Outcome":
+its own git, edit and report signals). Migration `20261019010000_deviation_objective.sql`
+adds two columns to `deviations` (RLS unchanged):
+
+| Column | Value |
+|---|---|
+| `result_outcome` | the session's outcome when the deviation was stored |
+| `objective_result` | 0..1 from that outcome |
+
+| outcome | objective_result |
+|---|---|
+| `shipped` | 1.0 |
+| `pushed` | 0.9 |
+| `committed` | 0.8 |
+| `no-change` | 0.7 on a Q&A session (kind `chat`, `headless`, `routine`, or a subagent whose agent type is not `worker`); else null (a parent or dispatch worker that changed nothing is not graded) |
+| `partial` | 0.4 |
+| `abandoned` | 0.1 |
+| `failed` | 0.0 |
+| `active`, unknown | null |
+
+- Scan: both columns are stored with the deviation, and Jev's state gets the
+  `objective_result` line next to the raw `result_grade`. The question prompt tells Jev to
+  trust the objective one when both are known.
+- Outcomes change later (an active session ends, a branch gets pushed). `deviations report`
+  recomputes from the session's current outcome (`objective_result_mean`, `outcomes`), and
+  `deviations reref` writes the new values (`objective=N` in its summary when rows moved;
+  also for rows whose source file is gone).
 
 ## Privacy rules
 
@@ -259,7 +292,7 @@ it, and the scan goes on. The session is retried on the next scan. A missing Jev
 
 ```
 deviations (last 7 days): 2 rules, 6 deviations
-parent-md / Safety guards [safety-guards]: count=5 sessions=5 followed=0.30 result=0.80 | jev edit_instruction=5 enforce=0 leave=0 unjudged=0 confidence=0.80
+parent-md / Safety guards [safety-guards]: count=5 sessions=5 followed=0.30 result=0.80 objective=0.85 | jev edit_instruction=5 enforce=0 leave=0 unjudged=0 confidence=0.80
 claude-md:global / A rule nobody wrote [unmatched]: count=1 sessions=1 ...
 agents-md:app / Tests [tests]: count=2 sessions=2 ... | team repo
 ```
@@ -292,6 +325,9 @@ Rows without a rule id yet show `[no rule id]`; run `amem deviations reref`.
    "team_sessions": 0,
    "followed_grade_mean": 0.35,
    "result_grade_mean": 0.6,
+   "objective_result_mean": 0.85,
+   "outcomes": {"committed": 1, "shipped": 2},
+   "cost": {"sessions": 3, "tokens": 182000000, "active_seconds": 5400.0, "score": 272.0},
    "jev": {"edit_instruction": 3, "enforce": 1, "leave": 0, "unjudged": 0, "confidence_mean": 0.74},
    "verdict": "edit_instruction",
    "session_ids": ["..."],
@@ -311,6 +347,11 @@ Rows without a rule id yet show `[no rule id]`; run `amem deviations reref`.
 - `verdict`: the most common Jev verdict (ties: edit_instruction, enforce, leave), or null
   when nothing was judged.
 - `examples`: up to 3, newest sessions first.
+- `objective_result_mean`: the mean objective result over the distinct sessions (from their
+  outcome now; null when none is graded). `outcomes`: distinct sessions per outcome.
+- `cost`: what the deviating sessions cost, each session once: `tokens` (all four kinds),
+  `active_seconds`, and `score = tokens / 1,000,000 + active_seconds / 60` (1M tokens weigh
+  as much as one active minute). `edits run` orders by it (docs/edits.md, "Order").
 - `tools`: deviations per agent tool. `team`: the source is a team repo's own file, so an
   edit must not touch it (see Team repos). `team_sessions`: sessions in a team repo.
 

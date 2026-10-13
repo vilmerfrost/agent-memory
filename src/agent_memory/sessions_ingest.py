@@ -424,6 +424,7 @@ class SessionRow:
     profile: dict[str, Any] | None = None   # Summary.profile(): model, effort, time (None: not known)
     signals: dict[str, int] | None = None   # outcome signals (None: not known, the stored outcome stays)
     end: str | None = None
+    outcome: str | None = None   # the stored outcome (a row read back from the database), else None
 
     def with_summary(self, s: session_tokens.Summary) -> SessionRow:
         """Title, profile and outcome signals from a full read."""
@@ -716,6 +717,8 @@ class IngestReport:
     cloud: int = 0      # cloud routine sessions ingested from cloud_digests in this run
     cloud_bad: int = 0  # cloud_digests rows that could not be ingested
     spool: int = 0      # hook pings flushed from the local spool file (docs/sessions-live.md)
+    outcomes: int = 0   # stored rows whose outcome changed on the recompute pass (refresh_stored)
+    places: int = 0     # stored rows whose null category / project was filled (refresh_stored)
 
     def line(self) -> str:
         kinds = " ".join(f"{k}={self.kinds.get(k, 0)}" for k in KINDS)
@@ -723,8 +726,9 @@ class IngestReport:
         cloud = f" cloud={self.cloud}" if self.cloud or self.cloud_bad else ""
         bad = f" cloud_bad={self.cloud_bad}" if self.cloud_bad else ""
         spool = f" spool={self.spool}" if self.spool else ""
+        fixed = (f" outcomes={self.outcomes}" if self.outcomes else "") + (f" places={self.places}" if self.places else "")
         return (f"sessions: {self.files} files, {self.new} new, {self.updated} updated, "
-                f"{self.skipped} skipped ({kinds}) tools({tools}) team={self.team}{cloud}{bad}{spool}")
+                f"{self.skipped} skipped ({kinds}) tools({tools}) team={self.team}{cloud}{bad}{spool}{fixed}")
 
 
 def collect(root: Path | None, *, days: int = DEFAULT_DAYS, now: datetime | None = None,
@@ -854,10 +858,10 @@ def profile_values(profile: dict[str, Any] | None) -> dict[str, Any]:
 
 
 def outcome_values(signals: dict[str, int] | None, end: str | None, last: datetime | None,
-                   now: datetime | None) -> dict[str, Any]:
+                   now: datetime | None, kind: str | None = None) -> dict[str, Any]:
     if signals is None:
         return {"outcome": None, "outcome_evidence": None}
-    name, evidence = session_tokens.outcome_of(signals, end, last, now)
+    name, evidence = session_tokens.outcome_of(signals, end, last, now, kind)
     return {"outcome": name, "outcome_evidence": Jsonb(evidence)}
 
 
@@ -870,7 +874,7 @@ def _params(r: SessionRow, now: datetime | None = None) -> dict[str, Any]:
             "transcript_bytes": r.transcript_bytes, "skills": Jsonb(r.skills),
             "instructions": Jsonb(r.instructions), "meta": Jsonb(r.meta), **dict(zip(_TOKEN_COLS, tv)),
             "last_activity_at": last, "category": category, "project": project, "title": r.title,
-            **profile_values(r.profile), **outcome_values(r.signals, r.end, last, now)}
+            **profile_values(r.profile), **outcome_values(r.signals, r.end, last, now, r.kind)}
 
 
 def upsert(rows: list[SessionRow], *, db_url: str | None = None, now: datetime | None = None) -> tuple[int, int]:
@@ -1041,6 +1045,57 @@ def ingest_cloud(*, db_url: str | None = None, now: datetime | None = None) -> C
     return report
 
 
+# ---------------------------------------------------------------- stored rows
+# Every ingest also fixes stored rows outside its window (docs/sessions-live.md, "Outcome"):
+# the outcome is recomputed from the stored evidence (signal names and counts plus `end`) with
+# today's rules and time, and a null category / project is filled from the stored kind and cwd.
+
+_STORED_SQL = """
+select session_id, kind, repo, project_dir, meta, category, project, outcome, outcome_evidence,
+       coalesce(last_activity_at, ended_at) as last_at
+from sessions
+where outcome_evidence is not null or category is null or project is null
+"""
+
+
+def stored_outcome(evidence: Any, last_at: datetime | None, now: datetime | None,
+                   kind: str | None) -> str | None:
+    """The outcome of a stored row from its `outcome_evidence`, None when there is none."""
+    if not isinstance(evidence, dict):
+        return None
+    signals = {str(k): v for k, v in evidence.items()
+               if k != "end" and isinstance(v, int) and not isinstance(v, bool)}
+    end = evidence.get("end") if isinstance(evidence.get("end"), str) else None
+    return session_tokens.outcome_of(signals, end, last_at, now, kind)[0]
+
+
+def refresh_stored(*, db_url: str | None = None, now: datetime | None = None) -> tuple[int, int]:
+    """(outcomes changed, places filled) over every stored row. Idempotent: a second run
+    changes nothing (until the clock moves a session past the active / abandoned limits)."""
+    from psycopg.rows import dict_row
+
+    outcomes = places = 0
+    with store.connect(db_url) as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(_STORED_SQL)
+            recs = cur.fetchall()
+        for rec in recs:
+            name = stored_outcome(rec["outcome_evidence"], rec["last_at"], now, rec["kind"])
+            if name is not None and name != rec["outcome"]:
+                conn.execute("update sessions set outcome = %s, outcome_at = now() where session_id = %s",
+                             (name, rec["session_id"]))
+                outcomes += 1
+            if rec["category"] is None or rec["project"] is None:
+                row = SessionRow(rec["session_id"], rec["kind"], rec["repo"], rec["project_dir"] or "", None, None,
+                                 0, [], [], dict(rec["meta"] or {}))
+                category, project = place(row)
+                conn.execute("update sessions set category = coalesce(category, %s), "
+                             "project = coalesce(project, %s) where session_id = %s",
+                             (category, project, rec["session_id"]))
+                places += 1
+    return outcomes, places
+
+
 def ingest(root: Path | None, *, days: int = DEFAULT_DAYS, now: datetime | None = None,
            db_url: str | None = None, codex: Path | None = None,
            tools: tuple[str, ...] = TOOLS) -> IngestReport:
@@ -1059,6 +1114,7 @@ def ingest(root: Path | None, *, days: int = DEFAULT_DAYS, now: datetime | None 
         report.updated += cloud.updated
         report.cloud = len(cloud.rows)
         report.cloud_bad = cloud.bad
+    report.outcomes, report.places = refresh_stored(db_url=db_url, now=now)
     for r in rows:
         report.kinds[r.kind] = report.kinds.get(r.kind, 0) + 1
         report.tools[r.tool] = report.tools.get(r.tool, 0) + 1

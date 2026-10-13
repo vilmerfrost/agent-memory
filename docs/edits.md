@@ -37,20 +37,35 @@ All need the Postgres backend. The write commands honour `AMEM_REQUIRE_REMOTE=1`
   with `--dry-run`) it prints the plan and calls and writes nothing:
 
   ```
-  plan edit skill:dispatch spawn -> ~/.agents/skills/dispatch/SKILL.md: edit_instruction 0.80, dev:3 deviations, 3 sessions
-  plan suggest claude-md:demo-repo whole -> ~/work/demo-repo/CLAUDE.md: repo file: never edited, suggested instead
-  skip parent-md merge -> -: jev confidence 0.40 < 0.60
-  skip claude-md:global shell-habits -> ~/.claude/CLAUDE.md: cooldown until 2026-10-20 (last edit kept 2026-10-13, scoreboard: too early)
-  skip routine:evals-parent whole -> ~/.claude/scheduled-tasks/evals-parent/SKILL.md: file pinned (judge prompt: the measuring stick is never changed by the loop (Vilmer, 2026-10-13))
+  plan edit skill:dispatch spawn -> ~/.agents/skills/dispatch/SKILL.md cost=182.0M tok/1h30m: edit_instruction 0.80, dev:3 deviations, 3 sessions
+  plan suggest claude-md:demo-repo whole -> ~/work/demo-repo/CLAUDE.md cost=12.5M tok/8m10s: repo file: never edited, suggested instead
+  skip parent-md merge -> - cost=3.1M tok/2m05s: jev confidence 0.40 < 0.60
+  skip claude-md:global shell-habits -> ~/.claude/CLAUDE.md cost=40.0M tok/20m00s: cooldown until 2026-10-20 (last edit kept 2026-10-13, scoreboard: too early)
+  skip routine:evals-parent whole -> ~/.claude/scheduled-tasks/evals-parent/SKILL.md cost=0 tok/0s: file pinned (judge prompt: the measuring stick is never changed by the loop (Vilmer, 2026-10-13))
   edits (dry run, nothing called or written): plan_edit=1 plan_suggest=1 skip=3
   ```
 
 - `--limit` caps edits + suggestions per run (writer calls cost money and time); the rest
   waits (`deferred=N`).
+- `cost=<tokens> tok/<active time>` on every line: what the deviating sessions of that rule
+  cost (the candidate's `cost`, below).
+
+## Order
+
+`edits run` works through the candidates in this order, so `--limit` spends the writer calls
+on the rules that cost the most:
+
+1. **Jev confidence tier**, highest first: the mean Jev confidence rounded down to its 0.1
+   band (0.74 → 0.7). Unjudged groups last.
+2. **Cost**, highest first, inside a tier: `score = Σ tokens / 1,000,000 + Σ active_seconds / 60`
+   over the distinct sessions with a deviation on the rule (all four token kinds; 1M tokens
+   weigh as much as one active minute). The candidates JSON carries it as
+   `cost: {sessions, tokens, active_seconds, score}` (docs/deviations.md).
+3. Ties keep the report's order (most sessions, then most deviations).
 
 ## Candidates
 
-From `deviations report --json` (`deviations.candidates`, same data), most recurring first:
+From `deviations report --json` (`deviations.candidates`, same data), in the order above:
 
 - Jev verdict `edit_instruction` or `enforce`, mean Jev confidence >= `--min-confidence`.
   `leave` and unjudged groups are not candidates.
@@ -284,6 +299,7 @@ closes the request with `nothing to revert (status ...)`.
 ```
 edits scoreboard (last 28 days): 2 edits, 1 fewer, 0 same, 0 more, 1 too early
 - skill:dispatch / 4. Spawn [spawn] (kept, 2026-10-15, ~/.agents/skills/dispatch/SKILL.md): before 0.50 per session (4 in 8) -> after 0.08 per session (1 in 13): fewer
+  outcomes: before good 0.80 bad 0.20 (5 of 10), median 2.0M tok 10m00s -> after good 0.86 bad 0.14 (7 of 13), median 1.0M tok 5m00s: same; overall better
 ```
 
 - before: deviations on the same source + rule id in sessions that started in the N days
@@ -296,6 +312,18 @@ edits scoreboard (last 28 days): 2 edits, 1 fewer, 0 same, 0 more, 1 too early
   `same`.
 - cooldown: kept / trial edits inside the cooldown window end with `; cooldown until <date>`
   (or `; cooldown lifted (more)`); `--json` has `cooldown_until` and `cooldown_lifted`.
+- outcomes (the second line per edit): every session with the source in force (scanned or
+  not, not eval) in the same two windows. `good` = shipped + pushed + committed, `bad` =
+  abandoned + failed, both as a share of the sessions with a finished outcome (`5 of 10`:
+  active and unknown are left out); the median total tokens and median active time per
+  session. Outcome verdict: `too early` until both windows hold 5 finished sessions; `worse`
+  when the good share fell or the bad share rose by more than 0.10; `better` when one moved
+  the other way by more than 0.10 and nothing got worse; else `same`.
+- overall (both signals): `better` = fewer deviations and outcomes not worse (an outcome
+  verdict of `too early` counts as not worse); `mixed` = fewer deviations but worse outcomes;
+  `worse` = more deviations, or the same with worse outcomes; `too early` while the
+  deviation verdict is; else `same`. `--json` has `before_outcomes`, `after_outcomes`,
+  `outcome_verdict` and `overall`. The cooldown still follows the deviation verdict only.
 
 ## Design notes from MASS
 

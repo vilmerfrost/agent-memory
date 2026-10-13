@@ -319,11 +319,12 @@ def test_reref_backfills_old_rows_and_is_idempotent(
 
     dry = deviations.reref(dry_run=True)
     assert dry.summary() == ("reref: rows=7 exact=1 snapped=5 unmatched=0 no_source=1 changed=6 "
-                             "(dry run, nothing written)")
+                             "objective=1 (dry run, nothing written)")
     assert _q(db, "select count(*) from deviations where rule_id is not null") == [(0,)]
 
     done = deviations.reref()
-    assert done.summary() == "reref: rows=7 exact=1 snapped=5 unmatched=0 no_source=1 changed=6"
+    # objective=1: the hand-made dev:gone row had no result_outcome yet (its session has one).
+    assert done.summary() == "reref: rows=7 exact=1 snapped=5 unmatched=0 no_source=1 changed=6 objective=1"
     assert any(ln.startswith('claude-md:global: "Safety guards: Never read [file] files yourself" -> '
                              "safety-guards (Safety guards) snapped") for ln in done.lines())
     assert any(ln.startswith('skill:dispatch: "10. Record / 9. Clean" -> record (10. Record) snapped')
