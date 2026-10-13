@@ -711,7 +711,7 @@ def _record_error(o: Outcome, db_url: str | None) -> None:
             conn.execute(
                 "update sessions set meta = meta || jsonb_build_object('scan_error', %s::text, "
                 "'scan_errors', coalesce((meta ->> 'scan_errors')::int, 0) + 1) where session_id = %s",
-                (o.reason, o.session_id))
+                (_one_line(redact(o.reason), 300), o.session_id))
     except psycopg.Error:
         pass  # the session stays unscanned and is tried again next time
 
