@@ -233,10 +233,24 @@ state wins, in this order:
 | `committed` | `git commit`, nothing pushed |
 | `partial` | a worker report `Status: PARTIAL` / `BLOCKED` (also in a `SubagentHandback`) |
 | `active` | last activity under 2 h ago |
-| `abandoned` | last activity over 24 h ago and the session ended on a prompt with no reply or a tool call with no result, or it edited files, never committed and reported no `Status: DONE` |
+| `abandoned` | last activity over 24 h ago and the session ended on a prompt with no reply (`end` `user`) or a tool call with no result (`end` `tool`), or it edited files, never committed and reported no `Status: DONE`. Never for a worker (below). Ending on a tool result (`end` `result`) is not abandonment: the call got its answer |
 | `partial` | files were edited (Edit, Write, MultiEdit, NotebookEdit, apply_patch, a Codex FileChange), nothing committed |
 | `failed` | it ended on an API / tool error or an interrupt |
 | `no-change` | none of the above: Q&A, research, reviews |
+
+**Workers** (kind `worker`: subagents, dispatch workers, Codex subagent threads). A subagent
+transcript normally ends on the tool result of its hand-back (`SubagentHandback`) or on its
+final reply, so its end shape says nothing about abandonment. After the git rows, `partial`
+from a `Status: PARTIAL` / `BLOCKED` report and `active`: edits without a commit → `partial`;
+no report and an error or interrupt at the end → `failed`; else `no-change` (a `Status: DONE`
+with nothing committed is `no-change`).
+
+**Stored rows.** Every `sessions ingest` also recomputes the outcome of every stored row from
+its `outcome_evidence` (the signals plus `end`), its `last_activity_at` and its kind, with
+today's rules and clock (ingest line `outcomes=N` when any changed, `outcome_at` moves). So a
+rule change or the clock reaches rows outside the ingest window too. A row with a null
+`category` or `project` (an old hook row) gets them from its stored kind and cwd (`places=N`).
+The scanner state version did not change: the hook state holds signals and `end`, not the outcome.
 
 `outcome_evidence` holds signal names and counts only (`edit`, `commit`, `push`,
 `push_main`, `pr_create`, `pr_merge`, `merge_main`, `deploy`, `report_done`,
@@ -286,3 +300,28 @@ by repo
 top sessions
   2026-10-13 16:20  claude/parent    agent-memory  b1b2011c  total  234.3M  out  439.2k  44 turns  (subagents 61.0M)
 ```
+
+## Cost of a window: `amem sessions cost`
+
+```
+amem sessions cost --since ISO [--until ISO] [--category eval|routine|chat|parent|worker|headless]
+                   [--project P] [--json]
+```
+
+Totals of the sessions that **started** (`started_at`, else `created_at`) in `[since, until)`.
+`--until` defaults to now; an ISO time without an offset is UTC. Each row counts once
+(subagents are their own rows; `meta.subagent_tokens` is never added). Unmeasured columns
+count as 0. Postgres backend only (exit 1 on REST), read only. Nothing matches: zeros, exit 0.
+
+`--json` is a contract: agent-config's `improve` calls it (`--category eval|routine`) to show
+the cost of each kept change. Keep these keys:
+
+```json
+{"sessions": 2,
+ "tokens": {"input": 11, "output": 22, "cache_read": 303, "cache_creation": 44, "total": 380},
+ "active_seconds": 61.5, "api_seconds": 30.0, "tool_seconds": 5.0,
+ "by_project": {"evals": {"sessions": 2, "tokens": {"...": "same keys"}, "active_seconds": 61.5,
+                          "api_seconds": 30.0, "tool_seconds": 5.0}}}
+```
+
+Without `--json`: a total line, a token / time line and one line per project.

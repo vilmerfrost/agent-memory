@@ -33,8 +33,8 @@ def test_text_report(sdb: ScoringDb) -> None:
     assert result.returncode == 0, result.stderr
     out = result.stdout
     assert out.startswith("cli-lesson  [trial, scope: cli-repo]  verdict WIN  (n>=3, margin 0.10)")
-    assert "  with         3     3  1.00  0.44-1.00       0    0      3" in out
-    assert "  without      3     1  0.33  0.06-0.79       0    0      3" in out
+    assert "  with         3     3  1.00  0.44-1.00       0    0       0      3" in out
+    assert "  without      3     1  0.33  0.06-0.79       0    0       0      3" in out
     assert "  diff +0.67  z +1.73" in out
     assert f"    {shaky}  t-routine  conf 0.50 < 0.7  with  status pass" in out
 

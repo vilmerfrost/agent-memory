@@ -111,7 +111,7 @@ def test_jev_state_never_holds_transcript_or_writer_text(setup_home: Home, db: s
             assert text not in state, (text, state)
         assert set(ln.split(":", 1)[0] for ln in state.splitlines()[1:]) == {
             "instruction_source", "instruction_rule", "rule_title", "session_kind", "followed_grade",
-            "result_grade", "recurrence"}
+            "result_grade", "objective_result", "recurrence"}
 
 
 def test_recurrence_counts_other_sessions(setup_home: Home, db: str, writer: Writer,  # noqa: F811
@@ -200,7 +200,8 @@ def test_jev_fixture_mode_end_to_end(setup_home: Home, db: str, writer: Writer, 
     monkeypatch.setenv("AMEM_JEV_FIXTURES_DIR", str(fixtures))
     f = deviations.parse_findings(json.dumps({"deviations": [finding()]}), {"claude-md:global"})[0]
     f = replace(f, rule_id="explaining", rule_title="Explaining")  # what the scan resolves it to
-    key = jev.fixture_key(deviations.jev_state(f, "chat", 0), deviations.question_set().jev_questions())
+    state = deviations.jev_state(f, "chat", 0, "no-change")  # the chat session answered, changed nothing
+    key = jev.fixture_key(state, deviations.question_set().jev_questions())
     (fixtures / f"{key}.json").write_text(json.dumps({"model": "jev-latest", "usage": {}, "answers": {
         "verdict": {"type": "choice", "choice": "enforce", "confidence": 0.91,
                     "probabilities": {"edit_instruction": 0.05, "enforce": 0.91, "leave": 0.04}},
@@ -282,7 +283,7 @@ def test_report_groups_and_json_candidates(setup_home: Home, db: str, writer: Wr
     lines = deviations.report_lines(cands, 7)
     assert lines[0] == "deviations (last 7 days): 2 rules, 6 deviations"
     assert lines[1].startswith("claude-md:global / Explaining [explaining]: count=5 sessions=5 followed=0.30 "
-                               "result=0.80 | ")
+                               "result=0.80 objective=0.70 | ")  # chat, routine, headless: no-change on Q&A
 
     env = base_env(AMEM_DB_URL=db, AMEM_CLAUDE_HOME=str(setup_home.claude),
                    AMEM_AGENT_CONFIG_DIR=str(setup_home.agent_config))
@@ -293,7 +294,7 @@ def test_report_groups_and_json_candidates(setup_home: Home, db: str, writer: Wr
     assert set(doc["candidates"][0]) == {
         "instruction_source", "rule_id", "rule_title", "instruction_ref", "refs", "instruction_shas",
         "target_paths", "count", "sessions", "kinds", "tools", "team", "team_sessions",
-        "followed_grade_mean", "result_grade_mean", "jev", "verdict", "session_ids", "deviation_ids", "examples",
+        "followed_grade_mean", "result_grade_mean", "objective_result_mean", "outcomes", "cost", "jev", "verdict", "session_ids", "deviation_ids", "examples",
         "session_titles"}  # session_titles: {session id: title} for sessions with a known title
 
 

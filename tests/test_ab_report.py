@@ -80,7 +80,7 @@ def test_win_and_loss(sdb: ScoringDb) -> None:
     w = got["good"]
     assert (w["with"]["runs"], w["with"]["pass"], w["without"]["runs"], w["without"]["pass"]) == (5, 4, 5, 2)
     assert (w["diff"], w["verdict"]) == (0.4, "WIN")
-    assert w["with"]["sources"] == {"label": 0, "jev": 0, "status": 5}
+    assert w["with"]["sources"] == {"label": 0, "jev": 0, "session": 0, "status": 5}
     lo, hi = w["with"]["ci95"]
     assert lo < 0.8 < hi
     assert w["z"] == pytest.approx(1.291, abs=1e-3)
@@ -128,7 +128,7 @@ def test_label_beats_jev_and_confident_jev_beats_status(sdb: ScoringDb) -> None:
         str(confident_pass): ("without", "pass", "jev"),
         str(plain): ("without", "pass", "status"),
     }
-    assert e["with"]["sources"] == {"label": 1, "jev": 1, "status": 0}
+    assert e["with"]["sources"] == {"label": 1, "jev": 1, "session": 0, "status": 0}
     assert e["low_confidence"] == []  # 0.7 is not below the 0.7 threshold
 
 

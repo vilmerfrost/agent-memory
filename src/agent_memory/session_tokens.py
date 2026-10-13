@@ -163,9 +163,10 @@ class Summary:
     signals: dict[str, int] = field(default_factory=dict)
     end: str | None = None
 
-    def outcome(self, now: datetime | None = None) -> tuple[str, dict[str, Any]]:
-        """(outcome, evidence) as of `now` (docs/sessions-live.md, "Outcome")."""
-        return outcome_of(self.signals, self.end, self.last_at, now)
+    def outcome(self, now: datetime | None = None, kind: str | None = None) -> tuple[str, dict[str, Any]]:
+        """(outcome, evidence) as of `now` (docs/sessions-live.md, "Outcome"). `kind`: the
+        session kind (`worker` has its own rule)."""
+        return outcome_of(self.signals, self.end, self.last_at, now, kind)
 
     @property
     def calls(self) -> int:

@@ -8,6 +8,9 @@ See docs/ab.md. Postgres only in V1.
   Arm `without` (B): every other in-scope run.
 - Outcome per run, most trusted first: the human label (up = pass, down = fail),
   then Jev's pass_question answer when its confidence >= the routine's threshold,
+  then the outcome of the run's session (`runs.meta.session`, a dispatch task's parent
+  session, else `runs.meta.session_id`): shipped / pushed / committed = pass, partial /
+  abandoned / failed = fail, anything else decides nothing,
   then `runs.status` (pass = pass, fail/error = fail). Each run records its source.
 - Uncertainty: a Wilson 95% interval per arm and a pooled two-proportion z score.
 """
@@ -28,8 +31,10 @@ from agent_memory.questions import QuestionCache
 DEFAULT_N = 10
 DEFAULT_MARGIN = 0.1
 Z95 = 1.959963984540054
-SOURCES = ("label", "jev", "status")
+SOURCES = ("label", "jev", "session", "status")
 ARMS = ("with", "without")
+SESSION_PASS = ("shipped", "pushed", "committed")
+SESSION_FAIL = ("partial", "abandoned", "failed")   # active, no-change, unknown: the session decides nothing
 
 
 class AbError(RuntimeError):
@@ -41,9 +46,11 @@ select r.id, r.routine, r.status, r.started_at, l.verdict as label,
        (select json_agg(json_build_object('question', s.question, 'value', s.value,
                                           'value_num', s.value_num, 'confidence', s.confidence,
                                           'probabilities', s.probabilities))
-          from scores s where s.run_id = r.id) as scores
+          from scores s where s.run_id = r.id) as scores,
+       ss.session_id, ss.outcome as session_outcome
 from runs r
 left join labels l on l.run_id = r.id
+left join sessions ss on ss.session_id = coalesce(r.meta ->> 'session', r.meta ->> 'session_id')
 where {lessons.RUN_SCOPE_SQL}
   and (%(since)s::timestamptz is null or coalesce(r.started_at, r.created_at) >= %(since)s::timestamptz)
 order by r.started_at nulls last, r.created_at, r.id
@@ -58,14 +65,16 @@ class Outcome:
     routine: str
     status: str
     passed: bool
-    source: str  # label | jev | status
+    source: str  # label | jev | session | status
     confidence: float | None  # Jev's pass_question confidence, when the run has one
     threshold: float | None  # the routine's threshold, when it has a question file
-    low_confidence: bool  # a Jev grade below threshold, no label: decided by status
+    low_confidence: bool  # a Jev grade below threshold, no label: decided by the session or status
+    session_id: str | None = None       # the run's session, when it maps to a stored one
+    session_outcome: str | None = None  # that session's outcome
 
 
 def resolve(run: dict[str, Any], cache: QuestionCache) -> Outcome:
-    """Decide one run's outcome: label > confident Jev grade > status."""
+    """Decide one run's outcome: label > confident Jev grade > session outcome > status."""
     qset = cache.get(run["routine"])
     answer = scoring._pass_answer(run, qset) if qset is not None and run.get("scores") else None
     # The verdict confidence (up vs down), the same number escalations compare with the threshold.
@@ -73,16 +82,22 @@ def resolve(run: dict[str, Any], cache: QuestionCache) -> Outcome:
     confidence = None if raw is None else float(raw)
     threshold = qset.threshold if qset is not None else None
 
+    sid, s_out = run.get("session_id"), run.get("session_outcome")
+
     def out(passed: bool, source: str, low: bool = False) -> Outcome:
-        return Outcome(run["id"], run["routine"], run["status"], passed, source, confidence, threshold, low)
+        return Outcome(run["id"], run["routine"], run["status"], passed, source, confidence, threshold, low,
+                       sid, s_out)
 
     if run.get("label") in ("up", "down"):
         return out(run["label"] == "up", "label")
+    low = False
     if qset is not None and answer is not None and confidence is not None:
         if confidence >= qset.threshold:
             return out(qset.jev_verdict(answer["value"], answer["value_num"]) == "up", "jev")
-        return out(run["status"] == "pass", "status", low=True)
-    return out(run["status"] == "pass", "status")
+        low = True
+    if s_out in SESSION_PASS or s_out in SESSION_FAIL:
+        return out(s_out in SESSION_PASS, "session", low=low)
+    return out(run["status"] == "pass", "status", low=low)
 
 
 # --------------------------------------------------------------------------- statistics
@@ -214,7 +229,8 @@ def run_details(arms: dict[str, list[Outcome]]) -> list[dict[str, Any]]:
     """Every run of both arms with its outcome and the source that decided it."""
     return [
         {"run_id": str(o.run_id), "routine": o.routine, "arm": arm,
-         "outcome": "pass" if o.passed else "fail", "source": o.source}
+         "outcome": "pass" if o.passed else "fail", "source": o.source,
+         "session_id": o.session_id, "session_outcome": o.session_outcome}
         for arm in ARMS for o in arms[arm]
     ]
 
@@ -233,13 +249,13 @@ def render_text(entry: dict[str, Any]) -> str:
             f"(n>={entry['n']}, margin {entry['margin']:.2f}"
             + (f", since {entry['since']}" if entry["since"] else "") + ")")
     lines = [head, f"  {'arm':<8} {'runs':>5} {'pass':>5} {'rate':>5}  {'95% CI':<11} "
-                   f"{'label':>5} {'jev':>4} {'status':>6}"]
+                   f"{'label':>5} {'jev':>4} {'session':>7} {'status':>6}"]
     for arm in ARMS:
         s = entry[arm]
         ci = f"{s['ci95'][0]:.2f}-{s['ci95'][1]:.2f}" if s["ci95"] else "-"
         src = s["sources"]
         lines.append(f"  {arm:<8} {s['runs']:>5} {s['pass']:>5} {_rate(s['pass_rate']):>5}  {ci:<11} "
-                     f"{src['label']:>5} {src['jev']:>4} {src['status']:>6}")
+                     f"{src['label']:>5} {src['jev']:>4} {src.get('session', 0):>7} {src['status']:>6}")
     diff = "-" if entry["diff"] is None else f"{entry['diff']:+.2f}"
     z = "-" if entry["z"] is None else f"{entry['z']:+.2f}"
     lines.append(f"  diff {diff}  z {z}")
