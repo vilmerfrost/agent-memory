@@ -1,7 +1,7 @@
 // Unit tests for handler.ts with a fake PostgREST (no network).
 // Run: `deno test supabase/functions/amem-undo/` or `node --test supabase/functions/amem-undo/handler_test.ts`.
 
-import { type Deps, handle, OK_TEXT, safeEqual, sha256Hex } from "./handler.ts";
+import { ALREADY_TEXT, type Deps, handle, NOTHING_TEXT, OK_TEXT, safeEqual, sha256Hex } from "./handler.ts";
 
 // deno-lint-ignore no-explicit-any
 const g = globalThis as any;
@@ -18,9 +18,16 @@ const KEY = "service-key-for-tests";
 
 interface Call { url: string; method: string; body: string | null; auth: string | null; prefer: string | null }
 
-async function fakeDb(hash: string | null) {
+// The fake's undo_requests row mirrors amem_request_undo: none -> insert, closed without a
+// revert -> reopen, reverted -> left alone. `opts.row` is the row before the tap; `opts.status`
+// the edit's status (not kept -> "nothing"). The real SQL is tested in tests/test_edits_undo.py.
+type Row = { handled: boolean; result: string | null; attempts: number };
+
+async function fakeDb(hash: string | null, opts: { row?: Row; status?: string } = {}) {
   const calls: Call[] = [];
   const requests = new Set<string>();
+  const rows = new Map<string, Row>();
+  if (opts.row) rows.set(EDIT, { ...opts.row });
   const deps: Deps = {
     supabaseUrl: "https://project.example.test/",
     serviceKey: KEY,
@@ -32,15 +39,20 @@ async function fakeDb(hash: string | null) {
         const rows = hash === null || !url.includes(`id=eq.${EDIT}`) ? [] : [{ id: EDIT, undo_token_hash: hash }];
         return new Response(JSON.stringify(rows), { status: 200 });
       }
-      if (method === "POST" && url.includes("/rest/v1/undo_requests")) {
-        requests.add(JSON.parse(init!.body as string).edit_id);
-        return new Response(null, { status: 201 });
+      if (method === "POST" && url.endsWith("/rest/v1/rpc/amem_request_undo")) {
+        const id = JSON.parse(init!.body as string).p_edit_id;
+        const row = rows.get(id);
+        if (row?.result === "reverted") return new Response(JSON.stringify("reverted"), { status: 200 });
+        rows.set(id, { handled: false, result: null, attempts: 0 });
+        requests.add(id);
+        const state = (opts.status ?? "kept") === "kept" ? "queued" : "nothing";
+        return new Response(JSON.stringify(state), { status: 200 });
       }
       if (method === "PATCH") return new Response(null, { status: 204 });
       return new Response("unexpected", { status: 500 });
     },
   };
-  return { deps, calls, requests };
+  return { deps, calls, requests, rows };
 }
 
 function post(body: unknown): Request {
@@ -50,7 +62,7 @@ function post(body: unknown): Request {
   });
 }
 
-test("good token: 200, one undo request, idempotent", async () => {
+test("first tap: 200 queued via amem_request_undo, one request per edit", async () => {
   const db = await fakeDb(await sha256Hex(TOKEN));
   for (let i = 0; i < 2; i++) {
     const res = await handle(post({ edit_id: EDIT, token: TOKEN }), db.deps);
@@ -59,12 +71,52 @@ test("good token: 200, one undo request, idempotent", async () => {
     eq(res.headers.get("content-type"), "text/plain; charset=utf-8");
   }
   eq([...db.requests], [EDIT]);
-  const ins = db.calls.filter((c) => c.method === "POST");
-  eq(ins.length, 2);
-  eq(ins[0].url, "https://project.example.test/rest/v1/undo_requests?on_conflict=edit_id");
-  eq(ins[0].prefer, "resolution=ignore-duplicates,return=minimal");
-  eq(JSON.parse(ins[0].body!), { edit_id: EDIT, source: "phone" });
-  eq(ins[0].auth, `Bearer ${KEY}`);
+  eq(db.rows.size, 1);
+  const rpc = db.calls.filter((c) => c.method === "POST");
+  eq(rpc.length, 2);
+  eq(rpc[0].url, "https://project.example.test/rest/v1/rpc/amem_request_undo");
+  eq(JSON.parse(rpc[0].body!), { p_edit_id: EDIT, p_source: "phone" });
+  eq(rpc[0].auth, `Bearer ${KEY}`);
+  eq(db.calls.filter((c) => c.method === "PATCH").length, 2);
+});
+
+test("re-tap after a closed failed request: reopened and queued", async () => {
+  const db = await fakeDb(await sha256Hex(TOKEN),
+    { row: { handled: true, result: "failed (attempt 3): lock held", attempts: 3 } });
+  const res = await handle(post({ edit_id: EDIT, token: TOKEN }), db.deps);
+  eq(res.status, 200);
+  eq(await res.text(), OK_TEXT);
+  eq(db.rows.get(EDIT), { handled: false, result: null, attempts: 0 });
+});
+
+test("re-tap after the edit was reverted: honest text, no new work", async () => {
+  const db = await fakeDb(await sha256Hex(TOKEN), { row: { handled: true, result: "reverted", attempts: 1 } });
+  const res = await handle(post({ edit_id: EDIT, token: TOKEN }), db.deps);
+  eq(res.status, 200);
+  eq(await res.text(), ALREADY_TEXT);
+  eq(db.rows.get(EDIT), { handled: true, result: "reverted", attempts: 1 });
+  eq(db.requests.size, 0);
+  eq(db.calls.filter((c) => c.method === "PATCH").length, 0);
+});
+
+test("tap on an edit that is no longer active: honest text, not 'queued'", async () => {
+  const db = await fakeDb(await sha256Hex(TOKEN), { status: "auto-reverted" });
+  const res = await handle(post({ edit_id: EDIT, token: TOKEN }), db.deps);
+  eq(res.status, 200);
+  eq(await res.text(), NOTHING_TEXT);
+});
+
+test("rpc fails or answers something unknown: 502, never 'queued'", async () => {
+  const db = await fakeDb(await sha256Hex(TOKEN));
+  for (const answer of [new Response("boom", { status: 404 }), new Response(JSON.stringify("weird"), { status: 200 })]) {
+    const deps: Deps = {
+      ...db.deps,
+      fetch: (url, init) => url.includes("/rpc/") ? Promise.resolve(answer) : db.deps.fetch(url, init),
+    };
+    const res = await handle(post({ edit_id: EDIT, token: TOKEN }), deps);
+    eq(res.status, 502);
+    eq(await res.text(), "Try again later");
+  }
 });
 
 test("wrong token or unknown edit: 403, nothing inserted, no detail", async () => {
