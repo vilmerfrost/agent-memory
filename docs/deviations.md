@@ -1,14 +1,15 @@
 # Deviations: where agents leave their instructions
 
-The deviation finder reads Vilmer's Claude Code sessions. It finds where an agent did not
-follow a skill, a CLAUDE.md or PARENT.md rule, an agent definition or a routine prompt. It
-writes down why, when and how, gives two raw grades, and Jev makes the call.
+The deviation finder reads Vilmer's Claude Code and Codex sessions. It finds where an agent
+did not follow a skill, a CLAUDE.md, AGENTS.md or PARENT.md rule, an agent definition or a
+routine prompt. It writes down why, when and how, gives two raw grades, and Jev makes the call.
 
 It is **read only** toward the setup. It never edits a skill or any instruction file.
-Editing comes later (step E4), through agent-config's `improve apply` / `improve revert`.
+Editing is step E4, `amem edits run` (docs/edits.md), through agent-config's `improve apply` / `improve revert`.
 
 ```
-~/.claude/projects/*.jsonl ──sessions ingest──▶ sessions
+~/.claude/projects/*.jsonl ─┐
+~/.codex/sessions/**/rollout-*.jsonl ─┴─sessions ingest──▶ sessions (tool = claude | codex)
                                                    │ deviations scan (daily) 
                                                    ▼
             digest (redacted, capped) + instructions in force + rule catalog
@@ -20,14 +21,14 @@ Editing comes later (step E4), through agent-config's `improve apply` / `improve
             jev_verdict: edit_instruction | enforce | leave
                                                    │ deviations report --json
                                                    ▼
-            candidates file ──(E4, later)──▶ improve apply → one commit per edit
+            candidates file ──amem edits run──▶ improve apply → one commit per edit
 ```
 
 ## Commands
 
 | Command | Does |
 |---|---|
-| `amem sessions ingest [--days 7] [--projects-dir DIR]` | Indexes transcripts touched in the last N days into `sessions`. Idempotent. |
+| `amem sessions ingest [--days 7] [--projects-dir DIR] [--codex-home DIR] [--tool all\|claude\|codex]` | Indexes Claude Code and Codex transcripts touched in the last N days into `sessions`. Prints `sessions: ... (kinds) tools(claude=N codex=M) team=T`. Idempotent. |
 | `amem deviations scan [--days 7] [--limit 15] [--session ID] [--dry-run] [--timeout 300]` | Scans unscanned sessions. Prints one line per session and `deviations: sessions=N found=D edit=E enforce=F leave=L errors=X`. Exit 1 when a session failed. |
 | `amem deviations report [--days 7] [--json]` | Groups deviations by instruction source + rule id, most recurring first. `--json` prints the candidates file. |
 | `amem deviations reref [--dry-run]` | Backfills `rule_id` / `rule_title` on stored rows: snaps each row's writer ref against today's rule catalog. No writer, no Jev. Prints one mapping line per source + ref and `reref: rows=N exact=E snapped=S unmatched=U no_source=X changed=C`. Idempotent. |
@@ -62,7 +63,58 @@ id `<parent session>/agent-<id>`.
   scratch workspace.
 - `skills`: `Skill` tool calls plus slash commands, without Claude Code built-ins.
 - `instructions`: the instruction sources in force whose file exists (see below).
+- `tool`: `claude` or `codex` (see Codex below).
+- `meta.team`: true for a team repo's session (see Team repos below).
 - A re-ingest refreshes the facts and keeps `scanned_at` and the scan keys in `meta`.
+
+## Codex
+
+The ChatGPT desktop app's Codex (and the Codex CLI) writes one rollout per thread to
+`~/.codex/sessions/YYYY/MM/DD/rollout-<time>-<thread id>.jsonl` (and
+`~/.codex/archived_sessions/`). `~/Library/Application Support/Codex` holds only browser
+state, no transcripts. Parsing: `src/agent_memory/codex_sessions.py`.
+
+- Id `codex:<thread id>`. `project_dir` is the folder under the Codex home
+  (`sessions/2026/10/13`), `meta.file` the file name.
+- Kind (first match wins): `eval` (cwd as above), `worker` (a subagent thread:
+  `thread_source = subagent`; `meta.parent_session` = `codex:<parent thread>`), `headless`
+  (`originator = codex_exec`), `parent` (used the `dispatch` skill), `chat`. Codex
+  automations have no marker in the rollout, so `routine` is not detected.
+- Repo: from the cwd; a Codex app worktree (`~/.codex/worktrees/<task>`) names the repo by
+  its main checkout.
+- Skills: the `<skill><name>X</name>` block Codex adds when the user invokes a skill, plus
+  a SKILL.md the agent read from `~/.agents/skills`, `~/.codex/skills` or `~/.claude/skills`
+  (a `read` in the command's `parsed_cmd`). A SKILL.md read inside a repo checkout is not a
+  skill use.
+- A forked subagent's rollout starts with a copy of the parent's history (below
+  `subagent_history_start_ordinal`). That copy is left out of the facts and the digest.
+- Digest: the same line shapes as for Claude Code. `[turn N] USER:` typed prompts (the
+  AGENTS.md block, `<environment_context>`, developer messages and reasoning are left out),
+  `SKILL <name> invoked`, `ASSISTANT:`, `TOOL exec_command: <script>` / `TOOL apply_patch:
+  <paths>` / `TOOL mcp:<server>/<tool>` / `TOOL spawn_agent: <task>` from the completed
+  items, `ERROR` (failed command with exit code, failed MCP call), `DENIED` (declined),
+  `INTERRUPTED`. A subagent's brief is `[turn 1] MESSAGE from /root:`; in a parent, a
+  subagent's report is `NOTICE agent-message`. Same redaction and cap.
+- The writer prompt names the agent (`You audit one Codex agent session`).
+
+## Team repos
+
+A session's repo is a team repo when its git remote owner is not a personal owner
+(`AMEM_PERSONAL_OWNERS`, default `vilmerfrost`), or `~/.claude/parent/<repo>/profile.md`
+says `mode: team`. The remote comes from the Codex rollout (`git.repository_url`) or from
+the repo's `.git/config` (`origin`, else the first remote; a worktree reads its main
+checkout's). `meta.team`, `meta.remote_owner` and `meta.team_reason` (`remote-owner` |
+`profile` | `same-repo`) hold the result.
+
+- No owner and no team profile (a worktree that was cleaned up, a repo without a remote):
+  unknown. Ingest then writes no `team` key, so a flag stored by an earlier ingest stays.
+- A session with an unknown remote is a team session when another session of the same repo
+  in the same ingest is one (`same-repo`). This only ever turns the flag on.
+
+The flag is read only here. The future edit step (E4) must never edit a team repo's files:
+a candidate whose source is a team repo's own file (`claude-md:<repo>` / `agents-md:<repo>`)
+has `team: true`. Global sources and skills are personal files and stay `team: false` even
+when the evidence came from team sessions (`team_sessions` counts those).
 
 ## Instructions in force
 
@@ -74,6 +126,18 @@ id `<parent session>/agent-<id>`.
 | `parent-md` | `~/agent-config/parent/PARENT.md` (parent sessions) |
 | `skill:<name>` | `~/.claude/skills/<name>/SKILL.md` (symlinks are fine). Plugin skills (`ns:name`) have no local file and are left out. |
 | `claude-md:<repo>` | `CLAUDE.md` and `CLAUDE.local.md` in the cwd, and in the main checkout when the cwd is a git worktree |
+| `agents-md:<repo>` | `AGENTS.md` in the cwd and the main checkout (Claude Code and Codex sessions) |
+
+Codex sessions have their own sources (Codex reads no CLAUDE.md):
+
+| Source | File |
+|---|---|
+| `agents-md:global` | `~/.codex/AGENTS.override.md`, else `~/.codex/AGENTS.md` |
+| `skill:<name>` | the first of `~/.claude/skills/<name>/SKILL.md` (the shared `~/.agents/skills`), `~/.codex/skills/<name>/SKILL.md`, `~/.codex/skills/.system/<name>/SKILL.md` |
+| `agents-md:<repo>` | as above |
+
+A file that two sources name (a `CLAUDE.md` symlinked to `AGENTS.md`) is read once, by the
+first. The rule catalog treats AGENTS.md like any other markdown source.
 
 `.env*` files are never read. Each source is capped at 24k characters, all sources at 70k.
 
@@ -181,11 +245,14 @@ it, and the scan goes on. The session is retried on the next scan. A missing Jev
 deviations (last 7 days): 2 rules, 6 deviations
 parent-md / Safety guards [safety-guards]: count=5 sessions=5 followed=0.30 result=0.80 | jev edit_instruction=5 enforce=0 leave=0 unjudged=0 confidence=0.80
 claude-md:global / A rule nobody wrote [unmatched]: count=1 sessions=1 ...
+agents-md:app / Tests [tests]: count=2 sessions=2 ... | team repo
 ```
+
+Scan lines carry `tool=codex` for Codex sessions and `team=1` for team-repo sessions.
 
 Rows without a rule id yet show `[no rule id]`; run `amem deviations reref`.
 
-`--json` prints the candidates file, the input for the future improve ACT step (E4):
+`--json` prints the candidates file, the input for the edit step (E4, `amem edits run`, docs/edits.md):
 
 ```json
 {
@@ -204,13 +271,16 @@ Rows without a rule id yet show `[no rule id]`; run `amem deviations reref`.
    "count": 4,
    "sessions": 3,
    "kinds": {"parent": 3, "worker": 1},
+   "tools": {"claude": 4},
+   "team": false,
+   "team_sessions": 0,
    "followed_grade_mean": 0.35,
    "result_grade_mean": 0.6,
    "jev": {"edit_instruction": 3, "enforce": 1, "leave": 0, "unjudged": 0, "confidence_mean": 0.74},
    "verdict": "edit_instruction",
    "session_ids": ["..."],
    "deviation_ids": ["..."],
-   "examples": [{"session_id": "...", "turn": 2, "what": "...", "why": "...", "how": "..."}]
+   "examples": [{"session_id": "...", "turn": 2, "what": "...", "why": "...", "how": "...", "team": false}]
   }
  ]
 }
@@ -225,6 +295,8 @@ Rows without a rule id yet show `[no rule id]`; run `amem deviations reref`.
 - `verdict`: the most common Jev verdict (ties: edit_instruction, enforce, leave), or null
   when nothing was judged.
 - `examples`: up to 3, newest sessions first.
+- `tools`: deviations per agent tool. `team`: the source is a team repo's own file, so an
+  edit must not touch it (see Team repos). `team_sessions`: sessions in a team repo.
 
 ## Daily
 
@@ -244,4 +316,6 @@ it, so the step retries the next day. See [daily.md](daily.md).
 | `AMEM_DEVIATIONS_CLAUDE` | Writer executable (default `claude`). |
 | `AMEM_PROJECTS_DIR` | Transcripts folder (default `~/.claude/projects`). |
 | `AMEM_CLAUDE_HOME` | Claude home for instructions (default `~/.claude`). Tests only. |
+| `AMEM_CODEX_HOME` | Codex home (default: `.codex` next to the Claude home, so `~/.codex`). |
+| `AMEM_PERSONAL_OWNERS` | Comma list of git remote owners that are personal (default `vilmerfrost`). Any other owner makes a team repo. |
 | `AMEM_AGENT_CONFIG_DIR` | agent-config checkout for PARENT.md (default `~/agent-config`). Tests only. |

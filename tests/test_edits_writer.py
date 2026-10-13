@@ -1,0 +1,127 @@
+"""Writer prompt and proposal validation (edits_writer). No database, no CLI."""
+
+from __future__ import annotations
+
+import json
+from typing import Any
+
+import pytest
+
+from agent_memory import edits_sections, edits_writer
+from agent_memory.edits_writer import NoChange, ProposalError, parse_proposal
+from test_edits_support import GLOBAL_MD, SKILL_MD, SPAWN_NEW, proposal
+
+DEV_ID = "0b8f8f3e-4c1a-4f7e-9d2a-1f2e3d4c5b6a"
+CAND: dict[str, Any] = {
+    "instruction_source": "skill:dispatch", "rule_id": "spawn", "rule_title": "4. Spawn", "verdict": "enforce",
+    "jev": {"edit_instruction": 1, "enforce": 3, "leave": 0, "unjudged": 0, "confidence_mean": 0.81},
+    "count": 4, "sessions": 3, "kinds": {"parent": 3, "worker": 1}, "followed_grade_mean": 0.35,
+    "result_grade_mean": 0.6, "session_ids": ["sess-alpha-1", "sess-alpha-2"], "deviation_ids": [DEV_ID],
+    "examples": [{"session_id": "sess-alpha-1", "turn": 2,
+                  "what": "The parent spawned workers without naming the branch in each brief.",
+                  "why": "The rule is easy to skim past in a long step list.",
+                  "how": "It showed at the first spawn and cost one retry."}],
+}
+
+
+def parse(new_section: str, text: str = SKILL_MD, rule_id: str = "spawn", **over: Any) -> edits_writer.Proposal:
+    return parse_proposal(json.dumps({**proposal(new_section), **over}), file_text=text, rule_id=rule_id, cand=CAND)
+
+
+def test_valid_proposal_splices_only_the_section() -> None:
+    p = parse(SPAWN_NEW)
+    assert p.topic == "worker spawn brief"
+    assert p.new_text == SKILL_MD.replace("Each brief names the branch.\n",
+                                          "Each brief names the branch on its first line, before the task text.\n")
+    assert len(p.why) <= edits_writer.WHY_MAX and len(p.summary) <= edits_writer.SUMMARY_MAX
+
+
+def test_fenced_reply_is_accepted() -> None:
+    reply = "```json\n" + json.dumps(proposal(SPAWN_NEW)) + "\n```"
+    assert parse_proposal(reply, file_text=SKILL_MD, rule_id="spawn", cand=CAND).new_section.startswith("## 4. Spawn")
+
+
+def test_no_change_is_its_own_error() -> None:
+    with pytest.raises(NoChange):
+        parse(edits_sections.section_text(SKILL_MD, "spawn") + "\n\n")
+
+
+def test_negated_permission_words_are_fine() -> None:
+    parse("## 4. Spawn\nSpawn one worker per task without waiting for approval.\nEach brief names the branch.\n")
+
+
+def test_child_rule_and_money_line_kept() -> None:
+    old = edits_sections.section_text(GLOBAL_MD, "explaining-completed-work/response-budget")
+    p = parse(old + "\nThree sentences for a trivial task.", text=GLOBAL_MD,
+              rule_id="explaining-completed-work/response-budget", topic="response budget length")
+    assert "Spending money always needs Vilmer's yes." in p.new_text
+
+
+@pytest.mark.parametrize("reply,match", [
+    ("not json", "not JSON"),
+    ("[1, 2]", "not a JSON object"),
+    (json.dumps({"topic": "a b", "why": "x", "summary": "y"}), "new_section"),
+])
+def test_malformed_replies(reply: str, match: str) -> None:
+    with pytest.raises(ProposalError, match=match):
+        parse_proposal(reply, file_text=SKILL_MD, rule_id="spawn", cand=CAND)
+
+
+@pytest.mark.parametrize("new_section,over,match", [
+    (SPAWN_NEW, {"topic": "spawn"}, "topic"),
+    (SPAWN_NEW, {"topic": "worker spawn brief branch name first"}, "topic"),
+    (SPAWN_NEW, {"why": "w" * 201}, "why is"),
+    (SPAWN_NEW, {"summary": "Changed the spawn rule. " * 8}, "summary is"),
+    (SPAWN_NEW, {"why": f"See deviation {DEV_ID}"}, "why holds an id"),
+    (SPAWN_NEW, {"summary": 3}, "summary must be a string"),
+    ("## Spawn\nSpawn one worker per task.\nName the branch.\n", {}, "heading"),
+    ("## 4. Spawn\nSpawn one worker per task.\n### Branch\nName the branch.\n", {}, "rule list"),
+    ("## 4. Spawn\nSpawn one worker per task.\n## Branches\nName the branch.\n", {}, "rule list"),
+    ("## 4. Spawn\nSpawn one worker.\n```\ngit branch -m x\n```\n", {}, "code block"),
+    (f"## 4. Spawn\nSpawn one worker per task (see {DEV_ID}).\n", {}, "id"),
+    ("## 4. Spawn\nSpawn one worker per task, unlike sess-alpha-1.\n", {}, "id"),
+    ("## 4. Spawn\nSpawn one worker per task.\nNever write to [path].\n", {}, "placeholder"),
+    ("## 4. Spawn\nSpawn one worker. The parent spawned workers without naming the branch in each brief.\n", {},
+     "word for word"),
+    ("## 4. Spawn\nSpawn one worker per task.\nAsk Vilmer before you spawn a second worker.\n", {}, "permission gate"),
+    ("## 4. Spawn\nSpawn one worker per task.\nWorkers need his approval before pushing.\n", {}, "permission gate"),
+    ("## 4. Spawn\nSpawn one worker per task.\nUse token=abcdefghijklmnopqrstuv in the brief.\n", {}, "secret"),
+    ("## 4. Spawn\n" + "Spawn one worker per task.\n" * 70, {}, "grows the rule"),
+])
+def test_rejections(new_section: str, over: dict[str, Any], match: str) -> None:
+    with pytest.raises(ProposalError, match=match):
+        parse(new_section, **over)
+
+
+def test_money_line_cannot_be_loosened() -> None:
+    rid = "explaining-completed-work/response-budget"
+    with pytest.raises(ProposalError, match="spending money"):
+        parse("### Response budget\nShort answers. Spending money is fine under 10 dollars.\n", text=GLOBAL_MD,
+              rule_id=rid, topic="response budget length")
+    with pytest.raises(ProposalError, match="spending money"):
+        parse("### Response budget\nShort answers.\n", text=GLOBAL_MD, rule_id=rid, topic="response budget length")
+
+
+def test_why_and_summary_are_cleaned() -> None:
+    p = parse(SPAWN_NEW, why="Agents skipped ~/.claude/skills/dispatch/SKILL.md step four; clearer now.")
+    assert "~/.claude" not in p.why and "[path]" in p.why
+
+
+def test_prompt_holds_the_section_neighbours_policy_and_numbers() -> None:
+    sec = edits_sections.find(SKILL_MD, "spawn")
+    prev, nxt = edits_sections.neighbours(SKILL_MD, "spawn")
+    prompt = edits_writer.writer_prompt(CAND, target="~/.agents/skills/dispatch/SKILL.md", section=sec,
+                                        section_text=edits_sections.section_text(SKILL_MD, "spawn"),
+                                        prev=prev, nxt=nxt, days=7)
+    for needle in ("## 4. Spawn\nSpawn one worker per task.", "Intro text for the skill.", "## 5. Track",
+                   "Jev verdict: enforce (confidence 0.81)", "Count: 4 deviations in 3 sessions (parent 3, worker 1)",
+                   "followed 0.35", "result 0.60", "never add a new \"ask Vilmer", "Never remove or loosen anything about "
+                   "spending money", "fix the conflict so they agree", "One rule = one topic",
+                   "The rule is easy to skim past", "'## 4. Spawn', unchanged"):
+        assert needle.lower() in prompt.lower(), needle
+    assert DEV_ID not in prompt and "sess-alpha-1" not in prompt
+
+
+def test_writer_argv_has_no_tools() -> None:
+    argv = edits_writer.writer_argv()
+    assert argv[argv.index("--tools") + 1] == "" and "--strict-mcp-config" in argv and "--disable-slash-commands" in argv

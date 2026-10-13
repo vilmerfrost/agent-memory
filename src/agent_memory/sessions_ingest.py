@@ -21,6 +21,18 @@ Kind, first match wins:
 5. parent    the session ran `parent-lock`, the `dispatch` skill, or spawned a `worker`
 6. chat      everything else
 
+Codex sessions (`tool = codex`, codex_sessions.py) come from `<codex home>/sessions` and
+`<codex home>/archived_sessions`. Id `codex:<thread id>`, `project_dir` the folder relative
+to the Codex home (`sessions/2026/10/13`), `meta.file` the file name. Kind, first match wins:
+eval (cwd), worker (a subagent thread), headless (`codex_exec`), parent (the `dispatch`
+skill), chat. Skills: `<skill>` blocks the user invoked plus SKILL.md files the agent read
+from a skill home.
+
+Team repos (both tools): `meta.team` is true when the repo's git remote owner is not a
+personal owner (AMEM_PERSONAL_OWNERS, default `vilmerfrost`) or
+`<claude home>/parent/<repo>/profile.md` says `mode: team`. The edit step never edits a
+team repo's files.
+
 Idempotent: one upsert per session_id. A re-ingest refreshes the facts and keeps
 `scanned_at` and the scan keys in `meta`.
 """
@@ -38,10 +50,13 @@ from typing import Any
 
 from psycopg.types.json import Jsonb
 
-from agent_memory import config, store
+from agent_memory import codex_sessions, config, store
 
 KINDS = ("chat", "parent", "worker", "headless", "eval", "routine")
+TOOLS = ("claude", "codex")
 DEFAULT_DAYS = 7
+PERSONAL_OWNERS_ENV = "AMEM_PERSONAL_OWNERS"
+DEFAULT_PERSONAL_OWNERS = ("vilmerfrost",)
 
 SCRATCH_CWD = "/scratch-workspaces/"
 SKIP_PROJECT_RE = re.compile(r"-cache-(agent|skill)-evals|-cache-sbx|claude-mem|-private-tmp-claude-\d+-probe|stallprobe")
@@ -84,6 +99,150 @@ def agent_config_dir() -> Path:
     config.load_env()
     env = os.environ.get("AMEM_AGENT_CONFIG_DIR", "").strip()
     return Path(env).expanduser() if env else Path.home() / "agent-config"
+
+
+def codex_home(arg: Path | None = None) -> Path:
+    """--codex-home, else AMEM_CODEX_HOME, else `.codex` next to the Claude home (~/.codex).
+    Following the Claude home means a test that points AMEM_CLAUDE_HOME at a tmp dir never
+    reads the real ~/.codex."""
+    if arg is not None:
+        return arg.expanduser()
+    config.load_env()
+    env = os.environ.get("AMEM_CODEX_HOME", "").strip()
+    return Path(env).expanduser() if env else claude_home().parent / ".codex"
+
+
+# ---------------------------------------------------------------- team repos
+
+
+def main_checkout(cwd: Path) -> Path | None:
+    """For a git worktree (`.git` is a file `gitdir: <main>/.git/worktrees/<x>`), the main checkout."""
+    dotgit = cwd / ".git"
+    try:
+        if not dotgit.is_file():
+            return None
+        line = dotgit.read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return None
+    m = re.match(r"gitdir:\s*(.+)", line)
+    if not m:
+        return None
+    parts = Path(m.group(1).strip()).parts
+    if "worktrees" in parts:
+        i = parts.index("worktrees")
+        main_git = Path(*parts[:i])
+        if main_git.name == ".git":
+            return main_git.parent
+    return None
+
+
+_REMOTE_RE = re.compile(r'^\s*\[remote\s+"([^"]+)"\]\s*$')
+_URL_RE = re.compile(r"^\s*url\s*=\s*(\S+)\s*$")
+_SECTION_RE = re.compile(r"^\s*\[")
+
+
+def git_remote_url(cwd: str) -> str | None:
+    """The `origin` url (else the first remote's) from the repo's `.git/config`: the cwd or
+    the nearest parent with a `.git`, a worktree's main checkout. Reads no other file."""
+    if not cwd:
+        return None
+    start = Path(cwd)
+    home = Path.home()
+    for d in [start, *start.parents]:
+        if d == home or d.parent == d:
+            break
+        dotgit = d / ".git"
+        try:
+            if dotgit.is_dir():
+                cfg = dotgit / "config"
+            elif dotgit.is_file():
+                main = main_checkout(d)
+                if main is None:
+                    return None
+                cfg = main / ".git" / "config"
+            else:
+                continue
+            lines = cfg.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            return None
+        urls: dict[str, str] = {}
+        remote = None
+        for line in lines:
+            m = _REMOTE_RE.match(line)
+            if m:
+                remote = m.group(1)
+                continue
+            if _SECTION_RE.match(line):
+                remote = None
+                continue
+            u = _URL_RE.match(line)
+            if remote is not None and u:
+                urls.setdefault(remote, u.group(1))
+        return urls.get("origin") or next(iter(urls.values()), None)
+    return None
+
+
+_OWNER_RE = re.compile(r"^(?:[a-z][a-z0-9+.-]*://)?(?:[^@/]+@)?[^/:]+(?::\d+)?[:/]+([\w.-]+)/[\w.-]+?(?:\.git)?/?$")
+
+
+def remote_owner(url: str | None) -> str | None:
+    """`git@github-x:owner/repo.git`, `https://github.com/owner/repo` -> owner. None for a
+    local path or anything else."""
+    if not url:
+        return None
+    m = _OWNER_RE.match(url.strip())
+    return m.group(1) if m else None
+
+
+def personal_owners() -> set[str]:
+    config.load_env()
+    env = os.environ.get(PERSONAL_OWNERS_ENV, "").strip()
+    names = env.split(",") if env else DEFAULT_PERSONAL_OWNERS
+    return {n.strip().lower() for n in names if n.strip()}
+
+
+_MODE_RE = re.compile(r"^\s*[-*]?\s*mode:\s*([\w-]+)", re.M | re.I)
+
+
+def profile_mode(repo: str | None) -> str | None:
+    """`mode:` from `<claude home>/parent/<repo>/profile.md` (personal | team | off), or None."""
+    if not repo or not re.fullmatch(r"[\w][\w .-]{0,100}", repo) or ".." in repo:
+        return None
+    path = claude_home() / "parent" / repo / "profile.md"
+    try:
+        m = _MODE_RE.search(path.read_text(encoding="utf-8", errors="replace"))
+    except OSError:
+        return None
+    return m.group(1).lower() if m else None
+
+
+def team_info(cwd: str, repo: str | None, url: str | None = None) -> dict[str, Any]:
+    """`team`, plus `remote_owner` and `team_reason` when known. `url` (the remote a Codex
+    transcript recorded) wins over the repo's git config.
+
+    No owner and no team profile -> {} (unknown): a re-ingest after the worktree was removed
+    keeps what an earlier ingest stored, so a team flag is never lost to a cleanup."""
+    owner = remote_owner(url or git_remote_url(cwd))
+    if profile_mode(repo) == "team":
+        out: dict[str, Any] = {"team": True, "team_reason": "profile"}
+    elif owner:
+        team = owner.lower() not in personal_owners()
+        out = {"team": team, "team_reason": "remote-owner"} if team else {"team": False}
+    else:
+        return {}
+    if owner:
+        out["remote_owner"] = owner
+    return out
+
+
+def spread_team(rows: list[SessionRow]) -> None:
+    """A session whose remote is unknown (its worktree is gone) is a team session when another
+    session of the same repo in this ingest is one (`team_reason = same-repo`). Only ever
+    turns the flag on: the safe direction."""
+    team_repos = {r.repo for r in rows if r.team and r.repo}
+    for r in rows:
+        if "team" not in r.meta and r.repo in team_repos:
+            r.meta.update(team=True, team_reason="same-repo")
 
 
 # ---------------------------------------------------------------- reading
@@ -178,10 +337,15 @@ class SessionRow:
     instructions: list[str]
     meta: dict[str, Any] = field(default_factory=dict)
     path: Path | None = None
+    tool: str = "claude"   # claude | codex
 
     @property
     def cwd(self) -> str:
         return str(self.meta.get("cwd") or "")
+
+    @property
+    def team(self) -> bool:
+        return self.meta.get("team") is True
 
 
 @dataclass
@@ -317,12 +481,65 @@ def session_row(path: Path, project_dir: str, *, parent_session: str | None = No
         size = path.stat().st_size
     except OSError:
         size = 0
-    row = SessionRow(sid, kind, repo_of(cwd), project_dir, facts.start, facts.end, size,
+    repo = repo_of(cwd)
+    meta.update(team_info(cwd, repo))
+    row = SessionRow(sid, kind, repo, project_dir, facts.start, facts.end, size,
                      facts.skills, [], meta, path)
+    return _with_instructions(row)
+
+
+def _with_instructions(row: SessionRow) -> SessionRow:
     from agent_memory import deviations  # local import: deviations imports this module
 
     row.instructions = [src.name for src in deviations.instruction_sources(row)]
     return row
+
+
+def classify_codex(f: codex_sessions.CodexFacts, cwd: str) -> str:
+    if (cwd and EVAL_CWD_RE.search(cwd)) or any(EVAL_CWD_RE.search(c) for c in f.cwds):
+        return "eval"
+    if f.subagent:
+        return "worker"
+    if f.headless:
+        return "headless"
+    if "dispatch" in f.skills:
+        return "parent"
+    return "chat"
+
+
+def codex_row(path: Path, rel_dir: str) -> SessionRow:
+    """One Codex rollout file to a row (no database). `rel_dir`: its folder relative to the
+    Codex home."""
+    events = load_events(path)
+    f = codex_sessions.scan_facts(events, path.stem)
+    cwd, scratch_only = work_cwd(f.cwds, "")
+    kind = classify_codex(f, cwd)
+    meta: dict[str, Any] = {
+        "cwd": cwd or None,
+        "scratch_only": scratch_only,
+        "file": path.name,
+        "originator": f.originator,
+        "source": f.source,
+        "thread_source": f.thread_source,
+        "prompts": f.prompts,
+        "tool_calls": f.tool_calls,
+        "spawned_workers": f.spawned_workers,
+    }
+    if f.subagent:
+        meta["parent_session"] = codex_sessions.PREFIX + f.parent_thread if f.parent_thread else None
+        meta["agent_type"] = f.agent_role
+    # Codex app worktrees (~/.codex/worktrees/<task>) are named after the task: the main
+    # checkout names the repo.
+    main = main_checkout(Path(cwd)) if cwd else None
+    repo = main.name if main is not None else repo_of(cwd)
+    meta.update(team_info(cwd, repo, f.repo_url))
+    try:
+        size = path.stat().st_size
+    except OSError:
+        size = 0
+    sid = codex_sessions.PREFIX + (f.thread_id or path.stem)
+    row = SessionRow(sid, kind, repo, rel_dir, f.start, f.end, size, f.skills, [], meta, path, tool="codex")
+    return _with_instructions(row)
 
 
 # ---------------------------------------------------------------- discovery
@@ -353,6 +570,23 @@ def transcripts(root: Path, since: datetime) -> Iterator[tuple[Path, str, str | 
                 continue
 
 
+CODEX_DIRS = ("sessions", "archived_sessions")
+
+
+def codex_transcripts(home: Path, since: datetime) -> Iterator[tuple[Path, str]]:
+    """(file, folder relative to the Codex home) for rollout files touched since `since`."""
+    for sub in CODEX_DIRS:
+        base = home / sub
+        if not base.is_dir():
+            continue
+        for f in sorted(base.rglob("rollout-*.jsonl")):
+            try:
+                if f.is_file() and _mtime(f) >= since:
+                    yield f, str(f.parent.relative_to(home))
+            except (OSError, ValueError):
+                continue
+
+
 @dataclass
 class IngestReport:
     files: int = 0
@@ -360,42 +594,53 @@ class IngestReport:
     updated: int = 0
     skipped: int = 0  # empty transcripts or ones that ended before the window
     kinds: dict[str, int] = field(default_factory=dict)
+    tools: dict[str, int] = field(default_factory=dict)
+    team: int = 0
 
     def line(self) -> str:
         kinds = " ".join(f"{k}={self.kinds.get(k, 0)}" for k in KINDS)
+        tools = " ".join(f"{t}={self.tools.get(t, 0)}" for t in TOOLS)
         return (f"sessions: {self.files} files, {self.new} new, {self.updated} updated, "
-                f"{self.skipped} skipped ({kinds})")
+                f"{self.skipped} skipped ({kinds}) tools({tools}) team={self.team}")
 
 
-def collect(root: Path, *, days: int = DEFAULT_DAYS, now: datetime | None = None) -> tuple[list[SessionRow], int]:
-    """Rows for every transcript in the window, plus the number skipped."""
+def collect(root: Path | None, *, days: int = DEFAULT_DAYS, now: datetime | None = None,
+            codex: Path | None = None, tools: tuple[str, ...] = TOOLS) -> tuple[list[SessionRow], int]:
+    """Rows for every transcript in the window, plus the number skipped. `root`: the Claude
+    projects folder; `codex`: the Codex home (default `codex_home()`)."""
     now = now or datetime.now(UTC)
     since = now - timedelta(days=days)
+    found: list[SessionRow] = []
+    if "claude" in tools and root is not None:
+        found += [session_row(path, project, parent_session=parent)
+                  for path, project, parent in transcripts(root, since)]
+    if "codex" in tools:
+        found += [codex_row(path, rel) for path, rel in codex_transcripts(codex_home(codex), since)]
     rows: list[SessionRow] = []
     skipped = 0
-    for path, project, parent in transcripts(root, since):
-        row = session_row(path, project, parent_session=parent)
+    for row in found:
         if row.started_at is None or (row.ended_at is not None and row.ended_at < since):
             skipped += 1
             continue
         rows.append(row)
+    spread_team(rows)
     return rows, skipped
 
 
 _UPSERT_SQL = """
-insert into sessions (session_id, kind, repo, project_dir, started_at, ended_at, transcript_bytes,
+insert into sessions (session_id, tool, kind, repo, project_dir, started_at, ended_at, transcript_bytes,
                       skills, instructions, meta)
-values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
 on conflict (session_id) do update
-    set kind = excluded.kind, repo = excluded.repo, project_dir = excluded.project_dir,
+    set tool = excluded.tool, kind = excluded.kind, repo = excluded.repo, project_dir = excluded.project_dir,
         started_at = excluded.started_at, ended_at = excluded.ended_at,
         transcript_bytes = excluded.transcript_bytes, skills = excluded.skills,
         instructions = excluded.instructions, meta = sessions.meta || excluded.meta
-    where (sessions.kind, sessions.repo, sessions.started_at, sessions.ended_at, sessions.transcript_bytes,
-           sessions.skills, sessions.instructions)
+    where (sessions.tool, sessions.kind, sessions.repo, sessions.project_dir, sessions.started_at,
+           sessions.ended_at, sessions.transcript_bytes, sessions.skills, sessions.instructions)
           is distinct from
-          (excluded.kind, excluded.repo, excluded.started_at, excluded.ended_at, excluded.transcript_bytes,
-           excluded.skills, excluded.instructions)
+          (excluded.tool, excluded.kind, excluded.repo, excluded.project_dir, excluded.started_at,
+           excluded.ended_at, excluded.transcript_bytes, excluded.skills, excluded.instructions)
        or not (sessions.meta @> excluded.meta)
 returning (xmax = 0) as inserted
 """
@@ -407,8 +652,8 @@ def upsert(rows: list[SessionRow], *, db_url: str | None = None) -> tuple[int, i
     with store.connect(db_url) as conn:
         for r in rows:
             got = conn.execute(_UPSERT_SQL, (
-                r.session_id, r.kind, r.repo, r.project_dir, r.started_at, r.ended_at, r.transcript_bytes,
-                Jsonb(r.skills), Jsonb(r.instructions), Jsonb(r.meta),
+                r.session_id, r.tool, r.kind, r.repo, r.project_dir, r.started_at, r.ended_at,
+                r.transcript_bytes, Jsonb(r.skills), Jsonb(r.instructions), Jsonb(r.meta),
             )).fetchone()
             if got is None:
                 continue
@@ -419,11 +664,14 @@ def upsert(rows: list[SessionRow], *, db_url: str | None = None) -> tuple[int, i
     return new, updated
 
 
-def ingest(root: Path, *, days: int = DEFAULT_DAYS, now: datetime | None = None,
-           db_url: str | None = None) -> IngestReport:
-    rows, skipped = collect(root, days=days, now=now)
+def ingest(root: Path | None, *, days: int = DEFAULT_DAYS, now: datetime | None = None,
+           db_url: str | None = None, codex: Path | None = None,
+           tools: tuple[str, ...] = TOOLS) -> IngestReport:
+    rows, skipped = collect(root, days=days, now=now, codex=codex, tools=tools)
     report = IngestReport(files=len(rows) + skipped, skipped=skipped)
     for r in rows:
         report.kinds[r.kind] = report.kinds.get(r.kind, 0) + 1
+        report.tools[r.tool] = report.tools.get(r.tool, 0) + 1
+        report.team += r.team
     report.new, report.updated = upsert(rows, db_url=db_url)
     return report
