@@ -160,8 +160,13 @@ def test_prompt_puts_contract_and_hop_fixes_before_prose() -> None:
 
 @pytest.mark.parametrize("kind,want", [("contract", "contract"), ("Hop", "hop"), (" prose ", "prose")])
 def test_kind_is_parsed(kind: str, want: str) -> None:
+    # The writer's label is parsed as given; the checked label comes from the diff. SPAWN_NEW
+    # sharpens what each brief must name (an output content clause): contract.
     p = parse(SPAWN_NEW, kind=kind, kind_reason="Reordering makes the branch step come first.")
-    assert p.kind == want and p.kind_reason == "Reordering makes the branch step come first."
+    assert p.kind_writer == want and p.kind_reason == "Reordering makes the branch step come first."
+    assert p.kind == "contract" and p.kind_mismatch == (want != "contract")
+    assert p.kind_shown == ("Reordering makes the branch step come first." if want == "contract"
+                            else f"new or sharpened output content clause; writer said {want}")
 
 
 @pytest.mark.parametrize("over,match", [
