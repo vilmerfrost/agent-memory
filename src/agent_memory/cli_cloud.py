@@ -213,7 +213,8 @@ def _live_body(state: str, questions: list[jev.Question]) -> dict[str, Any]:
     import typesafe_sdk
 
     with typesafe_sdk.TypeSafeClient(api_key=config.typesafe_api_key()) as client:
-        response = client.system_one(state=state, questions={q.name: q.to_sdk() for q in questions})
+        response = client.system_one(state=state, questions={q.name: q.to_sdk() for q in questions},
+                                     model=jev.MODEL)
     body = response.model_dump(mode="json") if hasattr(response, "model_dump") else dict(response)
     return {"model": body.get("model"), "usage": body.get("usage"), "answers": body.get("answers")}
 

@@ -68,8 +68,8 @@ class FakeClient:
     def __exit__(self, *exc: object) -> None:
         pass
 
-    def system_one(self, state: Any, questions: dict[str, Any]) -> Any:
-        FakeClient.calls.append({"state": state, "questions": questions})
+    def system_one(self, state: Any, questions: dict[str, Any], model: str | None = None) -> Any:
+        FakeClient.calls.append({"state": state, "questions": questions, "model": model})
         return typesafe_sdk.SystemOneResponse.model_validate_json(json.dumps(FakeClient.response))
 
 
@@ -126,6 +126,7 @@ def test_record_writes_fixture_that_fixture_mode_reads(live: type[FakeClient], q
     (call,) = live.calls
     assert call["state"] == STATE
     assert list(call["questions"]) == ["verdict", "severity", "flag"]
+    assert call["model"] == "jev-latest"   # pinned: TYPESAFE_DEFAULT_MODEL cannot swap it
 
     body = json.loads(path.read_text())
     assert body["answers"] == RESPONSE["answers"]
@@ -166,3 +167,32 @@ def test_record_needs_live_mode(qfile: Path, tmp_path: Path, extra: dict[str, st
     assert "TYPESAFE_API_KEY" in result.stderr and "AMEM_JEV_LIVE=1" in result.stderr
     assert DUMMY_KEY not in result.stdout + result.stderr
     assert not out.exists()
+
+
+def test_jev_ask_pins_the_latest_model_even_with_an_env_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: list[str | None] = []
+
+    class Stop(Exception):
+        pass
+
+    class Capture:
+        def __init__(self, api_key: str) -> None:
+            pass
+
+        def __enter__(self) -> Capture:
+            return self
+
+        def __exit__(self, *exc: object) -> None:
+            pass
+
+        def system_one(self, state: Any, questions: dict[str, Any], model: str | None = None) -> Any:
+            seen.append(model)
+            raise Stop
+
+    monkeypatch.setenv("TYPESAFE_API_KEY", DUMMY_KEY)
+    monkeypatch.setenv("AMEM_JEV_LIVE", "1")
+    monkeypatch.setenv("TYPESAFE_DEFAULT_MODEL", "jev-2025-01")
+    monkeypatch.setattr(typesafe_sdk, "TypeSafeClient", Capture)
+    with pytest.raises(Stop):
+        jev.ask("state: x", [jev.noul("flag", "Is it flagged?")])
+    assert seen == ["jev-latest"]

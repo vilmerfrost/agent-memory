@@ -33,6 +33,10 @@ from pydantic import TypeAdapter
 
 from agent_memory import config
 
+# Every live call names the model. The SDK's own default is also "jev-latest", but the
+# TYPESAFE_DEFAULT_MODEL env var can replace it silently; an explicit argument wins over both.
+MODEL = "jev-latest"
+
 Kind = Literal["choice", "score", "noul"]
 Mode = Literal["fixture", "live"]
 
@@ -230,7 +234,8 @@ def _ask_live(state: str, questions: list[Question]) -> dict[str, JevResult]:
 
     try:
         with TypeSafeClient(api_key=config.typesafe_api_key()) as client:
-            response = client.system_one(state=state, questions={q.name: q.to_sdk() for q in questions})
+            response = client.system_one(state=state, questions={q.name: q.to_sdk() for q in questions},
+                                         model=MODEL)
         answers = dict(response.answers)
     except TypeSafeError as exc:  # HTTP 4xx/5xx, rate limit, connection, timeout, invalid response
         raise JevError(f"Jev API error: {_describe(exc)}") from exc
