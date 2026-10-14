@@ -26,7 +26,8 @@ A command in the background (its output is elsewhere) gives only what its result
 
 When the transcript gives no commit but the outcome signals count one (`commit` > 0), the
 caller can ask for the git-log fallback (`Fallback`, `git_log_commits`): `git log` in the
-dirs where the commit calls ran (else the session cwd), limited to the session's time window,
+dirs where the commit calls ran (the session cwd only when no commit call was seen), limited
+to the session's time window,
 HEAD only, no merges, and the repo's configured `user.email` as author. Those entries carry
 `"source": "git-log"` and branch null. Parallel sessions of the same user on the same branch
 of the same checkout can still pick up each other's commits; separate worktrees cannot.
@@ -36,7 +37,10 @@ Each commit is {sha, message, repo, branch}:
 - message  the subject (first line), redacted, at most MESSAGE_MAX chars
 - repo     repo_of the `git -C <path>` path, else of a leading `cd <path> &&`, else of the
            command's cwd (the transcript line's cwd; Codex: the item's cwd), else of the
-           session cwd. Relative paths resolve against that cwd.
+           session cwd. Relative paths resolve against that cwd. null when the path is a
+           command substitution (`$(...)`, backticks) or a `$VAR` not set earlier in the
+           command ($HOME is ~). A commit in a `mktemp` dir (`W=$(mktemp -d); cd $W`) is a
+           throwaway repo and is left out.
 - branch   the branch as printed (`detached HEAD` for a detached checkout), redacted, capped;
            null when not printed
 
@@ -70,7 +74,7 @@ GIT_COMMIT_RE = re.compile(r"(?:^|[\s;&|(`])git(?:\s+(?:-[Cc]\s+(?:\"[^\"]*\"|'[
                            r"\s+commit\b")
 _GIT_C_RE = re.compile(r"(?:^|[\s;&|(`])git\s+(?:(?:-c\s+\S+|--?[\w-]+(?:=\S+)?)\s+)*-C\s+(\"[^\"]*\"|'[^']*'|\S+)"
                        r"(?:\s+(?:-[Cc]\s+\S+|--?[\w-]+(?:=\S+)?))*\s+commit\b")
-_CD_RE = re.compile(r"(?:^|(?<=[;&\n]))\s*cd\s+(\"[^\"]*\"|'[^']*'|[^\s;&|]+)\s*(?:&&|;|\n)")
+_CD_RE = re.compile(r"(?:^|(?<=[;&\n]))\s*cd\s+(\"[^\"]*\"|'[^']*'|`[^`]*`|\$\([^)]*\)|[^\s;&|]+)\s*(?:&&|;|\n)")
 
 
 _HEREDOC_RE = re.compile(r"<<(-?)[ \t]*(?:'([^'\n]+)'|\"([^\"\n]+)\"|\\?([A-Za-z_][\w.-]*))")
@@ -155,8 +159,16 @@ def _local_path(value: Any) -> str:
     return s[len("file://"):] if s.startswith("file://") else s
 
 
-def command_dir(command: str, cwd: str) -> str:
-    """Where the commit ran: the `git -C` path, else a leading `cd <path> &&`, else `cwd`."""
+DIR_OK, DIR_UNKNOWN, DIR_TEMP = "ok", "unknown", "temp"
+_SHELL_EXPR_RE = re.compile(r"\$|`")
+
+
+def resolve_dir(command: str, cwd: str) -> tuple[str, str]:
+    """(dir, state) of where the commit ran: the `git -C` path, else the last `cd <path>`
+    before the commit, else `cwd`. A `$VAR` set by a plain assignment earlier in the command is
+    resolved. state: DIR_OK; DIR_UNKNOWN when the path holds a command substitution (`$(...)`,
+    backticks) or a `$VAR` it cannot resolve (dir ""); DIR_TEMP when it comes from `mktemp`
+    (a throwaway repo, dir "")."""
     command = split_heredocs(command)[0]
     m = _GIT_C_RE.search(command)
     if m is None:   # the last `cd <path> &&` before the commit
@@ -164,18 +176,29 @@ def command_dir(command: str, cwd: str) -> str:
         cds = [c for c in _CD_RE.finditer(command) if at is None or c.end() <= at.start() + 1]
         m = cds[-1] if cds else None
     if not m:
-        return cwd
-    path = _unquote(m.group(1))
+        return cwd, DIR_OK
+    raw = re.sub(r"^([\"']?)\$\{?HOME\}?(?=/|[\"']?$)", r"\1~", m.group(1))
+    path = _unquote(raw)
     var = re.match(r"\$\{?(\w+)\}?(.*)$", path)
     if var:   # `W=~/worktrees/x/y; git -C $W commit`: a plain assignment earlier in the command
-        value = re.search(rf"(?:^|[\s;&]){var.group(1)}=(\"[^\"]*\"|'[^']*'|[^\s;&|]+)", command)
-        path = _unquote(value.group(1)) + var.group(2) if value else ""
+        value = re.search(rf"(?:^|[\s;&]){var.group(1)}=(\"[^\"]*\"|'[^']*'|\$\([^)]*\)|`[^`]*`|[^\s;&|]+)", command)
+        if value is None:
+            return "", DIR_UNKNOWN
+        raw = value.group(1)
+        path = _unquote(raw) + var.group(2) if not raw.startswith(("$(", "`")) else raw
+    if _SHELL_EXPR_RE.search(path) or _SHELL_EXPR_RE.search(raw):
+        return "", DIR_TEMP if "mktemp" in raw else DIR_UNKNOWN
     if not path:
-        return cwd
+        return cwd, DIR_OK
     p = Path(path).expanduser()
     if not p.is_absolute() and cwd:
         p = Path(cwd) / p
-    return os.path.normpath(p)
+    return os.path.normpath(p), DIR_OK
+
+
+def command_dir(command: str, cwd: str) -> str:
+    """resolve_dir's dir: "" when it cannot be known."""
+    return resolve_dir(command, cwd)[0]
 
 
 def _repo(directory: str) -> str | None:
@@ -287,6 +310,7 @@ class Collector:
     def __init__(self) -> None:
         self.commits: dict[Any, dict[str, Any]] = {}
         self.missed_dirs: list[str] = []   # where commit calls ran that gave no commit (git-log fallback)
+        self.calls = 0                     # commit calls seen (with or without a result)
 
     def _put(self, sha: str | None, message: str, repo: str | None, branch: str | None) -> None:
         key: Any = sha or ("?", repo, message)
@@ -303,7 +327,10 @@ class Collector:
         shape = command_shape(command)
         if shape is None:
             return
-        directory = command_dir(command, cwd)
+        self.calls += 1
+        directory, state = resolve_dir(command, cwd)
+        if state == DIR_TEMP:   # a throwaway `mktemp` repo: not the session's work
+            return
         if not self._add(output, shape, _repo(directory), ok=ok, background=background) and directory:
             if directory not in self.missed_dirs:
                 self.missed_dirs.append(directory)
@@ -401,7 +428,9 @@ def git_log_commits(directory: str, since: datetime, until: datetime, *,
 def with_fallback(found: list[dict[str, Any]], dirs: list[str], cwd: str, fallback: Fallback | None, *,
                   run: Runner = subprocess.run) -> list[dict[str, Any]]:
     """`found`, or when it is empty but the session's signals count a commit: the git-log
-    commits of the dirs where the commit calls ran (else the session cwd)."""
+    commits of the dirs where the commit calls ran. `cwd`: the session cwd, asked only when no
+    commit call was seen at all (callers pass "" otherwise: a commit in an unknown or throwaway
+    dir must not pull in the session cwd's commits)."""
     if found or fallback is None or fallback.commit_signal <= 0 or fallback.since is None:
         return found
     until = fallback.until or fallback.since
@@ -443,10 +472,11 @@ def claude_commits(events: list[dict[str, Any]], *, cwd: str = "", own_session: 
                     ok = not b.get("is_error") and not e.get("toolDenialKind")
                     out.add(_result_text(b.get("content")), command, call_cwd, ok=ok, background=background)
     for command, call_cwd, _background in calls.values():   # a call with no result line yet
+        out.calls += 1
         directory = command_dir(command, call_cwd)
         if directory and directory not in out.missed_dirs:
             out.missed_dirs.append(directory)
-    return with_fallback(out.result(), out.missed_dirs, cwd, fallback)
+    return with_fallback(out.result(), out.missed_dirs, "" if out.calls else cwd, fallback)
 
 
 def codex_commits(events: list[dict[str, Any]], *, cwd: str = "",
@@ -468,4 +498,4 @@ def codex_commits(events: list[dict[str, Any]], *, cwd: str = "",
                 code = item.get("exit_code")
                 ok = item.get("status") == "completed" and code == 0 and not isinstance(code, bool)
                 out.add(output, command, _local_path(item.get("cwd")) or turn_cwd, ok=ok)
-    return with_fallback(out.result(), out.missed_dirs, _local_path(cwd or turn_cwd), fallback)
+    return with_fallback(out.result(), out.missed_dirs, "" if out.calls else _local_path(cwd or turn_cwd), fallback)

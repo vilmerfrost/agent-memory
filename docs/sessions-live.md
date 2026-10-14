@@ -273,7 +273,11 @@ the last ingest or ping.
 runs `git ... commit`: Claude Code `Bash` tool results, Codex `CommandExecution` items
 (`aggregated_output`). `sha` is the short sha as printed; `message` the subject, redacted,
 max 200 chars; `repo` the repo of the `git -C` path, else of the last `cd <path> &&` before the
-commit (a `$VAR` set earlier in the same command is resolved), else of the command's cwd.
+commit (a `$VAR` set earlier in the same command is resolved, `$HOME` is `~`), else of the
+command's cwd. A target that is a command substitution (`$(...)`, backticks) or a `$VAR` not
+set in the command gives `repo: null`; a `mktemp` target (`W=$(mktemp -d); cd $W`) is a
+throwaway repo and its commit is left out (no git-log fallback in the session cwd either).
+The backfill drops stored entries whose repo is shell syntax (`$(mktemp`).
 A quiet `git commit -q` prints nothing. Its subject is the `-m` value or, for `-F -`, the first
 line of the heredoc (`<<'EOF' ... EOF`; heredoc bodies are cut out before the command is read,
 so a line break or `;` in a message is not an operator). When a later `git log --oneline` line
@@ -314,8 +318,13 @@ user and assistant text plus shortened tool calls. The prompt frames the record 
 inside `<session_record>` tags and asks for third-person sentences that begin with "The
 session". Nothing of the transcript is stored; the reply is redacted, cut to 3 sentences and
 600 chars, and dropped when empty or junk (a refusal, JSON, a code fence, under 20 chars) or
-when it does not start with "The session" ("This session" is repaired). A dropped reply gets
-one retry with a format note; a second miss counts as failed and nothing is stored.
+when it does not start with "The session" ("This session" is repaired) or is a refusal or a
+remark about the prompt even with that prefix ("The session record was not included in this
+message, so I cannot describe..."; first person, "cannot describe/summarize", "record/
+transcript was not provided", "this message"). A dropped reply gets one retry with a reminder
+that the record is above; a second miss counts as failed and nothing is stored. A row whose
+digest is under 200 chars or holds no assistant or tool line is skipped (`skipped-empty`,
+ingest `summary_empty=N`) and never sent to the model.
 
 A row gets one when it is finished (an outcome other than `active`, and no activity for 30
 minutes or the SessionEnd hook was seen), has no summary or one older than its
@@ -336,7 +345,8 @@ its transcript is on this machine.
   `skipped-subagent`, `failed` (plus up-to-date, not-finished, left-for-next-run,
   commits-updated, bad-summaries), then a `commits:` line: committed sessions (signal
   `commit` > 0) with a non-empty commits list before / after, all and top-level. `--redo-bad`
-  also summarizes the rows whose summary does not start with "The session". `--commits-only`
+  also summarizes the rows whose summary fails the same check (no "The session" prefix, or a
+  refusal). `--commits-only`
   re-reads commits only (no model call). Needs `AMEM_SUMMARY_LIVE=1` unless `--dry-run` or
   `--commits-only`. A top-level transcript that moved to another project folder (the session
   changed directory) is found by its file name.

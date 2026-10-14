@@ -107,6 +107,52 @@ def test_semicolon_chain_without_set_e_stays_unknown() -> None:
     assert session_commits.claude_commits(events) == []
 
 
+# --------------------------------------------------------------------------- dirs from shell syntax
+
+
+MKTEMP = ("set -e; W=$(mktemp -d /tmp/audit-routines/repro.XXXX); cp -R /tmp/fx/. $W/; cd $W; git init -q && "
+          "git add -A && git -c user.email=b@b -c user.name=b commit -qm base; python3 -m unittest -q 2>&1 | tail -1")
+
+
+def test_mktemp_repo_commit_is_dropped() -> None:
+    # [b1b2011c/agent-a5dfc06f3febc7edf] stored {repo: "$(mktemp", message: "base"}
+    events = commit("/work/demo-repo", "t1", "OK\n", MKTEMP)
+    assert session_commits.resolve_dir(MKTEMP, "/work/demo-repo") == ("", session_commits.DIR_TEMP)
+    assert session_commits.claude_commits(events) == []
+    direct = 'cd "$(mktemp -d)" && git init -q && git commit -q --allow-empty -m tmp'
+    assert session_commits.claude_commits(commit("/work/demo-repo", "t2", "", direct)) == []
+
+
+def test_mktemp_commit_never_falls_back_to_the_session_cwd(tmp_path: Path) -> None:
+    calls: list[list[str]] = []
+
+    def run(argv: list[str], **kw: Any) -> subprocess.CompletedProcess[str]:
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 1, "", "")
+
+    events = commit(str(tmp_path), "t3", "OK\n", MKTEMP)
+    fb = session_commits.Fallback(2, T, T + timedelta(hours=1))
+    assert session_commits.with_fallback([], [], "", fb, run=run) == [] and calls == []
+    assert session_commits.claude_commits(events, cwd=str(tmp_path), fallback=fb) == []
+
+
+@pytest.mark.parametrize("command", [
+    'cd "$(git rev-parse --show-toplevel)" && git commit -q -m "Subshell dir"',
+    "cd `pwd -P` && git commit -q -m \"Subshell dir\"",
+    'cd $UNSET_DIR && git commit -q -m "Subshell dir"',
+    'git -C "$(dirname $X)" commit -q -m "Subshell dir"',
+])
+def test_unresolvable_dir_gives_a_null_repo(command: str) -> None:
+    got = session_commits.claude_commits(commit("/work/demo-repo", "u1", "", command))
+    assert got == [{"sha": None, "message": "Subshell dir", "repo": None, "branch": None}]
+
+
+def test_home_variable_and_plain_assignment_still_resolve() -> None:
+    assert session_commits.command_dir('cd "$HOME/worktrees/x/w1" && git commit -m a', "/c") == \
+        str(Path("~/worktrees/x/w1").expanduser())
+    assert session_commits.command_dir("W=/src/proj; git -C $W commit -m a", "/c") == "/src/proj"
+
+
 # --------------------------------------------------------------------------- git-log fallback
 
 
