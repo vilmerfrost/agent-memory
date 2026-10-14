@@ -177,8 +177,12 @@ MUCH_LATER = T0 + timedelta(days=3)
     ("active", [user("go", 0), assistant(tool("Edit", "e1", file_path="a.py")), ok("e1")], T0 + timedelta(hours=1)),
     ("abandoned", [user("go", 0), assistant(text("hm"), minute=1), user("are you there?", 2)], MUCH_LATER),
     ("abandoned", [user("go", 0), bash("1", "sleep 99")], MUCH_LATER),
-    ("abandoned", [assistant(tool("Edit", "e1", file_path="a.py")), ok("e1"), assistant(text("done"), minute=2)],
+    # Edited, then a final reply: finished, not abandoned (edits without a commit = partial).
+    ("partial", [assistant(tool("Edit", "e1", file_path="a.py")), ok("e1"), assistant(text("done"), minute=2)],
      MUCH_LATER),
+    # Edited, then no final reply (ended on the tool result, mid-action or on an error): abandoned.
+    ("abandoned", [assistant(tool("Edit", "e1", file_path="a.py")), ok("e1")], MUCH_LATER),
+    ("abandoned", [assistant(tool("Edit", "e1", file_path="a.py")), ok("e1"), bash("1", "pytest")], MUCH_LATER),
     ("failed", [user("go", 0), bash("1", "pytest"), result("1", "boom", 2, error=True)], LATER),
     ("failed", [user("go", 0), assistant(text("x"), minute=1), user("[Request interrupted by user]", 2)], MUCH_LATER),
     ("no-change", [user("what is X?", 0), assistant(text("X is Y."), minute=1)], MUCH_LATER),

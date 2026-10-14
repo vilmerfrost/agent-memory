@@ -234,7 +234,7 @@ state wins, in this order:
 | `committed` | a proven `git commit` (below), nothing pushed |
 | `partial` | a worker report `Status: PARTIAL` / `BLOCKED` (also in a `SubagentHandback`) |
 | `active` | last activity under 2 h ago |
-| `abandoned` | last activity over 24 h ago and the session ended on a prompt with no reply (`end` `user`) or a tool call with no result (`end` `tool`), or it edited files, never committed and reported no `Status: DONE`. Never for a worker (below). Ending on a tool result (`end` `result`) is not abandonment: the call got its answer |
+| `abandoned` | last activity over 24 h ago and the session ended on a prompt with no reply (`end` `user`) or a tool call with no result (`end` `tool`), or it edited files, never committed, reported no `Status: DONE` and did not end on a final reply (`end` `reply`: edited, then answered, is `partial`). Never for a worker (below). Ending on a tool result (`end` `result`) is not abandonment: the call got its answer |
 | `partial` | files were edited (Edit, Write, MultiEdit, NotebookEdit, apply_patch, a Codex FileChange), nothing committed |
 | `failed` | it ended on an API / tool error or an interrupt |
 | `no-change` | none of the above: Q&A, research, reviews |
