@@ -20,6 +20,7 @@ from agent_memory import dedupe
 from agent_memory import cli_lessons
 from agent_memory import cli_scoring
 from agent_memory import cli_tasks
+from agent_memory import cli_skills
 
 
 def _db_host(url: str) -> str:
@@ -178,6 +179,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     cli_cloud.register(sub, ingest_sub=ingest_sub)
     cli_tasks.register(sub, ingest_sub=ingest_sub)
+    cli_skills.register(sub, ingest_sub=ingest_sub)
     cli_lessons.register(sub)
     cli_scoring.register(sub)
     cli_ab.register(sub)
