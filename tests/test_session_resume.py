@@ -78,11 +78,11 @@ def test_ingest_counts_only_own_lines(setup_home: Home) -> None:  # noqa: F811
     old, new = rows[OLD], rows[NEW]
     assert old.tokens is not None and old.tokens.tokens == EXPECTED and old.tokens.turns == 2
     assert new.tokens is not None and new.tokens.tokens == OWN and new.tokens.turns == 2
-    # Subagents: the copied file adds nothing to the resumed session; the original keeps its tokens.
-    assert rows[f"{NEW}/agent-a1"].tokens.tokens.total == 0  # type: ignore[union-attr]
+    # Subagents: the copied file is a pure copy (no row, adds nothing); the original keeps its tokens.
+    assert f"{NEW}/agent-a1" not in rows
     assert rows[f"{NEW}/agent-a2"].tokens.tokens.as_list() == [1, 2, 3, 4]  # type: ignore[union-attr]
     assert new.meta["subagent_tokens"] == {"input": 1, "output": 2, "cache_read": 3, "cache_creation": 4,
-                                           "sessions": 2}
+                                           "sessions": 1}
     assert old.meta["subagent_tokens"] == {"input": 100, "output": 200, "cache_read": 300, "cache_creation": 400,
                                            "sessions": 1}
 
@@ -100,5 +100,6 @@ def test_stop_ping_counts_only_own_lines(setup_home: Home, db: str) -> None:  # 
             row["tokens_cache_creation"]] == OWN.as_list()
     assert row["turns"] == 2 and set(row["models"]) == {"claude-test-1"}
     assert row["started_at"] == T0 + timedelta(minutes=20)  # the session's own first line
+    # The copied file is a pure copy: not one of this session's subagents (as in `sessions ingest`).
     assert row["meta"]["subagent_tokens"] == {"input": 1, "output": 2, "cache_read": 3, "cache_creation": 4,
-                                              "sessions": 2}
+                                              "sessions": 1}

@@ -46,7 +46,7 @@ from typing import Any
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
-from agent_memory import config, distill, redact, session_commits, sessions_ingest, store
+from agent_memory import config, distill, redact, session_commits, session_resume, sessions_ingest, store
 
 LIVE_ENV = "AMEM_SUMMARY_LIVE"
 CLAUDE_ENV = "AMEM_SUMMARY_CLAUDE"
@@ -143,6 +143,16 @@ def transcript_of(rec: dict[str, Any]) -> Path:
         return path
     moved = sorted(sessions_ingest.projects_dir().glob(f"*/{sid}.jsonl"))
     return moved[0] if moved else path
+
+
+def load_transcript(path: Path, rec: dict[str, Any]) -> list[dict[str, Any]]:
+    """The transcript's lines, without the lines a resumed Claude Code transcript copied from an
+    earlier one of its chain (session_resume: same uuid, new sessionId). Those belong to the
+    earlier session's row (its commits, its summary)."""
+    events = sessions_ingest.load_events(path)
+    if rec.get("tool") == "codex" or is_cloud(rec):
+        return events
+    return session_resume.resume_of(path).own(events)
 
 
 def own_events(events: list[dict[str, Any]], rec: dict[str, Any]) -> list[dict[str, Any]]:
@@ -520,7 +530,7 @@ def summarize(*, days: int, now: datetime | None = None, db_url: str | None = No
                     if path is None or not path.is_file():
                         report.skip("no_transcript")
                         continue
-                    _refresh_commits(conn, rec, sessions_ingest.load_events(path), report, dry_run)
+                    _refresh_commits(conn, rec, load_transcript(path, rec), report, dry_run)
                 return report
             return _summaries(conn, recs, report, now=now, workers=workers, dry_run=dry_run,
                               refresh_commits=refresh_commits, redo_bad=redo_bad, remaining=remaining)
@@ -545,7 +555,7 @@ def _summaries(conn: Any, recs: list[dict[str, Any]], report: SummaryReport, *, 
                 if not path.is_file():
                     report.skip("no_transcript")
                     continue
-                events = sessions_ingest.load_events(path)
+                events = load_transcript(path, rec)
                 _refresh_commits(conn, rec, events, report, dry_run)
             reason = skip_reason(rec, now, redo_bad=redo_bad)
             if reason is not None:
@@ -555,7 +565,7 @@ def _summaries(conn: Any, recs: list[dict[str, Any]], report: SummaryReport, *, 
                 if not path.is_file():
                     report.skip("no_transcript")
                     continue
-                events = sessions_ingest.load_events(path)
+                events = load_transcript(path, rec)
             digest_text = digest(own_events(events, rec))
             if not substantial(digest_text):   # never ask the model to describe nothing
                 report.skip("empty")

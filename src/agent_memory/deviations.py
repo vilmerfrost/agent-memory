@@ -61,6 +61,7 @@ from agent_memory.sessions_ingest import (
     codex_home,
     is_human,
     load_events,
+    own_events,
     projects_dir,
     text_of,
 )
@@ -1093,7 +1094,10 @@ def _scan_one(row: SessionRow, *, dry_run: bool, timeout: float, qset: questions
         if not path.is_file():
             out.status, out.reason = "error", "transcript file not found"
             return out
-        digest = build_digest(load_events(path))
+        # A resumed transcript's copied lines are the earlier session's (session_resume): its
+        # own scan finds them, so they are left out here (no finding twice).
+        digest = build_digest(own_events(path, load_events(path), row.session_id,
+                                         row.meta.get("parent_session")))
         sources = instruction_sources(row)
         out.digest_chars = len(digest)
         out.instructions = [s.name for s in sources]

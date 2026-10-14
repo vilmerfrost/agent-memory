@@ -40,7 +40,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from agent_memory import config, session_tokens, sessions_ingest
+from agent_memory import config, session_resume, session_tokens, sessions_ingest
 
 EVENTS = ("SessionStart", "Stop", "SessionEnd")
 DEBOUNCE_SECONDS = 20.0
@@ -368,7 +368,15 @@ def _scan_subagents(p: Ping, entry: dict[str, Any]) -> dict[str, int] | None:
     subs = entry.setdefault("subs", {})
     total, n = session_tokens.Tokens(), 0
     for f in sorted(sub_dir.glob("agent-*.jsonl")):
+        if (subs.get(f.stem) or {}).get("copy"):
+            continue   # a pure copy of an earlier session's subagent (session_resume): not this session's
         sc = session_tokens.ClaudeScanner(subs.get(f.stem), own_session=p.session_id)  # a copied file adds 0
+        if sc.offset == 0:   # a first read: skip lines copied from an earlier file (session_resume)
+            resume = session_resume.resume_of(f)
+            if resume.pure_copy(sessions_ingest.load_events(f), p.session_id):
+                subs[f.stem] = {"copy": True}
+                continue
+            sc.skip_uuids = resume.copied
         sc.scan_file(f)
         subs[f.stem] = sc.state()
         total.add(sc.summary.tokens)
@@ -403,6 +411,13 @@ def build_record(p: Ping, entry: dict[str, Any], now: datetime) -> dict[str, Any
         return rec
     sc = session_tokens.ClaudeScanner(entry.get("scan"), own_session=p.session_id)  # resumed: own lines only
     if p.transcript is not None and p.transcript.is_file():
+        if sc.offset == 0 or p.transcript.stat().st_size < sc.offset:
+            # A first read of a resumed transcript: its copied lines (session_resume) are the
+            # earlier session's. The copy is the file's start, so later reads need no skip set.
+            resume = session_resume.resume_of(p.transcript)
+            sc.skip_uuids = resume.copied
+            if resume.resumed_from:
+                meta["resumed_from"] = resume.resumed_from
         sc.scan_file(p.transcript)
     entry["scan"] = sc.state()
     s = sc.summary

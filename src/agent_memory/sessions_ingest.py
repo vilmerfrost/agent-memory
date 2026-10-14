@@ -37,6 +37,11 @@ Tokens (session_tokens.py, docs/sessions-live.md): every row also gets its token
 per-model breakdown, turns and last activity; a parent's `meta.subagent_tokens` sums its
 subagents. Pings the hook spooled (session_live.py) are flushed first.
 
+Resumed sessions (session_resume.py, docs/sessions-live.md): a resumed transcript copies the
+earlier transcript's lines. Its row counts only its own lines (tokens, turns, time, prompts, tool
+calls, skills, commits, started_at / ended_at) and links the earlier row in `meta.resumed_from`.
+A pure copy gets no row.
+
 Commits and summaries (docs/sessions-live.md): `outcome_evidence.commits` from the git commit
 output in the transcript (session_commits.py); the last step writes `summary` for finished
 sessions with a cheap model (session_summary.py, off unless AMEM_SUMMARY_LIVE=1, time-boxed,
@@ -59,7 +64,7 @@ from typing import Any
 
 from psycopg.types.json import Jsonb
 
-from agent_memory import codex_sessions, config, session_commits, session_tokens, store
+from agent_memory import codex_sessions, config, session_commits, session_resume, session_tokens, store
 
 KINDS = ("chat", "parent", "worker", "headless", "eval", "routine")
 TOOLS = ("claude", "codex")
@@ -431,6 +436,7 @@ class SessionRow:
     end: str | None = None
     outcome: str | None = None   # the stored outcome (a row read back from the database), else None
     commits: list[dict[str, Any]] | None = None   # session_commits: {sha, message, repo, branch}; None: not read
+    copy_only: bool = False   # a pure copy of an earlier transcript (session_resume): no row is stored
 
     def with_summary(self, s: session_tokens.Summary) -> SessionRow:
         """Title, profile and outcome signals from a full read."""
@@ -550,10 +556,19 @@ def _subagent_meta(path: Path) -> dict[str, Any]:
 
 
 def session_row(path: Path, project_dir: str, *, parent_session: str | None = None) -> SessionRow:
-    """One transcript file to a row (no database)."""
+    """One transcript file to a row (no database). A pure copy (session_resume) gets
+    `copy_only` set: `collect` stores no row for it."""
     events = load_events(path)
     facts = scan_facts(events)
     subagent = parent_session is not None
+    # Count only this session's lines: a resumed session's transcript starts with a copy of the
+    # earlier transcript's lines (session_resume: the same uuids, or, older shape, the earlier
+    # sessionId). A subagent's lines carry the parent's id. Kind, cwd and routine still read
+    # every line (the chain is one conversation); counts, skills and times read only own lines.
+    own = parent_session if subagent else path.stem
+    resume = session_resume.resume_of(path)
+    own_events = resume.own(events, own)
+    mine = scan_facts(own_events) if len(own_events) != len(events) else facts
     cwd, scratch_only = work_cwd(facts.cwds, project_dir)
     kind = classify(facts, project_dir=project_dir, cwd=cwd, subagent=subagent)
     meta: dict[str, Any] = {
@@ -561,10 +576,14 @@ def session_row(path: Path, project_dir: str, *, parent_session: str | None = No
         "cwds": facts.cwds,  # every cwd the session visited (skills.MATCH_SQL)
         "scratch_only": scratch_only,
         "entrypoints": sorted(facts.entrypoints),
-        "prompts": facts.prompts,
-        "tool_calls": facts.tool_calls,
-        "spawned_workers": facts.spawned_workers,
+        "prompts": mine.prompts,
+        "tool_calls": mine.tool_calls,
+        "spawned_workers": mine.spawned_workers,
     }
+    if resume.resumed_from:
+        meta["resumed_from"] = resume.resumed_from
+    if mine is not facts:
+        meta["copied_lines"] = len(events) - len(own_events)
     if subagent:
         sub = _subagent_meta(path)
         meta["parent_session"] = parent_session
@@ -584,16 +603,21 @@ def session_row(path: Path, project_dir: str, *, parent_session: str | None = No
         size = 0
     repo = repo_of(cwd)
     meta.update(team_info(cwd, repo))
-    # Count only this session's lines: a resumed session's transcript starts with a copy of the
-    # earlier session's lines (their sessionId is the earlier id). A subagent's lines carry the
-    # parent's id. The facts above (kind, skills, start) still read every line.
-    own = parent_session if subagent else path.stem
-    tokens = session_tokens.claude_summary(events, own_session=own)
-    row = SessionRow(sid, kind, repo, project_dir, facts.start, facts.end, size,
-                     facts.skills, [], meta, path, tokens=tokens).with_summary(tokens)
-    row.commits = confirm_commits(row, session_commits.claude_commits(events, cwd=cwd, own_session=own,
+    tokens = session_tokens.claude_summary(events, own_session=own, skip_uuids=resume.copied)
+    start, end = (mine.start, mine.end) if mine.start is not None else (facts.start, facts.end)
+    row = SessionRow(sid, kind, repo, project_dir, start, end, size,
+                     mine.skills, [], meta, path, tokens=tokens).with_summary(tokens)
+    row.copy_only = resume.pure_copy(events, own)
+    row.commits = confirm_commits(row, session_commits.claude_commits(own_events, cwd=cwd, own_session=own,
                                                                       fallback=commit_fallback(row)))
     return _with_instructions(row)
+
+
+def own_events(path: Path, events: list[dict[str, Any]], session_id: str,
+               parent_session: str | None = None) -> list[dict[str, Any]]:
+    """A local Claude Code transcript's own lines (session_row's rule): no line copied from an
+    earlier transcript of its resume chain. For digests and commit re-reads of stored rows."""
+    return session_resume.resume_of(path).own(events, parent_session or session_id)
 
 
 def commit_fallback(row: SessionRow) -> session_commits.Fallback:
@@ -740,7 +764,7 @@ class IngestReport:
     files: int = 0
     new: int = 0
     updated: int = 0
-    skipped: int = 0  # empty transcripts or ones that ended before the window
+    skipped: int = 0  # empty transcripts, pure copies of a resumed one, or ones that ended before the window
     kinds: dict[str, int] = field(default_factory=dict)
     tools: dict[str, int] = field(default_factory=dict)
     team: int = 0
@@ -791,7 +815,7 @@ def collect(root: Path | None, *, days: int = DEFAULT_DAYS, now: datetime | None
     rows: list[SessionRow] = []
     skipped = 0
     for row in found:
-        if row.started_at is None or (row.ended_at is not None and row.ended_at < since):
+        if row.copy_only or row.started_at is None or (row.ended_at is not None and row.ended_at < since):
             skipped += 1
             continue
         rows.append(row)
@@ -804,7 +828,7 @@ def rollup_subagents(rows: list[SessionRow]) -> None:
     """`meta.subagent_tokens` on each parent row: the summed tokens of its subagents
     ({input, output, cache_read, cache_creation, sessions}). Claude Code: every
     `<session>/subagents/agent-*.jsonl` next to the parent transcript (a subagent file not in
-    this ingest is read for its tokens only). Codex: the subagent rows of this ingest whose
+    this ingest is read for its tokens only; a pure copy, session_resume, adds nothing). Codex: the subagent rows of this ingest whose
     `meta.parent_session` is the parent. The subagents keep their own rows: a sum over all
     rows never adds this field."""
     by_id = {r.session_id: r for r in rows}
@@ -820,9 +844,15 @@ def rollup_subagents(rows: list[SessionRow]) -> None:
             sub_dir = r.path.parent / r.path.stem / "subagents"
             for f in sorted(sub_dir.glob("agent-*.jsonl")) if sub_dir.is_dir() else []:
                 got = by_id.get(f"{r.session_id}/{f.stem}")
-                summary = got.tokens if got is not None and got.tokens is not None \
-                    else session_tokens.scan_claude_file(f, own_session=r.session_id)
-                add(r.session_id, summary.tokens)
+                if got is not None and got.tokens is not None:
+                    add(r.session_id, got.tokens.tokens)
+                    continue
+                events = load_events(f)
+                resume = session_resume.resume_of(f)
+                if resume.pure_copy(events, r.session_id):
+                    continue   # a copied subagent file: its tokens are the earlier session's
+                add(r.session_id, session_tokens.claude_summary(events, own_session=r.session_id,
+                                                                skip_uuids=resume.copied).tokens)
         elif r.tool == "codex" and r.meta.get("parent_session") and r.tokens is not None:
             add(str(r.meta["parent_session"]), r.tokens.tokens)
     for sid, (total, n) in sums.items():
