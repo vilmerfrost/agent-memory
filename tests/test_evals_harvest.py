@@ -21,15 +21,10 @@ from conftest import base_env, run_amem
 
 NOW = datetime.now(UTC)
 
-HANDOFFS_DDL = """
-create table public.handoffs (
-    session_id   text not null,
-    project      text,
-    handoff_path text not null,
-    reason       text,
-    created_at   timestamptz not null default now()
-)
-"""
+def drop_handoffs(url: str) -> None:
+    """Simulate a DB from before migration 20261020020000_handoffs.sql."""
+    with psycopg.connect(url) as conn:
+        conn.execute("drop table public.handoffs")
 
 
 @pytest.fixture
@@ -71,7 +66,7 @@ def add_deviation(url: str, sid: str, *, verdict: str | None = "edit_instruction
     return str(row[0])
 
 
-def add_handoff(url: str, sid: str, path: str = "/home/x/.claude/handoffs/h1.md", reason: str = "compact") -> None:
+def add_handoff(url: str, sid: str, path: str = "/home/x/.claude/handoffs/h1.md", reason: str = "manual") -> None:
     with psycopg.connect(url) as conn:
         conn.execute("insert into handoffs (session_id, project, handoff_path, reason) values (%s, 'demo', %s, %s)",
                      (sid, path, reason))
@@ -102,7 +97,7 @@ def test_drafts_from_deviations_and_incidents(db: str, tmp_path: Path) -> None:
     out = tmp_path / "drafts"
     report = evals_harvest.harvest(out, days=7, db_url=db)
     assert report.line() == "drafted 2 new, 0 already drafted, 1 skipped (team-repo=1)"
-    assert not report.handoffs_table
+    assert report.handoffs_table   # migrated, no rows
     files = drafts(out)
     assert len(files) == 2
     by_source = {evals_harvest.SOURCE_LINE_RE.findall(t)[0]: (n, t) for n, t in files.items()}
@@ -149,13 +144,11 @@ def test_idempotent_and_survives_moved_drafts(db: str, tmp_path: Path) -> None:
 
 
 def test_handoffs_drafted_when_table_exists(db: str, tmp_path: Path) -> None:
-    with psycopg.connect(db) as conn:
-        conn.execute(HANDOFFS_DDL)
     add_session(db, "c1", category="chat")
     add_deviation(db, "c1", verdict="leave", source="skill:dispatch", rule_id="brief")
     add_handoff(db, "c1")
-    add_handoff(db, "c2", path="/home/x/.claude/handoffs/h2.md", reason="context limit")
-    add_handoff(db, "", path="", reason="broken")
+    add_handoff(db, "c2", path="/home/x/.claude/handoffs/h2.md", reason="auto")
+    add_handoff(db, "", path="", reason="manual")
     report = evals_harvest.harvest(tmp_path, days=7, db_url=db)
     assert report.handoffs_table
     assert report.line() == "drafted 2 new, 0 already drafted, 1 skipped (incomplete-handoff=1)"
@@ -163,13 +156,14 @@ def test_handoffs_drafted_when_table_exists(db: str, tmp_path: Path) -> None:
     c1 = next(t for t in texts if "session: c1" in t)
     c2 = next(t for t in texts if "session: c2" in t)
     assert "source_kind: handoff" in c1 and "rule: skill:dispatch/brief" in c1   # the session's top rule
-    assert "rule: unknown" in c2 and "reason: context limit" in c2
+    assert "rule: unknown" in c2 and "reason: auto" in c2
     assert evals_harvest.strip_header(c1).startswith(evals_harvest.RESUME_PROMPT)
     assert evals_harvest.harvest(tmp_path, days=7, db_url=db).line() == \
         "drafted 0 new, 2 already drafted, 1 skipped (incomplete-handoff=1)"
 
 
 def test_missing_handoffs_table_is_zero_handoffs(db: str, tmp_path: Path) -> None:
+    drop_handoffs(db)
     report = evals_harvest.harvest(tmp_path, days=7, db_url=db)
     assert not report.handoffs_table
     assert report.line() == "drafted 0 new, 0 already drafted, 0 skipped"
@@ -211,6 +205,7 @@ def test_cli_dry_run_writes_nothing(db: str, tmp_path: Path) -> None:
 
 def test_cli_logs_one_run_per_harvest(db: str, tmp_path: Path) -> None:
     fixture_data(db)
+    drop_handoffs(db)
     out = tmp_path / "drafts"
     env = base_env(AMEM_DB_URL=db)
     first = run_amem("evals", "harvest", "--out", str(out), env=env)
