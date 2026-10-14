@@ -253,10 +253,10 @@ rule change or the clock reaches rows outside the ingest window too. A row with 
 `category` or `project` (an old hook row) gets them from its stored kind and cwd (`places=N`).
 The scanner state version did not change: the hook state holds signals and `end`, not the outcome.
 
-`outcome_evidence` holds signal names and counts only (`edit`, `commit`, `push`,
+`outcome_evidence` holds signal names and counts (`edit`, `commit`, `push`,
 `push_main`, `pr_create`, `pr_merge`, `merge_main`, `deploy`, `report_done`,
 `report_partial`, `report_blocked`) plus `end` (`reply`, `user`, `tool`, `result`, `error`,
-`interrupt`). Never command text, paths or messages.
+`interrupt`), and `commits` (below) when the session made any. Never command text or paths.
 
 Limits: a heuristic. It is git- and English-centric: the tool must be the command word of a
 shell segment (`echo git push` does not count); a push or merge done another way (an IDE,
@@ -264,6 +264,59 @@ a script, a merge on GitHub) is not seen; `git merge` counts as a merge into mai
 after `git checkout main` / `git switch main` in the same command; `amem db migrate`
 counts as a deploy even against a local DB. `active` and `abandoned` depend on the time of
 the last ingest or ping.
+
+### Commits
+
+`outcome_evidence.commits`: `[{sha, message, repo, branch}]`, one per commit the session made
+(session_commits.py). Read from the output line git prints for each commit
+(`[<branch> <sha>] <subject>`, also `(root-commit)` and `detached HEAD`) of a shell call that
+runs `git ... commit`: Claude Code `Bash` tool results, Codex `CommandExecution` items
+(`aggregated_output`). `sha` is the short sha as printed; `message` the subject, redacted,
+max 200 chars; `repo` the repo of the `git -C` path, else of the last `cd <path> &&` before the
+commit (a `$VAR` set earlier in the same command is resolved), else of the command's cwd.
+A quiet `git commit -q` prints nothing: when the same command runs `&& git log --oneline`
+after it, the first log line is the commit (branch from `HEAD -> x` when decorated); else, when
+the commit is in an `&&`-only chain that exited 0 and has a `-m` message, it is stored with
+`sha: null` and `branch: null`. `git commit` inside quotes (a grep pattern) is not a commit.
+Deduped by sha (null sha: by repo + message), at most 50 (the latest). A resumed session's
+copied lines count for the earlier session.
+
+`sessions ingest` writes them (the full read is the truth). A hook ping never reads them and
+never drops them: when the stored evidence has `commits` and the ping's has none, the stored
+list is kept. Not seen: a commit made another way (an IDE, a script), one run in the
+background (`run_in_background`: the output is in another file), one whose output was piped
+away. Cloud sessions (no local transcript) get no commits.
+
+### Summary
+
+`summary` (+ `summary_updated_at`): 1 to 3 plain sentences: what was changed or decided, which
+files or areas, whether it finished (session_summary.py). A cheap model (`claude -p --model
+haiku`, no tools, no MCP, no session file, the subscription login; AMEM_SUMMARY_CLAUDE may point
+at another executable) writes it from the title, outcome, `outcome_evidence` (signals and
+commits) and a redacted digest of the transcript: its start (1.5k chars) and end (12k chars),
+user and assistant text plus shortened tool calls. Nothing of the transcript is stored; the
+reply is redacted, cut to 3 sentences and 600 chars, and dropped when empty or junk (a
+refusal, JSON, a code fence, under 20 chars).
+
+A row gets one when it is finished (an outcome other than `active`, and no activity for 30
+minutes or the SessionEnd hook was seen), has no summary or one older than its
+`last_activity_at`, is not a subagent transcript without commits, is not a cloud session, and
+its transcript is on this machine.
+
+- **Automatic:** the last step of `amem sessions ingest`, for sessions active in the ingest
+  window. Off unless `AMEM_SUMMARY_LIVE=1`. Time budget `AMEM_SUMMARY_BUDGET` seconds (default
+  120): no new call starts with less than 10 s left, so the launchd run stays under its 300 s
+  timeout; the rest waits for the next run (`summary_left=N`). `AMEM_SUMMARY_CONCURRENCY`
+  calls at once (default 2). A failed call is counted (`summary_failed=N`); an error of the
+  whole step is `summary_error=<type>`. Neither fails the ingest.
+- **Backfill:** `amem sessions summarize --days 7 [--concurrency 4] [--budget S] [--dry-run]`:
+  sessions started in the window. It also re-reads each transcript's commits into
+  `outcome_evidence.commits` (other keys untouched, stored commits never dropped). Prints
+  `done`, `skipped-no-transcript`, `skipped-subagent`, `failed` (plus up-to-date, not-finished,
+  left-for-next-run, commits-updated). Needs `AMEM_SUMMARY_LIVE=1` unless `--dry-run`.
+
+Cloud sessions (cloud routines and cloud chats, `cloud:` ids) have no local transcript, so no
+summary and no commits.
 
 ## View `session_groups`
 
