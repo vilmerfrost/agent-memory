@@ -45,7 +45,7 @@ FIELDS =("input", "output", "cache_read", "cache_creation")
 SYNTHETIC_MODEL = "<synthetic>"
 UNKNOWN_MODEL = "unknown"
 RECENT_IDS = 64          # message ids remembered for the latest-line-wins rule (lines of one id are adjacent)
-STATE_VERSION = 3       # 2: title, profile (model, effort, time), outcome signals; 3: copied lines of a resumed session left out
+STATE_VERSION = 4       # 2: title, profile (model, effort, time), outcome signals; 3: copied lines of a resumed session left out; 4: commit counted at the result, on proof
 
 
 IDLE_GAP_SECONDS = 600   # a gap between two events longer than this is idle time, not active time

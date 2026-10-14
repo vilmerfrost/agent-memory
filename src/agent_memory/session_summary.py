@@ -111,7 +111,7 @@ def _last(rec: dict[str, Any]) -> datetime | None:
 def skip_reason(rec: dict[str, Any], now: datetime, *, redo_bad: bool = False) -> str | None:
     """Why a stored row gets no summary now (one of REASONS but `no_transcript`), else None.
     Reads the row only; the transcript check comes after. `redo_bad`: a stored summary that
-    is not `compliant` (no PREFIX, or a refusal) is never up to date."""
+    fails `valid_summary` (any rule of summary_problem) is never up to date."""
     meta = rec.get("meta") or {}
     last = _last(rec)
     done_at = rec.get("summary_updated_at")
@@ -170,13 +170,15 @@ def fallback_of(rec: dict[str, Any]) -> session_commits.Fallback | None:
     return session_commits.Fallback(commit_signal(rec), rec.get("started_at"), max(ends) if ends else None)
 
 
-def commits_of(events: list[dict[str, Any]], rec: dict[str, Any]) -> list[dict[str, Any]]:
+def commits_of(events: list[dict[str, Any]], rec: dict[str, Any],
+               stats: dict[str, int] | None = None) -> list[dict[str, Any]]:
+    """The transcript's commits; `stats` gets `confirmed` (confirmed commit calls)."""
     cwd = str((rec.get("meta") or {}).get("cwd") or "")
     fallback = fallback_of(rec)
     if rec.get("tool") == "codex":
-        return session_commits.codex_commits(events, cwd=cwd, fallback=fallback)
+        return session_commits.codex_commits(events, cwd=cwd, fallback=fallback, stats=stats)
     own = (rec.get("meta") or {}).get("parent_session") or rec["session_id"]
-    return session_commits.claude_commits(events, cwd=cwd, own_session=own, fallback=fallback)
+    return session_commits.claude_commits(events, cwd=cwd, own_session=own, fallback=fallback, stats=stats)
 
 
 # --------------------------------------------------------------------------- the prompt
@@ -297,8 +299,9 @@ def call_model(text: str, *, timeout: float = CALL_TIMEOUT) -> str:
 def write_summary(text: str, *, timeout: float = CALL_TIMEOUT,
                   clock: Callable[[], float] = time.monotonic) -> str:
     """The stored summary for a prompt: one model call, and one retry (RETRY_NOTE added) when
-    the reply is junk, a refusal or does not start with PREFIX. `timeout` covers both calls.
-    Raises distill.DraftError when no compliant summary came back: nothing is stored then."""
+    `clean` rejects the reply (it fails valid_summary: a refusal, a remark about the input,
+    markdown, too many sentences, or no PREFIX). `timeout` covers both calls.
+    Raises distill.DraftError when no valid summary came back: nothing is stored then."""
     start = clock()
     got = clean(call_model(text, timeout=timeout))
     if got is not None:
@@ -313,57 +316,105 @@ def write_summary(text: str, *, timeout: float = CALL_TIMEOUT,
     return got
 
 
+# --------------------------------------------------------------------------- the validator
+# One function decides what may be stored: `summary_problem` (None = valid). `clean` runs it on
+# every model reply, `_store` runs it again before the write, and `--redo-bad` redoes every
+# stored row that fails it. The rules are listed in docs/sessions-live.md ("Summary").
+
 _SENTENCE_RE = re.compile(r"(?<=[.!?])\s+(?=[A-Z0-9\"'(`])")
 _LABEL_RE = re.compile(r"^(?:summary|session summary)\s*:\s*", re.I)
-_JUNK_RE = re.compile(r"^(?:i (?:can(?:no|')t|am unable|don't|do not)|as an ai|sorry\b|i'm sorry)|```|^[\[{<]", re.I)
-
-
 _THIS_SESSION_RE = re.compile(r"^This session\s+")
-# A refusal or a note about the input, even when it starts with PREFIX: "The session record was
-# not included in this message, so I cannot describe what the session did."
-# Narrow on purpose: "The session could not access the tool" is a real description and stays.
-_REFUSAL_RE = re.compile(
-    r"\b(?:can ?not|can't|could ?not|couldn't|unable to|not able to)\s+(?:\w+\s+)?(?:describ|summari[sz])\w*"
-    r"|\b(?:record|transcript|digest|session data|details|content)\s+(?:was|were|is|are|has been|have been)\s+"
-    r"not\s+(?:\w+\s+)?(?:included|provided|available|shown|given|attached|present)\b"
-    r"|\b(?:no|missing|empty|without (?:a|the|any))\s+(?:session\s+)?(?:record|transcript|digest)\s+"
-    r"(?:was|were|is|are|to|in|provided|included|given)\b"
-    r"|\bthis (?:message|prompt|request)\b",
+_END_RE = re.compile(r"[.!?][\"')\]`]?$")
+# Markdown structure in the raw reply: a heading, a bullet or numbered item, a code fence.
+_MARKDOWN_RE = re.compile(r"(?m)^\s*(?:#{1,6}\s|[-*+•]\s|\d+[.)]\s)|```|^\s*[\[{<]")
+# The input / prompt / record said to be missing, empty or not included.
+_INPUT = r"(?:input|prompt|record|digest|transcript|session data|details)"
+_MISSING_RE = re.compile(
+    rf"\b{_INPUT}s?\s+(?:is|was|are|were|seems|seemed|appears|appeared|has been|have been)\s+"
+    r"(?:\w+\s+)?(?:missing|absent|empty|blank|truncated|unavailable|"
+    r"not\s+(?:\w+\s+)?(?:included|provided|available|present|given|shown|attached|supplied))\b"
+    r"|\b(?:missing|absent|left out|omitted)\s+(?:from|in)\s+(?:the|this)\s+"
+    r"(?:input|prompt|record|digest|transcript|message|request)\b"
+    r"|\b(?:no|missing|empty|without (?:a|the|any))\s+(?:session\s+)?(?:record|transcript|digest|input)\s+"
+    r"(?:was|were|is|are|to|in|provided|included|given|available)\b",
     re.I)
-_FIRST_PERSON_RE = re.compile(r"(?:^|[\s,;(])I(?:\s|'m\b|'ve\b|'d\b|'ll\b)")
+_NO_SUMMARY_RE = re.compile(r"\bno summary\b|\bsummary (?:was|is|could|can) not\b|\bsummary (?:cannot|can't)\b", re.I)
+_CANNOT_RE = re.compile(r"\b(?:can ?not|can't|could ?not|couldn't|unable to|not able to)\s+(?:\w+\s+){0,2}"
+                        r"(?:describ|summari[sz])\w*", re.I)
+# "I" as a word ("I/O" is not), I'm / I've / I'd / I'll, and me / my / mine / myself.
+_FIRST_PERSON_RE = re.compile(r"(?<![\w/])I(?![\w/])|\b(?:me|my|mine|myself)\b|(?<![\w/])I'(?:m|ve|d|ll)\b")
+_YOU_RE = re.compile(r"\byou(?:r|rs|rself|'re|'ve|'d|'ll)?\b", re.I)
+_META_RE = re.compile(r"\bthis (?:input|message|prompt|request|reply|response|conversation)\b|\bthe provided\b"
+                      r"|\bthe digest\b|\bthe (?:session )?record\b|session[_-]record", re.I)
+
+
+def sentences(text: str) -> list[str]:
+    return [s for s in _SENTENCE_RE.split(text.strip()) if s.strip()]
+
+
+def summary_problem(text: Any) -> str | None:
+    """Why `text` may not be stored as a summary, else None. ALL of these must hold:
+    - a string that starts with "The session " (exact case),
+    - SUMMARY_MIN to SUMMARY_MAX chars, 1 to MAX_SENTENCES sentences, ends with . ! or ?,
+    - plain prose: no markdown heading, bullet, numbered item, code fence, or JSON / tag start,
+    - no remark that the input, prompt, record, digest or transcript is missing, absent, empty
+      or not included,
+    - no "no summary", and no "cannot / can't / unable to describe or summarize",
+    - no first person (I, me, my), and no "you" (it never addresses the reader),
+    - no meta words about the prompt: "this input", "this message", "this prompt",
+      "the provided", "the digest", "the record"."""
+    if not isinstance(text, str) or not text.strip():
+        return "empty"
+    if not text.startswith(PREFIX + " "):
+        return f"does not start with {PREFIX!r}"
+    if len(text) < SUMMARY_MIN:
+        return "too short"
+    if len(text) > SUMMARY_MAX:
+        return "too long"
+    if _MARKDOWN_RE.search(text):
+        return "markdown, not plain prose"
+    if "\n" in text:
+        return "more than one line"
+    if not _END_RE.search(text):
+        return "not a finished sentence"
+    if len(sentences(text)) > MAX_SENTENCES:
+        return f"more than {MAX_SENTENCES} sentences"
+    for name, pattern in (("says the input is missing", _MISSING_RE), ("says no summary", _NO_SUMMARY_RE),
+                          ("says it cannot describe", _CANNOT_RE), ("first person", _FIRST_PERSON_RE),
+                          ("addresses the reader", _YOU_RE), ("talks about the prompt", _META_RE)):
+        if pattern.search(text):
+            return name
+    return None
+
+
+def valid_summary(text: Any) -> bool:
+    """True only for a summary that may be stored (summary_problem is None)."""
+    return summary_problem(text) is None
 
 
 def refusal(summary: str) -> bool:
-    """True for a refusal or a remark about the prompt instead of a description of the session
-    (first person, "cannot describe", "was not included", "no transcript")."""
-    return bool(_REFUSAL_RE.search(summary)) or bool(_FIRST_PERSON_RE.search(summary))
+    """True for a refusal or a remark about the prompt instead of a description of the session."""
+    return any(p.search(summary) for p in (_MISSING_RE, _NO_SUMMARY_RE, _CANNOT_RE, _FIRST_PERSON_RE,
+                                            _YOU_RE, _META_RE))
 
 
 def compliant(summary: Any) -> bool:
-    """A stored summary describes the session in the third person: it starts with PREFIX and is
-    no refusal. Anything else (the agent's own last reply, advice, a continuation, "the record
-    was not included") is never stored, and `--redo-bad` redoes it."""
-    return isinstance(summary, str) and summary.startswith(PREFIX + " ") and not refusal(summary)
+    """A stored summary passes the validator (valid_summary). `--redo-bad` redoes the rest."""
+    return valid_summary(summary)
 
 
 def clean(text: Any) -> str | None:
-    """The stored summary: one line, redacted, at most MAX_SENTENCES sentences and SUMMARY_MAX
-    chars, starting with PREFIX. None for empty, junk (a refusal, JSON, a code fence, too
-    short) or non-compliant output (it does not start with PREFIX, or is a refusal)."""
-    if not isinstance(text, str):
+    """The stored summary for a raw model reply, or None (nothing is stored). Repairs only:
+    surrounding whitespace and quotes, `**` bold marks, a `Summary:` label, line breaks inside
+    prose, and "This session ..." -> "The session ...". Then redaction, then valid_summary.
+    Markdown structure in the raw reply (headings, bullets, fences) is rejected, never repaired."""
+    if not isinstance(text, str) or _MARKDOWN_RE.search(text.strip()):
         return None
     out = " ".join(text.replace("**", "").split())
     out = _LABEL_RE.sub("", out).strip().strip('"').strip()
     out = _THIS_SESSION_RE.sub(PREFIX + " ", out)   # the one safe repair: "This session ..." -> "The session ..."
-    if len(out) < SUMMARY_MIN or _JUNK_RE.search(out) or not compliant(out):
-        return None
-    out = " ".join(_SENTENCE_RE.split(out)[:MAX_SENTENCES])
     out = redact.redact(out)
-    if len(out) > SUMMARY_MAX:
-        cut = out[:SUMMARY_MAX]
-        end = max(cut.rfind(". "), cut.rfind("! "), cut.rfind("? "))
-        out = cut[: end + 1] if end >= SUMMARY_MIN else cut[: SUMMARY_MAX - 1].rstrip() + "…"
-    return out
+    return out if valid_summary(out) else None
 
 
 # --------------------------------------------------------------------------- the run
@@ -551,16 +602,20 @@ def bad_commit(commit: dict[str, Any]) -> bool:
 def _refresh_commits(conn: Any, rec: dict[str, Any], events: list[dict[str, Any]], report: SummaryReport,
                      dry_run: bool) -> None:
     """Re-read the transcript's commits into `outcome_evidence.commits`. A non-empty re-read
-    replaces the stored list; an empty one keeps it, minus `bad_commit` entries. Never touches
-    another evidence key, never creates evidence (a row without `outcome_evidence` has no
-    outcome yet)."""
+    replaces the stored list; an empty one keeps it, minus `bad_commit` entries and, when the
+    transcript has no confirmed commit call, minus git-log entries (an older fallback ran on a
+    `git commit` in a grep pattern). Never touches another evidence key, never creates
+    evidence (a row without `outcome_evidence` has no outcome yet)."""
     evidence = rec.get("outcome_evidence")
     if not isinstance(evidence, dict):
         return
-    found = commits_of(events, rec)
+    stats: dict[str, int] = {}
+    found = commits_of(events, rec, stats)
     stored = _commits(evidence)
     if not found:   # keep what is stored, but drop entries an older parser got wrong
-        found = [c for c in stored if not bad_commit(c)]
+        unconfirmed = not stats.get("confirmed")
+        found = [c for c in stored if not bad_commit(c)
+                 and not (unconfirmed and c.get("source") == session_commits.SOURCE_GIT_LOG)]
     if found == evidence.get("commits") or (not found and not stored):
         return
     report.commits_updated += 1
