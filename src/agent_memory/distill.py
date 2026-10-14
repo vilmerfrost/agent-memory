@@ -215,9 +215,14 @@ def call_writer(prompt: str, *, timeout: float = DEFAULT_TIMEOUT) -> str:
 
 
 def run_cli(argv: list[str], prompt: str, *, timeout: float = DEFAULT_TIMEOUT) -> str:
-    """Run a headless CLI argv with the prompt on stdin; return stdout. Raises WriterError."""
+    """Run a headless CLI argv with the prompt on stdin; return stdout. Raises WriterError.
+
+    The child gets `AMEM_HOOK_OFF=1`: the user's session hook (deploy/hooks/amem-session-hook.sh)
+    would otherwise record every model call as its own empty `sessions` row.
+    """
+    env = {**os.environ, "AMEM_HOOK_OFF": "1"}
     try:
-        proc = subprocess.run(argv, input=prompt, capture_output=True, text=True, timeout=timeout)
+        proc = subprocess.run(argv, input=prompt, capture_output=True, text=True, timeout=timeout, env=env)
     except subprocess.TimeoutExpired:
         raise WriterError(f"timed out after {timeout:g}s") from None
     except OSError as exc:

@@ -140,3 +140,14 @@ def writer(monkeypatch: pytest.MonkeyPatch) -> Callable[..., FakeWriter]:
         monkeypatch.setattr(distill, "call_writer", fake)
         return fake
     return use
+
+
+def test_run_cli_turns_the_session_hook_off_for_the_child(tmp_path, monkeypatch):
+    """A headless model call must not show up as its own `sessions` row (the hook skips it)."""
+    from agent_memory import distill
+
+    monkeypatch.delenv("AMEM_HOOK_OFF", raising=False)
+    script = tmp_path / "fake-claude"
+    script.write_text('#!/bin/sh\ncat >/dev/null\nprintf "%s" "${AMEM_HOOK_OFF:-unset}"\n')
+    script.chmod(0o755)
+    assert distill.run_cli([str(script)], "prompt") == "1"
