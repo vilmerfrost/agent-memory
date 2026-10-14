@@ -125,6 +125,7 @@ Each part has its own doc:
 | Evals harvest (draft eval cases) | `evals harvest --out DIR [--days 7] [--limit N] [--dry-run]` | [docs/evals-harvest.md](docs/evals-harvest.md) |
 | Daily job | `daily` | [docs/daily.md](docs/daily.md) |
 | Dispatch tasks as runs | `ingest tasks` | [docs/tasks.md](docs/tasks.md) |
+| Skill usage + scores | `ingest skills`, `skills scores [--refresh]`, `skills cache PATH`, `skills suggest` | [docs/skills.md](docs/skills.md) |
 | Cloud path (HTTPS, no raw Postgres) | `AMEM_BACKEND=rest`, `ingest git-ref`, `jev record`, `tools/amem_digest.py` / `digest-self` (cloud routine sessions) | [docs/cloud.md](docs/cloud.md) |
 | Jev scoring + human labels | `score`, `label`, `escalations`, `calibrate`, `drift` | [docs/scoring.md](docs/scoring.md) |
 | Lessons memory (frozen) | `lessons import/export/for/score/distill`, `lesson propose`, `gate friction` | [docs/lessons.md](docs/lessons.md) |
