@@ -62,11 +62,21 @@ Rules:
 
 ### Session match
 
-A call matches a session when all of these hold:
+**Direct link first.** Since 2026-10-14 `track.py` logs the hook's `session_id` on every line.
+`amem ingest skills` keeps it in `skill_calls.logged_session` (Codex ids get the `codex:` prefix
+that `sessions` uses) and links the call to that sessions row as soon as the row exists, whatever
+the cwd or time says.
+
+**Otherwise** (older lines, or the session row is missing) a call matches a session when all of
+these hold:
 
 1. `sessions.tool = skill_calls.agent`.
-2. `sessions.meta->>'cwd' = skill_calls.cwd` (exact).
+2. `skill_calls.cwd` is the session's `meta.cwd` or any cwd it visited (`meta.cwds`, written by
+   `sessions ingest`). `meta.cwd` alone is the session's final work folder, so a chat that moved
+   from a scratch folder to a repo would miss every call made before the move.
 3. `ts` lies in `started_at - 1 min .. greatest(started_at, ended_at, last_activity_at) + 1 min`.
+
+Rows ingested before `meta.cwds` existed get it when `amem sessions ingest` re-reads their transcript.
 
 When several sessions match, the one with the latest `started_at` wins. A call with no match
 keeps `session_id` null. Every ingest and every `scores --refresh` retries the null rows, so a
