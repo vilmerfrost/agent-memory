@@ -1,4 +1,4 @@
-"""`amem sessions ingest|summarize|tokens|cost` and `amem deviations scan|report|reref|rules`
+"""`amem sessions ingest|summarize|tokens|cost|find` and `amem deviations scan|report|reref|rules`
 (docs/deviations.md, docs/sessions-live.md). `amem sessions ping` is session_live.main (cli.main
 routes it). `sessions summarize` without `--dry-run` needs AMEM_SUMMARY_LIVE=1 (else exit 2).
 
@@ -114,6 +114,44 @@ def cmd_sessions_tokens(args: argparse.Namespace) -> int:
     else:
         for line in tokens_report.lines(doc, by=tuple(args.by) if args.by else tokens_report.DEFAULT_BY):
             print(line)
+    return 0
+
+
+def _agent_id(value: str) -> str:
+    from agent_memory import session_find
+
+    if not session_find.valid_agent_id(value):
+        raise argparse.ArgumentTypeError(f"not an agent id (letters, digits, - and _): {value!r}")
+    return value
+
+
+def cmd_sessions_find(args: argparse.Namespace) -> int:
+    from agent_memory import session_find
+
+    guard = _write_guard if args.ingest else _read_guard
+    if (code := guard("sessions find")) is not None:
+        return code
+    try:
+        if args.ingest:
+            root = sessions_ingest.projects_dir(args.projects_dir)
+            files, new, updated = session_find.ingest(args.agent_id, root)
+            if not files:
+                print(f"amem: sessions find: no transcript agent-{args.agent_id}.jsonl under "
+                      f"{root}/*/*/subagents/", file=sys.stderr)
+                return 1
+            print(f"ingested {files} file(s): {new} new, {updated} updated", file=sys.stderr)
+        rows = session_find.find(args.agent_id)
+    except (OSError, psycopg.Error) as exc:
+        return _err("sessions find", exc)
+    if not rows:
+        print(f"amem: sessions find: no session for agent {args.agent_id} yet (not ingested); "
+              "run again with --ingest, or run `amem sessions ingest`", file=sys.stderr)
+        return 1
+    for row in rows:
+        if args.json:
+            print(json.dumps(row, default=str, sort_keys=True))
+        else:
+            print("\t".join(str(row[k] or "") for k in ("session_id", "category", "project")))
     return 0
 
 
@@ -258,6 +296,17 @@ def register(sub: Any) -> None:
     p.add_argument("--project", default=None, help="this project only (the sessions.project value)")
     p.add_argument("--json", action="store_true", help="the totals as one JSON object (the improve contract)")
     p.set_defaults(func=cmd_sessions_cost)
+
+    p = s_sub.add_parser("find", help="the sessions row of a subagent transcript agent-<ID>.jsonl: prints "
+                                      "session_id, category, project (tab-separated); exit 1 when not ingested "
+                                      "(docs/deviations.md, \"Incident scans\")")
+    p.add_argument("--agent-id", required=True, type=_agent_id,
+                   help="the subagent id (the file is .../subagents/agent-<ID>.jsonl)")
+    p.add_argument("--ingest", action="store_true", help="ingest that one transcript first (idempotent)")
+    p.add_argument("--projects-dir", type=Path, default=None,
+                   help="Claude Code projects folder for --ingest (default AMEM_PROJECTS_DIR or ~/.claude/projects)")
+    p.add_argument("--json", action="store_true", help="JSON lines (adds kind, started_at, scanned_at)")
+    p.set_defaults(func=cmd_sessions_find)
 
     # Handled in cli.main before parsing (it must exit 0 even for bad arguments).
     s_sub.add_parser("ping", add_help=False,
