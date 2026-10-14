@@ -59,7 +59,7 @@ def ingest(agent_id: str, root: Path, *, db_url: str | None = None) -> tuple[int
         project_dir = path.parent.parent.parent.name
         parent = path.parent.parent.name
         row = sessions_ingest.session_row(path, project_dir, parent_session=parent)
-        if row.started_at is not None:
+        if row.started_at is not None and not row.copy_only:   # a pure copy gets no row (session_resume)
             rows.append(row)
     new, updated = sessions_ingest.upsert(rows, db_url=db_url) if rows else (0, 0)
     return len(paths), new, updated

@@ -117,6 +117,35 @@ def cmd_sessions_tokens(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_sessions_dedupe_resumes(args: argparse.Namespace) -> int:
+    from agent_memory import session_resume_backfill as backfill
+
+    write = args.apply or args.revert is not None
+    if (code := (_write_guard if write else _read_guard)("sessions dedupe-resumes")) is not None:
+        return code
+    try:
+        if args.revert is not None:
+            got = backfill.revert(args.revert)
+            print(f"dedupe-resumes: reverted {got['rows']} rows, {got['deviations']} deviations and "
+                  f"{got['skill_calls']} skill calls from {args.revert}")
+            return 0
+        plan = backfill.plan(sessions_ingest.projects_dir(args.projects_dir))
+        for line in backfill.lines(plan):
+            print(line)
+        if not args.apply:
+            print("  dry run: nothing written (--apply to fix)")
+            return 0
+        if not plan.changes:
+            return 0
+        log = args.log or backfill.default_log()
+        got = backfill.apply(plan, log)
+    except (OSError, ValueError, psycopg.Error) as exc:
+        return _err("sessions dedupe-resumes", exc)
+    print(f"  applied: {got['updated']} updated, {got['deleted']} deleted, {got['skill_calls']} skill calls moved; "
+          f"log {log} (undo: amem sessions dedupe-resumes --revert {log})")
+    return 0
+
+
 def _agent_id(value: str) -> str:
     from agent_memory import session_find
 
@@ -307,6 +336,17 @@ def register(sub: Any) -> None:
                    help="Claude Code projects folder for --ingest (default AMEM_PROJECTS_DIR or ~/.claude/projects)")
     p.add_argument("--json", action="store_true", help="JSON lines (adds kind, started_at, scanned_at)")
     p.set_defaults(func=cmd_sessions_find)
+
+    p = s_sub.add_parser("dedupe-resumes", help="re-read the rows of resumed transcripts so copied lines count "
+                                                "once (docs/sessions-live.md, \"Resumed sessions\"); dry run "
+                                                "unless --apply")
+    p.add_argument("--apply", action="store_true", help="write the fix (a JSON log of the old rows first)")
+    p.add_argument("--log", type=Path, default=None,
+                   help="the log file for --apply (default <claude home>/parent/amem-dedupe-resumes-<time>.json)")
+    p.add_argument("--revert", type=Path, default=None, metavar="LOG", help="put the rows of an --apply log back")
+    p.add_argument("--projects-dir", type=Path, default=None,
+                   help="Claude Code projects folder (default AMEM_PROJECTS_DIR or ~/.claude/projects)")
+    p.set_defaults(func=cmd_sessions_dedupe_resumes)
 
     # Handled in cli.main before parsing (it must exit 0 even for bad arguments).
     s_sub.add_parser("ping", add_help=False,
