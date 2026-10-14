@@ -590,8 +590,14 @@ def session_row(path: Path, project_dir: str, *, parent_session: str | None = No
     tokens = session_tokens.claude_summary(events, own_session=own)
     row = SessionRow(sid, kind, repo, project_dir, facts.start, facts.end, size,
                      facts.skills, [], meta, path, tokens=tokens).with_summary(tokens)
-    row.commits = session_commits.claude_commits(events, cwd=cwd, own_session=own)
+    row.commits = session_commits.claude_commits(events, cwd=cwd, own_session=own, fallback=commit_fallback(row))
     return _with_instructions(row)
+
+
+def commit_fallback(row: SessionRow) -> session_commits.Fallback:
+    """The git-log fallback of a local transcript: its `commit` signal count and time window."""
+    return session_commits.Fallback(int((row.signals or {}).get("commit") or 0), row.started_at,
+                                    row.ended_at or row.started_at)
 
 
 def _with_instructions(row: SessionRow) -> SessionRow:
@@ -668,7 +674,7 @@ def codex_row(path: Path, rel_dir: str, titles: dict[str, str] | None = None) ->
     title = (titles or {}).get(f.thread_id or path.stem)
     row = SessionRow(sid, kind, repo, rel_dir, f.start, f.end, size, f.skills, [], meta, path, tool="codex",
                      tokens=tokens, title=title).with_summary(tokens)
-    row.commits = session_commits.codex_commits(events, cwd=cwd)
+    row.commits = session_commits.codex_commits(events, cwd=cwd, fallback=commit_fallback(row))
     return _with_instructions(row)
 
 
@@ -735,6 +741,7 @@ class IngestReport:
     summary_failed: int = 0     # model calls that failed or answered junk
     summary_left: int = 0       # rows not looked at: the time budget ran out (the next run picks them up)
     summary_error: str | None = None   # the summary step itself failed (ingest still succeeds)
+    summary_live: bool = False  # the summary step ran (AMEM_SUMMARY_LIVE=1)
 
     def line(self) -> str:
         kinds = " ".join(f"{k}={self.kinds.get(k, 0)}" for k in KINDS)
@@ -743,7 +750,10 @@ class IngestReport:
         bad = f" cloud_bad={self.cloud_bad}" if self.cloud_bad else ""
         spool = f" spool={self.spool}" if self.spool else ""
         fixed = (f" outcomes={self.outcomes}" if self.outcomes else "") + (f" places={self.places}" if self.places else "")
-        summ = "".join(f" {k}={v}" for k, v in (("summaries", self.summaries), ("summary_failed", self.summary_failed),
+        # The summary step's state, always: `summary=off` (AMEM_SUMMARY_LIVE is not 1) or
+        # `summaries=N`, even 0, so a launchd log tells "off" from "nothing eligible".
+        summ = " summary=off" if not self.summary_live else f" summaries={self.summaries}"
+        summ += "".join(f" {k}={v}" for k, v in (("summary_failed", self.summary_failed),
                                                  ("summary_left", self.summary_left)) if v)
         summ += f" summary_error={self.summary_error}" if self.summary_error else ""
         return (f"sessions: {self.files} files, {self.new} new, {self.updated} updated, "
@@ -1155,6 +1165,7 @@ def summarize_step(report: IngestReport, *, days: int, now: datetime | None, db_
 
     if not session_summary.live():
         return
+    report.summary_live = True
     try:
         got = session_summary.summarize(days=days, now=now, db_url=db_url, budget=session_summary.budget_seconds(),
                                         workers=session_summary.concurrency(), window="active")

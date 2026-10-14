@@ -98,7 +98,7 @@ def test_codex_ingest_is_idempotent_and_stores_the_tool(setup_home: Home, pg_url
         conn.execute("delete from sessions")
     first = sessions_ingest.ingest(setup_home.projects, days=7, now=NOW, db_url=pg_url)
     assert (first.new, first.updated, first.tools) == (11, 0, {"claude": 6, "codex": 5})
-    assert first.line().endswith("tools(claude=6 codex=5) team=0")
+    assert first.line().endswith("tools(claude=6 codex=5) team=0 summary=off")
     second = sessions_ingest.ingest(setup_home.projects, days=7, now=NOW, db_url=pg_url)
     assert (second.new, second.updated) == (0, 0)
     with psycopg.connect(pg_url) as conn:
