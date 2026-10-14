@@ -418,7 +418,20 @@ def digest_lines(events: list[dict[str, Any]]) -> list[str]:
             if a.get("type") == "hook_blocking_error":
                 lines.append(f"HOOK BLOCKED {a.get('hookEvent') or '?'}: "
                              f"{_one_line(a.get('blockingError') or '', ERROR_MAX)}")
-    return lines
+    return _number_preamble(lines)
+
+
+_TURN_LABEL = re.compile(r"^\[turn (\d+)\]")
+
+
+def _number_preamble(lines: list[str]) -> list[str]:
+    """Activity before the first labeled prompt (a slash command or pasted block that is not a
+    typed prompt, a resumed session) gets its own `[turn 1]`, and every later turn moves up one.
+    Without it the writer had no turn to cite for that activity and sent `turn: 0`."""
+    if not lines or _TURN_LABEL.match(lines[0]):
+        return lines
+    shifted = [_TURN_LABEL.sub(lambda m: f"[turn {int(m.group(1)) + 1}]", line) for line in lines]
+    return ["[turn 1] START: activity before the first typed prompt", *shifted]
 
 
 _CODEX_ARG_KEYS = {
@@ -750,6 +763,8 @@ def parse_findings(text: str, offered: set[str]) -> list[Finding]:
         if source not in offered:
             raise FindingError(f"deviation {i}: instruction_source {source!r} was not offered")
         turn = item.get("turn")
+        if turn == 0 and not isinstance(turn, bool):
+            turn = 1   # the digest numbers from 1; 0 can only mean the activity before the first prompt
         if turn is not None and (isinstance(turn, bool) or not isinstance(turn, int) or turn < 1):
             raise FindingError(f"deviation {i}: turn must be a positive integer or null, got {turn!r}")
         try:

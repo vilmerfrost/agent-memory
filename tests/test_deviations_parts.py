@@ -63,6 +63,22 @@ def test_digest_scheduled_task_start_is_one_line() -> None:
     assert lines == ["[turn 1] SCHEDULED TASK nightly-check started (its prompt is in the instructions)"]
 
 
+def test_digest_activity_before_the_first_prompt_is_turn_1() -> None:
+    # A resumed session: tool calls and a reply before any typed prompt (the writer used to cite turn 0).
+    events = [
+        assistant(tool("Skill", "s1", skill="handoff", args="resume"), minute=0),
+        assistant(text("I resumed the handoff."), minute=1),
+        user("Fix the bug.", 2),
+        assistant(text("Fixed."), minute=3),
+        user("Now ship it.", 4),
+    ]
+    lines = deviations.digest_lines(events)
+    assert lines[0] == "[turn 1] START: activity before the first typed prompt"
+    assert "[turn 2] USER: Fix the bug." in lines and "[turn 3] USER: Now ship it." in lines
+    assert [line for line in lines if line.startswith("[turn")][1:] == ["[turn 2] USER: Fix the bug.",
+                                                                        "[turn 3] USER: Now ship it."]
+
+
 def test_digest_redacts_credentials() -> None:
     secrets = ["sk-ant-api03-abcdefghijklmnop", "ghp_abcdefghijklmnopqrstuvwx", "AKIAABCDEFGHIJKLMNOP",
                "eyJhbGciOiJIUzI1.eyJzdWIiOiIxMjM0.c2lnbmF0dXJl"]
@@ -176,7 +192,7 @@ def test_parse_good_reply() -> None:
     (_reply(finding(followed=1.5)), "followed_grade must be a number in 0..1"),
     (_reply(finding(result_=True)), "result_grade must be a number"),
     (_reply(finding(turn=True)), "turn must be a positive integer"),
-    (_reply(finding(turn=0)), "turn must be a positive integer"),
+    (_reply(finding(turn=-1)), "turn must be a positive integer"),
     (_reply(finding(what=7)), "what must be a string"),
     (_reply(finding(why="```\nrm -rf x\n```")), "code block"),
     (_reply(finding(how='"the exact words the user typed in that turn"')), "empty after removing"),
@@ -185,6 +201,11 @@ def test_parse_good_reply() -> None:
 def test_parse_rejects_malformed(reply: str, message: str) -> None:
     with pytest.raises(FindingError, match=message):
         parse_findings(reply, OFFERED)
+
+
+def test_parse_turn_0_means_the_first_turn() -> None:
+    (f,) = parse_findings(_reply(finding(turn=0)), OFFERED)
+    assert f.turn == 1
 
 
 def test_parse_strips_quotes_paths_code_and_secrets() -> None:
