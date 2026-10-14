@@ -31,7 +31,7 @@ from test_deviations_support import (  # noqa: F401
 
 ROOT = Path(__file__).resolve().parent.parent
 MIGRATION = ROOT / "supabase" / "migrations" / "20261019030000_session_summary.sql"
-SUMMARY = "Fixed the flaky parser test in parser.py and committed the fix. The work finished."
+SUMMARY = "The session fixed the flaky parser test in parser.py and committed the fix. The work finished."
 
 
 def commit(cwd: str, tid_: str, output: str, *, command: str = 'git commit -m "x"', minute: int = 5,
@@ -162,8 +162,12 @@ def test_skip_reasons() -> None:
 
 @pytest.mark.parametrize("reply,want", [
     (SUMMARY, SUMMARY),
-    ("Summary: Did one thing.  Then another thing. Then a third. And a fourth.",
-     "Did one thing. Then another thing. Then a third."),
+    ("Summary: The session did one thing.  Then another thing. Then a third. And a fourth.",
+     "The session did one thing. Then another thing. Then a third."),
+    ("This session fixed the parser in parser.py.", "The session fixed the parser in parser.py."),
+    # Not about the session: the agent's own reply, advice, first person. Never stored.
+    ("A handoff from 19 hours ago exists. Treat its claims as unverified.", None),
+    ("I fixed the parser and committed it.", None), ("In this session the parser was fixed.", None),
     ("", None), ("   ", None), ("ok", None), ("I can't help with that request, sorry.", None),
     ('{"summary": "json is junk here"}', None), ("```\nfenced text here\n```", None),
 ])
@@ -172,7 +176,7 @@ def test_clean(reply: str, want: str | None) -> None:
 
 
 def test_clean_caps_and_redacts() -> None:
-    got = session_summary.clean("Set api_key=abcdefghijklmnop0123 in the config. " + "word " * 300)
+    got = session_summary.clean("The session set api_key=abcdefghijklmnop0123 in the config. " + "word " * 300)
     assert got is not None and len(got) <= session_summary.SUMMARY_MAX and "abcdefghijklmnop0123" not in got
 
 
@@ -339,8 +343,10 @@ def test_ingest_runs_the_summary_step_and_never_fails_on_it(setup_home: Home, db
     _sessions(setup_home)
     off = _ingest(setup_home, db)                              # live flag off: no step
     assert off.summaries == 0 and _row(db, "committed-1")["summary"] is None
+    assert " summary=off" in off.line() and "summaries=" not in off.line()
     monkeypatch.setenv(session_summary.LIVE_ENV, "1")
-    fake = FakeModel(distill.WriterError("timed out after 60s"), "ok")   # a failure, junk, then a good one
+    # a failure; junk twice (the reply and its one retry); then a good one
+    fake = FakeModel(distill.WriterError("timed out after 60s"), "ok", "ok")
     monkeypatch.setattr(session_summary, "call_model", fake)
     monkeypatch.setenv(session_summary.CONCURRENCY_ENV, "1")
     got = _ingest(setup_home, db)
@@ -384,7 +390,114 @@ def test_cli_summarize_dry_run_and_live_gate(setup_home: Home, db: str) -> None:
     res = run_amem("sessions", "summarize", "--days", "3650", "--dry-run", env=env)
     assert res.returncode == 0, res.stderr
     assert re.fullmatch(r"summaries: would summarize \d+, skipped-no-transcript \d+, skipped-subagent \d+, "
-                        r"failed 0 \(up-to-date \d+, not-finished \d+, left-for-next-run 0, commits-updated \d+\)\n",
-                        res.stdout), res.stdout
+                        r"failed 0 \(up-to-date \d+, not-finished \d+, left-for-next-run 0, commits-updated \d+, "
+                        r"bad-summaries \d+\)\n" + COMMITS_LINE + r"\n", res.stdout), res.stdout
     gated = run_amem("sessions", "summarize", "--days", "7", env=env)
     assert gated.returncode == 2 and "AMEM_SUMMARY_LIVE" in gated.stderr
+    for flags in (["--redo-bad", "--dry-run"], ["--commits-only", "--dry-run"]):
+        res = run_amem("sessions", "summarize", "--days", "3650", *flags, env=env)
+        assert res.returncode == 0, res.stderr
+        assert re.search(COMMITS_LINE, res.stdout) and ("summaries:" in res.stdout) == ("--redo-bad" in flags)
+
+
+COMMITS_LINE = (r"commits: committed sessions with a non-empty commits list: before \d+/\d+, (?:after|would be) "
+                r"\d+/\d+; top-level before \d+/\d+, (?:after|would be) \d+/\d+ \(rows updated \d+, from git log \d+\)")
+
+
+# --------------------------------------------------------------------------- third-person summaries
+
+
+ADVICE = ("A handoff from 19 hours ago exists. Treat its claims as unverified and check the branch before "
+          "you continue.")
+
+
+def _advice_session(home: Home) -> str:
+    cwd = str(home.repo)
+    events = (chat_events(cwd) + commit(cwd, "c1", "[main 1a2b3c4] Fix the parser", minute=7)
+              + [assistant(text(ADVICE), minute=9, cwd=cwd)])
+    write_transcript(home.project("-work-demo-repo") / "advice-1.jsonl", events)
+    return "advice-1"
+
+
+def test_advice_like_last_message_gets_a_third_person_summary(setup_home: Home, db: str,  # noqa: F811
+                                                             monkeypatch: pytest.MonkeyPatch) -> None:
+    sid = _advice_session(setup_home)
+    _ingest(setup_home, db)
+    # The model echoes the agent's last reply first: rejected, one retry, the retry is stored.
+    fake = FakeModel(ADVICE)
+    monkeypatch.setattr(session_summary, "call_model", fake)
+    got = session_summary.summarize(days=7, now=NOW, db_url=db)
+    stored = _row(db, sid)["summary"]
+    assert (got.done, got.failed) == (1, 0) and stored == SUMMARY and stored.startswith("The session")
+    first, retry = fake.prompts
+    record = first.index("<session_record>\n=== Facts")
+    assert record < first.index(ADVICE) < first.rindex("</session_record>")
+    assert 'must begin with "The session"' in first and retry == first + session_summary.RETRY_NOTE
+
+
+def test_non_compliant_reply_is_never_stored(setup_home: Home, db: str,  # noqa: F811
+                                            monkeypatch: pytest.MonkeyPatch) -> None:
+    sid = _advice_session(setup_home)
+    _ingest(setup_home, db)
+    fake = FakeModel(default=ADVICE)   # the reply and its retry both continue the transcript
+    monkeypatch.setattr(session_summary, "call_model", fake)
+    got = session_summary.summarize(days=7, now=NOW, db_url=db)
+    assert (got.done, got.failed, len(fake.prompts)) == (0, 1, 2)
+    assert _row(db, sid)["summary"] is None and "does not start with 'The session'" in got.errors[0]
+
+
+def test_redo_bad_summarizes_the_bad_rows_again(setup_home: Home, db: str,  # noqa: F811
+                                               monkeypatch: pytest.MonkeyPatch) -> None:
+    _sessions(setup_home)
+    _ingest(setup_home, db)
+    monkeypatch.setattr(session_summary, "call_model", FakeModel())
+    assert session_summary.summarize(days=7, now=NOW, db_url=db).done == 3
+    with psycopg.connect(db) as conn:   # one row holds an old summary: the agent's own reply
+        conn.execute("update sessions set summary = %s where session_id = 'committed-1'", (ADVICE,))
+    plain = session_summary.summarize(days=7, now=NOW, db_url=db, dry_run=True)
+    assert plain.done == 0 and plain.bad == 1                       # without the flag: up to date
+    dry = session_summary.summarize(days=7, now=NOW, db_url=db, dry_run=True, redo_bad=True)
+    assert dry.done == 1 and dry.bad == 1 and _row(db, "committed-1")["summary"] == ADVICE
+    got = session_summary.summarize(days=7, now=NOW, db_url=db, redo_bad=True)
+    assert got.done == 1 and _row(db, "committed-1")["summary"] == SUMMARY
+    assert session_summary.summarize(days=7, now=NOW, db_url=db, dry_run=True, redo_bad=True).bad == 0
+
+
+def test_ingest_line_shows_summaries_zero_when_live_and_nothing_is_eligible(setup_home: Home, db: str,  # noqa: F811
+                                                                           monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(session_summary.LIVE_ENV, "1")
+    monkeypatch.setattr(session_summary, "call_model", FakeModel())
+    got = _ingest(setup_home, db)            # no transcripts at all
+    assert got.summary_live and " summaries=0" in got.line() and "summary=off" not in got.line()
+    monkeypatch.setenv(session_summary.LIVE_ENV, "0")
+    assert " summary=off" in _ingest(setup_home, db).line()
+
+
+# --------------------------------------------------------------------------- commit backfill
+
+
+def test_commits_only_backfill_counts_before_and_after(setup_home: Home, db: str) -> None:  # noqa: F811
+    _sessions(setup_home)
+    _ingest(setup_home, db)
+    with psycopg.connect(db) as conn:   # rows stored by the old parser: no commits list
+        conn.execute("update sessions set outcome_evidence = outcome_evidence - 'commits'")
+    dry = session_summary.summarize(days=7, now=NOW, db_url=db, dry_run=True, commits_only=True)
+    assert (dry.committed, dry.with_commits_before, dry.with_commits_after) == ([2, 1], [0, 0], [2, 1])
+    assert dry.done == 0 and "commits" not in _row(db, "committed-1")["outcome_evidence"]
+    assert "before 0/2, would be 2/2; top-level before 0/1, would be 1/1" in dry.commits_line(dry_run=True)
+    got = session_summary.summarize(days=7, now=NOW, db_url=db, commits_only=True)
+    assert got.commits_updated == 2 and _row(db, "committed-1")["outcome_evidence"]["commits"][0]["sha"] == "1a2b3c4"
+    assert session_summary.summarize(days=7, now=NOW, db_url=db, dry_run=True,
+                                     commits_only=True).with_commits_before == [2, 1]
+
+
+def test_backfill_finds_a_transcript_that_moved_project_folder(setup_home: Home, db: str) -> None:  # noqa: F811
+    _sessions(setup_home)
+    _ingest(setup_home, db)
+    with psycopg.connect(db) as conn:   # the row names the folder the session started in
+        conn.execute("update sessions set project_dir = '-work-elsewhere', "
+                     "outcome_evidence = outcome_evidence - 'commits' where session_id = 'committed-1'")
+    rec = {**_row(db, "committed-1")}
+    assert session_summary.transcript_of(rec) == setup_home.projects / "-work-demo-repo" / "committed-1.jsonl"
+    got = session_summary.summarize(days=7, now=NOW, db_url=db, commits_only=True)
+    assert got.commits_updated == 1 and _row(db, "committed-1")["outcome_evidence"]["commits"][0]["sha"] == "1a2b3c4"

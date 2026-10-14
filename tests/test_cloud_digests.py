@@ -329,7 +329,7 @@ def test_ingest_turns_cloud_rows_into_sessions(setup_home: Home, db: str,  # noq
     post(db, cloud_row(files))
     first = sessions_ingest.ingest(setup_home.projects, days=7, now=NOW, db_url=db)
     assert first.line() == ("sessions: 1 files, 1 new, 0 updated, 0 skipped (chat=0 parent=0 worker=0 headless=0 "
-                            "eval=0 routine=1) tools(claude=1 codex=0) team=0 cloud=1")
+                            "eval=0 routine=1) tools(claude=1 codex=0) team=0 cloud=1 summary=off")
     (s,) = _q(db, "select session_id, tool, kind, repo, project_dir, started_at is not null, transcript_bytes, "
                   "skills, instructions, meta from sessions")
     assert s[:7] == (f"cloud:{SID}", "claude", "routine", "nightly-trials", "cloud", True,
@@ -363,7 +363,7 @@ def test_cli_sessions_ingest_reads_cloud_rows(setup_home: Home, db: str,  # noqa
                    AMEM_PROJECTS_DIR=str(setup_home.projects))
     res = run_amem("sessions", "ingest", env=env)
     assert res.returncode == 0, res.stderr
-    assert res.stdout.rstrip().endswith("cloud=1")
+    assert res.stdout.rstrip().endswith("cloud=1 summary=off")
 
 
 def _cloud_reply(prompt: str) -> str:

@@ -274,18 +274,34 @@ runs `git ... commit`: Claude Code `Bash` tool results, Codex `CommandExecution`
 (`aggregated_output`). `sha` is the short sha as printed; `message` the subject, redacted,
 max 200 chars; `repo` the repo of the `git -C` path, else of the last `cd <path> &&` before the
 commit (a `$VAR` set earlier in the same command is resolved), else of the command's cwd.
-A quiet `git commit -q` prints nothing: when the same command runs `&& git log --oneline`
-after it, the first log line is the commit (branch from `HEAD -> x` when decorated); else, when
-the commit is in an `&&`-only chain that exited 0 and has a `-m` message, it is stored with
+A quiet `git commit -q` prints nothing. Its subject is the `-m` value or, for `-F -`, the first
+line of the heredoc (`<<'EOF' ... EOF`; heredoc bodies are cut out before the command is read,
+so a line break or `;` in a message is not an operator). When a later `git log --oneline` line
+in the output shows `<sha> <that subject>`, that is the commit, whatever the operators between.
+Else, when the same command runs `&& git log --oneline` right after it, the first log line is
+the commit (branch from `HEAD -> x` when decorated); else, when the commit is in an `&&`-only
+chain or a `set -e` script that exited 0 and its subject is known, it is stored with
 `sha: null` and `branch: null`. `git commit` inside quotes (a grep pattern) is not a commit.
 Deduped by sha (null sha: by repo + message), at most 50 (the latest). A resumed session's
 copied lines count for the earlier session.
 
+**git-log fallback:** when the transcript gives no commit but the outcome signals count one
+(`commit` > 0), `git -C <dir> log --no-merges --since=<start> --until=<end> --format=%h|%s`
+runs (no shell, 10 s timeout) in each dir where a commit call ran (else the session cwd), on
+HEAD only, with `--author=<the repo's user.email>` when it has one. Entries carry
+`"source": "git-log"` and `branch: null`. A dir that is not a local git checkout is skipped.
+Limits: two sessions of the same user on the same branch of the same checkout in overlapping
+windows can pick up each other's commits (separate worktrees cannot); a commit on another
+branch than the dir's current HEAD is missed. The vendored `commit` signal also counts a
+`git commit` inside a quoted grep pattern split by `\|`, so a few rows run the fallback for
+nothing.
+
 `sessions ingest` writes them (the full read is the truth). A hook ping never reads them and
 never drops them: when the stored evidence has `commits` and the ping's has none, the stored
-list is kept. Not seen: a commit made another way (an IDE, a script), one run in the
-background (`run_in_background`: the output is in another file), one whose output was piped
-away. Cloud sessions (no local transcript) get no commits.
+list is kept. Not seen in the transcript (the fallback may still find them): a commit made
+another way (an IDE, a script), one run in the background (`run_in_background`: the output is
+in another file), one whose output was piped away. Cloud sessions (no local transcript, no
+local repo) get no commits and no fallback.
 
 ### Summary
 
@@ -294,9 +310,12 @@ files or areas, whether it finished (session_summary.py). A cheap model (`claude
 haiku`, no tools, no MCP, no session file, the subscription login; AMEM_SUMMARY_CLAUDE may point
 at another executable) writes it from the title, outcome, `outcome_evidence` (signals and
 commits) and a redacted digest of the transcript: its start (1.5k chars) and end (12k chars),
-user and assistant text plus shortened tool calls. Nothing of the transcript is stored; the
-reply is redacted, cut to 3 sentences and 600 chars, and dropped when empty or junk (a
-refusal, JSON, a code fence, under 20 chars).
+user and assistant text plus shortened tool calls. The prompt frames the record as quoted data
+inside `<session_record>` tags and asks for third-person sentences that begin with "The
+session". Nothing of the transcript is stored; the reply is redacted, cut to 3 sentences and
+600 chars, and dropped when empty or junk (a refusal, JSON, a code fence, under 20 chars) or
+when it does not start with "The session" ("This session" is repaired). A dropped reply gets
+one retry with a format note; a second miss counts as failed and nothing is stored.
 
 A row gets one when it is finished (an outcome other than `active`, and no activity for 30
 minutes or the SessionEnd hook was seen), has no summary or one older than its
@@ -307,13 +326,20 @@ its transcript is on this machine.
   window. Off unless `AMEM_SUMMARY_LIVE=1`. Time budget `AMEM_SUMMARY_BUDGET` seconds (default
   120): no new call starts with less than 10 s left, so the launchd run stays under its 300 s
   timeout; the rest waits for the next run (`summary_left=N`). `AMEM_SUMMARY_CONCURRENCY`
-  calls at once (default 2). A failed call is counted (`summary_failed=N`); an error of the
-  whole step is `summary_error=<type>`. Neither fails the ingest.
-- **Backfill:** `amem sessions summarize --days 7 [--concurrency 4] [--budget S] [--dry-run]`:
-  sessions started in the window. It also re-reads each transcript's commits into
-  `outcome_evidence.commits` (other keys untouched, stored commits never dropped). Prints
-  `done`, `skipped-no-transcript`, `skipped-subagent`, `failed` (plus up-to-date, not-finished,
-  left-for-next-run, commits-updated). Needs `AMEM_SUMMARY_LIVE=1` unless `--dry-run`.
+  calls at once (default 2). The ingest line always shows the step: `summary=off` (the flag is
+  not 1) or `summaries=N`, also when N is 0. A failed call is counted (`summary_failed=N`); an
+  error of the whole step is `summary_error=<type>`. Neither fails the ingest.
+- **Backfill:** `amem sessions summarize --days 7 [--concurrency 4] [--budget S] [--dry-run]
+  [--redo-bad] [--commits-only]`: sessions started in the window. It also re-reads each
+  transcript's commits (with the git-log fallback) into `outcome_evidence.commits` (other keys
+  untouched, stored commits never dropped). Prints `done`, `skipped-no-transcript`,
+  `skipped-subagent`, `failed` (plus up-to-date, not-finished, left-for-next-run,
+  commits-updated, bad-summaries), then a `commits:` line: committed sessions (signal
+  `commit` > 0) with a non-empty commits list before / after, all and top-level. `--redo-bad`
+  also summarizes the rows whose summary does not start with "The session". `--commits-only`
+  re-reads commits only (no model call). Needs `AMEM_SUMMARY_LIVE=1` unless `--dry-run` or
+  `--commits-only`. A top-level transcript that moved to another project folder (the session
+  changed directory) is found by its file name.
 
 Cloud sessions (cloud routines and cloud chats, `cloud:` ids) have no local transcript, so no
 summary and no commits.
