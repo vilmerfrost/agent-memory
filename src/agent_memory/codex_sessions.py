@@ -196,15 +196,34 @@ def outcome_signals(events: list[dict[str, Any]]) -> tuple[dict[str, int], str |
     """(signals, end) of a Codex rollout, the same names as amem_digest.SignalTracker: shell
     commands (CommandExecution items, else shell function calls), file changes (FileChange
     items, apply_patch), report lines in assistant messages. `end`: reply | user | tool |
-    result | error | interrupt. Names and counts only."""
-    from agent_memory.amem_digest import REPORT_RE, command_signals
+    result | error | interrupt. Names and counts only.
+
+    `commit` counts only on proof (amem_digest.commit_confirmed): a CommandExecution item
+    whose output shows git's commit line, or a certain commit chain that exited 0 (status
+    `completed`, `exit_code` 0). Without items, a shell function call's commit waits for its
+    output: a commit line there, or a certain chain whose output reports exit code 0."""
+    from agent_memory.amem_digest import (COMMIT_CERTAIN, REPORT_RE, _EXIT_CODE_RE, command_signals,
+                                          commit_call, commit_confirmed)
 
     signals: dict[str, int] = {}
     end: str | None = None
+    commit_calls: dict[str, str] = {}   # call id -> how its result can prove the commit
 
     def add(names: list[str]) -> None:
         for n in names:
             signals[n] = signals.get(n, 0) + 1
+
+    def add_command(command: str, *, ok: bool | None = None, output: str = "", call_id: str = "") -> None:
+        """The signals of one command. `ok` None: the result comes later (a function call)."""
+        names = command_signals(command)
+        add([n for n in names if n != "commit"])
+        how = commit_call(command) if "commit" in names else None
+        if how is None:
+            return
+        if ok is not None:
+            add(["commit"] if commit_confirmed(how, ok, output) else [])
+        elif call_id:
+            commit_calls[call_id] = how
 
     own = own_events(events)
     has_items = any(e.get("type") == "event_msg" and payload(e).get("type") == "item_completed" for e in own)
@@ -228,13 +247,24 @@ def outcome_signals(events: list[dict[str, Any]]) -> tuple[dict[str, int], str |
             elif name in SHELL_TOOLS or pt == "local_shell_call":
                 args = args_of(p)
                 action = p.get("action") if isinstance(p.get("action"), dict) else {}
-                add(command_signals(command_text(args.get("command", args.get("cmd", action.get("command"))))))
+                add_command(command_text(args.get("command", args.get("cmd", action.get("command")))),
+                            call_id=str(p.get("call_id") or ""))
         elif t == "response_item" and pt in ("function_call_output", "custom_tool_call_output"):
             end = "result"
+            how = commit_calls.pop(str(p.get("call_id") or ""), None)
+            if how is not None:
+                text = message_text(p.get("output"))
+                code = _EXIT_CODE_RE.search(text)
+                ok = how == COMMIT_CERTAIN and code is not None and int(code.group(1)) == 0
+                add(["commit"] if commit_confirmed(how, ok, text) else [])
         elif t == "event_msg" and pt == "item_completed":
             item = p.get("item") if isinstance(p.get("item"), dict) else {}
             if item.get("type") == "CommandExecution":
-                add(command_signals(command_text(item.get("command"))))
+                code = item.get("exit_code")
+                ok = item.get("status") == "completed" and code == 0 and not isinstance(code, bool)
+                output = item.get("aggregated_output")
+                add_command(command_text(item.get("command")), ok=ok,
+                            output=output if isinstance(output, str) else "")
             elif item.get("type") == "FileChange":
                 add(["edit"])
         elif t == "event_msg" and pt == "turn_aborted":

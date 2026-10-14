@@ -162,8 +162,9 @@ def test_skip_reasons() -> None:
 
 @pytest.mark.parametrize("reply,want", [
     (SUMMARY, SUMMARY),
-    ("Summary: The session did one thing.  Then another thing. Then a third. And a fourth.",
+    ("Summary: The session did one thing.  Then another thing. Then a third.",
      "The session did one thing. Then another thing. Then a third."),
+    ("The session did one thing. Then another thing. Then a third. And a fourth.", None),   # 4 sentences
     ("This session fixed the parser in parser.py.", "The session fixed the parser in parser.py."),
     # Not about the session: the agent's own reply, advice, first person. Never stored.
     ("A handoff from 19 hours ago exists. Treat its claims as unverified.", None),
@@ -175,9 +176,10 @@ def test_clean(reply: str, want: str | None) -> None:
     assert session_summary.clean(reply) == want
 
 
-def test_clean_caps_and_redacts() -> None:
-    got = session_summary.clean("The session set api_key=abcdefghijklmnop0123 in the config. " + "word " * 300)
-    assert got is not None and len(got) <= session_summary.SUMMARY_MAX and "abcdefghijklmnop0123" not in got
+def test_clean_redacts_and_rejects_overlong() -> None:
+    got = session_summary.clean("The session set api_key=abcdefghijklmnop0123 in the config.")
+    assert got is not None and "abcdefghijklmnop0123" not in got
+    assert session_summary.clean("The session set a flag in the config " + "word " * 300 + "today.") is None
 
 
 def test_prompt_holds_facts_and_a_bounded_redacted_digest() -> None:
@@ -461,6 +463,59 @@ REFUSAL = "The session record was not included in this message, so I cannot desc
 def test_refusals_are_rejected_even_with_the_prefix(reply: str, ok: bool) -> None:
     assert session_summary.compliant(reply) is ok
     assert (session_summary.clean(reply) is not None) is ok
+
+
+GOOD_STORED = [
+    "The session ran the handoff command in the handoff-chat repo and produced a chat handoff with no recorded task. "
+    "No files were changed and no commits were made.",
+    "The session ran a scheduled weekly audit of skill usage across the parent workflow and wrote a report to "
+    "~/.claude/parent/reports/skill-evals-2026-10-14.md.",
+    "The session could not access the RemoteTrigger tool, so it listed the routines from the repo files instead. "
+    "No files were changed.",
+]
+
+
+@pytest.mark.parametrize("text", GOOD_STORED)
+def test_validator_accepts_real_summaries(text: str) -> None:
+    assert session_summary.summary_problem(text) is None and session_summary.valid_summary(text)
+    assert session_summary.clean(text) == text
+
+
+@pytest.mark.parametrize("text,why", [
+    ("The session record is missing from this input, so no summary was written.", "says the input is missing"),
+    ("The Codex chat session in the spyre-live-codex repo recorded no code changes. The digest shows only "
+     "session-start context.", "does not start with 'The session'"),
+    ("The session in the spyre-live-codex repo recorded no code changes. The digest shows only session-start "
+     "context.", "talks about the prompt"),
+    ("The session transcript was empty, so nothing can be said about it.", "says the input is missing"),
+    ("The session details were not included in the provided facts.", "says the input is missing"),
+    ("The session is described here, but no summary was produced.", "says no summary"),
+    ("The session could not be summarized.", "says it cannot describe"),
+    ("The session fixed a bug, as you asked.", "addresses the reader"),
+    ("The session fixed my parser in parser.py.", "first person"),
+    ("The session ended before this message could be read.", "talks about the prompt"),
+    ("The session record shows a fix to parser.py.", "talks about the prompt"),
+    ("## Summary\nThe session fixed parser.py.", "does not start with 'The session'"),
+    ("The session fixed parser.py:\n- added a test\n- committed it.", "markdown, not plain prose"),
+    ("The session fixed parser.py.\n```\ncode\n```", "markdown, not plain prose"),
+    ("The session fixed one thing. It fixed two. It fixed three. It fixed four.", "more than 3 sentences"),
+    ("The session fixed the parser and", "not a finished sentence"),
+    ("", "empty"), ("   ", "empty"), (None, "empty"),
+    ("The session did.", "too short"),
+])
+def test_validator_rejects(text: Any, why: str) -> None:
+    assert session_summary.summary_problem(text) == why
+    assert session_summary.clean(text) is None
+
+
+def test_redo_bad_selects_rows_failing_the_validator() -> None:
+    old = NOW - timedelta(hours=1)
+    for bad in ("The session record is missing from this input, so no summary was written.",
+                "The session did a. It did b. It did c. It did d."):
+        assert session_summary.skip_reason(_rec(summary=bad, summary_updated_at=old), NOW, redo_bad=True) is None
+        assert session_summary.skip_reason(_rec(summary=bad, summary_updated_at=old), NOW) == "current"
+    assert session_summary.skip_reason(_rec(summary=GOOD_STORED[0], summary_updated_at=old), NOW,
+                                       redo_bad=True) == "current"
 
 
 def test_refusal_reply_is_retried_and_never_stored(setup_home: Home, db: str,  # noqa: F811

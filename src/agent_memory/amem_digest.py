@@ -55,7 +55,8 @@ Output (stdout, one JSON object):
                 the session's token totals, see token_totals), plus `title` (script_version 3+)
                 when the session was named: the last `custom-title` line, redacted, max 200 chars,
                 `profile` (model, effort, duration: see profile) and `outcome` ({signals, end}:
-                signal names and counts, see SignalTracker)
+                signal names and counts, see SignalTracker; script_version 5+: shell commands
+                are read quote-aware, and `commit` counts only on proof from the call's result)
   hook mode adds `kind: chat`, `ingested_at: null` and meta.hook (the event); no `routine`.
 """
 
@@ -78,7 +79,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-SCRIPT_VERSION = "4"
+SCRIPT_VERSION = "5"
 SOURCE_PREFIX = "cloud:"
 PROMPT_NAME = "prompt"     # the routine prompt: instruction source routine:<routine>
 
@@ -526,7 +527,126 @@ def profile(events: list[dict[str, Any]]) -> dict[str, Any]:
 # docs/sessions-live.md, "Outcome". Signal names and counts only: no command text is kept.
 
 EDIT_TOOLS = frozenset({"Edit", "Write", "MultiEdit", "NotebookEdit", "apply_patch"})
-_SEGMENT_SPLIT_RE = re.compile(r"&&|\|\||;|\n|\|")
+_HEREDOC_RE = re.compile(r"<<(-?)[ \t]*(?:'([^'\n]+)'|\"([^\"\n]+)\"|\\?([A-Za-z_][\w.-]*))")
+
+
+def strip_heredocs(command: str) -> str:
+    """`command` without its heredoc bodies (session_commits.split_heredocs): the body of
+    `<<'EOF' ... EOF` is data, not shell code. A `<<` inside quotes is not a heredoc."""
+    out: list[str] = []
+    pending: list[tuple[str, bool]] = []
+    i, n = 0, len(command)
+    quote: str | None = None
+    while i < n:
+        ch = command[i]
+        if quote is not None:
+            out.append(ch)
+            if quote == '"' and ch == "\\" and i + 1 < n:
+                out.append(command[i + 1])
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+            i += 1
+            continue
+        if ch == "\\" and i + 1 < n:
+            out.append(command[i:i + 2])
+            i += 2
+            continue
+        if ch in "'\"":
+            quote = ch
+            out.append(ch)
+            i += 1
+            continue
+        if command.startswith("<<", i) and not command.startswith("<<<", i):
+            m = _HEREDOC_RE.match(command, i)
+            if m is not None:
+                pending.append((m.group(2) or m.group(3) or m.group(4), m.group(1) == "-"))
+                out.append(m.group(0))
+                i = m.end()
+                continue
+        if ch == "\n" and pending:
+            out.append("\n")
+            i += 1
+            for delim, dash in pending:
+                while i < n:
+                    end = command.find("\n", i)
+                    line = command[i:] if end < 0 else command[i:end]
+                    i = n if end < 0 else end + 1
+                    if (line.lstrip("\t") if dash else line) == delim:
+                        break
+            pending = []
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def segments(command: str) -> list[tuple[str, str | None]]:
+    """(segment, the operator after it) for the simple commands of a shell command line.
+    Quote-aware: an operator inside '...', "...", `...`, $(...) or after a backslash is text,
+    and heredoc bodies are cut out first. Operators: && || ; | |& & and a line break (a `&`
+    of a redirection such as 2>&1 or &> is not one)."""
+    text = strip_heredocs(command or "")
+    out: list[tuple[str, str | None]] = []
+    buf: list[str] = []
+    quote: str | None = None
+    depth = 0   # $( ... ) nesting outside quotes
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+        if quote == "'":
+            buf.append(ch)
+            quote = None if ch == "'" else quote
+            i += 1
+            continue
+        if ch == "\\" and i + 1 < n and quote != "'":
+            buf.append(text[i:i + 2])
+            i += 2
+            continue
+        if quote in ('"', "`"):
+            buf.append(ch)
+            quote = None if ch == quote else quote
+            i += 1
+            continue
+        if ch in "'\"`":
+            quote = ch
+            buf.append(ch)
+            i += 1
+            continue
+        if text.startswith("$(", i):
+            depth += 1
+            buf.append("$(")
+            i += 2
+            continue
+        if depth and ch == ")":
+            depth -= 1
+            buf.append(ch)
+            i += 1
+            continue
+        op = None
+        if not depth:
+            for cand in ("&&", "||", "|&", ";", "\n", "|"):
+                if text.startswith(cand, i):
+                    op = cand
+                    break
+            if op is None and ch == "&" and not (i and text[i - 1] in "<>") and not text.startswith("&>", i):
+                op = "&"
+        if op is None:
+            buf.append(ch)
+            i += 1
+            continue
+        if op == "\n" and not "".join(buf).strip():   # a blank line, or the line after `&&` / `|`
+            buf.append(" ")
+            i += 1
+            continue
+        out.append(("".join(buf), op))
+        buf = []
+        i += len(op)
+    out.append(("".join(buf), None))
+    return [(seg, op) for seg, op in out if seg.strip()]
+
+
 # The tool must be the segment's command word: `echo "git push"` is not a push. Allowed before it:
 # `(`, env assignments, and runners such as `sudo`, `uv run`, `npx`.
 _START = (r"^[\s(]*(?:[A-Za-z_]\w*=\S*\s+)*"
@@ -539,6 +659,7 @@ _SIGNAL_RES = (
     ("deploy", re.compile(_START + r"(?:vercel\b.*\s--prod\b|supabase\s+functions\s+deploy\b|supabase\s+db\s+push\b"
                           r"|railway\s+up\b|amem\s+db\s+migrate\b)")),
 )
+_COMMIT_RE = re.compile(_GIT + r"commit\b")
 _PUSH_RE = re.compile(_GIT + r"push\b(.*)")
 _MERGE_RE = re.compile(_GIT + r"merge\b")
 _TO_MAIN_RE = re.compile(r"(?:^|[\s:/])(?:main|master)(?:\s|$)")
@@ -546,11 +667,58 @@ _SWITCH_MAIN_RE = re.compile(_GIT + r"(?:checkout|switch)\s+(?:main|master)\b")
 REPORT_RE = re.compile(r"^\W*Status:\W*(DONE|PARTIAL|BLOCKED)\b", re.M)
 
 
+COMMIT_LINE_RE = re.compile(r"^\[(?:detached HEAD|[^\s\]]+)(?: \(root-commit\))? [0-9a-f]{7,40}\] ?.*$", re.M)
+_ERREXIT_RE = re.compile(r"^\s*set\s+(?:-[a-zA-Z]*e[a-zA-Z]*|-o\s+errexit)\b")
+_EXIT_CODE_RE = re.compile(r"(?:\"exit_code\"\s*:\s*|\bExit code:?\s*|\bexited with code\s+)(-?\d+)")
+COMMIT_CERTAIN, COMMIT_UNSURE, COMMIT_BACKGROUND = "c", "u", "b"
+
+
+def commit_call(command: str) -> str | None:
+    """How a shell command's own result can prove its `git commit` (None: it runs none; a
+    `git commit` inside quotes, a heredoc body or a grep / rg / echo argument is not one):
+    - COMMIT_CERTAIN: the commit is not inside a pipe (`|` right before or after it) and not
+      after `||`, and every list operator after it is `&&` (pipes between later commands are
+      fine: `git commit -q -m x && git push 2>&1 | tail -1`), or `set -e` runs before it: a
+      success exit means the commit was made;
+    - COMMIT_BACKGROUND: the commit runs in the background (`... &`): its output is elsewhere;
+    - COMMIT_UNSURE: anything else (`;`, `||`, `|` after it): only a commit line in the output counts."""
+    segs = segments(command)
+    for k, (seg, _op) in enumerate(segs):
+        if not _COMMIT_RE.search(seg):
+            continue
+        after = [op for _s, op in segs[k:] if op is not None]
+        if after and after[0] == "&":
+            return COMMIT_BACKGROUND
+        before = segs[k - 1][1] if k else None
+        piped = before in ("|", "|&", "||") or (bool(after) and after[0] in ("|", "|&", "||"))
+        if not piped and all(op in ("&&", "|", "|&") for op in after):
+            return COMMIT_CERTAIN
+        if not piped and any(_ERREXIT_RE.search(s) for s, _o in segs[:k]):
+            return COMMIT_CERTAIN
+        return COMMIT_UNSURE
+    return None
+
+
+def commit_confirmed(how: str | None, ok: bool, output: str) -> bool:
+    """A commit call made a commit: its output shows git's commit line `[<branch> <sha>] <subject>`
+    (a sha git printed is proof even when a later step of the command failed), or it is
+    COMMIT_CERTAIN and the call succeeded (`ok`: no error, not denied). A failed or denied call
+    without a commit line (`nothing to commit`, a hook that refused) and a background commit
+    are never counted here."""
+    if how is None:
+        return False
+    if COMMIT_LINE_RE.search(output or ""):
+        return True
+    return ok and how == COMMIT_CERTAIN
+
+
 def command_signals(command: str) -> list[str]:
-    """Signal names in one shell command (git / gh / deploy). Never the text itself."""
+    """Signal names in one shell command (git / gh / deploy). Never the text itself. `commit`
+    here means the command runs a `git commit`; the outcome counts it only on proof
+    (commit_confirmed, at the call's result)."""
     out: list[str] = []
     on_main = False
-    for seg in _SEGMENT_SPLIT_RE.split(command or ""):
+    for seg, _op in segments(command):
         for name, pattern in _SIGNAL_RES:
             if pattern.search(seg):
                 out.append(name)
@@ -582,7 +750,13 @@ class SignalTracker:
     """Outcome signals of one Claude Code transcript, line by line. `state()` / `__init__(state)`
     let a hook ping continue where it stopped. `end`: how the session stands now:
     reply | user (a prompt with no reply yet) | tool (a call with no result yet) | error |
-    interrupt."""
+    interrupt.
+
+    Every signal but `commit` counts at the tool call. `commit` counts at the call's result,
+    and only on proof (commit_confirmed): the call id waits in `commit_calls` (state key
+    `commit_calls`: {call id: COMMIT_*}, at most PENDING_MAX). A background commit
+    (`run_in_background`, `... &`) is never counted here: its output is not in the transcript.
+    An older state without `commit_calls` loads as none waiting."""
 
     PENDING_MAX = 64
 
@@ -593,9 +767,14 @@ class SignalTracker:
                                          if isinstance(v, int) and not isinstance(v, bool) and v > 0}
         self.end: str | None = s.get("end") if isinstance(s.get("end"), str) else None
         self.pending: list[str] = [str(p) for p in s.get("pending") or [] if isinstance(p, str)][-self.PENDING_MAX:]
+        calls = s.get("commit_calls") if isinstance(s.get("commit_calls"), dict) else {}
+        self.commit_calls: dict[str, str] = dict(list(
+            (str(k), v) for k, v in calls.items()
+            if v in (COMMIT_CERTAIN, COMMIT_UNSURE, COMMIT_BACKGROUND))[-self.PENDING_MAX:])
 
     def state(self) -> dict[str, Any]:
-        return {"signals": dict(self.signals), "end": self.end, "pending": list(self.pending)}
+        return {"signals": dict(self.signals), "end": self.end, "pending": list(self.pending),
+                "commit_calls": dict(self.commit_calls)}
 
     def add(self, names: list[str]) -> None:
         for n in names:
@@ -604,17 +783,31 @@ class SignalTracker:
     def tool_call(self, call_id: str | None, name: str, inp: Any) -> None:
         if name in EDIT_TOOLS:
             self.add(["edit"])
-        self.add(command_signals(_command_of(name, inp)))
+        command = _command_of(name, inp)
+        names = command_signals(command)
+        self.add([n for n in names if n != "commit"])
+        if "commit" in names and call_id:
+            how = commit_call(command)
+            if how is not None:
+                bg = isinstance(inp, dict) and inp.get("run_in_background") is True
+                self.commit_calls[call_id] = COMMIT_BACKGROUND if bg else how
+                while len(self.commit_calls) > self.PENDING_MAX:
+                    self.commit_calls.pop(next(iter(self.commit_calls)))
         if name == "SubagentHandback" and isinstance(inp, dict):
             self.add(_report_signals(str(inp.get("message") or "")))
         if call_id:
             self.pending = (self.pending + [call_id])[-self.PENDING_MAX:]
         self.end = "tool"
 
-    def tool_result(self, call_id: str | None, error: bool) -> None:
+    def tool_result(self, call_id: str | None, error: bool, output: str = "", denied: bool = False) -> None:
+        """One tool result. `error`: the call failed; `denied`: it never ran; `output`: its text."""
         if call_id in self.pending:
             self.pending.remove(call_id)
-        self.end = "error" if error else ("tool" if self.pending else "result")
+        how = self.commit_calls.pop(call_id, None) if call_id else None
+        if how is not None and how != COMMIT_BACKGROUND and not denied \
+                and commit_confirmed(how, not error, output):
+            self.add(["commit"])
+        self.end = "error" if error and not denied else ("tool" if self.pending else "result")
 
     def feed(self, e: dict[str, Any]) -> None:
         etype = e.get("type")
@@ -638,14 +831,17 @@ class SignalTracker:
         elif etype == "user" and not e.get("isMeta"):
             if isinstance(content, list) and any(isinstance(b, dict) and b.get("type") == "tool_result"
                                                  for b in content):
+                denied = bool(e.get("toolDenialKind"))
                 for b in content:
                     if isinstance(b, dict) and b.get("type") == "tool_result":
-                        denied = bool(e.get("toolDenialKind"))
-                        self.tool_result(str(b.get("tool_use_id") or "") or None, bool(b.get("is_error")) and not denied)
+                        body = b.get("content")
+                        self.tool_result(str(b.get("tool_use_id") or "") or None, bool(b.get("is_error")),
+                                         body if isinstance(body, str) else text_of(body), denied)
                 return
             text = text_of(content)
             if text.lstrip().startswith("[Request interrupted"):
                 self.pending = []
+                self.commit_calls = {}
                 self.end = "interrupt"
             elif is_human(text):
                 self.end = "user"

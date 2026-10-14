@@ -590,7 +590,8 @@ def session_row(path: Path, project_dir: str, *, parent_session: str | None = No
     tokens = session_tokens.claude_summary(events, own_session=own)
     row = SessionRow(sid, kind, repo, project_dir, facts.start, facts.end, size,
                      facts.skills, [], meta, path, tokens=tokens).with_summary(tokens)
-    row.commits = session_commits.claude_commits(events, cwd=cwd, own_session=own, fallback=commit_fallback(row))
+    row.commits = confirm_commits(row, session_commits.claude_commits(events, cwd=cwd, own_session=own,
+                                                                      fallback=commit_fallback(row)))
     return _with_instructions(row)
 
 
@@ -598,6 +599,15 @@ def commit_fallback(row: SessionRow) -> session_commits.Fallback:
     """The git-log fallback of a local transcript: its `commit` signal count and time window."""
     return session_commits.Fallback(int((row.signals or {}).get("commit") or 0), row.started_at,
                                     row.ended_at or row.started_at)
+
+
+def confirm_commits(row: SessionRow, commits: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """`commits`, and a `commit` signal of at least 1 when they are not empty: a commit with a
+    sha the outcome signals could not prove from the call's own result (a background commit
+    the git-log fallback found, a `git log --oneline` line with the commit's subject)."""
+    if commits and row.signals is not None and not row.signals.get("commit"):
+        row.signals["commit"] = 1
+    return commits
 
 
 def _with_instructions(row: SessionRow) -> SessionRow:
@@ -674,7 +684,7 @@ def codex_row(path: Path, rel_dir: str, titles: dict[str, str] | None = None) ->
     title = (titles or {}).get(f.thread_id or path.stem)
     row = SessionRow(sid, kind, repo, rel_dir, f.start, f.end, size, f.skills, [], meta, path, tool="codex",
                      tokens=tokens, title=title).with_summary(tokens)
-    row.commits = session_commits.codex_commits(events, cwd=cwd, fallback=commit_fallback(row))
+    row.commits = confirm_commits(row, session_commits.codex_commits(events, cwd=cwd, fallback=commit_fallback(row)))
     return _with_instructions(row)
 
 
@@ -1096,11 +1106,15 @@ where outcome_evidence is not null or category is null or project is null
 
 def stored_outcome(evidence: Any, last_at: datetime | None, now: datetime | None,
                    kind: str | None) -> str | None:
-    """The outcome of a stored row from its `outcome_evidence`, None when there is none."""
+    """The outcome of a stored row from its `outcome_evidence`, None when there is none. A
+    non-empty `commits` list counts as a `commit` signal (confirm_commits: a hook ping counts
+    no background commit, the ingest's commits list does)."""
     if not isinstance(evidence, dict):
         return None
     signals = {str(k): v for k, v in evidence.items()
                if k != "end" and isinstance(v, int) and not isinstance(v, bool)}
+    if not signals.get("commit") and isinstance(evidence.get("commits"), list) and evidence["commits"]:
+        signals["commit"] = 1
     end = evidence.get("end") if isinstance(evidence.get("end"), str) else None
     return session_tokens.outcome_of(signals, end, last_at, now, kind)[0]
 

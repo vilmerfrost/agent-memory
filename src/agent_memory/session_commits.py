@@ -22,11 +22,15 @@ A quiet commit (`git commit -q`) prints nothing. Fallbacks, in order:
 Heredoc bodies (`<<'EOF' ... EOF`) are not shell code: they are cut out before the command is
 read, so a line break or a `;` in a commit message is not an operator.
 A command in the background (its output is elsewhere) gives only what its result shows.
-`git commit` inside a quoted string (a grep pattern, an echo) is not a commit.
+A commit call is a `git commit` that is the command word of a shell segment, read quote-aware
+(amem_digest.commit_call): inside quotes, a heredoc body, or as a grep / rg / echo argument
+(`grep -n "a\\|git commit" f`) it is not a commit call.
 
-When the transcript gives no commit but the outcome signals count one (`commit` > 0), the
-caller can ask for the git-log fallback (`Fallback`, `git_log_commits`): `git log` in the
-dirs where the commit calls ran (the session cwd only when no commit call was seen), limited
+When the transcript gives no commit but a CONFIRMED commit call showed no sha (a background
+commit, or a certain `&&` / `set -e` chain that exited 0 without a known subject), the caller
+can ask for the git-log fallback (`Fallback`, `git_log_commits`): `git log` in the dirs where
+those calls ran, never the session cwd on its own and never on the `commit` signal count
+alone; a failed or denied commit call, or one with no result yet, never asks git. Limited
 to the session's time window,
 HEAD only, no merges, and the repo's configured `user.email` as author. Those entries carry
 `"source": "git-log"` and branch null. Parallel sessions of the same user on the same branch
@@ -142,7 +146,13 @@ def split_heredocs(command: str) -> tuple[str, list[str]]:
 
 
 def is_commit_command(command: str) -> bool:
-    return bool(command) and bool(GIT_COMMIT_RE.search(_mask(split_heredocs(command)[0])))
+    """The command runs `git commit` as a command (amem_digest.commit_call: quote-aware, the
+    command word of a segment). A `git commit` inside quotes, a heredoc body, or as an argument
+    of grep / rg / echo / sed is not one."""
+    from agent_memory.amem_digest import commit_call   # the vendored script: one parser for both
+
+    return bool(command) and commit_call(command) is not None and bool(
+        GIT_COMMIT_RE.search(_mask(split_heredocs(command)[0])))
 
 
 def _unquote(token: str) -> str:
@@ -309,8 +319,11 @@ class Collector:
 
     def __init__(self) -> None:
         self.commits: dict[Any, dict[str, Any]] = {}
-        self.missed_dirs: list[str] = []   # where commit calls ran that gave no commit (git-log fallback)
+        # Where confirmed commit calls ran that gave no commit (the git-log fallback asks only
+        # these): a background commit, or a certain chain that exited 0 without a sha.
+        self.missed_dirs: list[str] = []
         self.calls = 0                     # commit calls seen (with or without a result)
+        self.confirmed = 0                 # commit calls with proof: a commit found, or a missed dir above
 
     def _put(self, sha: str | None, message: str, repo: str | None, branch: str | None) -> None:
         key: Any = sha or ("?", repo, message)
@@ -331,8 +344,15 @@ class Collector:
         directory, state = resolve_dir(command, cwd)
         if state == DIR_TEMP:   # a throwaway `mktemp` repo: not the session's work
             return
-        if not self._add(output, shape, _repo(directory), ok=ok, background=background) and directory:
-            if directory not in self.missed_dirs:
+        from agent_memory.amem_digest import COMMIT_BACKGROUND, COMMIT_CERTAIN, commit_call
+
+        how = commit_call(command)
+        background = background or how == COMMIT_BACKGROUND
+        if self._add(output, shape, _repo(directory), ok=ok, background=background):
+            self.confirmed += 1
+        elif ok and (background or shape.certain or how == COMMIT_CERTAIN):   # it ran, but no sha shown
+            self.confirmed += 1
+            if directory and directory not in self.missed_dirs:
                 self.missed_dirs.append(directory)
 
     def _add(self, output: str, shape: Shape, repo: str | None, *, ok: bool, background: bool) -> bool:
@@ -380,7 +400,8 @@ Runner = Callable[..., "subprocess.CompletedProcess[str]"]
 
 @dataclass
 class Fallback:
-    """When to ask git: the session's `commit` signal count and its time window."""
+    """The session's time window for git. `commit_signal` is kept for callers; it no longer
+    decides whether git is asked (with_fallback: only a confirmed commit call does)."""
 
     commit_signal: int
     since: datetime | None
@@ -427,26 +448,29 @@ def git_log_commits(directory: str, since: datetime, until: datetime, *,
 
 def with_fallback(found: list[dict[str, Any]], dirs: list[str], cwd: str, fallback: Fallback | None, *,
                   run: Runner = subprocess.run) -> list[dict[str, Any]]:
-    """`found`, or when it is empty but the session's signals count a commit: the git-log
-    commits of the dirs where the commit calls ran. `cwd`: the session cwd, asked only when no
-    commit call was seen at all (callers pass "" otherwise: a commit in an unknown or throwaway
-    dir must not pull in the session cwd's commits)."""
-    if found or fallback is None or fallback.commit_signal <= 0 or fallback.since is None:
+    """`found`, or when it is empty: the git-log commits of `dirs`, the dirs where CONFIRMED
+    commit calls ran without showing a sha (Collector.missed_dirs: a background commit, or a
+    certain chain that exited 0). No confirmed call, no fallback: the `commit` signal count and
+    the session cwd are never enough on their own (a `git commit` in a grep pattern, a failed
+    commit or a call with no result never asks git). `cwd` is kept for callers; it is unused."""
+    del cwd
+    if found or fallback is None or fallback.since is None or not dirs:
         return found
     until = fallback.until or fallback.since
     out: dict[str, dict[str, Any]] = {}
-    for directory in dirs or ([cwd] if cwd else []):
+    for directory in dirs:
         for c in git_log_commits(directory, fallback.since, until, run=run):
             out.setdefault(c["sha"], c)
     return list(out.values())[-MAX_COMMITS:]
 
 
 def claude_commits(events: list[dict[str, Any]], *, cwd: str = "", own_session: str | None = None,
-                   fallback: Fallback | None = None) -> list[dict[str, Any]]:
+                   fallback: Fallback | None = None, stats: dict[str, int] | None = None) -> list[dict[str, Any]]:
     """The commits of a Claude Code transcript. `own_session`: count only lines whose
     `sessionId` is that id or missing (a resumed session's copied lines belong to the earlier
-    session). `cwd`: the session cwd, used when a line has none. `fallback`: ask git when the
-    transcript shows no commit but the signals count one (see the module doc)."""
+    session). `cwd`: the session cwd, used when a line has none. `fallback`: the time window
+    for git when a confirmed commit call shows no sha (see with_fallback). `stats`, when given,
+    gets `confirmed`: the number of confirmed commit calls."""
     calls: dict[str, tuple[str, str, bool]] = {}
     out = Collector()
     for e in events:
@@ -471,16 +495,14 @@ def claude_commits(events: list[dict[str, Any]], *, cwd: str = "", own_session: 
                     command, call_cwd, background = calls.pop(str(b.get("tool_use_id")))
                     ok = not b.get("is_error") and not e.get("toolDenialKind")
                     out.add(_result_text(b.get("content")), command, call_cwd, ok=ok, background=background)
-    for command, call_cwd, _background in calls.values():   # a call with no result line yet
-        out.calls += 1
-        directory = command_dir(command, call_cwd)
-        if directory and directory not in out.missed_dirs:
-            out.missed_dirs.append(directory)
-    return with_fallback(out.result(), out.missed_dirs, "" if out.calls else cwd, fallback)
+    out.calls += len(calls)   # calls with no result line yet: not confirmed, no git-log fallback
+    if stats is not None:
+        stats["confirmed"] = out.confirmed
+    return with_fallback(out.result(), out.missed_dirs, "", fallback)
 
 
-def codex_commits(events: list[dict[str, Any]], *, cwd: str = "",
-                  fallback: Fallback | None = None) -> list[dict[str, Any]]:
+def codex_commits(events: list[dict[str, Any]], *, cwd: str = "", fallback: Fallback | None = None,
+                  stats: dict[str, int] | None = None) -> list[dict[str, Any]]:
     """The commits of a Codex rollout (its own events; a fork's copied history is left out)."""
     out = Collector()
     turn_cwd = cwd
@@ -498,4 +520,6 @@ def codex_commits(events: list[dict[str, Any]], *, cwd: str = "",
                 code = item.get("exit_code")
                 ok = item.get("status") == "completed" and code == 0 and not isinstance(code, bool)
                 out.add(output, command, _local_path(item.get("cwd")) or turn_cwd, ok=ok)
-    return with_fallback(out.result(), out.missed_dirs, "" if out.calls else _local_path(cwd or turn_cwd), fallback)
+    if stats is not None:
+        stats["confirmed"] = out.confirmed
+    return with_fallback(out.result(), out.missed_dirs, "", fallback)

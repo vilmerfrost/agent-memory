@@ -231,7 +231,7 @@ state wins, in this order:
 |---|---|
 | `shipped` | `gh pr merge`, a `git push` to main/master, `git checkout main && git merge`, or a deploy (`vercel ... --prod`, `supabase functions deploy`, `supabase db push`, `railway up`, `amem db migrate`) |
 | `pushed` | `git push` of another branch, or `gh pr create` |
-| `committed` | `git commit`, nothing pushed |
+| `committed` | a proven `git commit` (below), nothing pushed |
 | `partial` | a worker report `Status: PARTIAL` / `BLOCKED` (also in a `SubagentHandback`) |
 | `active` | last activity under 2 h ago |
 | `abandoned` | last activity over 24 h ago and the session ended on a prompt with no reply (`end` `user`) or a tool call with no result (`end` `tool`), or it edited files, never committed and reported no `Status: DONE`. Never for a worker (below). Ending on a tool result (`end` `result`) is not abandonment: the call got its answer |
@@ -257,6 +257,29 @@ The scanner state version did not change: the hook state holds signals and `end`
 `push_main`, `pr_create`, `pr_merge`, `merge_main`, `deploy`, `report_done`,
 `report_partial`, `report_blocked`) plus `end` (`reply`, `user`, `tool`, `result`, `error`,
 `interrupt`), and `commits` (below) when the session made any. Never command text or paths.
+
+**Commands are read quote-aware** (amem_digest.segments, script_version 5): heredoc bodies
+are cut out, and `&&`, `||`, `;`, `|`, `&` and line breaks inside quotes, `$(...)`, backticks or
+after a backslash are text. So `grep -n "a\|git commit" f`, `rg 'git commit'`, `echo "git
+push origin main"` and a heredoc that mentions `git commit` give no signal.
+
+**`commit` needs proof** (amem_digest.commit_confirmed). Every other signal counts at the tool
+call; `commit` counts at the call's result, when one of these holds:
+- the output shows git's commit line `[<branch> <sha>] <subject>` (also when a later step of
+  the same command failed: git printed a sha), or
+- the call succeeded (no error, not denied) and the commit is certain: every operator after
+  it is `&&` (or there is none), or `set -e` runs before it (a quiet `git commit -q -m x &&
+  git push`).
+A failed or denied commit call (`nothing to commit`, a hook that refused), a commit after which
+`;` / `||` / `|` hid the exit code without a commit line, and a commit with no result yet never
+count. A background commit (`run_in_background`, `... &`) never counts from the transcript: its
+output is elsewhere. It counts only when `sessions ingest` finds its sha with the git-log
+fallback (Commits, below): a non-empty `commits` list sets `commit` to at least 1, and the
+stored-row recompute counts a non-empty `commits` list as a commit too (a hook ping, which never
+reads commits, can show such a row as uncommitted until the next ingest). Codex: the same rules
+on a `CommandExecution` item (`status` `completed` and `exit_code` 0 is success) or a shell
+function call's output (`exit_code` / `Exit code:` in it). The hook scanner state is version 4:
+a commit waits in `commit_calls` until its result; an older state loads with none waiting.
 
 Limits: a heuristic. It is git- and English-centric: the tool must be the command word of a
 shell segment (`echo git push` does not count); a push or merge done another way (an IDE,
@@ -285,20 +308,23 @@ in the output shows `<sha> <that subject>`, that is the commit, whatever the ope
 Else, when the same command runs `&& git log --oneline` right after it, the first log line is
 the commit (branch from `HEAD -> x` when decorated); else, when the commit is in an `&&`-only
 chain or a `set -e` script that exited 0 and its subject is known, it is stored with
-`sha: null` and `branch: null`. `git commit` inside quotes (a grep pattern) is not a commit.
+`sha: null` and `branch: null`. A commit call is read with the same quote-aware parser as the
+signals: `git commit` inside quotes, a heredoc body or as a grep / rg / echo argument is not one.
 Deduped by sha (null sha: by repo + message), at most 50 (the latest). A resumed session's
 copied lines count for the earlier session.
 
-**git-log fallback:** when the transcript gives no commit but the outcome signals count one
-(`commit` > 0), `git -C <dir> log --no-merges --since=<start> --until=<end> --format=%h|%s`
-runs (no shell, 10 s timeout) in each dir where a commit call ran (else the session cwd), on
-HEAD only, with `--author=<the repo's user.email>` when it has one. Entries carry
+**git-log fallback:** when the transcript gives no commit but a confirmed commit call showed
+no sha (a background commit, or a certain chain that exited 0 without a known subject),
+`git -C <dir> log --no-merges --since=<start> --until=<end> --format=%h|%s` runs (no shell,
+10 s timeout) in each dir where such a call ran, on HEAD only, with `--author=<the repo's
+user.email>` when it has one. Never on the `commit` signal count alone, never in the session
+cwd on its own, never for a failed or denied call or one with no result. Entries carry
 `"source": "git-log"` and `branch: null`. A dir that is not a local git checkout is skipped.
+The backfill (`--commits-only`, `--refresh-commits`) drops stored git-log entries of a row whose
+transcript has no confirmed commit call (an older fallback ran for a grep pattern).
 Limits: two sessions of the same user on the same branch of the same checkout in overlapping
 windows can pick up each other's commits (separate worktrees cannot); a commit on another
-branch than the dir's current HEAD is missed. The vendored `commit` signal also counts a
-`git commit` inside a quoted grep pattern split by `\|`, so a few rows run the fallback for
-nothing.
+branch than the dir's current HEAD is missed.
 
 `sessions ingest` writes them (the full read is the truth). A hook ping never reads them and
 never drops them: when the stored evidence has `commits` and the ping's has none, the stored
@@ -316,12 +342,22 @@ at another executable) writes it from the title, outcome, `outcome_evidence` (si
 commits) and a redacted digest of the transcript: its start (1.5k chars) and end (12k chars),
 user and assistant text plus shortened tool calls. The prompt frames the record as quoted data
 inside `<session_record>` tags and asks for third-person sentences that begin with "The
-session". Nothing of the transcript is stored; the reply is redacted, cut to 3 sentences and
-600 chars, and dropped when empty or junk (a refusal, JSON, a code fence, under 20 chars) or
-when it does not start with "The session" ("This session" is repaired) or is a refusal or a
-remark about the prompt even with that prefix ("The session record was not included in this
-message, so I cannot describe..."; first person, "cannot describe/summarize", "record/
-transcript was not provided", "this message"). A dropped reply gets one retry with a reminder
+session". Nothing of the transcript is stored. One validator decides what is stored
+(`session_summary.summary_problem`; `valid_summary` is its yes/no). The reply is redacted and
+stored only when ALL of these hold:
+- it starts with "The session " (repairs only: surrounding quotes and whitespace, `**`, a
+  `Summary:` label, line breaks inside prose, "This session" -> "The session");
+- 20 to 600 chars, 1 to 3 sentences, and it ends with `.`, `!` or `?` (a longer reply is
+  dropped, never cut);
+- plain prose: no markdown heading, bullet or numbered item, code fence, or JSON / tag start;
+- it never says the input, prompt, record, digest or transcript is missing, absent, empty
+  or not included;
+- no "no summary", and no "cannot / can't / unable to describe or summarize";
+- no first person (I, me, my; "I/O" is fine) and no "you";
+- no meta words about the prompt: "this input", "this message", "this prompt", "the
+  provided", "the digest", "the record".
+Examples dropped: "The session record is missing from this input, so no summary was
+written."; "The Codex chat session ... The digest shows only session-start context.". A dropped reply gets one retry with a reminder
 that the record is above; a second miss counts as failed and nothing is stored. A row whose
 digest is under 200 chars or holds no assistant or tool line is skipped (`skipped-empty`,
 ingest `summary_empty=N`) and never sent to the model.
@@ -345,8 +381,8 @@ its transcript is on this machine.
   `skipped-subagent`, `failed` (plus up-to-date, not-finished, left-for-next-run,
   commits-updated, bad-summaries), then a `commits:` line: committed sessions (signal
   `commit` > 0) with a non-empty commits list before / after, all and top-level. `--redo-bad`
-  also summarizes the rows whose summary fails the same check (no "The session" prefix, or a
-  refusal). `--commits-only`
+  also summarizes the rows whose stored summary fails the same validator (and counts them as
+  `bad-summaries`). `--commits-only`
   re-reads commits only (no model call). Needs `AMEM_SUMMARY_LIVE=1` unless `--dry-run` or
   `--commits-only`. A top-level transcript that moved to another project folder (the session
   changed directory) is found by its file name.
