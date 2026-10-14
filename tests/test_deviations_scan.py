@@ -240,6 +240,19 @@ def test_tiny_and_eval_sessions_are_skipped(setup_home: Home, db: str) -> None: 
     assert "tiny" not in picked and "idle" not in picked and "eval-1" not in picked and "chat-1" in picked
 
 
+def test_non_worker_subagents_are_picked_last(setup_home: Home, db: str) -> None:  # noqa: F811
+    # Their parent's scan usually covers them (then they are skipped), so they must not use up
+    # the daily limit before the parents and chats: 181 of 339 pickable sessions on 2026-10-14.
+    ids = _ingest(setup_home, db)
+    with psycopg.connect(db) as conn:
+        conn.execute("""update sessions set skills = '["dispatch"]'::jsonb,
+                        meta = meta || '{"agent_type": "Explore", "parent_session": "gone"}'::jsonb
+                        where session_id = %s""", (ids["worker"],))
+    picked = [r.session_id for r in deviations.pick_sessions(since=NOW.replace(day=1), limit=50)]
+    assert picked[-1] == ids["worker"] and ids["chat"] in picked and ids["headless"] in picked
+    assert [r.session_id for r in deviations.pick_sessions(since=NOW.replace(day=1), limit=1)] != [ids["worker"]]
+
+
 def test_cli_scan_needs_live_flag_unless_dry_run(setup_home: Home, db: str) -> None:  # noqa: F811
     _ingest(setup_home, db)
     env = base_env(AMEM_DB_URL=db, AMEM_PROJECTS_DIR=str(setup_home.projects),
