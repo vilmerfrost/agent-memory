@@ -17,6 +17,10 @@ amem daily [--no-push] [--routines-log PATH] [--state PATH]
 
 A failed step is recorded, and the next step still runs.
 
+First the job waits for the database: it tries `select 1` up to 10 times, 60 seconds apart
+(launchd runs a missed 09:20 job right after wake, often before DNS is back; on 2026-10-14
+every step failed on that). The steps run either way.
+
 1. **ingest**: the `ingest git-ref` logic (docs/cloud.md): `gh api` GET of
    `reports/routines.log` on `vilmerfrost/agent-config@claude/routine-reports`.
    Called in-process, not as a subprocess. A 404 (branch or file missing, or no
@@ -37,9 +41,10 @@ A failed step is recorded, and the next step still runs.
    - An id is marked as pushed only after ntfy answers 200. The Mac fallback
      does not mark it, so it is pushed again the next day.
    - `--no-push` never pushes and never marks; it still prunes.
-   Then **deviations** (daily, docs/deviations.md): `sessions ingest` + `deviations scan`
+   Then **deviations** (daily, docs/deviations.md): `sessions ingest` + `deviations scan --limit 40`
    when `deviations_last_scan` in the state file is missing or at least 20 hours old (`AMEM_DEVIATIONS_EVERY_HOURS`). Off (not a
    failure) unless `AMEM_DEVIATIONS_LIVE=1`; the launchd job sets it. A session error fails the step.
+   A database connection error before the scan loop waits for the database again and retries once.
    Then **edits** (docs/edits.md): `edits run` after the deviations step. Off (not a failure)
    unless `AMEM_EDITS_LIVE=1`; the launchd job sets it. Kept edits are pushed with an Undo
    button (not with `--no-push`). Any candidate error fails the step; the others still run.
@@ -106,7 +111,7 @@ An unreadable file is a failed step and is treated as empty (worst case: one rep
 
 - Runs `/opt/homebrew/bin/uv run --directory /Users/vilmerfrost/Projects/agent-memory --quiet amem daily`.
 - Env: `AMEM_REQUIRE_REMOTE=1`, `AMEM_JEV_LIVE=1`, `AMEM_DEVIATIONS_LIVE=1` (the daily
-  deviations step runs: one `claude -p` writer call per scanned session, at most 15 a day),
+  deviations step runs: one `claude -p` writer call per scanned session, at most 40 a day),
   `AMEM_EDITS_LIVE=1` (the edits step runs: at most 5 writer calls and `improve apply` runs a day),
   and `PATH` with `~/.local/bin` (launchd's default PATH has no `gh`; `claude` lives there
   too). The DB URL and the Jev key come from the main checkout's env file, which `amem`

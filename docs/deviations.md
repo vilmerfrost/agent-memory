@@ -205,8 +205,10 @@ before the catalog until `reref` runs, group by their lowercased ref.
 Which sessions: unscanned, not `eval`, not tiny (at least 20 kB of transcript and at least 4
 tool calls + typed prompts; attachments alone can make a file big), started in the window,
 failed fewer than 3 times. Order: sessions that used a skill, then `routine`, `parent`,
-`worker`, `chat`, `headless`; newest first inside each group. A subagent that is not a
-`worker` (Explore, general-purpose, ...) is skipped once its parent session was scanned.
+`worker`, `chat`, `headless`, then subagents that are not a `worker` (Explore,
+general-purpose, ...); newest first inside each group. Such a subagent is skipped once its
+parent session was scanned, so it comes last: its parent is usually scanned first and covers it.
+The daily job scans at most 40 sessions a run (docs/daily.md); a manual scan defaults to 15.
 
 Per session:
 

@@ -2,6 +2,9 @@
 
 Steps, in order. A failed step is recorded and the next step still runs:
 
+0. wait: `wait_for_db` tries the database for up to ~10 minutes first (launchd runs the job
+   right after wake, often before DNS is back). The steps run either way.
+
 1. ingest: the routines.log that cloud routines publish (`ingest git-ref` logic).
 1b. tasks: dispatch tasks from `<parent dir>/*/tasks.jsonl` (`ingest tasks` logic).
 2. score: every routine with a `questions/<routine>.toml`, one routine at a time.
@@ -12,9 +15,10 @@ Steps, in order. A failed step is recorded and the next step still runs:
 3. escalations: open escalations are compared with the ids already pushed
    (state file). Only new ids trigger a push. Ids no longer open are pruned.
    An id is marked pushed only after ntfy answered 200.
-3b. deviations (daily): `sessions ingest` + `deviations scan` (docs/deviations.md) when the
-   last scan in the state file is >= 20 hours old (AMEM_DEVIATIONS_EVERY_HOURS). Off unless AMEM_DEVIATIONS_LIVE=1 (then not
-   a failure, and the log line has no deviation fields). Any session error fails the step.
+3b. deviations (daily): `sessions ingest` + `deviations scan --limit 40` (docs/deviations.md) when
+   the last scan in the state file is >= 20 hours old (AMEM_DEVIATIONS_EVERY_HOURS). Off unless AMEM_DEVIATIONS_LIVE=1 (then not
+   a failure, and the log line has no deviation fields). Any session error fails the step. A lost
+   database before the scan loop is retried once, after `wait_for_db`.
 3c. edits: `edits run` (docs/edits.md) after the deviations step. Off unless AMEM_EDITS_LIVE=1
    (then not a failure, and the log line has no edit fields). Kept edits are pushed with an
    Undo button (not with --no-push). Any candidate error fails the step; the others still run.
@@ -43,6 +47,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+import psycopg
+
 from agent_memory import cli_cloud, config, deviations, distill, jev, scoring, sessions_ingest, store, tasks_ingest
 from agent_memory.questions import QuestionCache
 
@@ -54,6 +60,8 @@ DEFAULT_STATE = PARENT_DIR / "amem-daily-state.json"
 NOTIFY_ENV = PARENT_DIR / "notify.env"
 DEFAULT_NTFY_SERVER = "https://ntfy.sh"
 SCORE_LIMIT = 100  # per routine, same default as `amem score`
+DB_WAIT_TRIES = 10  # ~10 minutes: launchd runs the job right after wake, often before DNS is back
+DB_WAIT_SECONDS = 60.0
 _WS_RE = re.compile(r"\s+")
 _REASON_MAX = 300
 
@@ -232,6 +240,38 @@ def plan_push(open_rows: list[dict[str, Any]], pushed_before: set[str]) -> tuple
 # ---------------------------------------------------------------- steps
 
 
+def sleep(seconds: float) -> None:
+    """time.sleep. Tests replace this."""
+    time.sleep(seconds)
+
+
+def wait_for_db(tries: int = DB_WAIT_TRIES) -> bool:
+    """True once the Postgres database answers. A failed connect (no DNS or route yet, e.g.
+    right after wake) is tried again DB_WAIT_SECONDS later, `tries` times in all. Never raises:
+    False means the steps run anyway and record their own failures. True without a check
+    when the backend is not Postgres."""
+    try:
+        if config.backend() != "postgres":
+            return True
+    except config.BackendError:
+        return True  # the steps' own guard records it
+    for attempt in range(1, tries + 1):
+        try:
+            with store.connect(connect_timeout=10) as conn:
+                conn.execute("select 1")
+            return True
+        except psycopg.OperationalError as exc:
+            if attempt == tries:
+                _err(f"db: not reachable after {tries} tries ({_exc(exc)}); running the steps anyway")
+                return False
+            _err(f"db: not reachable ({_exc(exc)}); try {attempt + 1}/{tries} in {DB_WAIT_SECONDS:g}s")
+            sleep(DB_WAIT_SECONDS)
+        except Exception as exc:  # not a network problem (bad URL, auth): waiting will not help
+            _err(f"db: {_exc(exc)}")
+            return False
+    return False
+
+
 def _postgres_guard(step: str, result: DailyResult) -> bool:
     """Scoring and escalations are Postgres only in V1, and AMEM_REQUIRE_REMOTE applies."""
     try:
@@ -344,6 +384,7 @@ def step_distill(result: DailyResult, *, limit: int = distill.DEFAULT_LIMIT) -> 
 DEVIATIONS_KEY = "deviations_last_scan"
 DEVIATIONS_EVERY_ENV = "AMEM_DEVIATIONS_EVERY_HOURS"
 DEVIATIONS_EVERY_DEFAULT_HOURS = 20  # daily at 09:20, with slack so launchd jitter never skips a day
+DEVIATIONS_LIMIT = 40  # sessions per daily scan (one writer call each); 15 left a growing backlog
 
 
 def deviations_every() -> timedelta:
@@ -379,16 +420,24 @@ def step_deviations(result: DailyResult, *, state_file: Path, now: datetime) -> 
         return
     if not _postgres_guard("deviations", result):
         return
-    try:
-        root = sessions_ingest.projects_dir()
-        if not root.is_dir():
-            raise FileNotFoundError(f"no projects folder at {root}")
-        ingested = sessions_ingest.ingest(root, days=deviations.DEFAULT_DAYS, now=now)
-        _err(f"deviations: {ingested.line()}")
-        report = deviations.scan(days=deviations.DEFAULT_DAYS, limit=deviations.DEFAULT_LIMIT, now=now)
-    except Exception as exc:  # ingest, question file or DB error before the loop
-        result.fail(f"deviations: {_exc(exc)}")
-        return
+    for attempt in (1, 2):
+        try:
+            root = sessions_ingest.projects_dir()
+            if not root.is_dir():
+                raise FileNotFoundError(f"no projects folder at {root}")
+            ingested = sessions_ingest.ingest(root, days=deviations.DEFAULT_DAYS, now=now)
+            _err(f"deviations: {ingested.line()}")
+            report = deviations.scan(days=deviations.DEFAULT_DAYS, limit=DEVIATIONS_LIMIT, now=now)
+            break
+        except psycopg.OperationalError as exc:  # the database went away: one retry once it is back
+            if attempt == 1 and wait_for_db():
+                _err(f"deviations: {_exc(exc)}; the database answers again, retrying once")
+                continue
+            result.fail(f"deviations: {_exc(exc)}")
+            return
+        except Exception as exc:  # ingest, question file or DB error before the loop
+            result.fail(f"deviations: {_exc(exc)}")
+            return
     result.deviations = report
     _err(report.summary())
     if report.errors:
@@ -495,6 +544,7 @@ def run_daily(
         now = now.astimezone()
     result = DailyResult()
     log_file = routines_log_path(routines_log)
+    wait_for_db()
     step_ingest(result)
     step_tasks(result, (parent_dir or log_file.parent).expanduser())
     step_score(result)

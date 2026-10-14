@@ -977,7 +977,8 @@ where s.scanned_at is null
   and not (s.kind = 'worker' and coalesce(s.meta ->> 'agent_type', '') <> 'worker'
            and exists (select 1 from sessions p
                        where p.session_id = s.meta ->> 'parent_session' and p.scanned_at is not null))
-order by case when jsonb_array_length(s.skills) > 0 then 0
+order by case when s.kind = 'worker' and coalesce(s.meta ->> 'agent_type', '') <> 'worker' then 6
+              when jsonb_array_length(s.skills) > 0 then 0
               when s.kind = 'routine' then 1
               when s.kind = 'parent' then 2
               when s.kind = 'worker' then 3

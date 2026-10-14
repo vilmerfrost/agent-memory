@@ -119,6 +119,7 @@ def daily_io(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[DailyI
     monkeypatch.setattr(daily, "NOTIFY_ENV", notify_env)
     monkeypatch.setattr(daily, "http_post", lambda *a, **k: unexpected.append("http_post") or 599)
     monkeypatch.setattr(daily, "mac_notify", lambda *a, **k: unexpected.append("mac_notify"))
+    monkeypatch.setattr(daily, "sleep", lambda seconds: None)  # wait_for_db never really waits
     # Default: the branch exists but its routines.log is empty (nothing new). A 404 is a
     # daily FAIL since swarm #22, so tests that want it set it with `use_gh(NOT_FOUND)`.
     monkeypatch.setattr(cli_cloud, "run_command", FakeGh(0, gh_contents("")))
