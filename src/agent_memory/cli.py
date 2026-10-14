@@ -16,10 +16,13 @@ from agent_memory import cli_ab
 from agent_memory import cli_daily
 from agent_memory import cli_deviations
 from agent_memory import cli_edits
+from agent_memory import cli_handoffs
+from agent_memory import cli_evals
 from agent_memory import dedupe
 from agent_memory import cli_lessons
 from agent_memory import cli_scoring
 from agent_memory import cli_tasks
+from agent_memory import cli_skills
 
 
 def _db_host(url: str) -> str:
@@ -178,12 +181,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     cli_cloud.register(sub, ingest_sub=ingest_sub)
     cli_tasks.register(sub, ingest_sub=ingest_sub)
+    cli_skills.register(sub, ingest_sub=ingest_sub)
     cli_lessons.register(sub)
     cli_scoring.register(sub)
     cli_ab.register(sub)
     cli_daily.register(sub)
     cli_deviations.register(sub)
     cli_edits.register(sub)
+    cli_handoffs.register(sub)
+    cli_evals.register(sub)
 
     # Handled in main() before parsing: every argument goes to amem_digest as is.
     sub.add_parser("digest-self", add_help=False,

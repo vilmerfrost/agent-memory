@@ -1,0 +1,27 @@
+{"t": "2026-04-06T19:34:40.533Z", "skill": "release-auditor", "by": "codex", "agent": "codex", "cwd": "/Users/demo/Projects/alpha", "backfill": true}
+{"t": "2026-04-06T20:23:53.322Z", "skill": "release-auditor", "by": "codex", "agent": "codex", "cwd": "/Users/demo/worktrees/alpha/w1", "backfill": true}
+{"t": "2026-05-28T20:44:50.704Z", "skill": "ask-the-board", "by": "claude", "agent": "claude", "cwd": "/Users/demo/Projects/beta", "backfill": true}
+{"t": "2026-05-29T23:19:38.331Z", "skill": "ask-the-board", "by": "me", "agent": "claude", "cwd": "/Users/demo/Projects/beta", "backfill": true}
+{"t": "2026-06-06T14:27:21.565Z", "skill": "gmail", "by": "codex", "agent": "codex", "cwd": "/Users/demo/Projects/alpha", "backfill": true}
+{"t": "2026-06-06T15:48:12.586Z", "skill": "frontend-design", "by": "codex", "agent": "codex", "cwd": "/Users/demo/Projects/beta", "backfill": true}
+{"t": "2026-06-07T22:02:16.075Z", "skill": "release-auditor", "by": "me", "agent": "codex", "cwd": "/Users/demo", "backfill": true}
+{"t": "2026-06-10T11:08:26.864Z", "skill": "here-now", "by": "claude", "agent": "claude", "cwd": "/Users/demo/Projects/beta", "backfill": true}
+{"t": "2026-06-19T16:23:21.105Z", "skill": "release-auditor", "by": "me", "agent": "codex", "cwd": "/Users/demo/Projects/alpha", "backfill": true}
+{"t": "2026-10-07T15:36:30+00:00", "skill": "spark", "by": "me", "agent": "claude", "cwd": "/Users/demo/worktrees/alpha/w1"}
+{"t": "2026-10-07T15:41:36+00:00", "skill": "video", "by": "claude", "agent": "claude", "cwd": "/Users/demo/Projects/beta"}
+{"t": "2026-10-07T15:56:20+00:00", "skill": "goal", "by": "me", "agent": "claude", "cwd": "/Users/demo/worktrees/alpha/w1"}
+{"t": "2026-10-07T16:12:15+00:00", "skill": "goal", "by": "me", "agent": "claude", "cwd": "/Users/demo/worktrees/alpha/w1"}
+{"t": "2026-10-07T16:19:18+00:00", "skill": "meltdown", "by": "me", "agent": "claude", "cwd": "/Users/demo"}
+{"t": "2026-10-07T17:15:47+00:00", "skill": "goal", "by": "me", "agent": "claude", "cwd": "/Users/demo/Projects/alpha"}
+{"t": "2026-10-07T17:27:02+00:00", "skill": "magicpath", "by": "codex", "agent": "codex", "cwd": "/Users/demo/worktrees/alpha/w1"}
+{"t": "2026-10-07T18:08:44+00:00", "skill": "handoff", "by": "codex", "agent": "codex", "cwd": "/Users/demo/Projects/beta"}
+
+{"t": "2026-10-08T09:13:27+00:00", "skill": "change-reviewer", "by": "claude", "agent": "claude", "cwd": "/Users/demo"}
+{"t": "2026-10-08T09:23:14+00:00", "skill": "built-in-browser", "by": "claude", "agent": "claude", "cwd": "/Users/demo"}
+{"t": "2026-10-08T09:58:49+00:00", "skill": "definition-of-done", "by": "claude", "agent": "claude", "cwd": "/Users/demo"}
+{"t": "2026-10-08T11:26:57+00:00", "skill": "handoff", "by": "me", "agent": "claude", "cwd": "/Users/demo/Projects/alpha"}
+{"t": "2026-10-08T11:26:57+00:00", "skill": "handoff", "by": "me", "agent": "claude", "cwd": "/Users/demo/Projects/alpha"}
+not json at all
+{"t": "2026-10-08T12:00:00+00:00", "by": "me", "agent": "claude", "cwd": "/Users/demo"}
+{"t": "2026-10-08T12:00:01+00:00", "skill": "spark", "by": "robot", "agent": "claude", "cwd": "/Users/demo"}
+{"t": "2026-10-08 12:00:02", "skill": "spark", "by": "me", "agent": "claude", "cwd": "/Users/demo"}

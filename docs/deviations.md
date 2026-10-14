@@ -32,6 +32,7 @@ cloud_digests (cloud routines) ─┴─sessions ingest──▶ sessions (tool 
 | `amem sessions ingest [--days 7] [--projects-dir DIR] [--codex-home DIR] [--tool all\|claude\|codex]` | Indexes Claude Code and Codex transcripts touched in the last N days into `sessions`, with token totals per session (docs/sessions-live.md). Flushes the hook spool first. Prints `sessions: ... (kinds) tools(claude=N codex=M) team=T` (`spool=N` when it flushed any). Idempotent. |
 | `amem sessions tokens [--days 7] [--repo R] [--tool claude\|codex] [--json]` | Token totals per repo / tool / kind / model and the top sessions (docs/sessions-live.md). Read only. |
 | `amem sessions cost --since ISO [--until ISO] [--category C] [--project P] [--json]` | Tokens and active / api / tool time of the sessions that started in a window, per project (docs/sessions-live.md, "Cost of a window"). Read only. |
+| `amem sessions find --agent-id ID [--ingest] [--projects-dir DIR] [--json]` | The sessions row of a subagent transcript `agent-<ID>.jsonl`: prints `session_id`, `category`, `project` (tab-separated). Exit 1 when not ingested; `--ingest` ingests that transcript first. See "Incident scans". |
 | `amem sessions ping` | Claude Code hook (SessionStart / Stop): the live row of the running session (docs/sessions-live.md). Always exits 0. |
 | `amem deviations scan [--days 7] [--limit 15] [--session ID] [--dry-run] [--timeout 300]` | Scans unscanned sessions. Prints one line per session and `deviations: sessions=N found=D edit=E enforce=F leave=L errors=X`. Exit 1 when a session failed. |
 | `amem deviations report [--days 7] [--json]` | Groups deviations by instruction source + rule id, most recurring first. `--json` prints the candidates file. |
@@ -39,7 +40,7 @@ cloud_digests (cloud routines) ─┴─sessions ingest──▶ sessions (tool 
 | `amem deviations rules FILE...` | Prints the rule catalog (`N. id — title`) of instruction files. Read only, no database. |
 
 All but `rules` need the Postgres backend (V1). The write commands (`sessions ingest`,
-`deviations scan`, `deviations reref`) honour `AMEM_REQUIRE_REMOTE=1` (exit 3).
+`sessions find --ingest`, `deviations scan`, `deviations reref`) honour `AMEM_REQUIRE_REMOTE=1` (exit 3).
 
 - `scan` calls the Claude Code CLI. It needs `AMEM_DEVIATIONS_LIVE=1`; without it, it exits 2
   and calls nothing. `AMEM_DEVIATIONS_CLAUDE` may point at another executable (tests, demos).
@@ -245,6 +246,26 @@ recorded in `sessions.meta.scan_error` (and `scan_errors` counts up), nothing is
 it, and the scan goes on. The session is retried on the next scan. A missing Jev fixture
 (fixture mode) is not an error: the deviation is stored with `jev_verdict = null` and
 `jev_mode = fixture-missing`.
+
+## Incident scans
+
+A blocked or failed worker is an incident: scan its session now, not on the next daily run.
+The parent knows the worker's agent id (the transcript is
+`<projects>/<project>/<parent session>/subagents/agent-<ID>.jsonl`; the session id is
+`<parent session>/agent-<ID>`).
+
+```sh
+amem sessions find --agent-id <ID> --ingest     # prints: session_id <TAB> category <TAB> project
+amem deviations scan --session <session_id>     # --dry-run first to see the digest size
+```
+
+`sessions find` without `--ingest` only reads: exit 1 with `not ingested` when no row
+exists yet. `--ingest` reads that one transcript (`--projects-dir`, default
+`AMEM_PROJECTS_DIR` or `~/.claude/projects`) and upserts its row first, like
+`sessions ingest`; exit 1 when no such file exists. `--json` prints JSON lines with `kind`,
+`started_at` and `scanned_at` as well. Postgres only. `--ingest` honours
+`AMEM_REQUIRE_REMOTE=1` (exit 3). `deviations scan --session` scans the session even when
+it was scanned before; it still needs `AMEM_DEVIATIONS_LIVE=1` without `--dry-run`.
 
 ## Objective result
 

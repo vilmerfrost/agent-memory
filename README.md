@@ -119,10 +119,13 @@ Each part has its own doc:
 
 | Part | Commands | Doc |
 |---|---|---|
-| Deviation finder (v2) | `sessions ingest`, `deviations scan`, `deviations report [--json]` | [docs/deviations.md](docs/deviations.md) |
+| Deviation finder (v2) | `sessions ingest`, `sessions find --agent-id` (incident scans), `deviations scan`, `deviations report [--json]` | [docs/deviations.md](docs/deviations.md) |
+| Handoff events | `handoffs log`, `handoffs resume`, `handoffs list` | [docs/handoffs.md](docs/handoffs.md) |
 | Edits + proof (v2) | `edits run`, `edits list`, `edits undo`, `edits undo-poll`, `edits scoreboard` | [docs/edits.md](docs/edits.md) |
+| Evals harvest (draft eval cases) | `evals harvest --out DIR [--days 7] [--limit N] [--dry-run]` | [docs/evals-harvest.md](docs/evals-harvest.md) |
 | Daily job | `daily` | [docs/daily.md](docs/daily.md) |
 | Dispatch tasks as runs | `ingest tasks` | [docs/tasks.md](docs/tasks.md) |
+| Skill usage + scores | `ingest skills`, `skills scores [--refresh]`, `skills cache PATH`, `skills suggest` | [docs/skills.md](docs/skills.md) |
 | Cloud path (HTTPS, no raw Postgres) | `AMEM_BACKEND=rest`, `ingest git-ref`, `jev record`, `tools/amem_digest.py` / `digest-self` (cloud routine sessions) | [docs/cloud.md](docs/cloud.md) |
 | Jev scoring + human labels | `score`, `label`, `escalations`, `calibrate`, `drift` | [docs/scoring.md](docs/scoring.md) |
 | Lessons memory (frozen) | `lessons import/export/for/score/distill`, `lesson propose`, `gate friction` | [docs/lessons.md](docs/lessons.md) |
@@ -135,7 +138,7 @@ candidates to `edits run` → one commit per edit (`improve apply`), a push with
 
 The v1 loop (frozen, kept for history): runs are logged → Jev scores outcomes (low confidence → you label 👍/👎) → Jev gates which runs become lessons → `lessons for` injects the top lessons into briefs (`AMEM_MEMORY=off` turns injection off) → `ab report` shows whether each lesson actually helps → losers retire.
 
-Scoring, lessons, A/B and deviation commands use the Postgres backend only; the REST backend covers `runs` (`log-run`, `ingest`, `runs`).
+Scoring, lessons, A/B and deviation commands use the Postgres backend only; the REST backend covers `runs` (`log-run`, `ingest`, `runs`) and `handoffs`.
 
 ## Tests
 
