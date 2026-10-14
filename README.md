@@ -122,6 +122,7 @@ Each part has its own doc:
 | Deviation finder (v2) | `sessions ingest`, `sessions find --agent-id` (incident scans), `deviations scan`, `deviations report [--json]` | [docs/deviations.md](docs/deviations.md) |
 | Handoff events | `handoffs log`, `handoffs resume`, `handoffs list` | [docs/handoffs.md](docs/handoffs.md) |
 | Edits + proof (v2) | `edits run`, `edits list`, `edits undo`, `edits undo-poll`, `edits scoreboard` | [docs/edits.md](docs/edits.md) |
+| Evals harvest (draft eval cases) | `evals harvest --out DIR [--days 7] [--limit N] [--dry-run]` | [docs/evals-harvest.md](docs/evals-harvest.md) |
 | Daily job | `daily` | [docs/daily.md](docs/daily.md) |
 | Dispatch tasks as runs | `ingest tasks` | [docs/tasks.md](docs/tasks.md) |
 | Cloud path (HTTPS, no raw Postgres) | `AMEM_BACKEND=rest`, `ingest git-ref`, `jev record`, `tools/amem_digest.py` / `digest-self` (cloud routine sessions) | [docs/cloud.md](docs/cloud.md) |
