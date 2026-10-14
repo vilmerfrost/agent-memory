@@ -16,6 +16,7 @@ from agent_memory import cli_ab
 from agent_memory import cli_daily
 from agent_memory import cli_deviations
 from agent_memory import cli_edits
+from agent_memory import cli_handoffs
 from agent_memory import dedupe
 from agent_memory import cli_lessons
 from agent_memory import cli_scoring
@@ -184,6 +185,7 @@ def build_parser() -> argparse.ArgumentParser:
     cli_daily.register(sub)
     cli_deviations.register(sub)
     cli_edits.register(sub)
+    cli_handoffs.register(sub)
 
     # Handled in main() before parsing: every argument goes to amem_digest as is.
     sub.add_parser("digest-self", add_help=False,

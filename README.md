@@ -119,7 +119,8 @@ Each part has its own doc:
 
 | Part | Commands | Doc |
 |---|---|---|
-| Deviation finder (v2) | `sessions ingest`, `deviations scan`, `deviations report [--json]` | [docs/deviations.md](docs/deviations.md) |
+| Deviation finder (v2) | `sessions ingest`, `sessions find --agent-id` (incident scans), `deviations scan`, `deviations report [--json]` | [docs/deviations.md](docs/deviations.md) |
+| Handoff events | `handoffs log`, `handoffs resume`, `handoffs list` | [docs/handoffs.md](docs/handoffs.md) |
 | Edits + proof (v2) | `edits run`, `edits list`, `edits undo`, `edits undo-poll`, `edits scoreboard` | [docs/edits.md](docs/edits.md) |
 | Daily job | `daily` | [docs/daily.md](docs/daily.md) |
 | Dispatch tasks as runs | `ingest tasks` | [docs/tasks.md](docs/tasks.md) |
@@ -135,7 +136,7 @@ candidates to `edits run` → one commit per edit (`improve apply`), a push with
 
 The v1 loop (frozen, kept for history): runs are logged → Jev scores outcomes (low confidence → you label 👍/👎) → Jev gates which runs become lessons → `lessons for` injects the top lessons into briefs (`AMEM_MEMORY=off` turns injection off) → `ab report` shows whether each lesson actually helps → losers retire.
 
-Scoring, lessons, A/B and deviation commands use the Postgres backend only; the REST backend covers `runs` (`log-run`, `ingest`, `runs`).
+Scoring, lessons, A/B and deviation commands use the Postgres backend only; the REST backend covers `runs` (`log-run`, `ingest`, `runs`) and `handoffs`.
 
 ## Tests
 
