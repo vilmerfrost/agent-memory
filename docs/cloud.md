@@ -158,7 +158,7 @@ Output: one JSON object, the `cloud_digests` row.
 | `digest`, `digest_sha` | the redacted, capped digest and its sha256 |
 | `instructions` | `[{name, sha256, text}]`: text redacted, capped at 100k chars; sha256 of the text as read |
 | `skills` | `Skill` calls and slash commands, no built-ins |
-| `meta` | `{cloud: true, repo, script_version, transcript_bytes, tool_calls, prompts, tokens}`; `tokens` (script version 2+) = `{input, output, cache_read, cache_creation, models}`, the session's token totals (docs/sessions-live.md). Script version 3+ adds `title` (when named), `profile` (model, effort, duration) and `outcome` (`{signals, end}`: signal names and counts only) |
+| `meta` | `{cloud: true, repo, script_version, transcript_bytes, tool_calls, prompts, tokens}`; `tokens` (script version 2+) = `{input, output, cache_read, cache_creation, models}`, the session's token totals (docs/sessions-live.md). Script version 3+ adds `title` (when named), `profile` (model, effort, duration) and `outcome` (`{signals, end}`: signal names and counts only). Script version 5: shell commands are read quote-aware and `commit` counts only on proof from the call result (docs/sessions-live.md, "Outcome") |
 
 ### The routine's last step
 

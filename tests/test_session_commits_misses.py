@@ -208,14 +208,15 @@ def test_git_log_fallback_skips_dirs_that_are_no_local_repo(tmp_path: Path) -> N
     assert session_commits.git_log_commits("", T, T + timedelta(hours=1)) == []
 
 
-def test_fallback_only_when_nothing_parsed_and_the_signal_counts_a_commit(repo: Path) -> None:
+def test_fallback_only_when_nothing_parsed_and_a_confirmed_call_ran_in_the_dir(repo: Path) -> None:
     window = session_commits.Fallback(1, T, T + timedelta(hours=1))
     parsed = [{"sha": "abc1234", "message": "m", "repo": "r", "branch": "main"}]
-    assert session_commits.with_fallback(parsed, [], str(repo), window) == parsed
-    assert session_commits.with_fallback([], [], str(repo), session_commits.Fallback(0, T, T)) == []
-    assert session_commits.with_fallback([], [], str(repo), None) == []
-    assert [c["message"] for c in session_commits.with_fallback([], [], str(repo), window)] == ["Mine one",
-                                                                                               "Mine | two"]
+    assert session_commits.with_fallback(parsed, [str(repo)], str(repo), window) == parsed
+    assert session_commits.with_fallback([], [str(repo)], str(repo), None) == []
+    # The session cwd and the signal count alone never ask git (s-fix3): only a confirmed call's dir does.
+    assert session_commits.with_fallback([], [], str(repo), window) == []
+    assert [c["message"] for c in session_commits.with_fallback([], [str(repo)], "", window)] == ["Mine one",
+                                                                                                 "Mine | two"]
 
 
 def test_background_commit_uses_the_dir_it_ran_in(repo: Path, tmp_path: Path) -> None:
