@@ -886,9 +886,11 @@ def outcome(signals: dict[str, int], end: str | None, last_at: datetime | None,
             return "failed", evidence
         return "no-change", evidence
     # Unanswered: a prompt with no reply, or a tool call with no result. A session that ended
-    # on a tool result (`result`) got its answer; it is not abandoned for that.
+    # on a tool result (`result`) got its answer; it is not abandoned for that. Edits count as
+    # abandoned only without a final reply (`end` `reply`): edited, then answered = finished, `partial` below.
     dangling = end in ("user", "tool")
-    if age_h is not None and age_h > ABANDONED_HOURS and (dangling or (s.get("edit") and not s.get("report_done"))):
+    unfinished_edit = s.get("edit") and not s.get("report_done") and end != "reply"
+    if age_h is not None and age_h > ABANDONED_HOURS and (dangling or unfinished_edit):
         return "abandoned", evidence
     if s.get("edit"):
         return "partial", evidence

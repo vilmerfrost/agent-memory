@@ -118,8 +118,11 @@ def test_worker_rule_comes_from_the_kind(setup_home: Home) -> None:  # noqa: F81
                    result("r1", "ok", 1)]),
     ("abandoned", [user("go", 0), assistant(text("hm"), minute=1), user("still there?", 2)]),
     ("abandoned", [user("go", 0), assistant(tool("Bash", "b1", command="sleep 99"), minute=1)]),
-    ("abandoned", [user("go", 0), assistant(tool("Edit", "e1", file_path="a.py"), minute=1), result("e1", "ok", 1),
-                   assistant(text("done"), minute=2)]),
+    # Edited, then a final reply: finished (partial), not abandoned.
+    ("partial", [user("go", 0), assistant(tool("Edit", "e1", file_path="a.py"), minute=1), result("e1", "ok", 1),
+                 assistant(text("done"), minute=2)]),
+    # Edited, no final reply: abandoned.
+    ("abandoned", [user("go", 0), assistant(tool("Edit", "e1", file_path="a.py"), minute=1), result("e1", "ok", 1)]),
     ("no-change", [user("what is X?", 0), assistant(text("X is Y."), minute=1)]),
 ])
 def test_chat_abandoned_rule(setup_home: Home, want: str, events: list[dict[str, Any]]) -> None:  # noqa: F811
