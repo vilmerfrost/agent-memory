@@ -169,7 +169,7 @@ def test_spool_when_the_db_is_down_then_flush(setup_home: Home, db: str) -> None
 def test_sessions_ingest_flushes_the_spool(setup_home: Home, db: str) -> None:  # noqa: F811
     session_live.ping(payload("SessionStart", setup_home), now=NOW, db_url=dead_url())
     report = sessions_ingest.ingest(setup_home.projects, days=7, now=NOW, db_url=db, tools=("claude",))
-    assert report.spool == 1 and report.line().endswith("spool=1")
+    assert report.spool == 1 and report.line().endswith("spool=1 summary=off")
     assert _row(db) is not None and not (parent(setup_home) / session_live.SPOOL_NAME).exists()
 
 

@@ -150,7 +150,7 @@ def test_ingest_recomputes_stored_outcomes_and_fills_places(setup_home: Home, db
     _stored(db, "chat-null", "chat", None, None, old, cwd="/work/demo-repo")   # a ping row of an old version
     report = sessions_ingest.ingest(setup_home.projects, days=7, now=NOW, db_url=db)
     assert (report.outcomes, report.places) == (3, 1)
-    assert report.line().endswith(" outcomes=3 places=1")
+    assert report.line().endswith(" outcomes=3 places=1 summary=off")
     got = dict(_q(db, "select session_id, outcome from sessions"))
     assert got == {"p/agent-1": "no-change", "p/agent-2": "partial", "chat-r": "no-change",
                    "chat-u": "abandoned", "chat-null": None}
