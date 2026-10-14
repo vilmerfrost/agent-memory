@@ -390,7 +390,7 @@ def test_cli_summarize_dry_run_and_live_gate(setup_home: Home, db: str) -> None:
     res = run_amem("sessions", "summarize", "--days", "3650", "--dry-run", env=env)
     assert res.returncode == 0, res.stderr
     assert re.fullmatch(r"summaries: would summarize \d+, skipped-no-transcript \d+, skipped-subagent \d+, "
-                        r"failed 0 \(up-to-date \d+, not-finished \d+, left-for-next-run 0, commits-updated \d+, "
+                        r"skipped-empty \d+, failed 0 \(up-to-date \d+, not-finished \d+, left-for-next-run 0, commits-updated \d+, "
                         r"bad-summaries \d+\)\n" + COMMITS_LINE + r"\n", res.stdout), res.stdout
     gated = run_amem("sessions", "summarize", "--days", "7", env=env)
     assert gated.returncode == 2 and "AMEM_SUMMARY_LIVE" in gated.stderr
@@ -444,6 +444,83 @@ def test_non_compliant_reply_is_never_stored(setup_home: Home, db: str,  # noqa:
     got = session_summary.summarize(days=7, now=NOW, db_url=db)
     assert (got.done, got.failed, len(fake.prompts)) == (0, 1, 2)
     assert _row(db, sid)["summary"] is None and "does not start with 'The session'" in got.errors[0]
+
+
+REFUSAL = "The session record was not included in this message, so I cannot describe what the session did."
+
+
+@pytest.mark.parametrize("reply,ok", [
+    (REFUSAL, False),                                                        # the 2026-10-14 15:00 row
+    ("The session could not be described because no transcript was provided.", False),
+    ("The session cannot be summarized from the data given.", False),
+    ("The session did something, but I can't tell what from this prompt.", False),
+    ("The session is unclear; I only see the facts block.", False),
+    ("The session could not access the RemoteTrigger tool, so it audited the routines from the repos.", True),
+    ("The session fixed the I/O retry in io.py and found no transcript files to migrate; it finished.", True),
+])
+def test_refusals_are_rejected_even_with_the_prefix(reply: str, ok: bool) -> None:
+    assert session_summary.compliant(reply) is ok
+    assert (session_summary.clean(reply) is not None) is ok
+
+
+def test_refusal_reply_is_retried_and_never_stored(setup_home: Home, db: str,  # noqa: F811
+                                                  monkeypatch: pytest.MonkeyPatch) -> None:
+    sid = _advice_session(setup_home)
+    _ingest(setup_home, db)
+    fake = FakeModel(default=REFUSAL)
+    monkeypatch.setattr(session_summary, "call_model", fake)
+    got = session_summary.summarize(days=7, now=NOW, db_url=db)
+    assert (got.done, got.failed, len(fake.prompts)) == (0, 1, 2) and _row(db, sid)["summary"] is None
+    assert "previous reply" not in fake.prompts[1] and "<session_record> tags" in fake.prompts[1]
+    monkeypatch.setattr(session_summary, "call_model", FakeModel(REFUSAL))   # refusal, then a good retry
+    assert session_summary.summarize(days=7, now=NOW, db_url=db).done == 1 and _row(db, sid)["summary"] == SUMMARY
+
+
+def test_empty_digest_is_skipped_without_a_model_call(setup_home: Home, db: str,  # noqa: F811
+                                                     monkeypatch: pytest.MonkeyPatch) -> None:
+    cwd = str(setup_home.repo)
+    write_transcript(setup_home.project("-work-demo-repo") / "thin-1.jsonl",
+                     [user("hi", 0, cwd=cwd), *commit(cwd, "c1", "[main 1a2b3c4] x", minute=2)])
+    _ingest(setup_home, db)
+    assert _row(db, "thin-1")["outcome"] not in (None, "active")
+    fake = FakeModel()
+    monkeypatch.setattr(session_summary, "call_model", fake)
+    got = session_summary.summarize(days=7, now=NOW, db_url=db)
+    assert got.skipped.get("empty") == 1 and got.done == 0 and fake.prompts == []
+    assert "skipped-empty 1" in got.line() and _row(db, "thin-1")["summary"] is None
+    assert not session_summary.substantial("") and not session_summary.substantial("[turn 1] USER: " + "x" * 400)
+    assert session_summary.substantial("[turn 1] USER: fix it\nTOOL Bash: pytest\nASSISTANT: " + "y" * 200)
+
+
+def test_redo_bad_also_redoes_a_stored_refusal(setup_home: Home, db: str,  # noqa: F811
+                                              monkeypatch: pytest.MonkeyPatch) -> None:
+    _sessions(setup_home)
+    _ingest(setup_home, db)
+    monkeypatch.setattr(session_summary, "call_model", FakeModel())
+    session_summary.summarize(days=7, now=NOW, db_url=db)
+    with psycopg.connect(db) as conn:
+        conn.execute("update sessions set summary = %s where session_id = 'committed-1/agent-w1'", (REFUSAL,))
+    dry = session_summary.summarize(days=7, now=NOW, db_url=db, dry_run=True, redo_bad=True)
+    assert (dry.bad, dry.done) == (1, 1)
+    assert session_summary.summarize(days=7, now=NOW, db_url=db, redo_bad=True).done == 1
+    assert _row(db, "committed-1/agent-w1")["summary"] == SUMMARY
+
+
+def test_commits_only_drops_a_stored_shell_syntax_repo(setup_home: Home, db: str) -> None:  # noqa: F811
+    _sessions(setup_home)
+    _ingest(setup_home, db)
+    bad = {"sha": None, "message": "base", "repo": "$(mktemp", "branch": None}
+    good = {"sha": "1a2b3c4", "message": "Fix the parser", "repo": "demo-repo", "branch": "main"}
+    with psycopg.connect(db) as conn:   # stored by the older parser; the transcript now gives nothing
+        conn.execute("update sessions set outcome_evidence = outcome_evidence || %s::jsonb "
+                     "where session_id = 'committed-1/agent-q1'", (json.dumps({"commit": 1, "commits": [bad]}),))
+        conn.execute("update sessions set outcome_evidence = outcome_evidence || %s::jsonb "
+                     "where session_id = 'plain-1'", (json.dumps({"commits": [bad, good]}),))
+    got = session_summary.summarize(days=7, now=NOW, db_url=db, commits_only=True)
+    assert got.commits_updated == 2
+    assert _row(db, "committed-1/agent-q1")["outcome_evidence"]["commits"] == []
+    assert _row(db, "plain-1")["outcome_evidence"]["commits"] == [good]
+    assert session_summary.bad_commit(bad) and not session_summary.bad_commit(good)
 
 
 def test_redo_bad_summarizes_the_bad_rows_again(setup_home: Home, db: str,  # noqa: F811

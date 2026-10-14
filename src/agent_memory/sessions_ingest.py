@@ -740,6 +740,7 @@ class IngestReport:
     summaries: int = 0          # summaries written (session_summary; off unless AMEM_SUMMARY_LIVE=1)
     summary_failed: int = 0     # model calls that failed or answered junk
     summary_left: int = 0       # rows not looked at: the time budget ran out (the next run picks them up)
+    summary_empty: int = 0      # rows skipped: the transcript digest is too short to describe
     summary_error: str | None = None   # the summary step itself failed (ingest still succeeds)
     summary_live: bool = False  # the summary step ran (AMEM_SUMMARY_LIVE=1)
 
@@ -754,7 +755,8 @@ class IngestReport:
         # `summaries=N`, even 0, so a launchd log tells "off" from "nothing eligible".
         summ = " summary=off" if not self.summary_live else f" summaries={self.summaries}"
         summ += "".join(f" {k}={v}" for k, v in (("summary_failed", self.summary_failed),
-                                                 ("summary_left", self.summary_left)) if v)
+                                                 ("summary_left", self.summary_left),
+                                                 ("summary_empty", self.summary_empty)) if v)
         summ += f" summary_error={self.summary_error}" if self.summary_error else ""
         return (f"sessions: {self.files} files, {self.new} new, {self.updated} updated, "
                 f"{self.skipped} skipped ({kinds}) tools({tools}) team={self.team}{cloud}{bad}{spool}{fixed}{summ}")
@@ -1173,3 +1175,4 @@ def summarize_step(report: IngestReport, *, days: int, now: datetime | None, db_
         report.summary_error = type(exc).__name__
         return
     report.summaries, report.summary_failed, report.summary_left = got.done, got.failed, got.left
+    report.summary_empty = got.skipped.get("empty", 0)
