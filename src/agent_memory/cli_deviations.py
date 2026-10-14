@@ -231,7 +231,8 @@ def register(sub: Any) -> None:
     p.add_argument("--dry-run", action="store_true",
                    help="count what would be done: no model call, nothing written (needs no live mode)")
     p.add_argument("--redo-bad", action="store_true",
-                   help="also summarize again the sessions whose summary does not start with \"The session\"")
+                   help="also summarize again the sessions whose summary does not start with \"The session\" "
+                        "or is a refusal")
     p.add_argument("--commits-only", action="store_true",
                    help="only re-read commits (transcripts, then the git-log fallback): no summaries, no model "
                         "call, needs no live mode; prints committed sessions with commits before / after")

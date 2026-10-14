@@ -65,7 +65,7 @@ SUMMARY_MAX = 600
 SUMMARY_MIN = 20
 MAX_SENTENCES = 3
 
-REASONS = ("current", "active", "subagent", "no_transcript")
+REASONS = ("current", "active", "subagent", "no_transcript", "empty")
 
 
 def live() -> bool:
@@ -111,7 +111,7 @@ def _last(rec: dict[str, Any]) -> datetime | None:
 def skip_reason(rec: dict[str, Any], now: datetime, *, redo_bad: bool = False) -> str | None:
     """Why a stored row gets no summary now (one of REASONS but `no_transcript`), else None.
     Reads the row only; the transcript check comes after. `redo_bad`: a stored summary that
-    does not start with PREFIX is never up to date."""
+    is not `compliant` (no PREFIX, or a refusal) is never up to date."""
     meta = rec.get("meta") or {}
     last = _last(rec)
     done_at = rec.get("summary_updated_at")
@@ -246,9 +246,9 @@ Now write the summary. It must begin with "The session".
 """
 
 RETRY_NOTE = """
-Your previous reply did not follow the format. Describe the session in the third person and
-begin your reply with the exact words "The session". Do not continue the record or address
-anyone.
+Reminder: the full session record is above, between the <session_record> tags. Describe what
+that session did, in the third person, and begin your reply with the exact words "The
+session". Do not continue the record, do not address anyone, and do not comment on this prompt.
 """
 
 
@@ -257,7 +257,17 @@ def _one_line(text: Any, limit: int) -> str:
     return out if len(out) <= limit else out[: limit - 1].rstrip() + "…"
 
 
-def prompt(rec: dict[str, Any], events: list[dict[str, Any]]) -> str:
+MIN_DIGEST_CHARS = 200   # a shorter digest holds too little to describe: no model call
+
+
+def substantial(digest_text: str) -> bool:
+    """Enough of the transcript to describe: at least MIN_DIGEST_CHARS and some work by the
+    agent (an assistant line or a tool call). Else the row is skipped (`empty`), never sent."""
+    text = digest_text.strip()
+    return len(text) >= MIN_DIGEST_CHARS and bool(re.search(r"(?m)(?:^|\] )(?:ASSISTANT:|TOOL |ERROR )", text))
+
+
+def prompt(rec: dict[str, Any], events: list[dict[str, Any]], *, digest_text: str | None = None) -> str:
     evidence = rec.get("outcome_evidence") if isinstance(rec.get("outcome_evidence"), dict) else {}
     signals = ", ".join(f"{k}={v}" for k, v in sorted(evidence.items()) if k != "commits") or "-"
     commits = "\n".join(f"- {_one_line(c.get('sha') or 'sha unknown', 40)} ({_one_line(c.get('repo') or '-', 80)}, "
@@ -269,7 +279,7 @@ def prompt(rec: dict[str, Any], events: list[dict[str, Any]]) -> str:
     return PROMPT.format(max_chars=SUMMARY_MAX - 100, tool=rec.get("tool") or "claude", kind=rec.get("kind") or "-",
                          repo=rec.get("repo") or "-", title=quoted(_one_line(rec.get("title") or "-", 200)),
                          outcome=rec.get("outcome") or "-", signals=_one_line(signals, 400), commits=quoted(commits),
-                         digest=quoted(digest(own_events(events, rec))))
+                         digest=quoted(digest(own_events(events, rec)) if digest_text is None else digest_text))
 
 
 # --------------------------------------------------------------------------- the model
@@ -287,18 +297,19 @@ def call_model(text: str, *, timeout: float = CALL_TIMEOUT) -> str:
 def write_summary(text: str, *, timeout: float = CALL_TIMEOUT,
                   clock: Callable[[], float] = time.monotonic) -> str:
     """The stored summary for a prompt: one model call, and one retry (RETRY_NOTE added) when
-    the reply is junk or does not start with PREFIX. `timeout` covers both calls. Raises
-    distill.DraftError when no compliant summary came back: nothing is stored then."""
+    the reply is junk, a refusal or does not start with PREFIX. `timeout` covers both calls.
+    Raises distill.DraftError when no compliant summary came back: nothing is stored then."""
     start = clock()
     got = clean(call_model(text, timeout=timeout))
     if got is not None:
         return got
     left = timeout - (clock() - start)
+    why = f"reply is junk, a refusal, or does not start with {PREFIX!r}"
     if left < MIN_CALL_SECONDS:
-        raise distill.DraftError(f"reply is junk or does not start with {PREFIX!r}; no time left to retry")
+        raise distill.DraftError(f"{why}; no time left to retry")
     got = clean(call_model(text + RETRY_NOTE, timeout=left))
     if got is None:
-        raise distill.DraftError(f"reply is junk or does not start with {PREFIX!r}, also after one retry")
+        raise distill.DraftError(f"{why}, also after one retry")
     return got
 
 
@@ -308,18 +319,37 @@ _JUNK_RE = re.compile(r"^(?:i (?:can(?:no|')t|am unable|don't|do not)|as an ai|s
 
 
 _THIS_SESSION_RE = re.compile(r"^This session\s+")
+# A refusal or a note about the input, even when it starts with PREFIX: "The session record was
+# not included in this message, so I cannot describe what the session did."
+# Narrow on purpose: "The session could not access the tool" is a real description and stays.
+_REFUSAL_RE = re.compile(
+    r"\b(?:can ?not|can't|could ?not|couldn't|unable to|not able to)\s+(?:\w+\s+)?(?:describ|summari[sz])\w*"
+    r"|\b(?:record|transcript|digest|session data|details|content)\s+(?:was|were|is|are|has been|have been)\s+"
+    r"not\s+(?:\w+\s+)?(?:included|provided|available|shown|given|attached|present)\b"
+    r"|\b(?:no|missing|empty|without (?:a|the|any))\s+(?:session\s+)?(?:record|transcript|digest)\s+"
+    r"(?:was|were|is|are|to|in|provided|included|given)\b"
+    r"|\bthis (?:message|prompt|request)\b",
+    re.I)
+_FIRST_PERSON_RE = re.compile(r"(?:^|[\s,;(])I(?:\s|'m\b|'ve\b|'d\b|'ll\b)")
+
+
+def refusal(summary: str) -> bool:
+    """True for a refusal or a remark about the prompt instead of a description of the session
+    (first person, "cannot describe", "was not included", "no transcript")."""
+    return bool(_REFUSAL_RE.search(summary)) or bool(_FIRST_PERSON_RE.search(summary))
 
 
 def compliant(summary: Any) -> bool:
-    """A stored summary describes the session in the third person: it starts with PREFIX.
-    Anything else (the agent's own last reply, advice, a continuation) is never stored."""
-    return isinstance(summary, str) and summary.startswith(PREFIX + " ")
+    """A stored summary describes the session in the third person: it starts with PREFIX and is
+    no refusal. Anything else (the agent's own last reply, advice, a continuation, "the record
+    was not included") is never stored, and `--redo-bad` redoes it."""
+    return isinstance(summary, str) and summary.startswith(PREFIX + " ") and not refusal(summary)
 
 
 def clean(text: Any) -> str | None:
     """The stored summary: one line, redacted, at most MAX_SENTENCES sentences and SUMMARY_MAX
     chars, starting with PREFIX. None for empty, junk (a refusal, JSON, a code fence, too
-    short) or non-compliant output (it does not start with PREFIX)."""
+    short) or non-compliant output (it does not start with PREFIX, or is a refusal)."""
     if not isinstance(text, str):
         return None
     out = " ".join(text.replace("**", "").split())
@@ -347,7 +377,7 @@ class SummaryReport:
     commits_updated: int = 0
     skipped: dict[str, int] = field(default_factory=dict)   # reason -> rows
     errors: list[str] = field(default_factory=list)          # one short line per failure (first few)
-    bad: int = 0                  # rows in the window whose summary does not start with PREFIX (before the run)
+    bad: int = 0                  # rows in the window whose summary is not `compliant` (before the run)
     # Committed rows (evidence `commit` > 0) with a non-empty `commits` list, before and after the
     # commit refresh: [all rows, top-level rows (no meta.parent_session)].
     committed: list[int] = field(default_factory=lambda: [0, 0])
@@ -362,7 +392,7 @@ class SummaryReport:
         verb = "would summarize" if dry_run else "done"
         s = self.skipped
         return (f"summaries: {verb} {self.done}, skipped-no-transcript {s.get('no_transcript', 0)}, "
-                f"skipped-subagent {s.get('subagent', 0)}, failed {self.failed} "
+                f"skipped-subagent {s.get('subagent', 0)}, skipped-empty {s.get('empty', 0)}, failed {self.failed} "
                 f"(up-to-date {s.get('current', 0)}, not-finished {s.get('active', 0)}, "
                 f"left-for-next-run {self.left}, commits-updated {self.commits_updated}, bad-summaries {self.bad})")
 
@@ -475,7 +505,11 @@ def _summaries(conn: Any, recs: list[dict[str, Any]], report: SummaryReport, *, 
                     report.skip("no_transcript")
                     continue
                 events = sessions_ingest.load_events(path)
-            yield rec, prompt(rec, events)
+            digest_text = digest(own_events(events, rec))
+            if not substantial(digest_text):   # never ask the model to describe nothing
+                report.skip("empty")
+                continue
+            yield rec, prompt(rec, events, digest_text=digest_text)
 
     pending = jobs()
     if dry_run:
@@ -507,16 +541,27 @@ def _summaries(conn: Any, recs: list[dict[str, Any]], report: SummaryReport, *, 
     return report
 
 
+def bad_commit(commit: dict[str, Any]) -> bool:
+    """A stored commit with a repo name made of shell syntax (`$(mktemp`, `$W`, backticks): an
+    older parser read a `cd`/`-C` target it could not resolve."""
+    repo = commit.get("repo")
+    return isinstance(repo, str) and bool(re.search(r"[$`()]", repo))
+
+
 def _refresh_commits(conn: Any, rec: dict[str, Any], events: list[dict[str, Any]], report: SummaryReport,
                      dry_run: bool) -> None:
-    """Re-read the transcript's commits into `outcome_evidence.commits`. Never drops stored
-    commits, never touches another evidence key, never creates evidence (a row without
-    `outcome_evidence` has no outcome yet)."""
+    """Re-read the transcript's commits into `outcome_evidence.commits`. A non-empty re-read
+    replaces the stored list; an empty one keeps it, minus `bad_commit` entries. Never touches
+    another evidence key, never creates evidence (a row without `outcome_evidence` has no
+    outcome yet)."""
     evidence = rec.get("outcome_evidence")
     if not isinstance(evidence, dict):
         return
     found = commits_of(events, rec)
-    if not found or found == evidence.get("commits"):
+    stored = _commits(evidence)
+    if not found:   # keep what is stored, but drop entries an older parser got wrong
+        found = [c for c in stored if not bad_commit(c)]
+    if found == evidence.get("commits") or (not found and not stored):
         return
     report.commits_updated += 1
     report.from_git_log += any(c.get("source") == session_commits.SOURCE_GIT_LOG for c in found)
