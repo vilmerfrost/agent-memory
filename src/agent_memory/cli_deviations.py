@@ -1,5 +1,6 @@
-"""`amem sessions ingest|tokens` and `amem deviations scan|report|reref|rules` (docs/deviations.md,
-docs/sessions-live.md). `amem sessions ping` is session_live.main (cli.main routes it).
+"""`amem sessions ingest|summarize|tokens|cost` and `amem deviations scan|report|reref|rules`
+(docs/deviations.md, docs/sessions-live.md). `amem sessions ping` is session_live.main (cli.main
+routes it). `sessions summarize` without `--dry-run` needs AMEM_SUMMARY_LIVE=1 (else exit 2).
 
 Postgres only (like the lessons commands): on the REST backend they exit 1 (`rules` needs
 no database). Writes honour AMEM_REQUIRE_REMOTE=1 (exit 3). `deviations scan` without
@@ -75,6 +76,25 @@ def cmd_sessions_ingest(args: argparse.Namespace) -> int:
     except (OSError, psycopg.Error) as exc:
         return _err("sessions ingest", exc)
     print(report.line())
+    return 0
+
+
+def cmd_sessions_summarize(args: argparse.Namespace) -> int:
+    from agent_memory import session_summary
+
+    if not args.dry_run and not session_summary.live():
+        print(f"amem: sessions summarize calls the Claude Code CLI ({session_summary.MODEL}) for every finished "
+              f"session and needs live mode: set {session_summary.LIVE_ENV}=1, or use --dry-run. "
+              "Nothing was called or written.", file=sys.stderr)
+        return USAGE_EXIT
+    if (code := (_read_guard if args.dry_run else _write_guard)("sessions summarize")) is not None:
+        return code
+    try:
+        report = session_summary.summarize(days=args.days, budget=args.budget, workers=args.concurrency,
+                                           dry_run=args.dry_run, refresh_commits=True, window="started")
+    except (OSError, psycopg.Error) as exc:
+        return _err("sessions summarize", exc)
+    print(report.line(dry_run=args.dry_run))
     return 0
 
 
@@ -197,6 +217,17 @@ def register(sub: Any) -> None:
     p.add_argument("--tool", choices=("all", *sessions_ingest.TOOLS), default="all",
                    help="which transcripts to index (default all)")
     p.set_defaults(func=cmd_sessions_ingest)
+
+    p = s_sub.add_parser("summarize", help="backfill: commits and a 1-3 sentence summary (Haiku) for the finished "
+                                           "sessions started in the last N days (docs/sessions-live.md, \"Summary\")")
+    p.add_argument("--days", type=_positive, default=sessions_ingest.DEFAULT_DAYS,
+                   help="sessions started in the last N days (default 7)")
+    p.add_argument("--concurrency", type=_positive, default=4, help="model calls at once (default 4)")
+    p.add_argument("--budget", type=float, default=None, help="stop starting new calls after this many seconds "
+                                                              "(default: no limit)")
+    p.add_argument("--dry-run", action="store_true",
+                   help="count what would be done: no model call, nothing written (needs no live mode)")
+    p.set_defaults(func=cmd_sessions_summarize)
 
     p = s_sub.add_parser("tokens", help="token totals per category / project, model, effort, outcome, ... and "
                                         "the top sessions (docs/sessions-live.md)")

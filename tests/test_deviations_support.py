@@ -104,6 +104,7 @@ def setup_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Home:
     monkeypatch.setenv("AMEM_PROJECTS_DIR", str(projects))
     monkeypatch.setenv("AMEM_AGENT_CONFIG_DIR", str(agent_config))
     monkeypatch.setenv(deviations.CLAUDE_ENV, str(tmp_path / "no-claude-here"))
+    monkeypatch.setenv("AMEM_SUMMARY_CLAUDE", str(tmp_path / "no-claude-here"))
     return Home(root, claude, projects, agent_config, repo)
 
 
