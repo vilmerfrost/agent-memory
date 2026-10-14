@@ -139,7 +139,8 @@ class FakeJevClient:
     def __exit__(self, *exc: object) -> None:
         pass
 
-    def system_one(self, state: str, questions: dict[str, Any]) -> Any:
+    def system_one(self, state: str, questions: dict[str, Any], model: str | None = None) -> Any:
+        assert model == jev.MODEL
         summary = state.split("\nsummary: ", 1)[1].split("\n", 1)[0]
         FakeJevClient.calls.append(summary)
         if summary in FakeJevClient.errors:
