@@ -37,6 +37,11 @@ Tokens (session_tokens.py, docs/sessions-live.md): every row also gets its token
 per-model breakdown, turns and last activity; a parent's `meta.subagent_tokens` sums its
 subagents. Pings the hook spooled (session_live.py) are flushed first.
 
+Commits and summaries (docs/sessions-live.md): `outcome_evidence.commits` from the git commit
+output in the transcript (session_commits.py); the last step writes `summary` for finished
+sessions with a cheap model (session_summary.py, off unless AMEM_SUMMARY_LIVE=1, time-boxed,
+never fails the ingest).
+
 Idempotent: one upsert per session_id. A re-ingest refreshes the facts and keeps
 `scanned_at` and the scan keys in `meta`.
 """
@@ -54,7 +59,7 @@ from typing import Any
 
 from psycopg.types.json import Jsonb
 
-from agent_memory import codex_sessions, config, session_tokens, store
+from agent_memory import codex_sessions, config, session_commits, session_tokens, store
 
 KINDS = ("chat", "parent", "worker", "headless", "eval", "routine")
 TOOLS = ("claude", "codex")
@@ -425,6 +430,7 @@ class SessionRow:
     signals: dict[str, int] | None = None   # outcome signals (None: not known, the stored outcome stays)
     end: str | None = None
     outcome: str | None = None   # the stored outcome (a row read back from the database), else None
+    commits: list[dict[str, Any]] | None = None   # session_commits: {sha, message, repo, branch}; None: not read
 
     def with_summary(self, s: session_tokens.Summary) -> SessionRow:
         """Title, profile and outcome signals from a full read."""
@@ -580,9 +586,11 @@ def session_row(path: Path, project_dir: str, *, parent_session: str | None = No
     # Count only this session's lines: a resumed session's transcript starts with a copy of the
     # earlier session's lines (their sessionId is the earlier id). A subagent's lines carry the
     # parent's id. The facts above (kind, skills, start) still read every line.
-    tokens = session_tokens.claude_summary(events, own_session=parent_session if subagent else path.stem)
+    own = parent_session if subagent else path.stem
+    tokens = session_tokens.claude_summary(events, own_session=own)
     row = SessionRow(sid, kind, repo, project_dir, facts.start, facts.end, size,
                      facts.skills, [], meta, path, tokens=tokens).with_summary(tokens)
+    row.commits = session_commits.claude_commits(events, cwd=cwd, own_session=own)
     return _with_instructions(row)
 
 
@@ -660,6 +668,7 @@ def codex_row(path: Path, rel_dir: str, titles: dict[str, str] | None = None) ->
     title = (titles or {}).get(f.thread_id or path.stem)
     row = SessionRow(sid, kind, repo, rel_dir, f.start, f.end, size, f.skills, [], meta, path, tool="codex",
                      tokens=tokens, title=title).with_summary(tokens)
+    row.commits = session_commits.codex_commits(events, cwd=cwd)
     return _with_instructions(row)
 
 
@@ -722,6 +731,10 @@ class IngestReport:
     spool: int = 0      # hook pings flushed from the local spool file (docs/sessions-live.md)
     outcomes: int = 0   # stored rows whose outcome changed on the recompute pass (refresh_stored)
     places: int = 0     # stored rows whose null category / project was filled (refresh_stored)
+    summaries: int = 0          # summaries written (session_summary; off unless AMEM_SUMMARY_LIVE=1)
+    summary_failed: int = 0     # model calls that failed or answered junk
+    summary_left: int = 0       # rows not looked at: the time budget ran out (the next run picks them up)
+    summary_error: str | None = None   # the summary step itself failed (ingest still succeeds)
 
     def line(self) -> str:
         kinds = " ".join(f"{k}={self.kinds.get(k, 0)}" for k in KINDS)
@@ -730,8 +743,11 @@ class IngestReport:
         bad = f" cloud_bad={self.cloud_bad}" if self.cloud_bad else ""
         spool = f" spool={self.spool}" if self.spool else ""
         fixed = (f" outcomes={self.outcomes}" if self.outcomes else "") + (f" places={self.places}" if self.places else "")
+        summ = "".join(f" {k}={v}" for k, v in (("summaries", self.summaries), ("summary_failed", self.summary_failed),
+                                                 ("summary_left", self.summary_left)) if v)
+        summ += f" summary_error={self.summary_error}" if self.summary_error else ""
         return (f"sessions: {self.files} files, {self.new} new, {self.updated} updated, "
-                f"{self.skipped} skipped ({kinds}) tools({tools}) team={self.team}{cloud}{bad}{spool}{fixed}")
+                f"{self.skipped} skipped ({kinds}) tools({tools}) team={self.team}{cloud}{bad}{spool}{fixed}{summ}")
 
 
 def collect(root: Path | None, *, days: int = DEFAULT_DAYS, now: datetime | None = None,
@@ -861,10 +877,15 @@ def profile_values(profile: dict[str, Any] | None) -> dict[str, Any]:
 
 
 def outcome_values(signals: dict[str, int] | None, end: str | None, last: datetime | None,
-                   now: datetime | None, kind: str | None = None) -> dict[str, Any]:
+                   now: datetime | None, kind: str | None = None,
+                   commits: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    """`outcome` and `outcome_evidence`. The evidence gets `commits` (session_commits) when the
+    session made any; the signal keys and `end` stay as outcome_of builds them."""
     if signals is None:
         return {"outcome": None, "outcome_evidence": None}
     name, evidence = session_tokens.outcome_of(signals, end, last, now, kind)
+    if commits:
+        evidence["commits"] = commits
     return {"outcome": name, "outcome_evidence": Jsonb(evidence)}
 
 
@@ -877,7 +898,7 @@ def _params(r: SessionRow, now: datetime | None = None) -> dict[str, Any]:
             "transcript_bytes": r.transcript_bytes, "skills": Jsonb(r.skills),
             "instructions": Jsonb(r.instructions), "meta": Jsonb(r.meta), **dict(zip(_TOKEN_COLS, tv)),
             "last_activity_at": last, "category": category, "project": project, "title": r.title,
-            **profile_values(r.profile), **outcome_values(r.signals, r.end, last, now, r.kind)}
+            **profile_values(r.profile), **outcome_values(r.signals, r.end, last, now, r.kind, r.commits)}
 
 
 def upsert(rows: list[SessionRow], *, db_url: str | None = None, now: datetime | None = None) -> tuple[int, int]:
@@ -1122,4 +1143,22 @@ def ingest(root: Path | None, *, days: int = DEFAULT_DAYS, now: datetime | None 
         report.kinds[r.kind] = report.kinds.get(r.kind, 0) + 1
         report.tools[r.tool] = report.tools.get(r.tool, 0) + 1
         report.team += r.team
+    summarize_step(report, days=days, now=now, db_url=db_url)
     return report
+
+
+def summarize_step(report: IngestReport, *, days: int, now: datetime | None, db_url: str | None) -> None:
+    """Summaries of finished sessions active in the window (session_summary), inside the time
+    budget. Off unless AMEM_SUMMARY_LIVE=1. Never fails the ingest: an error is one field of
+    the report line."""
+    from agent_memory import session_summary  # local import: session_summary imports this module
+
+    if not session_summary.live():
+        return
+    try:
+        got = session_summary.summarize(days=days, now=now, db_url=db_url, budget=session_summary.budget_seconds(),
+                                        workers=session_summary.concurrency(), window="active")
+    except Exception as exc:  # the step is best effort; the next run tries again
+        report.summary_error = type(exc).__name__
+        return
+    report.summaries, report.summary_failed, report.summary_left = got.done, got.failed, got.left

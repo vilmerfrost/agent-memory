@@ -262,9 +262,24 @@ _NEWER = f"(excluded.tokens_input is not null and {_total('excluded')} >= coales
 # Title, profile and outcome follow the token rule (a newer ping wins, a late spooled one only
 # fills what is empty); category and project of an existing row stay (ingest knows the real kind).
 _PROFILE = ("title", *sessions_ingest.PROFILE_COLS, "outcome", "outcome_evidence")
-_PROFILE_SET = ",\n        ".join(
-    f"{c} = case when {_NEWER} then coalesce(excluded.{c}, sessions.{c}) else coalesce(sessions.{c}, excluded.{c}) end"
-    for c in _PROFILE)
+
+
+def _keep_commits(expr: str) -> str:
+    """`expr` (the new outcome_evidence) plus the stored `commits` when it has none: a ping
+    never reads commits (docs/sessions-live.md, "Commits"), so it must not drop the ones
+    `sessions ingest` stored."""
+    return (f"case when sessions.outcome_evidence ? 'commits' and not ({expr} ? 'commits') "
+            f"then {expr} || jsonb_build_object('commits', sessions.outcome_evidence -> 'commits') else {expr} end")
+
+
+def _profile_set(c: str) -> str:
+    newer = f"coalesce(excluded.{c}, sessions.{c})"
+    if c == "outcome_evidence":
+        newer = _keep_commits(newer)
+    return f"{c} = case when {_NEWER} then {newer} else coalesce(sessions.{c}, excluded.{c}) end"
+
+
+_PROFILE_SET = ",\n        ".join(_profile_set(c) for c in _PROFILE)
 
 PING_SQL = f"""
 insert into sessions (session_id, tool, kind, repo, project_dir, started_at, ended_at, meta,
