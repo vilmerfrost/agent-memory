@@ -127,11 +127,13 @@ def test_ingest_missing_file(db_env: dict[str, str], tmp_path: Path) -> None:
 
 
 def _session(conn: psycopg.Connection, sid: str, *, tool: str, cwd: str, start: datetime, end: datetime | None,
-             last: datetime | None, outcome: str | None, category: str = "worker", project: str = "proj") -> None:
+             last: datetime | None, outcome: str | None, category: str = "worker", project: str = "proj",
+             cwds: list[str] | None = None) -> None:
+    meta = {"cwd": cwd, **({"cwds": cwds} if cwds is not None else {})}
     conn.execute(
         "insert into sessions (session_id, tool, kind, project_dir, started_at, ended_at, last_activity_at, meta,"
         " category, project, outcome) values (%s, %s, 'chat', 'p', %s, %s, %s, %s, %s, %s, %s)",
-        (sid, tool, start, end, last, Jsonb({"cwd": cwd}), category, project, outcome),
+        (sid, tool, start, end, last, Jsonb(meta), category, project, outcome),
     )
 
 
@@ -177,6 +179,48 @@ def test_session_matching(db_env: dict[str, str], pg_url: str, tmp_path: Path) -
     assert refresh.returncode == 0, refresh.stderr
     got = {r["skill"].removeprefix(f"{tag}-"): r["session_id"] for r in _calls(pg_url, tag)}
     assert got["late-session"] == f"{tag}-c"
+
+
+def test_logged_session_and_visited_cwds(db_env: dict[str, str], pg_url: str, tmp_path: Path) -> None:
+    """A logged session_id links the call even when cwd and time say otherwise (Codex ids get the
+    codex: prefix); without one, any cwd the session visited (meta.cwds) matches."""
+    tag = f"t{uuid.uuid4().hex[:8]}"
+    t0 = datetime(2026, 9, 2, 10, 0, tzinfo=timezone.utc)
+    start_cwd, final_cwd = f"/scratch/{tag}", f"/Users/demo/{tag}/repo"
+    with psycopg.connect(pg_url) as conn:
+        # The session started in a scratch folder and moved to the repo: meta.cwd is the repo.
+        _session(conn, f"{tag}-moved", tool="claude", cwd=final_cwd, start=t0, end=t0 + timedelta(hours=1),
+                 last=None, outcome="shipped", cwds=[start_cwd, final_cwd])
+        _session(conn, f"{tag}-exact", tool="claude", cwd="/elsewhere", start=t0 - timedelta(days=3),
+                 end=t0 - timedelta(days=3), last=None, outcome="committed")
+        _session(conn, f"codex:{tag}-cx", tool="codex", cwd="/elsewhere", start=t0, end=t0, last=None,
+                 outcome="partial")
+
+    def call(skill: str, *, where: str, sid: str | None = None, agent: str = "claude") -> dict:
+        line = {"t": (t0 + timedelta(minutes=5)).isoformat(), "skill": f"{tag}-{skill}", "by": agent,
+                "agent": agent, "cwd": where}
+        return {**line, "session_id": sid} if sid else line
+
+    path = _log(tmp_path / "log.jsonl", [
+        call("visited-cwd", where=start_cwd),                       # matches through meta.cwds
+        call("logged", where="/nowhere", sid=f"{tag}-exact"),       # cwd and time miss; the id wins
+        call("logged-codex", where="/nowhere", sid=f"{tag}-cx", agent="codex"),
+        call("logged-unknown", where="/nowhere", sid=f"{tag}-missing"),  # no such session yet
+    ])
+    result = run_amem("ingest", "skills", str(path), env=db_env)
+    assert result.returncode == 0, result.stderr
+    assert "matched 3 call(s) to a session" in result.stderr
+    got = {r["skill"].removeprefix(f"{tag}-"): r["session_id"] for r in _calls(pg_url, tag)}
+    assert got == {"visited-cwd": f"{tag}-moved", "logged": f"{tag}-exact", "logged-codex": f"codex:{tag}-cx",
+                   "logged-unknown": None}
+
+    # The logged session arrives later: the next refresh links it directly.
+    with psycopg.connect(pg_url) as conn:
+        _session(conn, f"{tag}-missing", tool="claude", cwd="/other", start=t0 - timedelta(days=9),
+                 end=t0 - timedelta(days=9), last=None, outcome="failed")
+    assert run_amem("skills", "scores", "--refresh", env=db_env).returncode == 0
+    got = {r["skill"].removeprefix(f"{tag}-"): r["session_id"] for r in _calls(pg_url, tag)}
+    assert got["logged-unknown"] == f"{tag}-missing"
 
 
 def test_scores_refresh_and_cache(db_env: dict[str, str], pg_url: str, tmp_path: Path) -> None:

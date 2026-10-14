@@ -2,13 +2,16 @@
 
 docs/skills.md has the full rules. In short:
 
-- Log line: one JSON object, `{"t", "skill", "by", "agent", "cwd", "backfill"?}`. `t` is ISO 8601
+- Log line: one JSON object, `{"t", "skill", "by", "agent", "cwd", "backfill"?, "session_id"?}`. `t` is ISO 8601
   with an offset (`...Z` or `+00:00`). `by` is claude | codex | me. Anything else is unparsed.
 - `source_key = sha256(canonical JSON)` (sorted keys, no spaces). A byte-for-byte repeat of an
   earlier line is the same call logged twice: it is dropped and counted as a duplicate.
-- Session match: same tool (`sessions.tool = agent`), same cwd (`sessions.meta->>'cwd'`), and `ts`
-  inside `started_at - 1 min .. last activity + 1 min`. When several match, the latest start
-  wins. Unmatched calls keep `session_id` null and are retried on every ingest and refresh.
+- Session match: a line's own `session_id` (logged by track.py since 2026-10-14; Codex ids get the
+  `codex:` prefix) links the call directly when that sessions row exists. Otherwise: same tool
+  (`sessions.tool = agent`), the call's cwd is the session's cwd or any cwd it visited
+  (`meta.cwds`), and `ts` inside `started_at - 1 min .. last activity + 1 min`. When several
+  match, the latest start wins. Unmatched calls keep `session_id` null and are retried on every
+  ingest and refresh.
 - Score of a (skill, bucket): mean outcome weight of the matched sessions, pulled toward a
   prior of 0.5 with weight 2: `(sum(w) + 0.5 * 2) / (n_scored + 2)`.
 """
@@ -59,6 +62,7 @@ class SkillCall:
     backfill: bool
     source_key: str
     line_no: int
+    logged_session: str | None = None  # the session id track.py logged, as a sessions.session_id
 
 
 @dataclass
@@ -99,10 +103,13 @@ def parse_line(text: str, line_no: int) -> SkillCall | None:
     if ts is None:
         return None
     cwd = obj.get("cwd") if isinstance(obj.get("cwd"), str) and obj.get("cwd") else None
+    sid = obj.get("session_id") if isinstance(obj.get("session_id"), str) and obj.get("session_id").strip() else None
+    if sid and agent.strip() == "codex" and not sid.startswith("codex:"):
+        sid = "codex:" + sid  # sessions stores Codex threads as codex:<id>
     return SkillCall(
         ts=ts, skill=skill.strip(), invoked_by=by, agent=agent.strip(), cwd=cwd,
         project=project_for(cwd), backfill=obj.get("backfill") is True,
-        source_key=source_key(obj), line_no=line_no,
+        source_key=source_key(obj), line_no=line_no, logged_session=sid,
     )
 
 
@@ -143,19 +150,25 @@ def parse_file(path: Path) -> ParseResult:
 # ------------------------------------------------------------------ store
 
 _INSERT_SQL = """
-insert into skill_calls (ts, skill, invoked_by, agent, cwd, project, backfill, source_key)
-values (%s, %s, %s, %s, %s, %s, %s, %s)
+insert into skill_calls (ts, skill, invoked_by, agent, cwd, project, backfill, source_key, logged_session)
+values (%s, %s, %s, %s, %s, %s, %s, %s, %s)
 on conflict (source_key) do nothing
 returning id
 """
 
 # Fill session_id for calls that have none yet. Rule: docs/skills.md, "Session match".
 MATCH_SQL = """
-with m as (
+with direct as (
+    update skill_calls c set session_id = s.session_id
+    from sessions s
+    where c.session_id is null and c.logged_session is not null and s.session_id = c.logged_session
+    returning c.id
+),
+m as (
     select c.id,
            (select s.session_id from sessions s
              where s.tool = c.agent
-               and s.meta ->> 'cwd' = c.cwd
+               and (s.meta ->> 'cwd' = c.cwd or coalesce(s.meta -> 'cwds', '[]'::jsonb) ? c.cwd)
                and s.started_at is not null
                and c.ts >= s.started_at - interval '1 minute'
                and c.ts <= greatest(s.started_at, s.ended_at, s.last_activity_at) + interval '1 minute'
@@ -163,15 +176,20 @@ with m as (
              limit 1) as sid
     from skill_calls c
     where c.session_id is null and c.cwd is not null
+      and c.id not in (select id from direct)
+),
+fuzzy as (
+    update skill_calls c set session_id = m.sid
+    from m where m.id = c.id and m.sid is not null
+    returning c.id
 )
-update skill_calls c set session_id = m.sid
-from m where m.id = c.id and m.sid is not null
+select (select count(*) from direct) + (select count(*) from fuzzy)
 """
 
 
 def match_sessions(conn: Any) -> int:
     """Link unmatched calls to their session. Returns how many calls got a session now."""
-    return conn.execute(MATCH_SQL).rowcount
+    return int(conn.execute(MATCH_SQL).fetchone()[0])
 
 
 @dataclass
@@ -187,7 +205,7 @@ def ingest(calls: list[SkillCall], *, db_url: str | None = None) -> IngestReport
     with store.connect(db_url) as conn:
         for c in calls:
             got = conn.execute(_INSERT_SQL, (c.ts, c.skill, c.invoked_by, c.agent, c.cwd, c.project,
-                                             c.backfill, c.source_key)).fetchone()
+                                             c.backfill, c.source_key, c.logged_session)).fetchone()
             if got is None:
                 report.present += 1
             else:

@@ -558,6 +558,7 @@ def session_row(path: Path, project_dir: str, *, parent_session: str | None = No
     kind = classify(facts, project_dir=project_dir, cwd=cwd, subagent=subagent)
     meta: dict[str, Any] = {
         "cwd": cwd or None,
+        "cwds": facts.cwds,  # every cwd the session visited (skills.MATCH_SQL)
         "scratch_only": scratch_only,
         "entrypoints": sorted(facts.entrypoints),
         "prompts": facts.prompts,
@@ -657,6 +658,7 @@ def codex_row(path: Path, rel_dir: str, titles: dict[str, str] | None = None) ->
     kind = classify_codex(f, cwd)
     meta: dict[str, Any] = {
         "cwd": cwd or None,
+        "cwds": f.cwds,  # every cwd the session visited (skills.MATCH_SQL)
         "scratch_only": scratch_only,
         "file": path.name,
         "originator": f.originator,

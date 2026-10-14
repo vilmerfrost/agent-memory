@@ -323,3 +323,13 @@ def test_ab_report_uses_the_session_outcome_after_label_and_jev(sdb: ScoringDb) 
     out = ab.render_text(e)
     assert f"{'session':>7}" in out.splitlines()[1]
     assert "  with         1     1  1.00" in out
+
+
+def test_session_row_keeps_every_visited_cwd(setup_home: Home) -> None:  # noqa: F811
+    """meta.cwds lists each cwd once, in order, so skill calls made before a folder move still match."""
+    events = [user("start", 0), assistant(text("ok"), minute=1), user("moved", 2)]
+    for e, cwd in zip(events, ["/scratch/a", "/scratch/a", str(setup_home.repo)]):
+        e["cwd"] = cwd
+    row = sessions_ingest.session_row(write_transcript(setup_home.project() / "c3.jsonl", events, pad=False),
+                                      "-work-demo-repo")
+    assert row.meta["cwds"] == ["/scratch/a", str(setup_home.repo)]
