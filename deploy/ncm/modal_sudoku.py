@@ -34,13 +34,25 @@ from datetime import UTC, datetime
 
 import modal
 
-_LOCAL = pathlib.Path(__file__).resolve().parents[2] / "src" / "agent_memory" / "integrations" / "ncm_worker.py"
-_REMOTE = pathlib.Path("/root/ncm_worker.py")
+_REMOTE = pathlib.Path("/root/ncm_worker.py")      # where add_local_file puts the worker in the container
+
+
+def _worker_path(script: str) -> pathlib.Path:
+    """The repo's ncm_worker.py when this script runs from a checkout, else the copy mounted in the container.
+    `modal run` mounts this one file as /root/modal_sudoku.py, which has only two parents."""
+    parents = pathlib.Path(script).resolve().parents
+    if len(parents) > 2:
+        local = parents[2] / "src" / "agent_memory" / "integrations" / "ncm_worker.py"
+        if local.exists():
+            return local
+    return _REMOTE
+
+
+_LOCAL = _worker_path(__file__)
 
 
 def _load_worker():  # one file by path: putting its folder on sys.path would shadow the stdlib `http`
-    path = _LOCAL if _LOCAL.exists() else _REMOTE
-    spec = importlib.util.spec_from_file_location("ncm_worker", path)
+    spec = importlib.util.spec_from_file_location("ncm_worker", _LOCAL)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
