@@ -8,6 +8,10 @@
   exported by a cloud session can never route a test to a hosted DB. A test that
   wants the REST backend sets its own stub URL explicitly.
 - Every test runs with env files disabled and Jev forced to fixture mode.
+- Every test and every subprocess env built by `base_env` reads the admin Keychain item through a tripwire,
+  never `/usr/bin/security` (`AMEM_ADMIN_SECURITY`). Once `amem admin split-credentials` has run, the real
+  item holds the production connection string; a test must never open it. A test that needs Keychain
+  behaviour sets its own fake (test_least_privilege.py, `keychain`).
 - The SDK client is replaced by a tripwire, so no test can make a live Jev call.
 - `pg_url` starts one throwaway Postgres container per session on an OS-assigned
   port (never a fixed port: other worktrees run in parallel) and removes it after.
@@ -15,10 +19,12 @@
 
 from __future__ import annotations
 
+import atexit
 import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from collections.abc import Iterator, Mapping
 from pathlib import Path
@@ -36,14 +42,29 @@ AMEM = str(Path(sys.executable).parent / "amem")
 ISOLATED_PREFIXES = ("AMEM_", "PG", "TYPESAFE_", "SUPABASE_")
 
 
+SECURITY_ENV = "AMEM_ADMIN_SECURITY"           # agent_memory.credentials.SECURITY_ENV
+_TRIPWIRE_DIR = Path(tempfile.mkdtemp(prefix="amem-test-keychain-"))
+KEYCHAIN_TRIPWIRE = str(_TRIPWIRE_DIR / "security")
+Path(KEYCHAIN_TRIPWIRE).write_text('#!/bin/sh\necho "tests never read the real Keychain" >&2\nexit 44\n')
+os.chmod(KEYCHAIN_TRIPWIRE, 0o755)
+atexit.register(shutil.rmtree, _TRIPWIRE_DIR, True)
+
+
 def is_isolated_name(name: str) -> bool:
     return name.upper().startswith(ISOLATED_PREFIXES)
 
 
+def _safe_security(value: str | None) -> str:
+    """A test's own fake stays; nothing else (unset, or the real tool) ever reaches the real Keychain."""
+    v = (value or "").strip()
+    return KEYCHAIN_TRIPWIRE if not v or os.path.realpath(v) == "/usr/bin/security" else v
+
+
 def isolated_environ(source: Mapping[str, str]) -> dict[str, str]:
-    """A copy of `source` without any isolated name, with env files disabled."""
+    """A copy of `source` without any isolated name, with env files disabled and the Keychain tripwire."""
     env = {k: v for k, v in source.items() if not is_isolated_name(k)}
     env["AMEM_NO_DOTENV"] = "1"
+    env[SECURITY_ENV] = _safe_security(source.get(SECURITY_ENV) if source is os.environ else None)
     return env
 
 
@@ -51,6 +72,7 @@ def _scrub_process_env() -> None:
     for name in [k for k in os.environ if is_isolated_name(k)]:
         del os.environ[name]
     os.environ["AMEM_NO_DOTENV"] = "1"
+    os.environ[SECURITY_ENV] = KEYCHAIN_TRIPWIRE
 
 
 # At import: runs before collection, before session fixtures (pg_url) and before
@@ -64,6 +86,7 @@ def _offline_env(monkeypatch: pytest.MonkeyPatch) -> None:
     for name in [k for k in os.environ if is_isolated_name(k)]:
         monkeypatch.delenv(name)
     monkeypatch.setenv("AMEM_NO_DOTENV", "1")
+    monkeypatch.setenv(SECURITY_ENV, KEYCHAIN_TRIPWIRE)
 
     import typesafe_sdk
 
@@ -82,6 +105,7 @@ def base_env(**extra: str) -> dict[str, str]:
     """
     env = isolated_environ(os.environ)
     env.update(extra)
+    env[SECURITY_ENV] = _safe_security(env.get(SECURITY_ENV))
     return env
 
 

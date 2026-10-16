@@ -32,9 +32,20 @@ def sandbox(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setenv("RSI_SANDBOX_DIR", str(root))
     for k in [k for k in os.environ if k in AP.AGENT_ENV or (k.startswith("CODEX_") and k != "CODEX_HOME")]:
         monkeypatch.delenv(k)
-    for k in ("AMEM_RSI_DECIDE_PAGE", "AMEM_RSI_DECIDE_URL", C.ADMIN_ENV, C.SECURITY_ENV):
+    for k in ("AMEM_RSI_DECIDE_PAGE", "AMEM_RSI_DECIDE_URL", C.ADMIN_ENV):
         monkeypatch.delenv(k, raising=False)
-    return root
+    return root                                  # C.SECURITY_ENV stays: the conftest tripwire, or `keychain`'s fake
+
+
+def test_tests_never_reach_the_real_keychain() -> None:
+    """After the split the real item holds the production DSN: no test, in-process or subprocess, may open it."""
+    from conftest import KEYCHAIN_TRIPWIRE
+    assert C._security() == KEYCHAIN_TRIPWIRE != C.DEFAULT_SECURITY
+    assert base_env()[C.SECURITY_ENV] == KEYCHAIN_TRIPWIRE
+    assert base_env(AMEM_ADMIN_SECURITY="/usr/bin/security")[C.SECURITY_ENV] == KEYCHAIN_TRIPWIRE
+    assert not C.admin_present()                 # the tripwire exits 44: reads as "no item"
+    out = subprocess.run([AMEM, "admin", "credentials-status"], env=base_env(), capture_output=True, text=True)
+    assert "admin Keychain item: absent" in out.stdout
 
 
 def as_app(pg_url: str) -> str:
