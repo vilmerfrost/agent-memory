@@ -252,25 +252,29 @@ def _pd_batch() -> sync.Batch:
                                                                   ["amem:proposal/p1"])], "K")
 
 
-def test_content_rejected_is_a_record_level_refusal() -> None:
+def test_content_rejected_is_dead_lettered_without_a_split() -> None:
+    """Mission 004C (G-PD0): a split would re-send content past.dev already holds (answered `unchanged`)."""
     fake = _FakePD([{"status": "failed", "failure": {"code": "content-rejected"}}])
     sink = PD.PastDevSink(PD.Config("past_sk_test"), client=fake, poll_s=5.0, sleep=lambda s: None)  # type: ignore[arg-type]
-    with pytest.raises(http.HttpError) as ei:
+    with pytest.raises(sync.Refused) as ei:
         sink.push(_pd_batch())
-    assert ei.value.status == 422 and sync._record_error(ei.value) and fake.retries == 0
+    assert ei.value.rows == [{"id": "amem:proposal/p1"}] and fake.retries == 0 and not sync._record_error(ei.value)
+    (ev,) = ei.value.evidence
+    assert (ev.metrics["status"], ev.metrics["failure"], ev.metrics["ingestion_id"]) == \
+        ("rejected", "content-rejected", "00000000-0000-4000-8000-000000000001")
 
 
-def test_other_ingestion_failures_get_one_free_retry() -> None:
+def test_other_ingestion_failures_get_a_free_retry_and_stay_pending() -> None:
     fake = _FakePD([{"status": "failed", "failure": {"code": "model-unavailable"}}, {"status": "completed"}])
     sink = PD.PastDevSink(PD.Config("past_sk_test"), client=fake, poll_s=5.0, sleep=lambda s: None)  # type: ignore[arg-type]
     b = _pd_batch()
     sink.push(b)
-    assert fake.retries == 1 and b.evidence[0].metrics["status"] == "completed"
+    assert fake.retries == 1 and (b.evidence[0].metrics["status"], b.evidence[0].metrics["retries"]) == ("completed", 1)
     fake = _FakePD([{"status": "failed", "failure": {"code": "internal"}}])
     sink = PD.PastDevSink(PD.Config("past_sk_test"), client=fake, poll_s=5.0, sleep=lambda s: None)  # type: ignore[arg-type]
-    with pytest.raises(RuntimeError, match="internal"):
-        sink.push(_pd_batch())
-    assert fake.retries == 1 and not isinstance(RuntimeError("x"), http.HttpError)
+    b = _pd_batch()
+    sink.push(b)                                      # failed again after the retry: pending, the next run checks
+    assert fake.retries == 1 and (b.evidence[0].metrics["status"], b.evidence[0].metrics["failure"]) == ("queued", "internal")
 
 
 # ---------------------------------------------------------------- ClickHouse Cloud

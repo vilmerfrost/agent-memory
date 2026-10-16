@@ -11,6 +11,8 @@
    committed together. On failure the table's watermark stays, the failure is counted with backoff
    (1, 5, 30, 120 min), and after 6 attempts the table is marked dead (shown by `amem sync status`).
 6. A time budget stops the loop between batches (status `partial`); the next run continues.
+7. A record-level refusal (400/409/413/415/422) splits the batch and dead-letters only the refused rows; a
+   push that raises `Refused` (the provider's final verdict) dead-letters its rows without a split or retry.
 
 The cursor is one rsi_checkpoints row: job `sync:<sink>`, run_key `cursor`, meta
 `{"watermarks": {table: opaque}, "failures": {table: {...}}, "last_ok_at": ...}`. A watermark is owned
@@ -131,6 +133,19 @@ def limits(sink: str, environ: Mapping[str, str] | None = None) -> tuple[int, in
     return num("MAX_ROWS_PER_DAY", rows), num("MAX_REQUESTS_PER_DAY", reqs)
 
 
+class Refused(Exception):
+    """Raised by a sink's push(): the provider refused these records for good (Mission 004C: a past.dev
+    ingestion that failed as content-rejected, or failed after its free retries). No split and no retry:
+    `rows` are dead-lettered, `evidence` (the sink's record of the refusal, so the rows are not sent again
+    while unchanged) is recorded, and the table moves on."""
+
+    def __init__(self, message: str, *, rows: list[dict[str, Any]] | None = None,
+                 evidence: list[EvidenceRef] | None = None):
+        super().__init__(message)
+        self.rows = rows
+        self.evidence = list(evidence or [])
+
+
 def _record_error(exc: BaseException) -> bool:
     status = getattr(exc, "status", None)
     return isinstance(status, int) and status in RECORD_ERRORS
@@ -150,6 +165,12 @@ def _dead(batch: Batch, rows: list[dict[str, Any]], exc: BaseException, now: dat
              "at": _iso(now)} for r in rows]
 
 
+def _refused(batch: Batch, exc: Refused, usage: dict[str, Any], now: datetime) -> tuple[Batch, list[dict[str, Any]]]:
+    """A Refused push: the rows did go out (they count), nothing is delivered, the evidence is recorded."""
+    usage["rows"] += len(batch.rows)
+    return Batch(batch.table, [], batch.watermark, exc.evidence), _dead(batch, exc.rows or batch.rows, exc, now)
+
+
 def _deliver(sink: Sink, batch: Batch, usage: dict[str, Any],
              now: datetime) -> tuple[list[Batch], list[dict[str, Any]], BaseException | None]:
     """(pushed parts, dead letters, a retryable error or None)."""
@@ -158,6 +179,9 @@ def _deliver(sink: Sink, batch: Batch, usage: dict[str, Any],
         sink.push(batch)
         usage["rows"] += len(batch.rows)
         return [batch], [], None
+    except Refused as exc:
+        part, dead = _refused(batch, exc, usage, now)
+        return [part], dead, None
     except Exception as exc:  # noqa: BLE001
         if not _record_error(exc):
             return [], [], exc
@@ -173,6 +197,10 @@ def _deliver(sink: Sink, batch: Batch, usage: dict[str, Any],
             sink.push(part)
             usage["rows"] += len(part.rows)
             ok.append(part)
+        except Refused as exc:
+            done, refused = _refused(part, exc, usage, now)
+            ok.append(done)
+            dead += refused
         except Exception as exc:  # noqa: BLE001
             if not _record_error(exc):
                 return ok, dead, exc

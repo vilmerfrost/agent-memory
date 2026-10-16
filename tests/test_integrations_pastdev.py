@@ -19,7 +19,7 @@ import psycopg
 import pytest
 from psycopg.types.json import Jsonb
 
-from agent_memory.integrations import evidence as E, pastdev as PD, sync
+from agent_memory.integrations import evidence as E, http, pastdev as PD, sync
 from agent_memory.integrations.sanitize import CAP_BYTES
 from conftest import base_env, run_amem
 from integrations_mock import MockService, Request
@@ -179,16 +179,21 @@ SENT = ("proposal", "decision", "experiment", "edit", "lesson")
 
 
 class FakePastDev:
-    """In-memory past.dev on MockService: ingest/batch (+ idempotency keys), ingest status, recall, delete."""
+    """In-memory past.dev on MockService: ingest/batch (+ idempotency keys), ingest status, retry, recall, delete.
+
+    Like past.dev, a point's content is stored when the batch is accepted, so a re-send of the same content is
+    answered `200 unchanged` even when its ingestion failed (Mission 004C, G-PD0: the sink must not re-send)."""
 
     def __init__(self, svc: MockService):
         self.svc = svc
         self.points: dict[str, dict[str, Any]] = {}
         self.keys: dict[str, tuple[Any, dict[str, Any]]] = {}
+        self.ingestions: dict[str, list[str]] = {}   # ingestion id -> its source ids
         self.polls: list[str] = []                   # statuses for the next GET /ingest/{id} calls
+        self.failure_code = "model-unavailable"      # the failure.code a failed poll reports
         self.queue = True                            # False: a changed batch completes at once
         self.recall_answer: dict[str, Any] = {"asOf": "2026-10-16T00:00:00Z", "usedEvidenceTokens": 0, "results": []}
-        self.retries = 0                             # POST /ingest/{id}/retry calls (free on past.dev)
+        self.retries: list[str] = []                 # POST /ingest/{id}/retry calls (free on past.dev)
         self.deleted: set[str] = set()               # "A deleted id cannot be sent again; use a new id."
         for method, path, h in (("POST", "/api/v1/ingest/", self.retry),           # before ingest/batch: later routes win
                                 ("POST", "/api/v1/ingest/batch", self.ingest), ("GET", "/api/v1/ingest/", self.status),
@@ -232,19 +237,23 @@ class FakePastDev:
         receipt = {"projectId": 7, "ingestionId": str(uuid.uuid4()), "status": "completed" if done else "queued",
                    "unchanged": unchanged, "items": out}
         self.keys[key] = (body, receipt)
+        self.ingestions[receipt["ingestionId"]] = [it["id"] for it in body["items"]]
         return (200 if unchanged else 202), receipt
 
     def retry(self, req: Request) -> Any:
-        self.retries += 1
-        return 200, {"status": "processing"}
+        iid = req.path.split("/")[-2]
+        if not req.path.endswith("/retry") or iid not in self.ingestions:
+            return 404, {"code": "not-found", "status": 404}
+        self.retries.append(iid)
+        return 202, {"ingestionId": iid, "status": "queued"}            # the spec (2026-10-17): 202 queued
 
     def status(self, req: Request) -> Any:
-        if req.path.endswith(PD.NIL_INGESTION):
+        if req.path.split("/")[-1] not in self.ingestions:
             return 404, {"code": "not-found", "status": 404}
         s = self.polls.pop(0) if self.polls else "completed"
         return 200, {"status": s, "settled": s == "completed", "blocked": False,
                      "readiness": {"raw": 0, "comprehension": 0, "consolidation": 0, "failed": int(s == "failed")},
-                     "failure": {"code": "model-unavailable", "message": "try later"} if s == "failed" else None}
+                     "failure": {"code": self.failure_code, "message": "try later"} if s == "failed" else None}
 
     def recall(self, req: Request) -> Any:
         assert set(req.json) <= {"query", "identity", "limit", "occurredFrom", "occurredTo", "level", "sort"}
@@ -254,7 +263,7 @@ class FakePastDev:
         ids = req.json["ids"]
         assert set(req.json) == {"ids"} and 1 <= len(ids) <= 1000
         if any(i not in self.points for i in ids):
-            return 404, {"code": "not-found", "status": 404}            # all or nothing
+            return 404, {"code": "data-point-not-found", "status": 404}  # all or nothing (spec, 2026-10-17)
         for i in ids:
             del self.points[i]
             self.deleted.add(i)
@@ -336,8 +345,7 @@ def test_sync_sends_sanitized_records_with_the_contract_shape(db: Db, pdev: Fake
         assert set(req.json) == {"items", "idempotencyKey"} and len(req.json["items"]) <= PD.BATCH_MAX
         items = req.json["items"]
         assert req.json["idempotencyKey"] == sha256(json.dumps(
-            {"items": items, "attempt": 0},
-            sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()
+            {"items": items}, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()
         for it in items:
             assert set(it) == {"id", "content", "timestamp", "label", "identity"}          # no metadata
             assert it["identity"] == "rsi" and len(it["content"].encode()) <= CAP_BYTES
@@ -356,6 +364,7 @@ def test_sync_sends_sanitized_records_with_the_contract_shape(db: Db, pdev: Fake
         assert ln["kind"] == "decision-memory" and ln["subjects"] == [refs_[k]]
         assert ln["metrics"]["sha256"] == sha256(pdev.points[refs_[k]]["content"].encode()).hexdigest()
         assert ln["metrics"]["status"] == "completed"                                     # 202 queued, then polled
+        assert refs_[k] in pdev.ingestions[ln["metrics"]["ingestion_id"]]                 # Mission 004C: the id is kept
     assert len(pdev.svc.requests_to("GET", "/api/v1/ingest/")) >= 6                       # health + one poll per batch
 
 
@@ -417,29 +426,116 @@ def test_202_is_polled_until_completed_or_the_budget(db: Db, pdev: FakePastDev) 
     with psycopg.connect(db.app) as conn:
         rep = sync.run(sink(pdev, clock, poll_s=1.0), conn, environ={})
     assert rep.status == "ok" and all(s <= 1.0 for s in clock.slept)
-    assert "queued" in {ln["metrics"]["status"] for ln in links(db).values()}     # accepted, not yet completed
+    queued = {ext: ln["metrics"] for ext, ln in links(db).items() if ln["metrics"]["status"] == "queued"}
+    assert queued and all(m["ingestion_id"] in pdev.ingestions for m in queued.values())   # accepted, not completed
+    # Mission 004C (G-PD0): a later run checks each running ingestion by its id; nothing is sent again
+    pdev.polls = []
+    n_ingest, n_gets = len(pdev.ingest_requests()), len(pdev.svc.requests_to("GET", "/api/v1/ingest/"))
+    with psycopg.connect(db.app) as conn:
+        rep = sync.run(sink(pdev), conn, environ={})
+    assert rep.status == "ok" and len(pdev.ingest_requests()) == n_ingest
+    ids = {m["ingestion_id"] for m in queued.values()}
+    gets = pdev.svc.requests_to("GET", "/api/v1/ingest/")[n_gets:]
+    assert {r.path.rsplit("/", 1)[-1] for r in gets} == ids | {PD.NIL_INGESTION}            # health + one GET each
+    assert all(links(db)[ext]["metrics"]["status"] == "completed" for ext in queued)
 
 
-def test_failed_ingestion_holds_the_cursor_and_the_retry_uses_a_new_key(db: Db, pdev: FakePastDev) -> None:
+def test_a_failed_ingestion_is_retried_by_its_id_and_never_re_sent(db: Db, pdev: FakePastDev) -> None:
+    """Mission 004C (G-PD0). A re-send of content past.dev holds is answered `200 unchanged` even when its
+    ingestion failed, so the sink never re-sends to recover: it keeps the ingestion id, uses the free
+    POST .../retry (once per run) and links the records as sent only when the ingestion completed."""
     refs_ = seed(db)
     pdev.polls = ["failed", "failed"]                            # the first batch (rsi_proposals) fails, and again after
-                                                                 # the one free retry (Mission 004B)
-    t0 = datetime(2026, 10, 17, 9, 0, tzinfo=UTC)
+                                                                 # this run's free retry
     with psycopg.connect(db.app) as conn:
-        rep = sync.run(sink(pdev), conn, now=t0, environ={})
+        rep = sync.run(sink(pdev), conn, environ={})
+        assert (rep.status, rep.failed, rep.dead_letters) == ("ok", 0, 0)
+        ln = links(db)[f"past:{refs_['proposal']}"]["metrics"]
+        assert (ln["status"], ln["retries"], ln["failure"]) == ("queued", 1, "model-unavailable")   # not sent yet
+        iid = ln["ingestion_id"]
+        assert pdev.retries == [iid] and pdev.ingestions[iid] == [refs_["proposal"]]
+        assert "try later" not in json.dumps(links(db))
+        n_ingest = len(pdev.ingest_requests())
+        rep = sync.run(sink(pdev), conn, environ={})              # the next run checks it by its id
+        assert rep.status == "ok" and len(pdev.ingest_requests()) == n_ingest                       # never re-sent
+    ln = links(db)[f"past:{refs_['proposal']}"]["metrics"]
+    assert (ln["status"], ln["ingestion_id"], ln.get("failure")) == ("completed", iid, None)
+    assert pdev.retries == [iid]
+
+
+def test_retries_are_capped_then_the_records_are_dead_lettered(db: Db, pdev: FakePastDev) -> None:
+    refs_ = seed(db)
+    with psycopg.connect(db.app) as conn:
+        pdev.polls = ["failed", "failed"]
+        sync.run(sink(pdev), conn, environ={})                    # the proposal's ingestion: retry 1
+        iid = links(db)[f"past:{refs_['proposal']}"]["metrics"]["ingestion_id"]
+        for n in range(2, PD.MAX_FREE_RETRIES + 1):               # each later run: one more free retry
+            pdev.polls = ["failed"]
+            assert sync.run(sink(pdev), conn, environ={}).dead_letters == 0
+            assert links(db)[f"past:{refs_['proposal']}"]["metrics"]["retries"] == n
+        pdev.polls = ["failed"]
+        rep = sync.run(sink(pdev), conn, environ={})              # used up: dead-lettered, not sent again
         meta = sync.load(conn, "pastdev")
-        assert rep.status == "partial" and rep.failed == 1 and rep.batches == 4      # the other tables went on
-        assert "rsi_proposals" not in meta["watermarks"] and "edits" in meta["watermarks"]
-        assert meta["failures"]["rsi_proposals"]["attempts"] == 1
-        assert "model-unavailable" in meta["failures"]["rsi_proposals"]["last_error"] and "try later" not in str(meta)
-        assert f"past:{refs_['proposal']}" not in links(db)
-        rep = sync.run(sink(pdev), conn, now=t0 + timedelta(seconds=30), environ={})      # inside the backoff
-        assert rep.skipped_tables == ["rsi_proposals"] and rep.rows == 0
-        rep = sync.run(sink(pdev), conn, now=t0 + timedelta(minutes=2), environ={})
-        assert rep.status == "ok" and "rsi_proposals" in sync.load(conn, "pastdev")["watermarks"]
-    reqs = [r for r in pdev.ingest_requests() if r.json["items"][0]["id"] == refs_["proposal"]]
-    assert len(reqs) == 2 and reqs[0].json["idempotencyKey"] != reqs[1].json["idempotencyKey"]
-    assert links(db)[f"past:{refs_['proposal']}"]["metrics"]["status"] in ("completed", "unchanged")
+    assert rep.status == "ok" and rep.dead_letters == 1 and pdev.retries == [iid] * PD.MAX_FREE_RETRIES
+    assert [d["key"] for d in meta["dead_letters"]] == [refs_["proposal"]] and "model-unavailable" in \
+        meta["dead_letters"][0]["error"]
+    assert links(db)[f"past:{refs_['proposal']}"]["metrics"]["status"] == "failed"
+    n_ingest = len(pdev.ingest_requests())
+    with psycopg.connect(db.app) as conn:
+        assert sync.run(sink(pdev), conn, environ={}).rows == 0 and len(pdev.ingest_requests()) == n_ingest
+        db.sql("update rsi_proposals set summary = 'a new hypothesis' where id = %s", (refs_["proposal"].split("/")[1],))
+        sync.run(sink(pdev), conn, environ={})                    # new content: a new send
+    assert refs_["proposal"] in [it["id"] for r in pdev.ingest_requests()[n_ingest:] for it in r.json["items"]]
+
+
+def test_content_rejected_is_dead_lettered_not_split_and_re_sent(db: Db, pdev: FakePastDev) -> None:
+    db.sql("insert into edits (status, instruction_source, rule_id, why, summary) "
+           "select 'kept', 'claude-md:global', 'rule-' || g, 'why ' || g, 'summary ' || g from generate_series(1, 3) g")
+    pdev.polls, pdev.failure_code = ["failed"], "content-rejected"
+    with psycopg.connect(db.app) as conn:
+        rep = sync.run(sink(pdev), conn, environ={})
+        meta = sync.load(conn, "pastdev")
+        assert (rep.status, rep.rows, rep.dead_letters) == ("ok", 0, 3)
+        assert len(pdev.ingest_requests()) == 1 and pdev.retries == []          # no split, no re-send, no retry
+        assert meta["watermarks"]["edits"] and all("content-rejected" in d["error"] for d in meta["dead_letters"])
+        assert {ln["metrics"]["status"] for ln in links(db).values()} == {"rejected"}
+        assert sync.run(sink(pdev), conn, environ={}).rows == 0 and len(pdev.ingest_requests()) == 1   # stays dead
+
+
+def test_a_cap_reached_429_is_not_retried_and_stops_the_run(db: Db, pdev: FakePastDev) -> None:
+    seed(db)
+    capped = {"code": "project-cap-reached", "status": 429, "message": "project credit cap reached"}
+    pdev.svc.route("POST", "/api/v1/ingest/batch", lambda r: (429, capped))
+    slept: list[float] = []
+    s = PD.PastDevSink(pdev.cfg(), environ={}, sleep=slept.append)
+    with psycopg.connect(db.app) as conn:
+        rep = sync.run(s, conn, environ={})
+        assert rep.status == "capped" and "project-cap-reached" in rep.detail and not sync.load(conn, "pastdev").get("failures")
+    assert len(pdev.ingest_requests()) == 1 and slept == []                   # one request, no backoff
+    client = PD.Client(pdev.cfg(), sleep=slept.append)
+    for code in ("spend-cap-reached", "project-cap-reached"):
+        pdev.svc.route("POST", "/api/v1/ingest/batch", lambda r, c=code: (429, {"code": c, "status": 429}))
+        with pytest.raises(http.HttpError, match=code):
+            client.ingest_batch([{"id": "amem:edit/x", "content": "kind: edit"}], "k")
+    assert slept == []
+    pdev.svc.route("POST", "/api/v1/ingest/batch", lambda r: (429, b""))      # the per-minute limit: no body
+    with pytest.raises(http.HttpError):
+        client.ingest_batch([{"id": "amem:edit/x", "content": "kind: edit"}], "k")
+    assert slept == [1.0, 2.0, 4.0]                                           # retried with backoff, as before
+    pdev.svc.route("POST", "/api/v1/ingest/batch", lambda r: (429, capped))
+    with pytest.raises(http.HttpError):                                       # other sinks: no `final`, retried
+        http.request("POST", pdev.base + "/ingest/batch", body={}, retries=2, sleep=slept.append)
+    assert len(slept) == 5
+
+
+def test_delete_treats_only_data_point_not_found_as_gone(pdev: FakePastDev) -> None:
+    client = PD.Client(pdev.cfg(), sleep=lambda s: None)
+    pdev.points.update({"amem:edit/a": {}, "amem:edit/b": {}})
+    assert PD.delete_ids(client, ["amem:edit/a", "amem:edit/gone", "amem:edit/b"])[:2] == (
+        ["amem:edit/a", "amem:edit/b"], ["amem:edit/gone"])
+    wrong = PD.Client(PD.Config(KEY, pdev.svc.url + "/api/v0"), sleep=lambda s: None)    # 404: no route
+    with pytest.raises(http.HttpError, match="404"):
+        PD.delete_ids(wrong, ["amem:edit/x"])
 
 
 def test_a_different_source_id_fails_the_batch(db: Db, pdev: FakePastDev) -> None:
