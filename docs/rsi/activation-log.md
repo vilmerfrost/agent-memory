@@ -92,3 +92,35 @@ Hosted baseline before the migration:
 - `anon` and `authenticated` can read 0 of 16 tables; `service_role` can read 16 of 16;
 - 0 policies;
 - the latest physical backup is 2026-10-16 03:44 UTC; PITR is off.
+
+## Phase C: hosted migration (2026-10-16 18:27:40 CEST), approved in chat
+
+- **Applied:** exactly `20261022010000_rsi_core.sql` (sha256 `11668e7cab395a996dd4464b105f6de886c46041cb6ea1f50260e6e0ffeba615`,
+  commit `5668057`).
+  - Command: the main checkout's `amem db migrate --dir <a folder holding only that file>`.
+  - One transaction, together with its `schema_migrations` row. Exit 0, about 1 s.
+  - `schema_migrations` now holds 23 files; `applied_at` is 2026-10-16T16:27:40Z.
+- **[verify_rsi_core.sql](verify_rsi_core.sql)** (sha256 `1c60f6e0…`, same as the commit) ran with no error.
+  Every check raises on failure. It checked:
+  - 10 `rsi_*` tables, `sessions.env` and `experiment_id`, RLS on every `rsi_*` table;
+  - the API roles have no table rights;
+  - only `service_role` can run the phone function;
+  - the RSI roles have no decision path;
+  - wrong token → `denied`; wrong hash → `hash-mismatch`; valid token → `recorded`; replay →
+    `already`; proposal → `approved`; update on `rsi_decisions` → append-only error.
+
+  Afterwards the `rsi_*` tables hold 0 rows (the ROLLBACK worked).
+- **Rights after the migration**, compared with the baseline:
+  - `anon` / `authenticated`: 0 of 26 tables (before: 0 of 16);
+  - `service_role`: 16 of 26, the same 16 as before and none of the `rsi_*` tables;
+  - `rsi_reader`: select on 17;
+  - `rsi_writer`: select on 17, insert on 9 (not `rsi_decisions`);
+  - both RSI roles are NOLOGIN;
+  - 32 policies, all for `rsi_reader` / `rsi_writer`.
+- **Security advisors:** INFO only ("RLS enabled, no policy"), now 8 tables instead of 16. Nothing new.
+- **Data:** the 1330 existing sessions have `env = null`, which counts as prod. The `edits` status
+  check now allows `staged`.
+- **Ingestion after the migration:** the 18:32:47 amem-ingest run exited 0 (runs 223), with no
+  FAIL line. It upserted 4 sessions active after the migration, on the new schema, with the main code.
+- **Undo**, if ever needed (never run automatically): revert the code first (Phase D), export `rsi_*`,
+  then run [rollback_rsi_core.sql](rollback_rsi_core.sql).
