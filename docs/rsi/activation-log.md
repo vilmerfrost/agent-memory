@@ -242,3 +242,33 @@ Branch `rsi/m0035-e`, commit `c079c04`. Suite 1451 passed; edge function 12/12. 
   ingested as `amem_app`, and both triggers run.
 - **Routine code:** no superuser statements (`session_replication_role`, `vacuum`, `set role`, DDL).
   agent-config, the hooks and Codex never use `AMEM_DB_URL` directly; they call `amem`.
+
+## E3: credential split (2026-10-16 ~20:23 CEST), approved in chat, run by Vilmer
+
+- **Run:** Vilmer ran `.venv/bin/amem admin split-credentials` in `~/Projects/agent-memory`, from the
+  desktop app's `!` shell (his own terminal session: a TTY, no agent variables). Output: "done", and
+  `AMEM_SUPABASE_KEY: none`. The Keychain probe passed, so a read of `amem-admin-db` did not return
+  without a human. No value was printed.
+  - The agent's own tool shell sets `CLAUDECODE` and has no TTY, so `_human_only()` refuses it there.
+    That check is a safeguard, not a boundary (see least-privilege.md).
+- **`amem admin credentials-status`:** "connects as amem_app; admin Keychain item: present;
+  AMEM_SUPABASE_KEY: none". Exit 0. `freeze-status`: `FROZEN`.
+- **Forged decision as `amem_app`** (hosted database, the routines' own credential, one transaction ending
+  in ROLLBACK, each attempt in a savepoint): `current_user` = `amem_app`. All 11 attempts failed with
+  42501 (permission denied):
+  - insert, update and delete on `rsi_decisions`; insert on `rsi_decision_tokens`;
+  - `amem_rsi_record_decision`, `amem_rsi_record_phone_decision`, `amem_rsi_record_cli_decision`,
+    `amem_rsi_phone_bad_code`;
+  - select on `rsi_totp_used`; `create table`; `set role postgres`.
+
+  0 rows left for the probe id.
+- **First routine cycle as `amem_app`:** the 20:34 run exited 0: `amem-ingest` (0 new, 350 present),
+  `amem-sessions` (260 files, 2 updated, 2 summaries written) and `amem-undo-poll` (0 requests). No FAIL
+  lines since the split. No launchd plist and no agent-config script sets `AMEM_DB_URL`, so the routines read
+  the split line, the same path the probe used (`current_user` = `amem_app`).
+- **09:20 amem-daily (2026-10-17):** pending. Expected: exit 0, `scored=` and `deviations=`, no `edits=`.
+- **Dialog type** (reported by Vilmer): it asked for the login password before Deny or Allow. A same-user
+  process cannot pass it by clicking; see least-privilege.md, "Checked at E3".
+- **Still open:** T2 (Supabase CLI token) and T3 (the connector runs as `postgres`) until Phase G (A4, A5).
+  Until then the decision-record boundary is not complete.
+- **Undo** (never automatic): Vilmer runs `.venv/bin/amem admin restore-credentials` and clicks Allow once.

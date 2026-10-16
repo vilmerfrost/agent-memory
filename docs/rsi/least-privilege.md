@@ -1,6 +1,6 @@
 # RSI V1: least-privilege promotion (Mission 003.5, Phase E)
 
-Status: **E1 applied to the hosted database and E2 merged into local `main` (2026-10-16). E3 not run yet.**
+Status: **E1 applied to the hosted database, E2 merged into local `main`, E3 run by Vilmer (2026-10-16). A4 and A5 wait for Phase G.**
 Unattended promotion stays disabled while R2 is open (see "Decision" below).
 
 ## The problem (verified 2026-10-16)
@@ -115,10 +115,11 @@ approval *mandatory*. A compromised agent does not need a forged decision: it ca
 `~/.claude/CLAUDE.md`, a skill or a plist directly (T5). It can also change the `amem` code that you later
 run and Allow in the Keychain dialog. Only Plan B closes this.
 
-**Check at E3.** Note whether the Keychain dialog asks for your login password or shows only buttons. A
-password prompt is a human-presence gate. If it shows only buttons, it is not verified whether a process
-with Accessibility permission (for example a computer-use tool) can click them. Until that is known, treat
-A2 as a boundary only for code that has no Accessibility permission.
+**Checked at E3 (Vilmer, 2026-10-16).** The Keychain dialog asked for the login password before Deny or
+Allow. A read therefore needs a secret that is not on the Mac's disk, so a same-user process cannot get past
+the dialog by clicking it, even with Accessibility permission. The gate fails only if you type your password
+into a dialog you did not start (R1). This was observed once, at the split; if a later dialog shows only
+buttons, treat A2 as a safeguard again and say so.
 
 ## Decision: no unattended promotion while R2 is open (2026-10-16, Vilmer)
 
