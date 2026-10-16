@@ -34,6 +34,9 @@ Recommended order:
 | G-CH4 | owner approves | Review `amem sync plan --sink clickhouse --replay`, then run the real backfill once: `amem sync run --sink clickhouse --replay --budget 600` | `amem sync verify --sink clickhouse --days 30` shows parity; Usage under $1 | `TRUNCATE` the tables; `AMEM_SYNC_CLICKHOUSE=off` |
 | later | owner approves | A daily sync (not every 15 min: that keeps the service awake) | — | — |
 
+**G-CH2 done 2026-10-17 (owner approval; Mission 004C Phase A):** G-CH2a: `amem` database and 9 tables created from the console as the org admin (all `SharedReplacingMergeTree`). G-CH2b: `AMEM_CLICKHOUSE_KEY` via the popup into the 004B worktree `.env.local` (Cloud rule met); URL `https://gsgozod89n.eu-west-1.aws.clickhouse.cloud:8443` and user `amem_writer` are passed as plain env (not secrets). G-CH2c: the CREATE USER line (hash only) went from the clipboard into the console by the owner; the clipboard was cleared after; the GRANT ran from the console. `SHOW GRANTS FOR amem_writer` = `GRANT SELECT, INSERT ON amem.* TO amem_writer`. G-CH2d: `amem sync grants` from the Mac: 11/11 ok; the writer sees only the `amem` database; CREATE DATABASE/TABLE, ALTER, CREATE USER, GRANT, system.users and system.query_log all ACCESS_DENIED (15 s total, cold service). Credits after: Trial $0.47 used, Startup $0, billable $0.00. Known limit: the console's query history keeps the CREATE USER text (hash, not password).
+
+
 **Account state 2026-10-17 (read-only check of the console, no changes):** org BatchCortex, plan Scale, card
 on file, next billing period 2026-11-01. Credits: Startup Program $5,000, Active, valid 2026-10-16 to
 2027-10-16, used $0; Trial $300, Active, valid 2026-10-06 to 2026-11-06, used $0.43 (remaining
