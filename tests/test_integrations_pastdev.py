@@ -188,7 +188,10 @@ class FakePastDev:
         self.polls: list[str] = []                   # statuses for the next GET /ingest/{id} calls
         self.queue = True                            # False: a changed batch completes at once
         self.recall_answer: dict[str, Any] = {"asOf": "2026-10-16T00:00:00Z", "usedEvidenceTokens": 0, "results": []}
-        for method, path, h in (("POST", "/api/v1/ingest/batch", self.ingest), ("GET", "/api/v1/ingest/", self.status),
+        self.retries = 0                             # POST /ingest/{id}/retry calls (free on past.dev)
+        self.deleted: set[str] = set()               # "A deleted id cannot be sent again; use a new id."
+        for method, path, h in (("POST", "/api/v1/ingest/", self.retry),           # before ingest/batch: later routes win
+                                ("POST", "/api/v1/ingest/batch", self.ingest), ("GET", "/api/v1/ingest/", self.status),
                                 ("POST", "/api/v1/recall", self.recall),
                                 ("POST", "/api/v1/data-points/delete", self.delete)):
             svc.route(method, path, self._auth(h))
@@ -218,6 +221,8 @@ class FakePastDev:
         out = []
         for i, it in enumerate(body["items"]):
             assert set(it) <= {"content", "id", "timestamp", "label", "metadata", "audience", "identity"} and it["content"]
+            if it["id"] in self.deleted:     # the docs give the rule, not the code: the code here is assumed
+                return 400, {"code": "data-point-deleted", "status": 400}
             same = self.points.get(it["id"]) == it
             self.points[it["id"]] = it
             out.append({"ordinal": i, "sourceId": it["id"].strip(), "status": "completed" if same else "queued",
@@ -228,6 +233,10 @@ class FakePastDev:
                    "unchanged": unchanged, "items": out}
         self.keys[key] = (body, receipt)
         return (200 if unchanged else 202), receipt
+
+    def retry(self, req: Request) -> Any:
+        self.retries += 1
+        return 200, {"status": "processing"}
 
     def status(self, req: Request) -> Any:
         if req.path.endswith(PD.NIL_INGESTION):
@@ -248,6 +257,7 @@ class FakePastDev:
             return 404, {"code": "not-found", "status": 404}            # all or nothing
         for i in ids:
             del self.points[i]
+            self.deleted.add(i)
         return 202, {"operationId": str(uuid.uuid4()), "ids": ids}
 
     def ingest_requests(self) -> list[Request]:
@@ -326,7 +336,7 @@ def test_sync_sends_sanitized_records_with_the_contract_shape(db: Db, pdev: Fake
         assert set(req.json) == {"items", "idempotencyKey"} and len(req.json["items"]) <= PD.BATCH_MAX
         items = req.json["items"]
         assert req.json["idempotencyKey"] == sha256(json.dumps(
-            {"items": items, "after_delete": [None] * len(items), "attempt": 0, "replay": None},
+            {"items": items, "attempt": 0, "replay": None},
             sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()
         for it in items:
             assert set(it) == {"id", "content", "timestamp", "label", "identity"}          # no metadata
@@ -408,7 +418,8 @@ def test_202_is_polled_until_completed_or_the_budget(db: Db, pdev: FakePastDev) 
 
 def test_failed_ingestion_holds_the_cursor_and_the_retry_uses_a_new_key(db: Db, pdev: FakePastDev) -> None:
     refs_ = seed(db)
-    pdev.polls = ["failed"]                                      # the first batch (rsi_proposals) fails
+    pdev.polls = ["failed", "failed"]                            # the first batch (rsi_proposals) fails, and again after
+                                                                 # the one free retry (Mission 004B)
     t0 = datetime(2026, 10, 17, 9, 0, tzinfo=UTC)
     with psycopg.connect(db.app) as conn:
         rep = sync.run(sink(pdev), conn, now=t0, environ={})
@@ -497,9 +508,12 @@ def test_team_flag_later_retracts_and_a_gone_row_is_retracted(db: Db, pdev: Fake
         assert len(pdev.svc.requests_to("POST", "/api/v1/data-points/delete")) == 1
         assert len(pdev.ingest_requests()) == n_ingest
         db.sql("update rsi_proposals set meta = meta - 'team' where id = %s", (pid,))
-        sync.run(sink(pdev), conn, environ={})                   # personal again: sent again, fresh key
-    assert refs_["proposal"] in pdev.points and refs_["decision"] in pdev.points
-    assert links(db)[f"past:{refs_['proposal']}"]["metrics"].get("deleted") is None
+        s = sink(pdev)
+        rep = sync.run(s, conn, environ={})                      # personal again, but a deleted id is retired
+        assert rep.status == "ok" and rep.dead_letters == 0 and len(pdev.ingest_requests()) == n_ingest
+        assert refs_["proposal"] in s.retired and refs_["decision"] in s.retired
+    assert refs_["proposal"] not in pdev.points and refs_["decision"] not in pdev.points
+    assert links(db)[f"past:{refs_['proposal']}"]["metrics"]["deleted"] is True
 
 
 def test_kill_switch_stops_sink_and_retriever(db: Db, pdev: FakePastDev) -> None:

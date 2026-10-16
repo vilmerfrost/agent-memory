@@ -32,11 +32,14 @@ API path (checked against the official docs on 2026-10-16, plain HTTP through in
   v4 "does not reliably deduplicate repeated records on the read path". So `upload_run` first asks the
   Observations API whether the trace exists and exports the spans only when it does not. Scores are
   re-sent; they upsert (same id, name and timestamp; the event timestamp is the run's end time).
-- Scores: `score-create` events on `POST /api/public/ingestion` (207 multi-status). The compatibility
-  page says score ingestion stays "fully supported" in v4. `POST /api/public/scores` exists too, but its
-  body changed (one object in older specs, an array in the current main-branch spec), so it is not used.
-- Reads: `GET /api/public/v2/observations` (filter traceId or sessionId) and `GET /api/public/v3/scores`.
-  `GET /api/public/traces/{id}` and the v1/v2 score reads answer 404 on v4 `events_only`.
+- Scores (Mission 004B): `POST /api/public/scores` with a JSON array (202 accepted, 207 with accepted /
+  rejected counts; a 207 is never retried). Each score carries a fixed id and timestamp (the run's end):
+  the Cloud spec says "To update an existing score, send it again with the same id and timestamp."
+  The legacy ingestion endpoint is not in the Cloud OpenAPI spec, so it is no longer used.
+- Reads: `GET /api/public/v2/observations` (filter traceId or sessionId, always inside a start-time window)
+  and `GET /api/public/v3/scores`. `GET /api/public/traces/{id}` is removed on 2026-11-16.
+- Experiments (when datasets are on): `GET /api/public/experiment-items?datasetId=..&fields=core,scores`
+  returns each item's trace scores in one paged call (fromStartTime is required).
 - Datasets: `GET`/`POST /api/public/v2/datasets` and `POST /api/public/dataset-items` (upsert on id).
   A dataset run is the `langfuse.experiment.*` span attributes on every span of the item's trace;
   `POST /api/public/dataset-run-items` "must not be used with Langfuse v4".
@@ -58,6 +61,17 @@ Not verified against a real server (only against tests/test_integrations_langfus
 JSON attribute mapping, the score upsert key on the ingestion path, the dataset create/get shapes, and
 the Observations v2 / Scores v3 response fields. Check them once against the local v4 server.
 
+Langfuse Cloud (Mission 004B; `cloud` for a *.cloud.langfuse.com host). Hobby: 50k units/month, 30 days of
+visible data, general API 30 requests/min per organization, no spend alerts and no hard cap.
+- Every call but the OTLP export (its own 1,000/min ingestion limit) waits CLOUD_MIN_INTERVAL_S after the
+  previous one (AMEM_LANGFUSE_MIN_INTERVAL_S overrides). A 429 waits for Retry-After (integrations.http).
+- Reads look back READ_WINDOW_DAYS at most, because Hobby hides older data anyway.
+- A hidden trace is not a missing trace: before exporting, the sink also asks Supabase whether the run's
+  `lf:trace/<id>` link is already in rsi_evidence (written only after a successful upload), so a replay of
+  runs older than the window never exports their spans twice.
+- A rejected span or score is a record-level refusal (Rejected, status 422): the sync loop dead-letters the
+  run instead of retrying it.
+
 Known limits: a re-run of the same run_key (a new sandbox run id, same case and rep) keeps the first
 attempt's spans in Langfuse (spans are never re-exported); only its scores and its rsi_evidence metrics
 follow the newer attempt. The existence check reads what Langfuse already shows, so a retry within the
@@ -68,8 +82,9 @@ Run logs: the sink reads `<sandbox root>/experiments/<id>/logs/<run_id>.json` (R
 artifact). The orchestrator may add `<run_id>.rsi.json` with {case, rep, kind, env, proposal_id,
 check_passed, judge_winner, eval_verdict}; without it case = run_id and rep = 0.
 
-Config (env only, never a .env file): AMEM_LANGFUSE_HOST (https, or http to localhost),
-AMEM_LANGFUSE_PUBLIC_KEY, AMEM_LANGFUSE_SECRET_KEY. Unconfigured: health is unavailable.
+Config (env only, never a .env file): AMEM_LANGFUSE_HOST (https, or http to localhost; Cloud EU is
+https://cloud.langfuse.com), AMEM_LANGFUSE_PUBLIC_KEY, AMEM_LANGFUSE_SECRET_KEY, AMEM_LANGFUSE_MIN_INTERVAL_S.
+Unconfigured: health is unavailable.
 """
 
 from __future__ import annotations
@@ -108,12 +123,16 @@ TOOL_STATUSES = ("completed", "failed", "declined", "denied", "in_progress", "in
 TOOL_FAILED = frozenset({"failed", "declined", "denied", "incomplete"})
 
 OTLP_PATH = "/api/public/otel/v1/traces"
-INGESTION_PATH = "/api/public/ingestion"
+SCORES_WRITE_PATH = "/api/public/scores"
 OBSERVATIONS_PATH = "/api/public/v2/observations"
 SCORES_PATH = "/api/public/v3/scores"
+EXPERIMENT_ITEMS_PATH = "/api/public/experiment-items"
 DATASETS_PATH = "/api/public/v2/datasets"
 DATASET_ITEMS_PATH = "/api/public/dataset-items"
 HEALTH_PATH = "/api/public/projects"
+READ_WINDOW_DAYS = 30                  # Hobby shows 30 days; every observation read is bounded by it
+CLOUD_MIN_INTERVAL_S = 2.1             # Hobby: general API 30 requests/min, shared by the organization
+MAX_SCORED_TRACES = 25                 # experiment_scores without a dataset: one scores call per trace
 
 _NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:@/-]{0,99}")     # model and tool names
 _PART_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")          # mcp server / tool parts
@@ -130,6 +149,13 @@ class LangfuseError(Exception):
 
 class Refused(LangfuseError):
     """A record that must never reach Langfuse (not a sandbox record)."""
+
+
+class Rejected(LangfuseError):
+    """Langfuse refused the content of a record (a rejected span or score). Record-level, like HTTP 422,
+    so the sync loop dead-letters the run instead of retrying it (sync.RECORD_ERRORS)."""
+
+    status = 422
 
 
 def clean_text(text: Any) -> str | None:
@@ -593,7 +619,7 @@ def build_spans(run: SandboxRun, dataset_id: str | None = None) -> dict[str, Any
 
 
 def build_scores(run: SandboxRun) -> list[dict[str, Any]]:
-    """`score-create` ingestion events. Same id, name and timestamp on every retry, so Langfuse upserts."""
+    """`POST /api/public/scores` items. Same id, name and timestamp on every retry, so Langfuse updates."""
     ts, tid = _iso(run.ended_at), run.trace_id
     values: list[tuple[str, Any, str]] = []
     if run.check_passed is not None:
@@ -604,10 +630,8 @@ def build_scores(run: SandboxRun) -> list[dict[str, Any]]:
         values.append(("eval_verdict", run.eval_verdict, "CATEGORICAL"))
     out = []
     for name, value, dtype in values:
-        sid = score_id(tid, name)
-        out.append({"id": f"{sid}-create", "timestamp": ts, "type": "score-create",
-                    "body": {"id": sid, "traceId": tid, "name": name, "value": value, "dataType": dtype,
-                             "environment": ENV}})
+        out.append({"id": score_id(tid, name), "traceId": tid, "name": name, "value": value, "dataType": dtype,
+                    "environment": ENV, "timestamp": ts})
     return out
 
 
@@ -633,13 +657,39 @@ class LangfuseClient:
     timeout: float = 10.0
     retries: int = 2
     sleep: Callable[[float], None] = time.sleep
+    min_interval: float | None = None      # None: CLOUD_MIN_INTERVAL_S on Cloud, 0 elsewhere
+    clock: Callable[[], float] = time.monotonic
+    _last: float | None = field(default=None, init=False, repr=False)
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None, **kw: Any) -> LangfuseClient:
         env = os.environ if environ is None else environ
         host = (env.get("AMEM_LANGFUSE_HOST") or "").strip().rstrip("/") or None
+        try:
+            interval: float | None = float(env["AMEM_LANGFUSE_MIN_INTERVAL_S"])
+        except (KeyError, ValueError):
+            interval = None
+        kw.setdefault("min_interval", interval)
         return cls(host, (env.get("AMEM_LANGFUSE_PUBLIC_KEY") or "").strip() or None,
                    (env.get("AMEM_LANGFUSE_SECRET_KEY") or "").strip() or None, **kw)
+
+    @property
+    def cloud(self) -> bool:
+        h = (urlsplit(self.host).hostname or "") if self.host else ""
+        return h == "cloud.langfuse.com" or h.endswith(".cloud.langfuse.com")
+
+    @property
+    def interval(self) -> float:
+        if self.min_interval is not None:
+            return max(self.min_interval, 0.0)
+        return CLOUD_MIN_INTERVAL_S if self.cloud else 0.0
+
+    def _throttle(self) -> None:
+        if self.interval and self._last is not None:
+            wait = self.interval - (self.clock() - self._last)
+            if wait > 0:
+                self.sleep(wait)
+        self._last = self.clock()
 
     @property
     def problem(self) -> str | None:
@@ -655,6 +705,8 @@ class LangfuseClient:
               retries: int | None = None, timeout: float | None = None) -> http.Response:
         if self.problem:
             raise LangfuseError(self.problem)
+        if path != OTLP_PATH:              # the OTLP export has its own, much higher ingestion limit
+            self._throttle()
         url = f"{self.host}{path}" + (f"?{urlencode(params)}" if params else "")
         return http.request(method, url, headers=self._headers(), body=body, timeout=timeout or self.timeout,
                             retries=self.retries if retries is None else retries, sleep=self.sleep)
@@ -676,18 +728,22 @@ class LangfuseClient:
         return Health(True)
 
     def export_spans(self, body: Mapping[str, Any]) -> None:
-        data = self._json(self._call("POST", OTLP_PATH, body=body)) or {}
+        # One attempt only (Mission 004B): Langfuse v4 does not reliably dedupe a re-exported span id, so an
+        # HTTP-level retry after a lost response could duplicate spans. A failure surfaces to the sync loop;
+        # the next run checks trace_exists() before exporting again.
+        data = self._json(self._call("POST", OTLP_PATH, body=body, retries=0)) or {}
         partial = data.get("partialSuccess") if isinstance(data, dict) else None
         rejected = int((partial or {}).get("rejectedSpans") or 0)
         if rejected:
-            raise LangfuseError(f"OTLP rejected {rejected} span(s)")
+            raise Rejected(f"OTLP rejected {rejected} span(s)")
 
-    def ingest(self, events: Sequence[Mapping[str, Any]]) -> None:
-        data = self._json(self._call("POST", INGESTION_PATH, body={"batch": list(events)})) or {}
-        errors = data.get("errors") if isinstance(data, dict) else None
-        if errors:
-            ids = ", ".join(f"{e.get('id')}:{e.get('status')}" for e in errors[:5] if isinstance(e, dict))
-            raise LangfuseError(f"ingestion rejected {len(errors)} event(s): {ids}"[:300])
+    def create_scores(self, items: Sequence[Mapping[str, Any]]) -> None:
+        """202: all accepted. 207: counts and errors; never retried (the accepted ones already landed)."""
+        data = self._json(self._call("POST", SCORES_WRITE_PATH, body=list(items))) or {}
+        rejected = int(data.get("rejected") or 0) if isinstance(data, dict) else 0
+        if rejected:
+            msgs = "; ".join(str(e.get("message"))[:80] for e in (data.get("errors") or [])[:3] if isinstance(e, dict))
+            raise Rejected(f"scores rejected {rejected} of {len(items)}: {msgs}"[:300])
 
     def _pages(self, path: str, params: Mapping[str, Any], max_pages: int) -> list[dict[str, Any]]:
         out: list[dict[str, Any]] = []
@@ -708,8 +764,26 @@ class LangfuseClient:
     def scores(self, max_pages: int = 5, **params: Any) -> list[dict[str, Any]]:
         return self._pages(SCORES_PATH, params, max_pages)
 
-    def trace_exists(self, trace: str) -> bool:
-        return bool(self.observations(max_pages=1, traceId=trace, fields="core", limit=1))
+    def experiment_items(self, max_pages: int = 10, **params: Any) -> list[dict[str, Any]]:
+        return self._pages(EXPERIMENT_ITEMS_PATH, params, max_pages)
+
+    def trace_exists(self, trace: str, start: datetime | None = None, end: datetime | None = None) -> bool:
+        """Inside a start-time window around the run (a day each side), never an unbounded scan."""
+        window = {}
+        if start is not None:
+            window["fromStartTime"] = _iso(start - timedelta(days=1))
+        if end is not None:
+            window["toStartTime"] = _iso(end + timedelta(days=1))
+        return bool(self.observations(max_pages=1, traceId=trace, fields="core", limit=1, **window))
+
+    def dataset_id(self, name: str) -> str | None:
+        try:
+            data = self._json(self._call("GET", f"{DATASETS_PATH}/{quote(name, safe='')}"))
+        except http.HttpError as exc:
+            if exc.status == 404:
+                return None
+            raise
+        return data["id"] if isinstance(data, dict) and isinstance(data.get("id"), str) else None
 
     def ensure_dataset(self, name: str) -> str:
         """The dataset's Langfuse id (created once; v4 needs Dataset.id on experiment spans)."""
@@ -742,9 +816,11 @@ class UploadResult:
     dataset_item: str | None = None
 
 
-def upload_run(run: SandboxRun, client: LangfuseClient, *, datasets: bool = False) -> UploadResult:
-    """Send one stored run. Idempotent: spans only when the trace is not in Langfuse yet, scores upsert,
-    dataset and item are get-or-create / upsert by deterministic id."""
+def upload_run(run: SandboxRun, client: LangfuseClient, *, datasets: bool = False,
+               exported: bool = False) -> UploadResult:
+    """Send one stored run. Idempotent: spans only when the trace is not in Langfuse yet (and not known as
+    exported: `exported` is the caller's Supabase check), scores update in place, dataset and item are
+    get-or-create / upsert by deterministic id."""
     check(run)
     res = UploadResult(run.trace_id)
     dataset_id = None
@@ -754,15 +830,15 @@ def upload_run(run: SandboxRun, client: LangfuseClient, *, datasets: bool = Fals
         res.dataset_item = dataset_item_id(run.experiment_id, run.case)
         client.upsert_dataset_item(name, res.dataset_item, {"experiment_id": run.experiment_id, "case": run.case},
                                    {"source": "amem-rsi"})
-    res.existed = client.trace_exists(run.trace_id)
+    res.existed = exported or client.trace_exists(run.trace_id, run.started_at, run.ended_at)
     if not res.existed:
         body = build_spans(run, dataset_id)
         client.export_spans(body)
         res.spans = len(body["resourceSpans"][0]["scopeSpans"][0]["spans"])
-    events = build_scores(run)
-    if events:
-        client.ingest(events)
-        res.scores = len(events)
+    scores = build_scores(run)
+    if scores:
+        client.create_scores(scores)
+        res.scores = len(scores)
     return res
 
 
@@ -796,6 +872,7 @@ class LangfuseSink:
         self.refused: list[tuple[str, str]] = []
         self.uploads: list[UploadResult] = []
         self._runs: dict[str, SandboxRun] = {}
+        self._exported: set[str] = set()
 
     def health(self) -> Health:
         return self.client.health()
@@ -836,12 +913,17 @@ class LangfuseSink:
                 yield Batch(TABLE, [], wm)
                 continue
             self._runs[run.trace_id] = run
+            ref = refs.lf("trace", run.trace_id)
+            if conn.execute("select 1 from rsi_evidence where system = %s and external_ref = %s",
+                            (refs.parse(ref).system, ref)).fetchone():
+                self._exported.add(run.trace_id)        # uploaded before: the spans are there, maybe hidden
             yield Batch(TABLE, [{"trace_id": run.trace_id, **run.metrics()}], wm, [evidence_for(run)], key=run.trace_id)
 
     def push(self, batch: Batch) -> None:
         if not batch.key:
             return
-        self.uploads.append(upload_run(self._runs[batch.key], self.client, datasets=self.datasets))
+        self.uploads.append(upload_run(self._runs[batch.key], self.client, datasets=self.datasets,
+                                       exported=batch.key in self._exported))
         self._runs.pop(batch.key, None)
 
 
@@ -905,8 +987,9 @@ class LangfuseRetriever:
                                         "score aggregates per arm for one experiment", ("experiment_id",)),
     }
 
-    def __init__(self, client: LangfuseClient):
+    def __init__(self, client: LangfuseClient, *, now: Callable[[], datetime] | None = None):
         self.client = client
+        self._now = now or (lambda: datetime.now(UTC))
 
     def health(self) -> Health:
         return self.client.health()
@@ -914,13 +997,17 @@ class LangfuseRetriever:
     def named_queries(self) -> Mapping[str, NamedQuery]:
         return self._QUERIES
 
+    def _since(self) -> str:
+        return _iso(self._now() - timedelta(days=READ_WINDOW_DAYS))
+
     def query(self, name: str, params: Mapping[str, str]) -> list[EvidenceRef]:
         if name == "trace":
             return self._trace(params["trace_id"])
         return self._experiment(params["experiment_id"])
 
     def _trace(self, tid: str) -> list[EvidenceRef]:
-        rows = self.client.observations(traceId=tid, fields="core,basic,model,usage,metadata,trace_context", limit=100)
+        rows = self.client.observations(traceId=tid, fields="core,basic,model,usage,metadata,trace_context", limit=100,
+                                        fromStartTime=self._since())
         rows = [o for o in rows if o.get("traceId") == tid]
         if not rows:
             return []
@@ -952,23 +1039,45 @@ class LangfuseRetriever:
                             observed_at=_label(root.get("startTime"), re.compile(r"[0-9T:.+Z-]{10,40}")))]
 
     def _experiment(self, exp: str) -> list[EvidenceRef]:
-        roots = self.client.observations(sessionId=exp, isRootObservation="true",
-                                         fields="core,basic,metadata,trace_context", limit=1000)
+        """With a dataset: one paged experiment-items call carries every item's trace scores (rep 0 only,
+        as linked). Without one: root observations, then one scores call per trace, at most MAX_SCORED_TRACES
+        (the Hobby limit is 30 calls a minute), and `truncated` says when more were left out."""
+        ds = self.client.dataset_id(dataset_name(exp))
+        per_trace: list[tuple[str, dict[str, Any]]] = []          # (arm, score values)
+        truncated, via = False, "experiment-items"
+        if ds:
+            for it in self.client.experiment_items(datasetId=ds, fields="core,scores", fromStartTime=self._since(),
+                                                   limit=100):
+                name, tid = it.get("experimentName"), it.get("traceId")
+                if not (isinstance(name, str) and name.startswith(f"{exp}-") and isinstance(tid, str)
+                        and refs.TRACE_RE.fullmatch(tid)):
+                    continue
+                arm = name[len(exp) + 1:]
+                if re.fullmatch(r"[A-Z]", arm):
+                    per_trace.append((arm, _score_values([s for s in it.get("scores") or [] if isinstance(s, dict)])))
+        else:
+            via = "observations"
+            roots = self.client.observations(sessionId=exp, isRootObservation="true",
+                                             fields="core,basic,metadata,trace_context", limit=1000,
+                                             fromStartTime=self._since())
+            seen: set[str] = set()
+            for r in roots:
+                tid = r.get("traceId")
+                if not isinstance(tid, str) or not refs.TRACE_RE.fullmatch(tid) or tid in seen or r.get("parentObservationId"):
+                    continue
+                arm = _str_meta(r.get("metadata")).get("arm")
+                if not (isinstance(arm, str) and re.fullmatch(r"[A-Z]", arm)):
+                    continue
+                if len(seen) >= MAX_SCORED_TRACES:
+                    truncated = True
+                    break
+                seen.add(tid)
+                per_trace.append((arm, _score_values(self.client.scores(traceId=tid, limit=100))))
         arms: dict[str, dict[str, Any]] = {}
-        seen: set[str] = set()
-        for r in roots:
-            tid = r.get("traceId")
-            if not isinstance(tid, str) or not refs.TRACE_RE.fullmatch(tid) or tid in seen or r.get("parentObservationId"):
-                continue
-            seen.add(tid)
-            meta = _str_meta(r.get("metadata"))
-            arm = meta.get("arm")
-            if not (isinstance(arm, str) and re.fullmatch(r"[A-Z]", arm)):
-                continue
+        for arm, vals in per_trace:
             a = arms.setdefault(arm, {"traces": 0, "check_passed_n": 0, "check_passed_true": 0,
                                       "judge_winner": {}, "eval_verdict": {}})
             a["traces"] += 1
-            vals = _score_values(self.client.scores(traceId=tid, limit=100))
             if "check_passed" in vals:
                 a["check_passed_n"] += 1
                 a["check_passed_true"] += int(vals["check_passed"])
@@ -978,7 +1087,7 @@ class LangfuseRetriever:
         out = []
         for arm, a in sorted(arms.items()):
             n = a["check_passed_n"]
-            metrics = {"experiment_id": exp, "arm": arm, **a,
+            metrics = {"experiment_id": exp, "arm": arm, **a, "via": via, "truncated": truncated or None,
                        "check_passed_rate": round(a["check_passed_true"] / n, 4) if n else None}
             out.append(EvidenceRef(refs.lf("dataset_run", experiment_run_id(exp, arm)), SOURCE, "score",
                                    [refs.amem("experiment", exp)], {k: v for k, v in metrics.items() if v is not None}))

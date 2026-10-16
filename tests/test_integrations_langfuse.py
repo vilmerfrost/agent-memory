@@ -23,6 +23,8 @@ import pytest
 from agent_memory.integrations import evidence as E, langfuse as L, refs, sync
 from integrations_mock import MockService, Request
 
+NOW = datetime(2026, 10, 17, 12, 0, tzinfo=UTC)       # the retriever's clock: test runs are dated 2026-10-16
+
 PK, SK = "pk-lf-test-0000", "sk-lf-test-1111"
 APP_PW = "lf-test-pw-0123456789"
 EXP = "exp-20261017-01"
@@ -150,9 +152,10 @@ def _ns_iso(ns: str) -> str:
 
 class FakeLangfuse:
     """The v4 endpoints the adapter uses. Observations are appended, never merged (v4 "does not reliably
-    deduplicate repeated records"), so a duplicate export shows up as a duplicate row. Scores upsert on
-    (id, name, date of timestamp), as the scores docs say. The ingestion endpoint rejects every event type
-    but score-create (v4 events_only)."""
+    deduplicate repeated records"), so a duplicate export shows up as a duplicate row. Scores (POST
+    /api/public/scores, an array) update in place on the same id and timestamp, as the Cloud spec says;
+    unknown fields are rejected in a 207. Observation reads honor the start-time window, and
+    experiment-items (fromStartTime required) lists the root spans that carry langfuse.experiment.*."""
 
     def __init__(self, svc: MockService):
         self.svc = svc
@@ -164,7 +167,8 @@ class FakeLangfuse:
         r = svc.route
         r("GET", L.HEALTH_PATH, self._guard(lambda q: (200, {"data": [{"id": "proj-1", "name": "rsi"}]})))
         r("POST", L.OTLP_PATH, self._guard(self._otlp))
-        r("POST", L.INGESTION_PATH, self._guard(self._ingest))
+        r("POST", L.SCORES_WRITE_PATH, self._guard(self._create_scores))
+        r("GET", L.EXPERIMENT_ITEMS_PATH, self._guard(self._experiment_items))
         r("GET", L.OBSERVATIONS_PATH, self._guard(self._list_obs))
         r("GET", L.SCORES_PATH, self._guard(self._list_scores))
         r("POST", L.DATASETS_PATH, self._guard(self._create_ds))
@@ -213,21 +217,49 @@ class FakeLangfuse:
                 rows = [o for o in rows if o[k] == req.q(p)]
         if req.q("isRootObservation") == "true":
             rows = [o for o in rows if not o["parentObservationId"]]
+        if req.q("fromStartTime"):
+            rows = [o for o in rows if o["startTime"] >= req.q("fromStartTime")]
+        if req.q("toStartTime"):
+            rows = [o for o in rows if o["startTime"] < req.q("toStartTime")]
         start, limit = int(req.q("cursor") or 0), int(req.q("limit") or 50)
         page = rows[start:start + limit]
         nxt = str(start + limit) if start + limit < len(rows) else None
         return 200, {"data": page, "meta": {"cursor": nxt}}
 
-    def _ingest(self, req: Request) -> Any:
-        ok, errors = [], []
-        for ev in req.json["batch"]:
-            if ev["type"] != "score-create":
-                errors.append({"id": ev["id"], "status": 400, "message": "not supported in events_only"})
+    SCORE_FIELDS = {"id", "traceId", "sessionId", "observationId", "datasetRunId", "name", "value", "comment",
+                    "metadata", "environment", "queueId", "dataType", "configId", "source", "timestamp"}
+
+    def _create_scores(self, req: Request) -> Any:
+        assert isinstance(req.json, list), "the scores endpoint takes an array"
+        errors = []
+        for b in req.json:
+            if set(b) - self.SCORE_FIELDS or not {"name", "value"} <= set(b):
+                errors.append({"message": f"invalid score {b.get('id')}"})
                 continue
-            b = ev["body"]
-            self.scores[(b["id"], b["name"], ev["timestamp"][:10])] = {**b, "timestamp": ev["timestamp"]}
-            ok.append({"id": ev["id"], "status": 201})
-        return 207, {"successes": ok, "errors": errors}
+            self.scores[(b["id"], b["name"], b["timestamp"])] = b
+        if errors:
+            return 207, {"accepted": len(req.json) - len(errors), "rejected": len(errors), "errors": errors}
+        return 202, {"message": "Accepted"}
+
+    def _experiment_items(self, req: Request) -> Any:
+        if not req.q("fromStartTime"):
+            return 400, {"message": "fromStartTime is required"}
+        items = []
+        for o in reversed(self.observations):
+            a = o["attributes"]
+            if o["parentObservationId"] or "langfuse.experiment.id" not in a or o["startTime"] < req.q("fromStartTime"):
+                continue
+            if req.q("datasetId") and a.get("langfuse.experiment.dataset.id") != req.q("datasetId"):
+                continue
+            scores = [{"id": s["id"], "name": s["name"], "dataType": s["dataType"],
+                       "value": bool(s["value"]) if s["dataType"] == "BOOLEAN" else s["value"]}
+                      for s in self.scores.values() if s["traceId"] == o["traceId"]]
+            items.append({"id": o["id"], "traceId": o["traceId"], "startTime": o["startTime"], "endTime": o["endTime"],
+                          "level": o["level"], "environment": o["environment"],
+                          "experimentId": a["langfuse.experiment.id"], "experimentName": a["langfuse.experiment.name"],
+                          "experimentItemId": a["langfuse.experiment.item.id"],
+                          **({"scores": scores} if "scores" in (req.q("fields") or "") else {})})
+        return 200, {"data": items, "meta": {"cursor": None}}
 
     def _list_scores(self, req: Request) -> Any:
         rows = [s for s in self.scores.values() if not req.q("traceId") or s["traceId"] == req.q("traceId")]
@@ -341,7 +373,7 @@ def test_ids_are_deterministic_and_uploads_never_duplicate(tmp_path: Path) -> No
         ids = [o["id"] for o in lf.observations]
         assert sorted(ids) == sorted(s["spanId"] for s in spans)
         assert sorted(k[0] for k in lf.scores) == [f"{run.trace_id}-check_passed", f"{run.trace_id}-judge_winner"]
-        a, b = svc.requests_to("POST", L.INGESTION_PATH)
+        a, b = svc.requests_to("POST", L.SCORES_WRITE_PATH)
         assert a.body == b.body and len(svc.requests_to("POST", L.OTLP_PATH)) == 1
 
 
@@ -404,7 +436,7 @@ def test_round_trip_trace_query_returns_the_amem_session_and_scores(tmp_path: Pa
         client = client_for(svc)
         for run in (a, a2, b):
             L.upload_run(run, client)
-        r = L.LangfuseRetriever(client)
+        r = L.LangfuseRetriever(client, now=lambda: NOW)
         (res,) = E.gather("trace", {"trace_id": a.trace_id}, [r])
         assert res.status == "ok"
         (ev,) = res.refs
@@ -462,8 +494,9 @@ def test_rejections_and_missing_config_raise() -> None:
         with pytest.raises(L.LangfuseError, match="rejected 2 span"):
             L.upload_run(run, client_for(svc))
         svc.route("POST", L.OTLP_PATH, lambda r: (200, {}))
-        svc.route("POST", L.INGESTION_PATH, lambda r: (207, {"successes": [], "errors": [{"id": "e1", "status": 400}]}))
-        with pytest.raises(L.LangfuseError, match="rejected 1 event"):
+        svc.route("POST", L.SCORES_WRITE_PATH, lambda r: (207, {"accepted": 0, "rejected": 1,
+                                                                 "errors": [{"message": "bad value"}]}))
+        with pytest.raises(L.Rejected, match="scores rejected 1 of 1: bad value"):
             L.upload_run(run, client_for(svc))
 
 
@@ -596,3 +629,72 @@ def test_sink_down_moves_nothing(app: str, tmp_path: Path) -> None:
         assert (rep.status, rep.detail) == ("unavailable", "unreachable")
         assert "watermarks" not in sync.load(conn, "langfuse")
         assert sync.run(L.LangfuseSink(down, tmp_path), conn, environ={"AMEM_SYNC_LANGFUSE": "off"}).status == "off"
+
+
+# ---------------------------------------------------------------- Langfuse Cloud (Mission 004B)
+
+
+def test_a_run_supabase_knows_as_exported_is_never_exported_again(app: str, tmp_path: Path) -> None:
+    """Hobby hides data older than 30 days, so Langfuse cannot answer "is this trace there?" for an old run.
+    The rsi_evidence link (written only after a successful upload) answers it instead."""
+    pa, _ = _tree(tmp_path)
+    with MockService() as svc, psycopg.connect(app) as conn:
+        lf = FakeLangfuse(svc)
+        assert sync.run(L.LangfuseSink(client_for(svc), tmp_path), conn, environ={}).batches == 3
+        n_obs = len(lf.observations)
+        lf.observations.clear()                                          # hidden: past the visible window
+        rep = sync.run(L.LangfuseSink(client_for(svc), tmp_path), conn, replay=True, environ={})
+        assert rep.status == "ok" and lf.observations == [] and n_obs == 10
+        assert not svc.requests_to("POST", L.OTLP_PATH)[2:]              # the first run's two exports only
+
+
+def test_experiment_scores_use_experiment_items_when_a_dataset_exists(tmp_path: Path) -> None:
+    runs = [L.load_run_log(write_run(tmp_path, arm=arm, run_id=f"{arm}-20261016T10150{i}Z-1a2b3c",
+                                     stdout=json.dumps(claude_result()), sidecar={"case": f"c{i}", "check_passed": ok}))
+            for i, (arm, ok) in enumerate((("A", True), ("A", False), ("B", True)))]
+    with MockService() as svc:
+        FakeLangfuse(svc)
+        for run in runs:
+            L.upload_run(run, client_for(svc), datasets=True)
+        before = len(svc.requests_to("GET", L.SCORES_PATH))
+        (res,) = E.gather("experiment_scores", {"experiment_id": EXP}, [L.LangfuseRetriever(client_for(svc), now=lambda: NOW)])
+        assert res.status == "ok" and [x.ref for x in res.refs] == [f"lf:dataset_run/{EXP}-A", f"lf:dataset_run/{EXP}-B"]
+        ma, mb = (x.metrics for x in res.refs)
+        assert (ma["traces"], ma["check_passed_rate"], ma["via"]) == (2, 0.5, "experiment-items")
+        assert (mb["traces"], mb["check_passed_rate"]) == (1, 1.0) and "truncated" not in ma
+        assert len(svc.requests_to("GET", L.SCORES_PATH)) == before             # no per-trace score calls
+        (item_req,) = svc.requests_to("GET", L.EXPERIMENT_ITEMS_PATH)
+        assert item_req.q("fromStartTime") == "2026-09-17T12:00:00.000Z" and item_req.q("fields") == "core,scores"
+
+
+def test_experiment_scores_without_a_dataset_are_capped(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(L, "MAX_SCORED_TRACES", 1)
+    runs = [L.load_run_log(write_run(tmp_path, arm="A", run_id=f"A-20261016T10150{i}Z-1a2b3c",
+                                     stdout=json.dumps(claude_result()), sidecar={"case": f"c{i}", "check_passed": True}))
+            for i in range(3)]
+    with MockService() as svc:
+        FakeLangfuse(svc)
+        for run in runs:
+            L.upload_run(run, client_for(svc))
+        (res,) = E.gather("experiment_scores", {"experiment_id": EXP}, [L.LangfuseRetriever(client_for(svc), now=lambda: NOW)])
+        (ev,) = res.refs
+        assert (ev.metrics["traces"], ev.metrics["truncated"], ev.metrics["via"]) == (1, True, "observations")
+
+
+def test_a_rejected_score_dead_letters_the_run_and_the_rest_lands(app: str, tmp_path: Path) -> None:
+    _tree(tmp_path)
+    with MockService() as svc, psycopg.connect(app) as conn:
+        lf = FakeLangfuse(svc)
+        real = lf._create_scores
+
+        def picky(req: Any) -> Any:
+            if any(b.get("name") == "judge_winner" for b in req.json):
+                return 207, {"accepted": 1, "rejected": 1, "errors": [{"message": "score config mismatch"}]}
+            return real(req)
+        svc.route("POST", L.SCORES_WRITE_PATH, lf._guard(picky))
+        rep = sync.run(L.LangfuseSink(client_for(svc), tmp_path), conn, environ={})
+        assert (rep.status, rep.dead_letters, rep.failed) == ("ok", 1, 0)
+        meta = sync.load(conn, "langfuse")
+        (dl,) = meta["dead_letters"]
+        assert dl["table"] == "sandbox_runs" and "scores rejected 1 of 2" in dl["error"]
+        assert conn.execute("select count(*) from rsi_evidence where system = 'langfuse'").fetchone()[0] == 1

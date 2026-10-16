@@ -19,6 +19,7 @@ by its sink (for example `<iso ts>|<id>`); `--replay` starts from no watermark, 
 
 from __future__ import annotations
 
+import json
 import os
 import time
 from collections.abc import Callable, Iterator, Mapping
@@ -62,16 +63,19 @@ class Sink(Protocol):
 @dataclass
 class SyncReport:
     sink: str
-    status: str = "ok"            # ok | partial | unavailable | off | failed
+    status: str = "ok"            # ok | partial | capped | unavailable | off | failed
     batches: int = 0
     rows: int = 0
     failed: int = 0
+    dead_letters: int = 0
+    usage: dict[str, Any] = field(default_factory=dict)
     skipped_tables: list[str] = field(default_factory=list)
     seconds: float = 0.0
     detail: str = ""
 
     def line(self) -> str:
         extra = f" skipped={','.join(self.skipped_tables)}" if self.skipped_tables else ""
+        extra += f" dead_letters={self.dead_letters}" if self.dead_letters else ""
         return (f"sync {self.sink}: {self.status} batches={self.batches} rows={self.rows} failed={self.failed}"
                 f"{extra} {self.seconds:.1f}s" + (f" ({self.detail})" if self.detail else ""))
 
@@ -108,6 +112,74 @@ def _due(failure: Mapping[str, Any] | None, now: datetime) -> bool:
     return not nxt or datetime.fromisoformat(nxt) <= now
 
 
+# Mission 004B. A refusal of the content itself (not auth, not overload): split the batch, push the parts, and
+# dead-letter only the records that are still refused, so one bad record never blocks its table.
+RECORD_ERRORS = frozenset({400, 409, 413, 415, 422})
+MAX_DEAD_LETTERS = 500
+# Client-side daily limits (rows, requests) per sink. NOT a billing cap: they bound what this loop sends, and
+# the provider bills whatever it receives. Override with AMEM_SYNC_<SINK>_MAX_ROWS_PER_DAY / _MAX_REQUESTS_PER_DAY.
+DEFAULT_LIMITS = {"clickhouse": (100_000, 2_000), "langfuse": (500, 1_000), "pastdev": (300, 200)}
+
+
+def limits(sink: str, environ: Mapping[str, str] | None = None) -> tuple[int, int]:
+    env = os.environ if environ is None else environ
+    rows, reqs = DEFAULT_LIMITS.get(sink, (10_000, 1_000))
+
+    def num(name: str, default: int) -> int:
+        v = env.get(f"AMEM_SYNC_{sink.upper()}_{name}", "").strip()
+        return int(v) if v.isdigit() else default
+    return num("MAX_ROWS_PER_DAY", rows), num("MAX_REQUESTS_PER_DAY", reqs)
+
+
+def _record_error(exc: BaseException) -> bool:
+    status = getattr(exc, "status", None)
+    return isinstance(status, int) and status in RECORD_ERRORS
+
+
+def provider_cap(exc: BaseException) -> bool:
+    """The provider's own spending stop: 402 (out of credits) or a 429 that names a reached cap (past.dev
+    project-cap-reached / spend-cap-reached). Retrying cannot help, so the run stops as `capped`."""
+    status = getattr(exc, "status", None)
+    return status == 402 or (status == 429 and "cap-reached" in str(exc))
+
+
+def _dead(batch: Batch, rows: list[dict[str, Any]], exc: BaseException, now: datetime) -> list[dict[str, Any]]:
+    err = f"{type(exc).__name__}: {exc}"[:200]
+    return [{"table": batch.table, "key": str(r.get("id") or r.get("trace_id") or r.get("source_id") or batch.key or "?")[:200],
+             "error": err,
+             "at": _iso(now)} for r in rows]
+
+
+def _deliver(sink: Sink, batch: Batch, usage: dict[str, Any],
+             now: datetime) -> tuple[list[Batch], list[dict[str, Any]], BaseException | None]:
+    """(pushed parts, dead letters, a retryable error or None)."""
+    usage["requests"] += 1
+    try:
+        sink.push(batch)
+        usage["rows"] += len(batch.rows)
+        return [batch], [], None
+    except Exception as exc:  # noqa: BLE001
+        if not _record_error(exc):
+            return [], [], exc
+        split = getattr(sink, "split", None)
+        parts = split(batch) if split and len(batch.rows) > 1 else [batch]
+        if len(parts) <= 1:
+            return [], _dead(batch, batch.rows, exc, now), None
+    ok: list[Batch] = []
+    dead: list[dict[str, Any]] = []
+    for part in parts:
+        usage["requests"] += 1
+        try:
+            sink.push(part)
+            usage["rows"] += len(part.rows)
+            ok.append(part)
+        except Exception as exc:  # noqa: BLE001
+            if not _record_error(exc):
+                return ok, dead, exc
+            dead += _dead(part, part.rows, exc, now)
+    return ok, dead, None
+
+
 def run(sink: Sink, conn: psycopg.Connection, *, budget_s: float = 60.0, replay: bool = False,
         clock: Callable[[], float] = time.monotonic, now: datetime | None = None,
         environ: Mapping[str, str] | None = None) -> SyncReport:
@@ -120,6 +192,12 @@ def run(sink: Sink, conn: psycopg.Connection, *, budget_s: float = 60.0, replay:
     meta = load(conn, sink.name)
     watermarks: dict[str, str] = {} if replay else dict(meta.get("watermarks") or {})
     failures: dict[str, dict[str, Any]] = dict(meta.get("failures") or {})
+    dead_letters: list[dict[str, Any]] = list(meta.get("dead_letters") or [])
+    usage: dict[str, Any] = dict(meta.get("usage") or {})
+    if usage.get("day") != now.date().isoformat():
+        usage = {"day": now.date().isoformat(), "rows": 0, "requests": 0}
+    max_rows, max_requests = limits(sink.name, environ)
+    rep.usage = usage
     try:
         h = sink.health()
     except Exception as exc:  # noqa: BLE001
@@ -138,37 +216,90 @@ def run(sink: Sink, conn: psycopg.Connection, *, budget_s: float = 60.0, replay:
         if clock() - start > budget_s:
             rep.status, rep.detail = "partial", "time budget"
             break
-        try:
-            sink.push(batch)
-        except Exception as exc:  # noqa: BLE001 - one table's failure never stops the others
-            conn.rollback()
+        if usage["rows"] + len(batch.rows) > max_rows or usage["requests"] + 1 > max_requests:
+            rep.status = "capped"
+            rep.detail = f"client-side daily limit: {usage['rows']}/{max_rows} rows, {usage['requests']}/{max_requests} requests"
+            break
+        ok, dead, err = _deliver(sink, batch, usage, now)
+        for part in ok:                    # idempotent links for whatever did land
+            for ev in part.evidence:
+                record(conn, ev)
+        if err is not None and provider_cap(err):   # the provider's cap: stop the whole run, move nothing more
+            rep.status, rep.detail = "capped", f"provider cap: {err}"[:200]
+            _save(conn, sink.name, "running", {"usage": usage})
+            conn.commit()
+            break
+        if err is not None:                # retryable: the table backs off, its watermark stays
             f = failures.get(batch.table, {})
             n = int(f.get("attempts", 0)) + 1
             wait = BACKOFF_MIN[min(n - 1, len(BACKOFF_MIN) - 1)]
-            failures[batch.table] = {"attempts": n, "dead": n >= MAX_ATTEMPTS, "last_error": f"{type(exc).__name__}: {exc}"[:300],
+            failures[batch.table] = {"attempts": n, "dead": n >= MAX_ATTEMPTS, "last_error": f"{type(err).__name__}: {err}"[:300],
                                      "next_retry_at": _iso(now + timedelta(minutes=wait))}
             blocked.add(batch.table)
             rep.failed += 1
-            _save(conn, sink.name, "running", {"failures": failures})
+            _save(conn, sink.name, "running", {"failures": failures, "usage": usage})
             conn.commit()
             continue
-        for ev in batch.evidence:
-            record(conn, ev)
+        dead_letters = (dead_letters + dead)[-MAX_DEAD_LETTERS:]
+        rep.dead_letters += len(dead)
         watermarks[batch.table] = batch.watermark
         failures.pop(batch.table, None)
-        _save(conn, sink.name, "running", {"watermarks": watermarks, "failures": failures})
+        _save(conn, sink.name, "running", {"watermarks": watermarks, "failures": failures, "usage": usage,
+                                           "dead_letters": dead_letters})
         conn.commit()          # the links and the advanced watermark land together
         rep.batches += 1
-        rep.rows += len(batch.rows)
+        rep.rows += sum(len(p.rows) for p in ok)
     if rep.failed and rep.status == "ok":
         rep.status = "failed" if not rep.batches else "partial"
-    final = {"watermarks": watermarks, "failures": failures, "last_try_at": _iso(now)}
-    if rep.status in ("ok", "partial"):
+    final = {"watermarks": watermarks, "failures": failures, "last_try_at": _iso(now), "usage": usage,
+             "dead_letters": dead_letters}
+    if rep.status in ("ok", "partial", "capped"):
         final["last_ok_at"] = _iso(now)
     _save(conn, sink.name, "failed" if rep.status == "failed" else "done", final)
     conn.commit()
     rep.seconds = clock() - start
     return rep
+
+
+def plan(sink: Sink, conn: psycopg.Connection, *, replay: bool = False,
+         environ: Mapping[str, str] | None = None) -> dict[str, Any]:
+    """A dry run: what the next `run` (or a `--replay` backfill) would send, per table, against the
+    client-side daily limits. Read-only: the connection is put in read-only mode, health() is not called
+    (it may wake or write to the provider) and nothing is pushed. A sink may price batches with cost()."""
+    conn.read_only = True
+    try:
+        return _plan(sink, conn, replay=replay, environ=environ)
+    finally:
+        conn.rollback()
+        conn.read_only = False
+
+
+def _plan(sink: Sink, conn: psycopg.Connection, *, replay: bool,
+          environ: Mapping[str, str] | None) -> dict[str, Any]:
+    meta = load(conn, sink.name)
+    watermarks: dict[str, str] = {} if replay else dict(meta.get("watermarks") or {})
+    tables: dict[str, dict[str, int]] = {}
+    for batch in sink.batches(conn, watermarks, replay=replay):
+        t = tables.setdefault(batch.table, {"batches": 0, "rows": 0, "bytes": 0})
+        t["batches"] += 1
+        t["rows"] += len(batch.rows)
+        t["bytes"] += sum(len(json.dumps(r, default=str).encode("utf-8")) for r in batch.rows)
+        cost = getattr(sink, "cost", None)
+        if cost is not None and batch.rows:
+            t["cost"] = t.get("cost", 0) + int(cost(batch))
+    max_rows, max_requests = limits(sink.name, environ)
+    rows = sum(t["rows"] for t in tables.values())
+    reqs = sum(t["batches"] for t in tables.values())
+    out: dict[str, Any] = {"sink": sink.name, "replay": replay, "tables": tables, "rows": rows, "requests": reqs,
+                           "limit_rows_per_day": max_rows, "limit_requests_per_day": max_requests,
+                           "days_at_limit": max(-(-rows // max_rows) if max_rows else 0, -(-reqs // max_requests) if max_requests else 0)}
+    for attr in ("refused", "retired"):
+        v = getattr(sink, attr, None)
+        if isinstance(v, list):
+            out[attr] = len(v)
+    if any("cost" in t for t in tables.values()):
+        out["cost"] = sum(t.get("cost", 0) for t in tables.values())
+    return out
 
 
 def status(conn: psycopg.Connection) -> list[dict[str, Any]]:
@@ -182,5 +313,6 @@ def status(conn: psycopg.Connection) -> list[dict[str, Any]]:
                     "tables": sorted((meta.get("watermarks") or {}).keys()), "last_ok_at": meta.get("last_ok_at"),
                     "dead": sorted(t for t, f in fails.items() if f.get("dead")),
                     "failing": sorted(t for t, f in fails.items() if not f.get("dead")),
+                    "dead_letters": len(meta.get("dead_letters") or []), "usage": meta.get("usage") or {},
                     "last_error": meta.get("last_error")})
     return out

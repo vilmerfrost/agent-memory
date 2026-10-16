@@ -151,7 +151,8 @@ def record(conn: psycopg.Connection, ev: EvidenceRef, *, valid_days: int | None 
 
 
 class SupabaseRetriever:
-    """The authoritative retriever. Two named queries: one ref, and every evidence row linked to a ref."""
+    """The authoritative retriever: one ref, every evidence row linked to a ref, and the question queries of
+    sb_queries (Mission 004B: patterns, attempts, decisions, evals, promotion history)."""
 
     source = "sb"
     _QUERIES = {
@@ -174,10 +175,16 @@ class SupabaseRetriever:
             return Health(False, type(exc).__name__)
 
     def named_queries(self) -> Mapping[str, NamedQuery]:
-        return self._QUERIES
+        from agent_memory.integrations import sb_queries   # lazy: sb_queries imports this module
+
+        return {**self._QUERIES, **sb_queries.SPECS}
 
     def query(self, name: str, params: Mapping[str, str]) -> list[EvidenceRef]:
+        from agent_memory.integrations import sb_queries
+
         with self._connect() as conn:
+            if name in sb_queries.RUN:
+                return sb_queries.RUN[name](conn, params)
             if name == "ref":
                 if not exists(conn, params["ref"]):
                     return []

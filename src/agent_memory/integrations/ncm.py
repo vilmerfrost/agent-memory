@@ -19,6 +19,12 @@ results.json (written by the worker, one per run):
      "hardware": {"device": "cuda" | "cpu", "gpu": "L4", "gpu_count": 1},
      "metrics": {"solved_rate": 0.91, "cell_rate": 0.98, "valid_rate": 0.99},
      "cost": {"gpu_minutes": 7.5, "usd": 0.10}, "started_at": "...", "finished_at": "..."}
+
+Optional (Mission 004B, the brief's "dataset version", "runtime", "errors and limitations"):
+    "checkpoint_revision" / "dataset_revision": the 40-hex Hugging Face revisions downloaded,
+    "dataset_sha256": {"<file>": "<64 hex>"}, "runtime_s": 212.4, "provider": "modal",
+    "limitations": ["stdout metrics are rounded to 0.01%", ...]   (at most 10 one-line strings)
+The worker side that writes this file is integrations/ncm_worker.py.
 """
 
 from __future__ import annotations
@@ -70,6 +76,12 @@ class ResearchRun:
     cost: dict[str, float] = field(default_factory=dict)
     started_at: str | None = None
     finished_at: str | None = None
+    checkpoint_revision: str | None = None
+    dataset_revision: str | None = None
+    dataset_sha256: dict[str, str] = field(default_factory=dict)
+    runtime_s: float | None = None
+    provider: str | None = None
+    limitations: list[str] = field(default_factory=list)
 
 
 def _num(v: Any, what: str) -> float:
@@ -81,7 +93,8 @@ def _num(v: Any, what: str) -> float:
 def parse_results(data: Mapping[str, Any]) -> ResearchRun:
     """Validate one results.json. Strict: unknown tasks, metrics or fields are errors, not ignored."""
     allowed = {"run_id", "experiment_id", "task", "status", "reason", "repo_commit", "checkpoint_sha256", "commands",
-               "hardware", "metrics", "cost", "started_at", "finished_at"}
+               "hardware", "metrics", "cost", "started_at", "finished_at", "checkpoint_revision", "dataset_revision",
+               "dataset_sha256", "runtime_s", "provider", "limitations"}
     extra = set(data) - allowed
     if extra:
         raise ResultsError(f"unknown field(s): {', '.join(sorted(extra))}")
@@ -136,8 +149,30 @@ def parse_results(data: Mapping[str, Any]) -> ResearchRun:
     cost = {str(k): _num(v, f"cost {k}") for k, v in (data.get("cost") or {}).items()}
     if set(cost) - {"gpu_minutes", "usd"} or any(v < 0 for v in cost.values()):
         raise ResultsError("cost has non-negative gpu_minutes and usd only")
+    revs = {}
+    for k in ("checkpoint_revision", "dataset_revision"):
+        v = data.get(k)
+        if v is not None and (not isinstance(v, str) or not _HEX40.fullmatch(v)):
+            raise ResultsError(f"{k} is a 40-hex revision")
+        revs[k] = v
+    dsha = data.get("dataset_sha256") or {}
+    if not isinstance(dsha, dict) or any(not (isinstance(k, str) and _FILE.fullmatch(k) and isinstance(v, str)
+                                              and _HEX64.fullmatch(v)) for k, v in dsha.items()):
+        raise ResultsError("dataset_sha256 maps relative file names to 64-hex sha256")
+    runtime = data.get("runtime_s")
+    if runtime is not None and _num(runtime, "runtime_s") < 0:
+        raise ResultsError("runtime_s is non-negative")
+    provider = data.get("provider")
+    if provider is not None and (not isinstance(provider, str) or not _GPU.fullmatch(provider)):
+        raise ResultsError("provider is a short name")
+    lims = data.get("limitations") or []
+    if (not isinstance(lims, list) or len(lims) > MAX_COMMANDS
+            or any(not isinstance(x, str) or not x or len(x) > 200 or "\n" in x for x in lims)):
+        raise ResultsError(f"limitations: at most {MAX_COMMANDS} one-line strings of <= 200 characters")
     return ResearchRun(run_id, task, status, exp, reason, commit, dict(ckpt), list(cmds), dict(hw), metrics, cost,
-                       data.get("started_at"), data.get("finished_at"))
+                       data.get("started_at"), data.get("finished_at"), revs["checkpoint_revision"],
+                       revs["dataset_revision"], dict(dsha), float(runtime) if runtime is not None else None, provider,
+                       list(lims))
 
 
 def load_results(path: Path) -> ResearchRun:
@@ -157,6 +192,9 @@ def to_evidence(run: ResearchRun) -> EvidenceRef:
     metrics.update({f"hw_{k}": v for k, v in run.hardware.items()})
     if run.repo_commit:
         metrics["repo_commit"] = run.repo_commit
+    for k in ("checkpoint_revision", "dataset_revision", "runtime_s", "provider"):
+        if getattr(run, k) is not None:
+            metrics[k] = getattr(run, k)
     subjects = [refs.amem("experiment", run.experiment_id)] if run.experiment_id else []
     return EvidenceRef(refs.ncm_run(run.run_id), "ncm", "research-run", subjects, metrics,
                        summary=run.reason if run.status != "ok" else None, observed_at=run.finished_at)

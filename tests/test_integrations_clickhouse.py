@@ -168,6 +168,35 @@ class FakeClickHouse:
                         "active_p50_s": _qexact([s["active_seconds"] for s in ss], 0.5)})
         return sorted(out, key=lambda r: (r["tokens_total"], r["n_sessions"]), reverse=True)
 
+    def _q_research_runs(self, req: Request) -> list[dict[str, Any]]:
+        task, days = req.q("param_task") or "", int(req.q("param_days") or 0)
+        cutoff = datetime.now(UTC).date() - timedelta(days=days)
+        rows = [r for r in self.final("research_runs") if (not task or r["task"] == task)
+                and _ts(r["observed_at"]).date() >= cutoff]
+        return [{**{k: v for k, v in r.items() if k != "version"}, "observed": r["observed_at"]}
+                for r in sorted(rows, key=lambda r: r["observed_at"], reverse=True)]
+
+    def _q_skill_outcomes(self, req: Request) -> list[dict[str, Any]]:
+        days, min_n = int(req.q("param_days") or 0), int(req.q("param_min_n") or 0)
+        cutoff = datetime.now(UTC).date() - timedelta(days=days)
+        prod = self._prod_sessions()
+        pairs = {(k["session_id"], k["skill"]) for k in self.final("skill_calls")
+                 if k["skill"] and k["session_id"] and _ts(k["ts"]).date() >= cutoff}
+        groups: dict[tuple[Any, Any], list[dict[str, Any]]] = defaultdict(list)
+        for sid, skill in sorted(pairs):
+            if sid in prod:
+                groups[(skill, prod[sid]["model"])].append(prod[sid])
+        out = []
+        for (skill, model), ss in groups.items():
+            done = sum(s["outcome"] in ("shipped", "pushed", "committed") for s in ss)
+            tok = [(s["tokens_input"] or 0) + (s["tokens_output"] or 0) + (s["tokens_cache_read"] or 0)
+                   + (s["tokens_cache_creation"] or 0) for s in ss]
+            if len(ss) >= min_n:
+                out.append({"skill": skill, "model": model, "n_sessions": len(ss), "n_done": done,
+                            "done_rate": round(done / len(ss), 4), "tokens_avg": round(sum(tok) / len(tok), 1),
+                            "sample_ids": [s["id"] for s in ss][:5]})
+        return sorted(out, key=lambda r: (-r["done_rate"], -r["n_sessions"], r["skill"], r["model"] or ""))
+
     def _q_routine_streaks(self, req: Request) -> list[dict[str, Any]]:
         days, routine = int(req.q("param_days") or 0), req.q("param_routine") or ""
         cutoff = datetime.now(UTC).date() - timedelta(days=days)
@@ -318,6 +347,15 @@ class Seed:
                             change_id=self.mk("pchg"), result=self.mk("pres"), meta=Jsonb({"m": self.mk("pmeta")}))
             self.ins(conn, "rsi_decisions", proposal_id=prop, action="reject", artifact_hash=art, source="cli",
                      verified="cli-tty", reason=self.mk("reason"), expires_at=self.now + timedelta(days=1))
+            # Mission 004B: an NCM research run's evidence row ships to research_runs; any other evidence never does
+            ncm = self.ins(conn, "rsi_evidence", system="ncm", kind="research-run", subject_refs=["amem:experiment/exp-20261016-01"],
+                           summary=self.mk("ncmsum"), external_ref="ncm:run/ncm-20261016-sudoku-easy",
+                           metrics=Jsonb({"task": "sudoku-easy", "status": "ok", "solved_rate": 0.995, "cell_rate": 0.999,
+                                          "valid_rate": 1.0, "cost_usd": 0.05, "cost_gpu_minutes": 3.1, "hw_gpu": "NVIDIA L4",
+                                          "provider": "modal", "note": self.mk("ncmnote")}))
+            self.ids["research_runs"].append(ncm)
+            self.ins(conn, "rsi_evidence", system="langfuse", kind="trace", subject_refs=[], summary=self.mk("lfsum"),
+                     external_ref="lf:trace/" + "cd" * 16, metrics=Jsonb({"tokens_total": 1}))
             self.ins(conn, "rsi_eval_results", artifact_hash=art, experiment_id="exp-20261016-01", baseline_id="base-1",
                      suite="static", suite_version="1", model="none", effort="none", verdict="pass",
                      record=Jsonb({"format": "rsi-eval/1", "note": self.mk("record")}),
@@ -334,6 +372,7 @@ def _wipe(owner_url: str) -> None:
         for t in PLAIN:
             conn.execute(sql.SQL("delete from {}").format(sql.Identifier(t)))
         conn.execute("delete from rsi_checkpoints where job like 'sync:%'")
+        conn.execute("delete from rsi_evidence where system in ('ncm', 'langfuse')")
 
 
 @pytest.fixture
@@ -362,6 +401,11 @@ TEXT_COLUMNS = {"title", "summary", "what", "why", "how", "instruction_ref", "ru
                 "project_dir", "outcome_evidence", "value", "probabilities", "jev_answers", "source_key", "skills",
                 "instructions", "models", "efforts", "risk", "expected", "change_id", "manifest", "files"}
 
+
+
+@pytest.fixture(autouse=True)
+def _pseudonym_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(CH.PSEUDONYM_ENV, "t" * 40)
 
 def test_schema_is_replacing_merge_tree_with_dedup_window() -> None:
     stmts = CH.schema_sql()
@@ -414,7 +458,7 @@ def test_no_text_ever_leaves(seed: Seed, app: str, fake: FakeClickHouse) -> None
     leaked = [m for m in seed.markers if m in wire]
     assert leaked == [] and "ZZLEAK" not in wire
     assert fake.by_id("sessions")["chs-4"]["repo"] is None                # free text in a label column: null
-    assert fake.by_id("sessions")["chs-1"]["repo"] == "agent-memory"
+    assert fake.by_id("sessions")["chs-1"]["repo"] == CH.pseudonym("agent-memory")   # Mission 004B: a keyed pseudonym
     with psycopg.connect(app) as conn:                                     # no per-row rsi_evidence links
         assert conn.execute("select count(*) from rsi_evidence where system = 'clickhouse'").fetchone()[0] == 0
 
@@ -551,6 +595,20 @@ def test_named_queries_send_params_and_return_metrics(seed: Seed, app: str, fake
                           "duration_p50_s": 20.0, "duration_p95_s": 40.0}
     (lim,) = E.gather("routine_streaks", {"limit": "1"}, [r])
     assert len(lim.refs) == 1 and lim.refs[0].metrics["routine"] == "chtest-daily"
+
+    (rr,) = E.gather("research_runs", {"task": "sudoku-easy"}, [r])           # Mission 004B: NCM via ClickHouse
+    (ev,) = rr.refs
+    assert ev.ref == "ch:q.research_runs/ncm-20261016-sudoku-easy" and ev.subject_refs[0].startswith("amem:evidence/")
+    assert (ev.metrics["solved_rate"], ev.metrics["cost_usd"], ev.metrics["gpu"]) == (0.995, 0.05, "NVIDIA_L4")
+    with psycopg.connect(app) as conn:
+        assert E.usable(conn, ev)                                          # the evidence row re-reads in Supabase
+
+    (sk,) = E.gather("skill_outcomes", {"min_n": "1"}, [r])                # Mission 004B: skill x model
+    assert fake.svc.requests[-1].body.decode() == CH.SKILL_OUTCOMES_SQL and fake.svc.requests[-1].q("param_min_n") == "1"
+    (ev,) = sk.refs
+    assert ev.ref == "ch:q.skill_outcomes/dispatch/claude-test-1" and ev.subject_refs == ["amem:session/chs-1"]
+    assert (ev.metrics["n_sessions"], ev.metrics["n_done"], ev.metrics["done_rate"]) == (1, 1, 1.0)
+    assert E.gather("skill_outcomes", {"min_n": "2"}, [r])[0].refs == []
 
 
 def test_named_queries_reject_bad_params_before_any_request(seed: Seed, app: str, fake: FakeClickHouse) -> None:

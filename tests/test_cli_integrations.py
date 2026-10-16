@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterator
+from typing import Any
 
 import psycopg
 import pytest
@@ -65,3 +66,14 @@ def test_evidence_query_supabase_and_param_checks(app: str, capsys: pytest.Captu
 def test_verify_without_clickhouse_fails_closed(app: str, capsys: pytest.CaptureFixture[str]) -> None:
     assert cli.main(["sync", "verify", "--sink", "clickhouse"]) == 1
     assert "unavailable" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("sink", ["clickhouse", "langfuse", "pastdev"])
+def test_plan_is_a_read_only_dry_run(app: str, sink: str, tmp_path: Any, monkeypatch: pytest.MonkeyPatch,
+                                     capsys: pytest.CaptureFixture[str]) -> None:
+    monkeypatch.setenv("RSI_SANDBOX_DIR", str(tmp_path))
+    from agent_memory.integrations import http
+    monkeypatch.setattr(http, "request", lambda *a, **k: pytest.fail("plan must not call the provider"))
+    assert cli.main(["sync", "plan", "--sink", sink, "--replay", "--json"]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["sink"] == sink and out["replay"] is True and out["rows"] >= 0

@@ -6,6 +6,10 @@ Every numbered step below changes something outside the dev branch, so each need
 
 Test evidence: [test-report.md](test-report.md). The NCM track is separate: [ncm-track.md](ncm-track.md).
 
+**Mission 004B supersedes the hosting choices below.** The targets are ClickHouse Cloud, Langfuse Cloud EU,
+past.dev and NCM on Modal: see [cloud-readiness.md](cloud-readiness.md) (findings, costs, backfill counts,
+risks) and [cloud-activation.md](cloud-activation.md) (the per-provider approval steps).
+
 ## Ground rules (all steps)
 
 - **Supabase stays the only hub.** Sinks only read Supabase rows (as `amem_app`) and write their own links to

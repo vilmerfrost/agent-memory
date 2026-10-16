@@ -35,10 +35,21 @@ count and, on --replay, the run time: a re-send after a deletion or a failed ing
 Each record's own sha256(content) is kept in its rsi_evidence link (metrics.sha256).
 
 Watermarks: proposals, experiments and edits change status after they are first written and have no
-updated_at column, so change detection is by content: a record is sent when its link is missing, deleted,
-or holds another sha256. The watermark (`<record time>|<ref>` of the last record pushed) shows how far a
-table got. A link whose record is gone or now refused (a team item, a secret) is retracted first: deleted
-at past.dev and marked deleted. --replay re-sends every record.
+updated_at column, so change detection is by content: a record is sent when its link is missing or holds
+another sha256. The watermark (`<record time>|<ref>` of the last record pushed) shows how far a table got.
+A link whose record is gone or now refused (a team item, a secret) is retracted first: deleted at past.dev
+and marked deleted. --replay re-sends every record that is not retired.
+
+Deletion is final (Mission 004B). The docs: "A deleted id cannot be sent again; use a new id." The id is
+the record's amem: ref, so a record whose link is marked deleted is retired: never sent again, listed in
+`retired`. To bring one back would need a new id scheme or a new project; nothing here does that.
+
+Cost (Mission 004B, from the pricing page and the spec): 1 credit per 350 UTF-8 bytes of content, rounded
+up per item, at least 1 (local_credits); recall 0.1 credit. Credits are prepaid: at zero, sends answer 402
+out-of-credits and nothing is billed. A project credit cap (console) answers 429 project-cap-reached. The
+sync loop stops a run as `capped` on either (sync.provider_cap). POST /ingest/estimate prices a send
+without writing or spending, but it still uploads the content, so it runs only where sending is approved;
+GET /usage reads the month's balance and the project's spend and cap.
 """
 
 from __future__ import annotations
@@ -123,11 +134,31 @@ class Client:
     def ingestion(self, ingestion_id: str) -> dict[str, Any]:
         return _obj(self._call("GET", f"/ingest/{uuid.UUID(ingestion_id)}").json())
 
+    def retry_ingestion(self, ingestion_id: str) -> dict[str, Any]:
+        """POST /ingest/{id}/retry: free; re-runs a failed ingestion (docs: api-reference, 2026-10-16)."""
+        return _obj(self._call("POST", f"/ingest/{uuid.UUID(ingestion_id)}/retry", {}).json())
+
     def recall(self, body: dict[str, Any]) -> dict[str, Any]:
         return _obj(self._call("POST", "/recall", body).json())
 
     def delete(self, ids: list[str]) -> dict[str, Any]:
         return _obj(self._call("POST", "/data-points/delete", {"ids": ids}).json())
+
+    def estimate(self, items: list[dict[str, Any]]) -> dict[str, Any]:
+        """POST /ingest/estimate: credits, fits, balance. Writes and spends nothing, but the content leaves."""
+        return _obj(self._call("POST", "/ingest/estimate", {"items": items, "points": "none"}).json())
+
+    def usage(self) -> dict[str, Any]:
+        """GET /usage: {month, balance: {left, spent, ...}, project: {credits, creditCap, creditCapLeft, ...}}."""
+        return _obj(self._call("GET", "/usage").json())
+
+
+CREDIT_BYTES = 350
+
+
+def local_credits(items: Iterable[Mapping[str, Any]]) -> int:
+    """The pricing page's rule, computed here without sending anything: ceil(bytes / 350), at least 1 per item."""
+    return sum(max(1, -(-len(str(it.get("content") or "").encode("utf-8")) // CREDIT_BYTES)) for it in items)
 
 
 def _obj(v: Any) -> dict[str, Any]:
@@ -365,6 +396,7 @@ class PastDevSink:
         self.batch_max = max(1, min(batch_max, BATCH_MAX))
         self.poll_s, self.sleep, self.clock, self.now = poll_s, sleep, clock, now
         self.refused: list[tuple[str, list[str]]] = []      # (ref, reasons) from the last batches() call
+        self.retired: list[str] = []                         # refs deleted at past.dev: never sent again
 
     def health(self) -> Health:
         if switched_off(self._environ):
@@ -378,7 +410,7 @@ class PastDevSink:
         links = _links(conn)
         failures = (sync.load(conn, self.name).get("failures") or {})
         now = _ts(self.now())
-        self.refused = []
+        self.refused, self.retired = [], []
         ready: dict[str, tuple[Record, str]] = {}
         for rec in records:
             content, reasons = sanitize_record(rec.fields)
@@ -392,21 +424,25 @@ class PastDevSink:
             part = gone[i:i + DELETE_MAX]
             evs = [ev for sid in part if (ev := _evidence(sid, {"deleted": True, "deleted_at": now})) is not None]
             yield sync.Batch(RETRACT, [{"id": sid} for sid in part], f"{now}|{part[-1]}", evs)
-        # 2. send: a record whose link is missing, deleted or holds another hash
+        # 2. send: a record whose link is missing or holds another hash; a deleted id is retired for good
         for table in TABLES:
             attempts = int((failures.get(table) or {}).get("attempts", 0))
             todo = []
             for ref, (rec, content) in ready.items():
+                if rec.table != table:
+                    continue
                 link = links.get(ref) or {}
+                if link.get("deleted"):
+                    self.retired.append(ref)
+                    continue
                 sha = _sha(content)
-                if rec.table == table and (replay or link.get("deleted") or link.get("sha256") != sha):
+                if replay or link.get("sha256") != sha:
                     todo.append((rec, content, sha, link))
             for i in range(0, len(todo), self.batch_max):
                 part = todo[i:i + self.batch_max]
                 items = [{"id": rec.ref, "content": content, "timestamp": _ts(rec.at), "label": rec.fields["kind"],
                           "identity": IDENTITY} for rec, content, _, _ in part]
-                key = _sha({"items": items, "after_delete": [link.get("deleted_at") for *_, link in part],
-                            "attempt": attempts, "replay": now if replay else None})
+                key = _sha({"items": items, "attempt": attempts, "replay": now if replay else None})
                 evs = []
                 for rec, content, sha, _ in part:
                     f = _fields(content)
@@ -416,6 +452,18 @@ class PastDevSink:
                     evs.append(ev)
                 last = part[-1][0]
                 yield sync.Batch(table, items, f"{_ts(last.at)}|{last.ref}", evs, key)
+
+    def cost(self, batch: sync.Batch) -> int:
+        """Credits this batch would spend (local rule; a retraction spends none)."""
+        return 0 if batch.table == RETRACT else local_credits(batch.rows)
+
+    def split(self, batch: sync.Batch) -> list[sync.Batch]:
+        """One item per batch with a content-addressed key, so the sync loop can dead-letter only refused items."""
+        if batch.table == RETRACT:
+            return [batch]
+        return [sync.Batch(batch.table, [item], batch.watermark,
+                           [e for e in batch.evidence if e.ref == f"past:{item.get('id')}"], _sha({"item": item}))
+                for item in batch.rows]
 
     def push(self, batch: sync.Batch) -> None:
         if switched_off(self._environ):
@@ -449,6 +497,7 @@ class PastDevSink:
         """completed, or queued when the poll budget ran out (the send is durably accepted). Raises on failed."""
         deadline = self.clock() + self.poll_s
         wait = 0.5
+        retried = False
         while True:
             st = self.client.ingestion(ingestion_id) if self.client else {}
             s = st.get("status")
@@ -456,7 +505,16 @@ class PastDevSink:
                 return "completed"
             if s == "failed":
                 code = (st.get("failure") or {}).get("code") if isinstance(st.get("failure"), Mapping) else None
-                raise RuntimeError(f"ingestion failed: {code if code in FAILURE_CODES else 'unknown'}")
+                code = code if code in FAILURE_CODES else "unknown"
+                if code == "content-rejected":
+                    # Mission 004B: past.dev batches are atomic, so this is a record-level refusal. A 422 makes the
+                    # sync loop split the batch and dead-letter only the refused item(s).
+                    raise http.HttpError(422, "ingestion failed: content-rejected")
+                if not retried and self.client:
+                    self.client.retry_ingestion(ingestion_id)      # free; then keep polling
+                    retried = True
+                    continue
+                raise RuntimeError(f"ingestion failed: {code}")
             if self.clock() + wait > deadline:
                 return "queued"
             self.sleep(wait)
@@ -469,8 +527,9 @@ class PastDevSink:
 def delete_all(conn: psycopg.Connection, client: Client | None = None, *,
                environ: Mapping[str, str] | None = None) -> dict[str, int]:
     """Delete every past.dev data point linked in rsi_evidence (and not yet deleted), <= 1000 ids per call,
-    and mark each link deleted. Works with AMEM_PASTDEV=off: it only removes what was sent. Set the kill
-    switch first, or the next sync sends everything again."""
+    and mark each link deleted. Works with AMEM_PASTDEV=off: it only removes what was sent. The deleted ids
+    are retired (past.dev refuses them), but a record never sent before would still go on the next sync,
+    so set the kill switch first."""
     client = client or _client(config(environ), None, time.sleep)
     if client is None:
         raise RuntimeError(f"past.dev is not configured ({KEY_ENV})")

@@ -15,6 +15,18 @@ Shape. Database `amem` (AMEM_CLICKHOUSE_DB), one `ReplacingMergeTree(version)` t
 dedup log without it, so insert_deduplication_token would do nothing). No PARTITION BY: one INSERT is one
 block, so one token covers the whole batch. Reads use FINAL.
 
+ClickHouse Cloud (Mission 004B; `cloud` is on for a `*.clickhouse.cloud` host or AMEM_CLICKHOUSE_CLOUD=1):
+- The DDL has no SETTINGS clause. Cloud turns ReplacingMergeTree into SharedReplacingMergeTree, which is
+  replicated, so it keeps an insert dedup log by default and the non-replicated setting does not apply.
+- No auto-schema. amem writes as a least-privilege user (SELECT, INSERT on the database only), so it cannot
+  run DDL. The owner runs `amem sync schema --sink clickhouse` output once in the Cloud SQL console.
+- An idle service wakes on the first request, and wake-up time is not documented: the health ping waits up
+  to WAKE_TIMEOUT_S and inserts get a longer timeout. A stopped (not idle) service fails the ping, so the
+  run is `unavailable` and the cursor stays.
+- Plain http is refused for any host but loopback. Cloud listens on HTTPS 8443.
+Every insert sends async_insert=0, so the dedup token applies to the insert itself (Cloud 26.4 turned
+async inserts on by default).
+
 Write path. One HTTP POST per batch:
 
     POST {url}/?query=INSERT INTO amem.<t> FORMAT JSONEachRow&insert_deduplication_token=<sha256(table, body)>
@@ -58,6 +70,7 @@ Tested against a local mock only (tests/test_integrations_clickhouse.py): the SQ
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import math
 import os
@@ -81,6 +94,8 @@ from agent_memory.integrations.sync import Batch
 
 DEFAULT_DB = "amem"
 DEDUP_WINDOW = 1000        # inserts remembered per table for insert_deduplication_token
+WAKE_TIMEOUT_S = 60.0      # Cloud: an idle service wakes on the first request (time not documented)
+WRITER_USER = "amem_writer"
 BATCH_SIZE = 500
 LOOKBACK_DAYS = 7
 FETCH_LIMIT = 1000         # the fixed LIMIT in every named query; the `limit` param cuts further here
@@ -99,6 +114,7 @@ class Config:
     key: str = field(default="", repr=False)
     db: str = DEFAULT_DB
     lookback_days: int = LOOKBACK_DAYS
+    cloud: bool = False
 
     @property
     def problem(self) -> str:
@@ -106,7 +122,19 @@ class Config:
             return "not configured (AMEM_CLICKHOUSE_URL)"
         if not DB_RE.fullmatch(self.db):
             return "bad AMEM_CLICKHOUSE_DB"
+        if not self.url.startswith("https://") and _host(self.url) not in _LOOPBACK:
+            return "refusing plain http to a remote host (use https)"
         return ""
+
+
+_LOOPBACK = {"localhost", "127.0.0.1", "[::1]", "::1"}
+
+
+def _host(url: str) -> str:
+    rest = url.split("://", 1)[-1].split("/", 1)[0].rsplit("@", 1)[-1]
+    if rest.startswith("["):
+        return rest[: rest.find("]") + 1]
+    return rest.rsplit(":", 1)[0].lower()
 
 
 def config(environ: Mapping[str, str] | None = None) -> Config:
@@ -122,17 +150,20 @@ def config(environ: Mapping[str, str] | None = None) -> Config:
         lookback = int(get("AMEM_CLICKHOUSE_LOOKBACK_DAYS") or LOOKBACK_DAYS)
     except ValueError:
         lookback = LOOKBACK_DAYS
-    return Config(get("AMEM_CLICKHOUSE_URL").rstrip("/"), get("AMEM_CLICKHOUSE_USER"), get("AMEM_CLICKHOUSE_KEY"),
-                  get("AMEM_CLICKHOUSE_DB") or DEFAULT_DB, max(0, min(lookback, 90)))
+    url = get("AMEM_CLICKHOUSE_URL").rstrip("/")
+    cloud = _host(url).endswith(".clickhouse.cloud") or get("AMEM_CLICKHOUSE_CLOUD") == "1"
+    return Config(url, get("AMEM_CLICKHOUSE_USER"), get("AMEM_CLICKHOUSE_KEY"),
+                  get("AMEM_CLICKHOUSE_DB") or DEFAULT_DB, max(0, min(lookback, 90)), cloud)
 
 
 class Client:
     """The ClickHouse HTTP interface: ping, DDL, idempotent inserts and parameterized selects."""
 
-    def __init__(self, cfg: Config | None = None, *, timeout: float = 10.0, retries: int = 2,
+    def __init__(self, cfg: Config | None = None, *, timeout: float | None = None, retries: int = 2,
                  sleep: Callable[[float], None] = time.sleep):
         self.cfg = cfg if cfg is not None else config()
-        self.timeout, self.retries, self.sleep = timeout, retries, sleep
+        self.timeout = timeout if timeout is not None else (30.0 if self.cfg.cloud else 10.0)
+        self.retries, self.sleep = retries, sleep
 
     def _check(self) -> None:
         if self.cfg.problem:
@@ -151,7 +182,8 @@ class Client:
 
     def ping(self) -> None:
         self._check()
-        r = http.request("GET", f"{self.cfg.url}/ping", timeout=min(self.timeout, 3.0), retries=0, sleep=self.sleep)
+        wait = WAKE_TIMEOUT_S if self.cfg.cloud else min(self.timeout, 3.0)     # the ping is what wakes Cloud
+        r = http.request("GET", f"{self.cfg.url}/ping", timeout=wait, retries=0, sleep=self.sleep)
         if not r.text().startswith("Ok"):
             raise http.HttpError(r.status, "unexpected /ping answer")
 
@@ -162,7 +194,7 @@ class Client:
         if table not in TABLE_NAMES:
             raise ValueError(f"not a ClickHouse table: {table!r}")
         self._post({"query": f"INSERT INTO {self.cfg.db}.{table} FORMAT JSONEachRow",
-                    "insert_deduplication_token": token}, body)
+                    "insert_deduplication_token": token, "async_insert": "0"}, body)
 
     def select(self, statement: str, params: Mapping[str, str]) -> list[dict[str, Any]]:
         p = {"database": self.cfg.db, "wait_end_of_query": "1", "output_format_json_quote_64bit_integers": "0"}
@@ -189,6 +221,12 @@ class Table:
     changed: str                # SQL: when the row last changed (the cursor)
     cols: tuple[Col, ...]       # the allowlist; nothing else is selected
     lookback: bool = True       # False for append-only tables
+    source: str = ""            # the Supabase table when it differs from `name` (Mission 004B: research_runs)
+    where: str = ""             # a fixed SQL filter on the source rows
+
+    @property
+    def src(self) -> str:
+        return self.source or self.name
 
     @property
     def allowlist(self) -> tuple[str, ...]:
@@ -204,14 +242,42 @@ def _cols(spec: str, **exprs: str) -> tuple[Col, ...]:
     return tuple(out)
 
 
+# Project and repo names are not sent as such (Mission 004B: ClickHouse Cloud is a third party). A team row
+# (an employer repo: sessions.meta.team, see sessions_ingest) sends the literal 'team'; any other value becomes
+# a keyed pseudonym (HMAC-SHA256 with AMEM_PSEUDONYM_KEY, which never leaves the Mac). No key: null.
+_TEAM_MASK = "case when meta ->> 'team' = 'true' then 'team' else {col} end"
+_SKILL_TEAM_MASK = ("case when exists (select 1 from sessions s where s.session_id = skill_calls.session_id "
+                    "and s.meta ->> 'team' = 'true') then 'team' else project end")
+PSEUDONYM_ENV = "AMEM_PSEUDONYM_KEY"
+
+
+def pseudonym(value: str, environ: Mapping[str, str] | None = None) -> str | None:
+    if value == "team":
+        return "team"
+    key = ((os.environ if environ is None else environ).get(PSEUDONYM_ENV) or "").strip()
+    if len(key) < 32:
+        return None
+    return "p_" + hmac.new(key.encode("utf-8"), value.encode("utf-8"), hashlib.sha256).hexdigest()[:16]
+
+
+_NCM_FLOATS = {m: m for m in ("solved_rate", "cell_rate", "valid_rate", "rouge1", "rouge2", "gen_ppl",
+                                "sacrebleu_cased", "sacrebleu_lower", "chrf", "length_ratio", "unigram_entropy")}
+_NCM_FLOATS.update({"rouge_l": "rougeL", "cost_usd": "cost_usd", "gpu_minutes": "cost_gpu_minutes",
+                    "runtime_s": "runtime_s"})
+
+
+def _num_expr(key: str) -> str:
+    return f"case when jsonb_typeof(metrics -> '{key}') = 'number' then (metrics ->> '{key}')::float8 end"
+
+
 TABLES: tuple[Table, ...] = (
     Table("sessions", "session_id", "created_at",
           "greatest(created_at, ended_at, last_activity_at, tokens_updated_at, outcome_at)",
-          _cols("id:id label:kind,tool,env,category,project,repo,model,effort,outcome id:experiment_id "
+          _cols("id:id label:kind,tool,env,category,model,effort,outcome pseudo:project,repo id:experiment_id "
                 "ts:created_at,started_at,ended_at,last_activity_at,outcome_at "
                 "int:transcript_bytes,turns,tokens_input,tokens_output,tokens_cache_read,tokens_cache_creation "
                 "float:duration_seconds,active_seconds,api_seconds,tool_seconds int:lines_added,lines_removed",
-                id="session_id")),
+                id="session_id", project=_TEAM_MASK.format(col="project"), repo=_TEAM_MASK.format(col="repo"))),
     Table("runs", "id", "created_at", "greatest(created_at, finished_at)",
           _cols("id:id label:routine,source,status ts:started_at,finished_at,created_at float:duration_s",
                 duration_s="extract(epoch from finished_at - started_at)")),
@@ -222,13 +288,25 @@ TABLES: tuple[Table, ...] = (
     Table("scores", "id", "created_at", "created_at",
           _cols("id:id,run_id label:question,kind float:value_num,confidence label:jev_mode ts:created_at")),
     Table("skill_calls", "id", "created_at", "created_at",
-          _cols("id:id ts:ts label:skill,invoked_by,agent,project bool:backfill id:session_id ts:created_at")),
+          _cols("id:id ts:ts label:skill,invoked_by,agent pseudo:project bool:backfill id:session_id ts:created_at",
+                project=_SKILL_TEAM_MASK)),
     Table("rsi_proposals", "id", "created_at", "greatest(created_at, decided_at, promoted_at, reverted_at)",
           _cols("id:id,artifact_hash,experiment_id,candidate_id label:status float:confidence "
                 "ts:created_at,expires_at,decided_at,promoted_at,reverted_at")),
     Table("rsi_decisions", "id", "decided_at", "decided_at",
           _cols("id:id,proposal_id label:action id:artifact_hash label:source,verified ts:decided_at,expires_at"),
           lookback=False),
+    # Mission 004B: NCM research runs (public benchmark metrics) from their rsi_evidence rows. ch:research_runs/<id>
+    # maps to amem:evidence/<id>. Only the contract's metric names, cost, hardware and pins; never the summary.
+    Table("research_runs", "id", "observed_at", "observed_at",
+          _cols("id:id label:run_id,task,status,gpu,provider,repo_commit,checkpoint_revision,dataset_revision "
+                "float:" + ",".join(_NCM_FLOATS) + " ts:observed_at",
+                run_id="substring(external_ref from 9)", task="metrics ->> 'task'", status="metrics ->> 'status'",
+                gpu="replace(metrics ->> 'hw_gpu', ' ', '_')", provider="metrics ->> 'provider'", repo_commit="metrics ->> 'repo_commit'",
+                checkpoint_revision="metrics ->> 'checkpoint_revision'",
+                dataset_revision="metrics ->> 'dataset_revision'",
+                **{k: _num_expr(src) for k, src in _NCM_FLOATS.items()}),
+          source="rsi_evidence", where="system = 'ncm'"),
     Table("rsi_eval_results", "id", "created_at", "created_at",
           _cols("id:id,artifact_hash,experiment_id,baseline_id label:suite,suite_version,model,effort,verdict "
                 "id:record_sha ts:created_at"),
@@ -238,6 +316,7 @@ TABLE_NAMES = frozenset(t.name for t in TABLES)
 _TABLE = {t.name: t for t in TABLES}
 
 _CH_TYPES = {"id": "Nullable(String)", "label": "LowCardinality(Nullable(String))",
+             "pseudo": "LowCardinality(Nullable(String))",
              "ts": "Nullable(DateTime64(6, 'UTC'))", "int": "Nullable(Int64)", "float": "Nullable(Float64)",
              "bool": "Nullable(Bool)"}
 
@@ -250,21 +329,31 @@ def _ch_type(t: Table, c: Col) -> str:
     return _CH_TYPES[c.kind]
 
 
-def schema_sql(db: str = DEFAULT_DB) -> list[str]:
+def schema_sql(db: str = DEFAULT_DB, *, cloud: bool = False) -> list[str]:
     """One statement per item (the HTTP interface runs one statement per request)."""
     if not DB_RE.fullmatch(db):
         raise ValueError(f"bad database name: {db!r}")
     out = [f"CREATE DATABASE IF NOT EXISTS {db}"]
+    settings = "" if cloud else f"\nSETTINGS non_replicated_deduplication_window = {DEDUP_WINDOW}"
     for t in TABLES:
         cols = ",\n    ".join(f"{c.name} {_ch_type(t, c)}" for c in t.cols)
         out.append(f"CREATE TABLE IF NOT EXISTS {db}.{t.name} (\n    {cols},\n    version UInt64\n)\n"
-                   f"ENGINE = ReplacingMergeTree(version)\nORDER BY id\n"
-                   f"SETTINGS non_replicated_deduplication_window = {DEDUP_WINDOW}")
+                   f"ENGINE = ReplacingMergeTree(version)\nORDER BY id{settings}")
     return out
 
 
+def writer_sql(db: str = DEFAULT_DB, user: str = WRITER_USER) -> list[str]:
+    """The least-privilege user amem writes and reads as. The owner sets the password in the console; it is
+    never generated, printed or stored here. No CREATE/ALTER/DROP, so a stolen key cannot change the schema,
+    and no `readonly` setting, which would block INSERT."""
+    if not DB_RE.fullmatch(db) or not DB_RE.fullmatch(user):
+        raise ValueError("bad database or user name")
+    return [f"CREATE USER IF NOT EXISTS {user} IDENTIFIED WITH sha256_password BY '<PASSWORD: 12+ chars, set it here>'",
+            f"GRANT SELECT, INSERT ON {db}.* TO {user}"]
+
+
 def ensure_schema(client: Client) -> int:
-    stmts = schema_sql(client.cfg.db)
+    stmts = schema_sql(client.cfg.db, cloud=client.cfg.cloud)
     for s in stmts:
         client.command(s)
     return len(stmts)
@@ -281,6 +370,9 @@ def _value(kind: str, v: Any) -> Any:
     if kind == "label":
         s = str(v)
         return s if LABEL_RE.fullmatch(s) else None
+    if kind == "pseudo":                # label-shaped only: free text stays null, as for labels
+        s = str(v)
+        return pseudonym(s) if LABEL_RE.fullmatch(s) else None
     if kind == "id":
         s = str(v)
         return s if _is_id(s) else None
@@ -359,7 +451,7 @@ class ClickHouseSink:
         self.lookback_days = self.client.cfg.lookback_days if lookback_days is None else lookback_days
         self._now = now or (lambda: datetime.now(UTC))
         self.tables = tuple(tables)
-        self.auto_schema = auto_schema
+        self.auto_schema = auto_schema and not self.client.cfg.cloud      # Cloud: the owner runs the DDL once
         self._schema_ready = False
 
     def health(self) -> Health:
@@ -396,7 +488,7 @@ class ClickHouseSink:
             sql.SQL("{} as {}").format(sql.SQL(c.expr) if c.expr else sql.Identifier(c.name), sql.Identifier(c.name))
             for c in t.cols)
         while True:
-            conds: list[sql.Composable] = []
+            conds: list[sql.Composable] = [sql.SQL(t.where)] if t.where else []
             args: list[Any] = []
             if after is not None:
                 conds.append(sql.SQL("({}, {}) > (%s, %s)").format(changed, key))
@@ -410,7 +502,7 @@ class ClickHouseSink:
             where = sql.SQL(" where ") + sql.SQL(" and ").join(conds) if conds else sql.SQL("")
             q = sql.SQL("select {cols}, {changed} as _changed, {key} as _key from {table}{where} "
                         "order by _changed, _key limit %s").format(
-                cols=cols, changed=changed, key=key, table=sql.Identifier(t.name), where=where)
+                cols=cols, changed=changed, key=key, table=sql.Identifier(t.src), where=where)
             with conn.cursor(row_factory=dict_row) as cur:
                 rows = cur.execute(q, [*args, self.batch_size]).fetchall()
             if not rows:
@@ -423,6 +515,10 @@ class ClickHouseSink:
     def _batch(self, t: Table, rows: Sequence[Mapping[str, Any]], version: int, mark: Mark) -> Batch:
         mapped = [m for m in (map_row(t, r, version) for r in rows) if m is not None]
         return Batch(t.name, mapped, format_mark(mark), key=token_of(t.name, body_of(mapped)) if mapped else "")
+
+    def split(self, batch: Batch) -> list[Batch]:
+        """One row per batch, each with its own dedup token (sync dead-letters only the refused rows)."""
+        return [Batch(batch.table, [r], batch.watermark, [], key="") for r in batch.rows]
 
     def push(self, batch: Batch) -> None:
         if not batch.rows:
@@ -479,6 +575,34 @@ WHERE ifNull(env, 'prod') NOT IN ('sandbox', 'eval')
   AND ({project:String} = '' OR ifNull(project, '') = {project:String})
 GROUP BY outcome, category, model, effort
 ORDER BY tokens_total DESC, n_sessions DESC
+LIMIT 1000
+FORMAT JSONEachRow"""
+
+SKILL_OUTCOMES_SQL = """\
+SELECT k.skill AS skill, s.model AS model, count() AS n_sessions,
+       countIf(s.outcome IN ('shipped', 'pushed', 'committed')) AS n_done,
+       round(n_done / n_sessions, 4) AS done_rate,
+       round(avg(ifNull(s.tokens_input, 0) + ifNull(s.tokens_output, 0) + ifNull(s.tokens_cache_read, 0)
+                 + ifNull(s.tokens_cache_creation, 0)), 1) AS tokens_avg,
+       groupArray(5)(s.id) AS sample_ids
+FROM (SELECT DISTINCT session_id, skill FROM skill_calls FINAL
+      WHERE skill IS NOT NULL AND session_id IS NOT NULL AND toDate(ts) >= toDate(now('UTC')) - {days:UInt16}) AS k
+INNER JOIN (SELECT id, model, outcome, tokens_input, tokens_output, tokens_cache_read, tokens_cache_creation
+            FROM sessions FINAL WHERE ifNull(env, 'prod') NOT IN ('sandbox', 'eval')) AS s ON s.id = k.session_id
+GROUP BY skill, model
+HAVING n_sessions >= {min_n:UInt16}
+ORDER BY done_rate DESC, n_sessions DESC, skill, model
+LIMIT 1000
+FORMAT JSONEachRow"""
+
+RESEARCH_RUNS_SQL = """\
+SELECT id, run_id, task, status, gpu, provider, solved_rate, cell_rate, valid_rate, rouge1, rouge2, rouge_l, gen_ppl,
+       sacrebleu_cased, chrf, unigram_entropy, cost_usd, gpu_minutes, runtime_s,
+       toString(observed_at) AS observed
+FROM research_runs FINAL
+WHERE ({task:String} = '' OR task = {task:String})
+  AND toDate(observed_at) >= toDate(now('UTC')) - {days:UInt16}
+ORDER BY observed_at DESC
 LIMIT 1000
 FORMAT JSONEachRow"""
 
@@ -550,6 +674,21 @@ QUERIES: dict[str, Query] = {
         lambda r: "/".join(_part(r.get(c)) for c in ("outcome", "category", "model", "effort")),
         ("outcome", "category", "model", "effort", "n_sessions", "tokens_total", "tokens_out", "active_total_s",
          "active_p50_s")),
+    "skill_outcomes": Query(
+        NamedQuery("skill_outcomes", {"days": _DAYS_P, "min_n": _N_P, "limit": _N_P},
+                   "per skill x model: prod sessions that used the skill, share shipped/pushed/committed, tokens"),
+        SKILL_OUTCOMES_SQL, {"days": "30", "min_n": "3", "limit": "50"},
+        lambda r: f"{_part(r.get('skill'))}/{_part(r.get('model'))}" if r.get("skill") else None,
+        ("skill", "model", "n_sessions", "n_done", "done_rate", "tokens_avg"),
+        ("session", "sample_ids")),
+    "research_runs": Query(
+        NamedQuery("research_runs", {"task": _LABEL_P, "days": _DAYS_P, "limit": _N_P},
+                   "NCM research runs: task metrics, status, GPU, cost (public benchmarks only)"),
+        RESEARCH_RUNS_SQL, {"task": "", "days": "90", "limit": "50"},
+        lambda r: r.get("run_id") or None,
+        ("run_id", "task", "status", "gpu", "provider", "solved_rate", "cell_rate", "valid_rate", "rouge1", "rouge2",
+         "rouge_l", "gen_ppl", "sacrebleu_cased", "chrf", "unigram_entropy", "cost_usd", "gpu_minutes", "runtime_s"),
+        ("evidence", "id")),
     "routine_streaks": Query(
         NamedQuery("routine_streaks", {"routine": _LABEL_P, "days": _DAYS_P, "limit": _N_P},
                    "per routine: current fail streak (fail/error since the last pass, skips ignored), "
@@ -608,6 +747,11 @@ class ClickHouseRetriever:
     def query(self, name: str, params: Mapping[str, str]) -> list[EvidenceRef]:
         q = QUERIES[name]
         p = {**q.defaults, **q.spec.check(params)}       # checked again: query() may be called directly
+        if p.get("project"):            # ClickHouse holds pseudonyms only: translate on the Mac, never send the name
+            pseudo = pseudonym(p["project"])
+            if pseudo is None:
+                raise ValueError(f"{PSEUDONYM_ENV} is not set: cannot filter by project")
+            p["project"] = pseudo
         limit = int(p.pop("limit"))
         observed = self._now().astimezone(UTC).isoformat(timespec="seconds")
         out: list[EvidenceRef] = []
@@ -689,8 +833,9 @@ def verify(conn: psycopg.Connection, days: int = 30, *, client: Client | None = 
     for t in tables:
         per_day: dict[str, list[int]] = {}
         q = sql.SQL("select to_char(({day} at time zone 'UTC')::date, 'YYYY-MM-DD'), count(*) from {table} "
-                    "where {day} >= (%s::date)::timestamp at time zone 'UTC' group by 1").format(
-            day=sql.Identifier(t.day), table=sql.Identifier(t.name))
+                    "where {day} >= (%s::date)::timestamp at time zone 'UTC'{extra} group by 1").format(
+            day=sql.Identifier(t.day), table=sql.Identifier(t.src),
+            extra=sql.SQL(f" and ({t.where})") if t.where else sql.SQL(""))
         for d, n in conn.execute(q, (since,)).fetchall():
             per_day.setdefault(d, [0, 0])[0] = int(n)
         try:
