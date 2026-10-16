@@ -98,6 +98,12 @@ Accept when:
 - step 5 is denied;
 - the Usage page shows under $0.10.
 
+Prepared runner (Mission 004C, not yet run against Cloud): seed the disposable database with
+`amem synth seed --db-url <local URL> --out synth-out` (synthetic story + `gold.json`), then
+`uv run python scripts/c1_clickhouse.py --db-url <local URL> --gold synth-out/gold.json` runs every step above
+plus a named-query comparison against gold, the grant probes, the bad-host failure path, team masking and the
+marker leak scan, timed, into `synth-out/c1-report.json`. `--dry-run` prints the plan and touches nothing.
+
 **C2 Langfuse** (after G-LF1 to G-LF3). Synthetic run logs (the suite's `write_run`) go in a temp
 `RSI_SANDBOX_DIR`.
 1. `amem sync run --sink langfuse`
@@ -180,13 +186,16 @@ first (G-*-5). Recurring sync stays off.
 
 ## E. Shared intelligence
 
-`amem evidence ask <question>` answers the brief's six questions:
+`amem evidence ask <question>` answers the brief's six questions, plus one added in Mission 004C:
 - recurring_failures
 - best_combinations
 - attempted_before
 - why_rejected
 - failed_eval_traces
 - after_approval
+- repeat_failures (Mission 004C): why sessions keep failing the same rule (Claude vs Codex), and whether a
+  similar change was already tested (attempts, recall, evals, stored trace links, the failing trace).
+  `scripts/demo_evidence_ask.py --docker` runs it on the synthetic dataset.
 
 Each question is a fixed plan of named queries, Supabase first. Every finding carries:
 - the source service;
@@ -197,6 +206,9 @@ Each question is a fixed plan of named queries, Supabase first. Every finding ca
 - a status: `authoritative`, `linked`, `stale` or `unlinked`.
 
 `--record` stores linked external findings in `rsi_evidence`, valid for 30 days. That is the only write.
+Since Mission 004C it also stores one `answer` row (the structured finding: params, status per provider, steps,
+the Supabase refs it rests on), and it never re-writes a link a Supabase step only read back, or a past.dev
+recall (whose ref is the past.dev sink's own link key).
 
 Example flow (tested on the disposable database, `test_integrations_questions.py`): "Has rule
 `claude-md:global:q-quote-globs` been attempted before?"

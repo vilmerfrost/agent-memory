@@ -5,7 +5,8 @@ every result's ref is an `amem:` ref. They join the two named queries of evidenc
 (`ref`, `evidence_for`) under source `sb`. Free text (a proposal title, a decision reason) is scrubbed
 (sanitize.scrub_text) and cut before it is shown; numbers and labels are the measurement.
 
-    recurring_deviations  rules with at least min_n deviations in prod sessions in the last `days`
+    recurring_deviations  rules with at least min_n deviations in prod sessions in the last `days` (and how many
+                          of those sessions were Claude and how many Codex)
     attempts_for          rsi proposals (via their candidate's rule_key) and improve edits for one rule,
                           or the proposals for one artifact
     decisions_for         an experiment's status and verdict, and every decision on its proposals (or on one)
@@ -41,7 +42,8 @@ PROD = "coalesce(s.env, 'prod') not in ('sandbox', 'eval')"
 
 SPECS: dict[str, NamedQuery] = {
     "recurring_deviations": NamedQuery("recurring_deviations", {"days": DAYS_P, "min_n": N_P, "limit": N_P},
-                                       "rules with >= min_n deviations in prod sessions (newest deviation as ref)"),
+                                       "rules with >= min_n deviations in prod sessions, sessions per tool "
+                                       "(newest deviation as ref)"),
     "attempts_for": NamedQuery("attempts_for", {"rule": RULE_P, "artifact": HASH_P, "limit": N_P},
                                "proposals and improve edits for a rule key, or proposals for an artifact"),
     "decisions_for": NamedQuery("decisions_for", {"experiment": EXP_P, "proposal": UUID_P, "limit": N_P},
@@ -84,20 +86,24 @@ def _clean(m: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def recurring_deviations(conn: psycopg.Connection, p: Mapping[str, str]) -> list[EvidenceRef]:
+    """Mission 004C: also the sessions per tool (Claude vs Codex) that hit the rule."""
     rows = conn.execute(
         f"""select d.instruction_source || ':' || coalesce(d.rule_id, 'unknown') as rule_key, count(*) as n,
                    count(distinct d.session_id) as sessions, avg(d.followed_grade) as followed_avg,
                    avg(d.objective_result) as objective_avg, max(d.created_at) as last_at,
-                   (array_agg(d.id::text order by d.created_at desc))[1:5] as sample_ids
+                   (array_agg(d.id::text order by d.created_at desc))[1:5] as sample_ids,
+                   count(distinct d.session_id) filter (where s.tool = 'claude') as claude_sessions,
+                   count(distinct d.session_id) filter (where s.tool = 'codex') as codex_sessions
             from deviations d left join sessions s on s.session_id = d.session_id
             where d.created_at >= now() - make_interval(days => %s) and {PROD}
             group by 1 having count(*) >= %s order by n desc, rule_key limit %s""",
         (int(p.get("days", "30")), int(p.get("min_n", "3")), int(p.get("limit", "20")))).fetchall()
     out = []
-    for rule_key, n, sessions, followed, objective, last_at, samples in rows:
+    for rule_key, n, sessions, followed, objective, last_at, samples, claude, codex in rows:
         subjects = [refs.amem("deviation", i) for i in samples]
         out.append(EvidenceRef(subjects[0], "sb", "pattern", subjects,
-                               _clean({"rule_key": rule_key, "n": n, "sessions": sessions, "followed_avg": followed,
+                               _clean({"rule_key": rule_key, "n": n, "sessions": sessions, "claude_sessions": claude,
+                                       "codex_sessions": codex, "followed_avg": followed,
                                        "objective_avg": objective, "window_days": int(p.get("days", "30"))}),
                                None, _iso(last_at)))
     return out
