@@ -3,6 +3,8 @@ client-side daily limits, and record-level dead letters in the sink loop."""
 
 from __future__ import annotations
 
+import hashlib
+import json
 import ssl
 from collections.abc import Iterator, Mapping
 from datetime import UTC, datetime, timedelta
@@ -296,10 +298,79 @@ def test_cloud_schema_has_no_non_replicated_settings_and_no_auto_ddl() -> None:
 
 def test_writer_user_is_least_privilege_and_has_no_password() -> None:
     create, grant = CH.writer_sql()
-    assert create.startswith("CREATE USER IF NOT EXISTS amem_writer IDENTIFIED WITH sha256_password BY '<PASSWORD")
+    assert create == ("CREATE USER IF NOT EXISTS amem_writer IDENTIFIED WITH sha256_hash BY "
+                      "'<SHA-256 hex of the password>' DEFAULT DATABASE amem")
     assert grant == "GRANT SELECT, INSERT ON amem.* TO amem_writer"
-    with pytest.raises(ValueError):
-        CH.writer_sql("amem", "x; drop")
+    sha = "ab" * 32
+    assert f"BY '{sha}' DEFAULT DATABASE amem" in CH.writer_sql(sha256_hex=sha)[0]
+    for bad in ({"user": "x; drop"}, {"db": "a;b"}, {"sha256_hex": "AB" * 32}, {"sha256_hex": "x' OR 1"}):
+        with pytest.raises(ValueError):
+            CH.writer_sql(**bad)
+
+
+@pytest.mark.parametrize("pw, ok", [("Aa1!aaaaaaaa", True), ("Aa1!aaaaaaa", False), ("aa1!aaaaaaaa", False),
+                                    ("AA1!AAAAAAAA", False), ("Aaa!aaaaaaaa", False), ("Aa1aaaaaaaaa", False)])
+def test_cloud_password_rule(pw: str, ok: bool) -> None:
+    assert CH.password_ok(pw) is ok
+
+
+def test_cli_schema_parts_and_hash_from_env_never_print_the_password(
+        capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch) -> None:
+    from agent_memory import cli
+    monkeypatch.setattr(CH.http, "request", lambda *a, **k: pytest.fail("schema must not touch the network"))
+    monkeypatch.setenv("AMEM_NO_DOTENV", "1")
+    assert cli.main(["sync", "schema", "--sink", "clickhouse", "--cloud", "--part", "admin"]) == 0
+    admin = capsys.readouterr().out
+    assert admin.count("CREATE TABLE") == len(CH.TABLES) and "USER" not in admin and "GRANT" not in admin
+    pw = "Zx9!secret-Pw-for-test"
+    monkeypatch.setenv(CH.KEY_ENV, pw)
+    assert cli.main(["sync", "schema", "--sink", "clickhouse", "--cloud", "--part", "writer", "--hash-from-env"]) == 0
+    cap = capsys.readouterr()
+    sha = hashlib.sha256(pw.encode()).hexdigest()
+    assert f"IDENTIFIED WITH sha256_hash BY '{sha}'" in cap.out and "CREATE TABLE" not in cap.out
+    assert pw not in cap.out + cap.err
+    monkeypatch.setenv(CH.KEY_ENV, "weakpassword1")
+    assert cli.main(["sync", "schema", "--sink", "clickhouse", "--part", "writer", "--hash-from-env"]) == 2
+    cap = capsys.readouterr()
+    assert "does not meet the Cloud rule" in cap.err and "weakpassword1" not in cap.out + cap.err
+    monkeypatch.delenv(CH.KEY_ENV)
+    assert cli.main(["sync", "schema", "--sink", "clickhouse", "--part", "writer", "--hash-from-env"]) == 2
+
+
+def _fake_clickhouse(svc: MockService, allow: set[str]) -> None:
+    """Answers like ClickHouse over HTTP: ACCESS_DENIED (403, code 497) unless the statement's probe is allowed."""
+    def kind(stmt: str) -> str:
+        for k in ("SHOW GRANTS", "system.databases", "system.users", "system.query_log", "CREATE DATABASE",
+                  "CREATE TABLE", "ALTER TABLE", "CREATE USER", "GRANT SELECT", "INSERT INTO", "SELECT count()"):
+            if k in stmt:
+                return k
+        return "?"
+
+    def handle(r: Any) -> tuple[int, Any]:
+        k = kind(r.body.decode())
+        if k not in allow:
+            return 403, "Code: 497. DB::Exception: amem_writer: Not enough privileges. (ACCESS_DENIED)"
+        rows = {"SHOW GRANTS": [{"GRANTS FOR amem_writer": "GRANT SELECT, INSERT ON amem.* TO amem_writer"}],
+                "system.databases": [{"name": "amem"}, {"name": "system"}, {"name": "INFORMATION_SCHEMA"}],
+                "SELECT count()": [{"n": 0}]}.get(k, [])
+        return 200, "".join(json.dumps(x) + "\n" for x in rows)
+    svc.route("GET", "/ping", lambda r: (200, "Ok.\n"))
+    svc.route("POST", "/", handle)
+
+
+def test_grants_probe_passes_only_for_select_and_insert() -> None:
+    least = {"SHOW GRANTS", "system.databases", "SELECT count()", "INSERT INTO"}
+    with MockService() as svc:
+        _fake_clickhouse(svc, least)
+        rows = CH.check_grants(CH.Client(CH.Config(svc.url, "amem_writer", "k"), retries=0))
+        assert [r["probe"] for r in rows if not r["ok"]] == [] and len(rows) == 11
+        sent = " ".join(q.body.decode() for q in svc.requests)
+        assert "ENGINE = Null" in sent and "HOST NONE" in sent and "WHERE 0" in sent      # harmless if they ran
+    with MockService() as svc:                                    # a writer that can also create tables fails
+        _fake_clickhouse(svc, least | {"CREATE TABLE", "system.query_log"})
+        bad = {r["probe"] for r in CH.check_grants(CH.Client(CH.Config(svc.url, "amem_writer", "k"), retries=0))
+               if not r["ok"]}
+        assert bad == {"create table", "query log"}
 
 
 def test_cloud_ping_waits_for_wake_and_inserts_are_synchronous(monkeypatch: pytest.MonkeyPatch) -> None:

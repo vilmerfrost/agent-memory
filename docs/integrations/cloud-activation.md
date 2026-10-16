@@ -26,11 +26,12 @@ Recommended order:
 | Step | Who | What | Accept | Undo |
 |---|---|---|---|---|
 | G-CH1 | owner approves; owner or agent clicks | In the **existing** org (BatchCortex: Scale plan, card on file): no new org, no second trial, no plan change. Create one dedicated service `amem-rsi` in AWS **eu-west-1**: Custom configuration, vertical autoscaling, **1 replica, 8 GiB min and 8 GiB max**. Then Settings › Scaling: idle after **5 min**. Billing › Actions › Add spend alerts: one amount (**$10**; alerts at 50/75/90/100%). | the service is Idle; Billing shows both credit grants unchanged and one spend alert; `My first service` untouched | delete `amem-rsi`; remove the alert |
-| G-CH2 | owner | IP access list of `amem-rsi` only: the Mac's public IPv4 (IPv4 only; the default is "anywhere"). | a request from another network is refused | edit the list |
-| G-CH3 | owner | SQL console: paste the output of `amem sync schema --sink clickhouse --cloud`. Set the `amem_writer` password (12+ characters with an uppercase letter, a lowercase letter, a digit and a special character) in the CREATE USER line first. | 9 tables exist in `amem`; `amem_writer` has SELECT, INSERT only | `DROP DATABASE amem; DROP USER amem_writer` |
-| G-CH4 | agent (popup) | `request_secret`: `AMEM_CLICKHOUSE_URL` (`https://<host>:8443`), `AMEM_CLICKHOUSE_USER=amem_writer`, `AMEM_CLICKHOUSE_KEY`, and `AMEM_PSEUDONYM_KEY` (the owner makes it with `openssl rand -hex 32`; it never leaves the Mac) | `amem evidence query --source ch rule_gap` answers `ok` with 0 refs | remove the four keys |
-| G-CH5 | agent | Verification C1 (disposable Postgres, synthetic rows) | every C1 criterion | `TRUNCATE` the tables |
-| G-CH6 | owner approves | Review `amem sync plan --sink clickhouse --replay`, then run the real backfill once: `amem sync run --sink clickhouse --replay --budget 600` | `amem sync verify --sink clickhouse --days 30` shows parity; Usage under $1 | `TRUNCATE` the tables; `AMEM_SYNC_CLICKHOUSE=off` |
+| G-CH2a | owner (admin, Cloud SQL console) | Schema, separately from the user: paste `amem sync schema --sink clickhouse --cloud --part admin` (CREATE DATABASE `amem` + 9 tables, IF NOT EXISTS) and run it as the console admin. | `SHOW TABLES FROM amem` lists 9 tables | `DROP DATABASE amem` |
+| G-CH2b | owner, then agent (popup) | Credentials: the owner generates the writer password in the password manager (32 random characters with symbols; Cloud rule: 12+ with upper, lower, digit, special). `request_secret` into the 004B worktree `.env.local`: `AMEM_CLICKHOUSE_URL` (`https://<host>:8443`, from the service's Connect panel), `AMEM_CLICKHOUSE_USER=amem_writer`, `AMEM_CLICKHOUSE_KEY`. | `amem sync schema --part writer --hash-from-env` exits 0 (rule met; prints nothing secret) | remove the three keys |
+| G-CH2c | agent prepares, owner runs | Writer: `amem sync schema --sink clickhouse --cloud --part writer --hash-from-env \| pbcopy` puts `CREATE USER amem_writer IDENTIFIED WITH sha256_hash BY '<hash>' DEFAULT DATABASE amem` and `GRANT SELECT, INSERT ON amem.* TO amem_writer` on the clipboard (never in chat or logs). The owner pastes and runs them in the SQL console, then `clearclip`. | `SHOW GRANTS FOR amem_writer` shows only that GRANT | `DROP USER amem_writer` |
+| G-CH2d | agent | Verification: `amem sync grants --sink clickhouse` as the writer: SHOW GRANTS is exactly SELECT, INSERT ON amem.*; SELECT and a zero-row INSERT work; only `amem`, `system`, `information_schema` visible; CREATE DATABASE, CREATE TABLE, ALTER, CREATE USER, GRANT, system.users and system.query_log denied (ACCESS_DENIED). Each probe is harmless even if it ran. | all 11 probes ok | as G-CH2c and G-CH2a |
+| G-CH3 | owner approves, agent runs | Verification C1 (disposable Postgres, synthetic rows; needs `AMEM_PSEUDONYM_KEY` via the popup, made with `openssl rand -hex 32`). The disposable DB is migrated with a Keychain tripwire (see the separate migrate bug). | every C1 criterion | `TRUNCATE` the tables |
+| G-CH4 | owner approves | Review `amem sync plan --sink clickhouse --replay`, then run the real backfill once: `amem sync run --sink clickhouse --replay --budget 600` | `amem sync verify --sink clickhouse --days 30` shows parity; Usage under $1 | `TRUNCATE` the tables; `AMEM_SYNC_CLICKHOUSE=off` |
 | later | owner approves | A daily sync (not every 15 min: that keeps the service awake) | — | — |
 
 **Account state 2026-10-17 (read-only check of the console, no changes):** org BatchCortex, plan Scale, card
@@ -51,7 +52,7 @@ IP access list: 1 specific location (the Mac's public IPv4, 158.174.186.218, sam
 shell); crash reports off; daily backup kept 1 day (default). Organization spend alert: $100 per billing
 period, alerts at $50/$75/$90/$100 by email and UI (org-wide: it counts every service, including `My first
 service`). Untouched: the org, the plan, the credits, `My first service`. No database user, no data. Next
-steps (G-CH3 onward) need their own approval.
+steps (G-CH2 onward, renumbered on 2026-10-17: G-CH2 = least-privilege access) need their own approval.
 
 ## Langfuse Cloud EU
 

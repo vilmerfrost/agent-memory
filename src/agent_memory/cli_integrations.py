@@ -3,7 +3,9 @@
     amem sync run --sink clickhouse|langfuse|pastdev [--budget S] [--replay] [--json]
     amem sync status [--json]
     amem sync verify --sink clickhouse [--days N] [--json]
-    amem sync schema --sink clickhouse [--cloud] [--db NAME]   (prints SQL for the owner; sends nothing)
+    amem sync schema --sink clickhouse [--cloud] [--db NAME] [--part all|admin|writer] [--hash-from-env]
+                                                                (prints SQL for the owner; sends nothing)
+    amem sync grants --sink clickhouse [--json]   (as the writer: probes read/insert allowed, DDL/users denied)
     amem sync plan --sink clickhouse|langfuse|pastdev [--replay] [--json]   (dry run; read-only, sends nothing)
     amem evidence query --source sb|ch|lf|pd <named-query> [--param k=v ...] [--json]
     amem evidence ask <question> [--param k=v ...] [--record] [--json]     (questions.py: the six questions)
@@ -139,12 +141,33 @@ def cmd_sync_schema(args: argparse.Namespace) -> int:
     """The DDL and the least-privilege user, for the owner to run once in the provider's SQL console."""
     from agent_memory.integrations import clickhouse
     try:
-        stmts = clickhouse.schema_sql(args.db, cloud=args.cloud) + clickhouse.writer_sql(args.db)
+        admin = clickhouse.schema_sql(args.db, cloud=args.cloud) if args.part in ("all", "admin") else []
+        sha = clickhouse.password_sha256() if args.hash_from_env else None
+        writer = clickhouse.writer_sql(args.db, sha256_hex=sha) if args.part in ("all", "writer") else []
     except ValueError as exc:
         print(f"amem: sync schema: {exc}", file=sys.stderr)
         return 2
-    print(";\n\n".join(stmts) + ";")
+    print(";\n\n".join(admin + writer) + ";")
     return 0
+
+
+def cmd_sync_grants(args: argparse.Namespace) -> int:
+    """Probe, as the configured writer, that it can read and insert in its database and nothing else."""
+    from agent_memory.integrations import clickhouse
+    client = clickhouse.Client()
+    if client.cfg.problem:
+        print(f"amem: sync grants: {client.cfg.problem}", file=sys.stderr)
+        return 2
+    try:
+        client.ping()
+    except clickhouse.http.HttpError as exc:
+        print(f"amem: sync grants: unavailable ({str(exc)[:120]})", file=sys.stderr)
+        return 1
+    rows = clickhouse.check_grants(client)
+    ok = all(r["ok"] for r in rows)
+    lines = [f"grants {client.cfg.user}@{client.cfg.db}: {'ok' if ok else 'FAILED'}"]
+    lines += [f"  {'ok  ' if r['ok'] else 'FAIL'} {r['probe']}: expect {r['expect']}, got {r['got']}" for r in rows]
+    return _out(args, {"ok": ok, "probes": rows}, "\n".join(lines), 0 if ok else 1)
 
 
 def _params(pairs: list[str]) -> dict[str, str]:
@@ -278,7 +301,15 @@ def register(sub: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
     q.add_argument("--sink", required=True, choices=["clickhouse"])
     q.add_argument("--cloud", action="store_true", help="ClickHouse Cloud DDL (no non-replicated settings)")
     q.add_argument("--db", default="amem")
+    q.add_argument("--part", choices=["all", "admin", "writer"], default="all",
+                   help="admin: database and tables (run as the console admin); writer: the least-privilege user")
+    q.add_argument("--hash-from-env", action="store_true",
+                   help="identify the writer by the SHA-256 of AMEM_CLICKHOUSE_KEY (never printed)")
     q.set_defaults(func=cmd_sync_schema)
+    q = s.add_parser("grants", help="probe as the ClickHouse writer: read and insert allowed, nothing else")
+    q.add_argument("--sink", required=True, choices=["clickhouse"])
+    q.add_argument("--json", action="store_true")
+    q.set_defaults(func=cmd_sync_grants)
 
     p = sub.add_parser("evidence", help="the evidence facade (named queries only)")
     e = p.add_subparsers(dest="evidence_command", required=True)

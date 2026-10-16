@@ -19,10 +19,13 @@ ClickHouse Cloud (Mission 004B; `cloud` is on for a `*.clickhouse.cloud` host or
 - The DDL has no SETTINGS clause. Cloud turns ReplacingMergeTree into SharedReplacingMergeTree, which is
   replicated, so it keeps an insert dedup log by default and the non-replicated setting does not apply.
 - No auto-schema. amem writes as a least-privilege user (SELECT, INSERT on the database only), so it cannot
-  run DDL. The owner runs `amem sync schema --sink clickhouse` output once in the Cloud SQL console.
-- An idle service wakes on the first request, and wake-up time is not documented: the health ping waits up
-  to WAKE_TIMEOUT_S and inserts get a longer timeout. A stopped (not idle) service fails the ping, so the
-  run is `unavailable` and the cursor stays.
+  run DDL. Two separate owner steps in the Cloud SQL console: `amem sync schema --sink clickhouse --cloud
+  --part admin` (database and tables), then `--part writer --hash-from-env` (the user, identified by the
+  SHA-256 of AMEM_CLICKHOUSE_KEY, so the console never sees the password). `amem sync grants --sink
+  clickhouse` then probes, as the writer, that it can read and insert and nothing else.
+- An idle service wakes on the first request; the docs say "a few tens of seconds" and suggest a 1-2 min
+  timeout: the health ping waits up to WAKE_TIMEOUT_S and inserts get a longer timeout. A stopped (not idle)
+  service fails the ping, so the run is `unavailable` and the cursor stays.
 - Plain http is refused for any host but loopback. Cloud listens on HTTPS 8443.
 Every insert sends async_insert=0, so the dedup token applies to the insert itself (Cloud 26.4 turned
 async inserts on by default).
@@ -94,7 +97,7 @@ from agent_memory.integrations.sync import Batch
 
 DEFAULT_DB = "amem"
 DEDUP_WINDOW = 1000        # inserts remembered per table for insert_deduplication_token
-WAKE_TIMEOUT_S = 60.0      # Cloud: an idle service wakes on the first request (time not documented)
+WAKE_TIMEOUT_S = 120.0     # Cloud: an idle service wakes on the first request ("a few tens of seconds")
 WRITER_USER = "amem_writer"
 BATCH_SIZE = 500
 LOOKBACK_DAYS = 7
@@ -342,14 +345,89 @@ def schema_sql(db: str = DEFAULT_DB, *, cloud: bool = False) -> list[str]:
     return out
 
 
-def writer_sql(db: str = DEFAULT_DB, user: str = WRITER_USER) -> list[str]:
-    """The least-privilege user amem writes and reads as. The owner sets the password in the console; it is
-    never generated, printed or stored here. No CREATE/ALTER/DROP, so a stolen key cannot change the schema,
-    and no `readonly` setting, which would block INSERT."""
+PASSWORD_RULE = "12+ characters with an uppercase letter, a lowercase letter, a digit and a special character"
+KEY_ENV = "AMEM_CLICKHOUSE_KEY"
+_SHA256_RE = re.compile(r"[0-9a-f]{64}")
+
+
+def password_ok(password: str) -> bool:
+    """ClickHouse Cloud's password rule, checked here before hashing (the password is never printed)."""
+    return (len(password) >= 12 and any(c.isupper() for c in password) and any(c.islower() for c in password)
+            and any(c.isdigit() for c in password) and any(not c.isalnum() for c in password))
+
+
+def password_sha256(environ: Mapping[str, str] | None = None) -> str:
+    """SHA-256 hex of AMEM_CLICKHOUSE_KEY (the env the app loads itself). Raises ValueError without ever
+    echoing the value."""
+    amem_config.load_env()
+    key = ((os.environ if environ is None else environ).get(KEY_ENV) or "").strip()
+    if not key:
+        raise ValueError(f"{KEY_ENV} is not set")
+    if not password_ok(key):
+        raise ValueError(f"{KEY_ENV} does not meet the Cloud rule: {PASSWORD_RULE}")
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()
+
+
+def writer_sql(db: str = DEFAULT_DB, user: str = WRITER_USER, *, sha256_hex: str | None = None) -> list[str]:
+    """The least-privilege user amem writes and reads as: SELECT and INSERT on `db` only. No CREATE, ALTER,
+    DROP, TRUNCATE, user or grant management, and no other database, so a stolen key cannot change the
+    schema or read anything else; no `readonly` setting, which would block INSERT. `IDENTIFIED WITH
+    sha256_hash`: the console and its query log see the hash, never the password. Without `sha256_hex`
+    the statement carries a placeholder."""
     if not DB_RE.fullmatch(db) or not DB_RE.fullmatch(user):
         raise ValueError("bad database or user name")
-    return [f"CREATE USER IF NOT EXISTS {user} IDENTIFIED WITH sha256_password BY '<PASSWORD: 12+ chars, set it here>'",
+    if sha256_hex is not None and not _SHA256_RE.fullmatch(sha256_hex):
+        raise ValueError("sha256_hex is 64 lowercase hex characters")
+    secret = sha256_hex or "<SHA-256 hex of the password>"
+    return [f"CREATE USER IF NOT EXISTS {user} IDENTIFIED WITH sha256_hash BY '{secret}' DEFAULT DATABASE {db}",
             f"GRANT SELECT, INSERT ON {db}.* TO {user}"]
+
+
+def _denied(exc: http.HttpError) -> bool:
+    return "ACCESS_DENIED" in str(exc) or "Code: 497" in str(exc)
+
+
+def check_grants(client: Client) -> list[dict[str, Any]]:
+    """G-CH2 verification, run as the writer over HTTP. Each probe is harmless even if it unexpectedly
+    works: the insert copies zero rows, the ALTER deletes `WHERE 0`, the probe table uses the Null engine,
+    the probe user has `HOST NONE` and a random hash. One row per probe: {probe, expect, got, ok}."""
+    db, user, t = client.cfg.db, client.cfg.user, TABLES[0].name
+    tag = os.urandom(4).hex()
+    out: list[dict[str, Any]] = []
+
+    def probe(name: str, expect: str, statement: str,
+              judge: Callable[[list[dict[str, Any]]], bool] | None = None) -> None:
+        rows: list[dict[str, Any]] = []
+        try:
+            if "FORMAT JSONEachRow" in statement:
+                rows = client.select(statement, {})
+            else:
+                client.command(statement)
+            got = "allowed"
+            ok = expect == "allowed" and (judge is None or judge(rows))
+            if judge is not None:
+                got = f"allowed: {json.dumps(rows, sort_keys=True)[:200]}"
+        except http.HttpError as exc:
+            got = "denied" if _denied(exc) else f"error: {str(exc)[:160]}"
+            ok = got == expect
+        out.append({"probe": name, "expect": expect, "got": got, "ok": ok})
+
+    own = {f"GRANT SELECT, INSERT ON {db}.* TO {user}"}
+    probe("grants", "allowed", "SHOW GRANTS FORMAT JSONEachRow",
+          lambda rows: {next(iter(r.values()), "") for r in rows} == own)
+    probe("select", "allowed", f"SELECT count() AS n FROM {db}.{t} FORMAT JSONEachRow")
+    probe("insert", "allowed", f"INSERT INTO {db}.{t} SELECT * FROM {db}.{t} WHERE 0")
+    probe("databases", "allowed", "SELECT name FROM system.databases FORMAT JSONEachRow",
+          lambda rows: {r.get("name") for r in rows} <= {db, "system", "information_schema", "INFORMATION_SCHEMA"})
+    probe("create database", "denied", f"CREATE DATABASE {db}_probe_{tag}")
+    probe("create table", "denied", f"CREATE TABLE {db}.probe_{tag} (a Int8) ENGINE = Null")
+    probe("alter", "denied", f"ALTER TABLE {db}.{t} DELETE WHERE 0")
+    probe("create user", "denied",
+          f"CREATE USER probe_{tag} IDENTIFIED WITH sha256_hash BY '{os.urandom(32).hex()}' HOST NONE")
+    probe("grant", "denied", f"GRANT SELECT ON {db}.* TO {user}")
+    probe("users", "denied", "SELECT count() AS n FROM system.users FORMAT JSONEachRow")
+    probe("query log", "denied", "SELECT count() AS n FROM system.query_log FORMAT JSONEachRow")
+    return out
 
 
 def ensure_schema(client: Client) -> int:
