@@ -410,12 +410,159 @@ def test_leak_no_prompt_tool_input_path_file_or_secret_leaves(tmp_path: Path) ->
         assert len(svc.requests_to("POST", L.OTLP_PATH)) == 3 and sent
         for m in MARKERS:
             assert m not in sent, m
-        outputs = [o["output"] for o in lf.observations if o["output"] is not None]
-        assert len(outputs) == 3 and all(len(o) <= L.RESULT_MAX and "[redacted]" in o for o in outputs)
-        assert all(o["output"] is None for o in lf.observations if o["parentObservationId"])   # text only on the root
+        assert all(o["output"] is None for o in lf.observations)          # no agent text by default
+        assert "Wrote the file" not in sent and "x" * 50 not in sent and "y" * 50 not in sent
     for run in runs:                                                      # nor into rsi_evidence
         ev = json.dumps(L.evidence_for(run).to_json())
         assert not any(m in ev for m in MARKERS) and "x" * 50 not in ev
+
+
+# Values that must never reach Langfuse through any field. Each is shaped to pass the old name/id patterns.
+SENSITIVE = {
+    "abs-path": "Users/vilmer/.ssh/id_rsa",
+    "work-path": f"work/{PATH_M}.txt",
+    "deep-path": "src/billing/stripe_keys.py",
+    "anthropic-key": "sk-ant-api03-Zx9Zx9Zx9Zx9Zx9Zx9",
+    "langfuse-key": "sk-lf-0b3e7d2a-8c1f-4f6e-9a2b-1c3d4e5f6a7b",
+    "github-token": "ghp_Zx9Zx9Zx9Zx9Zx9Zx9Zx9Zx9Zx9Zx9Zx9Zx9",
+    "aws-key-id": "AKIAZX9ZX9ZX9ZX9ZX9Z",
+    "email": "vilmer@example.com",
+    "token-run": "Zx9" * 12,
+}
+
+
+def test_final_result_text_stays_local_by_default(tmp_path: Path) -> None:
+    """The agent's final response may quote paths, keys, emails or task text: none of it leaves by default,
+    neither through upload_run nor through the sink (which has no opt-in)."""
+    text = (f"Done. Edited /Users/vilmer/Projects/app/{PATH_M}.py, used {SENSITIVE['anthropic-key']}, "
+            f"mailed {SENSITIVE['email']}. FINAL-PROSE-MARKER-3e1f")
+    p = write_run(tmp_path, arm="A", stdout=json.dumps(claude_result(text)), sidecar={"case": "c1", "check_passed": True})
+    run = L.load_run_log(p)
+    assert run.result and "FINAL-PROSE-MARKER-3e1f" in run.result                # parsed and kept locally
+    assert "langfuse.observation.output" not in json.dumps(L.build_spans(run))
+    pieces = ("FINAL-PROSE-MARKER-3e1f", "/Users/vilmer", PATH_M, SENSITIVE["anthropic-key"], SENSITIVE["email"],
+              "Done. Edited")
+    with MockService() as svc:                                            # upload_run, as a caller would
+        lf = FakeLangfuse(svc)
+        L.upload_run(run, client_for(svc), datasets=True)
+        assert lf.observations and all(o["output"] is None for o in lf.observations)
+        assert not [p for p in pieces if p in lf.bodies()]
+    with MockService() as svc:                                            # the sink, as `amem sync run` does
+        lf = FakeLangfuse(svc)
+        sink = L.LangfuseSink(client_for(svc), tmp_path)
+        for batch in sink.batches(_NoSupabase(), {}, replay=True):
+            sink.push(batch)
+        assert [u.spans for u in sink.uploads] == [3]
+        assert all(o["output"] is None for o in lf.observations)
+        assert not [p for p in pieces if p in lf.bodies()]
+
+
+def test_opt_in_result_is_still_redacted_capped_and_root_only(tmp_path: Path) -> None:
+    long_result = f"Wrote the file. key={SECRET} and {SECRET} " + "x" * 1000
+    run = L.load_run_log(write_run(tmp_path, arm="A", stdout=json.dumps(claude_result(long_result)),
+                                   sidecar={"case": "c1", "check_passed": True}))
+    with MockService() as svc:
+        lf = FakeLangfuse(svc)
+        L.upload_run(run, client_for(svc), include_result=True)
+        outputs = [o["output"] for o in lf.observations if o["output"] is not None]
+        assert len(outputs) == 1 and len(outputs[0]) <= L.RESULT_MAX and "[redacted]" in outputs[0]
+        assert SECRET not in lf.bodies()
+        assert all(o["output"] is None for o in lf.observations if o["parentObservationId"])
+
+
+class _NoSupabase:
+    """The two lookups LangfuseSink.batches makes: no session row, no earlier lf:trace link."""
+
+    def execute(self, *_: Any) -> Any:
+        return self
+
+    def fetchone(self) -> None:
+        return None
+
+
+def _inject(where: str, value: str) -> L.SandboxRun:
+    run = base_run(judge_winner="B", eval_verdict="worse")
+    gen = run.generations[0]
+    return {
+        "model": lambda: dataclasses.replace(run, generations=[dataclasses.replace(gen, model=value)]),
+        "tool": lambda: dataclasses.replace(run, tools=[L.ToolCall(value, "completed")]),
+        "tool-status": lambda: dataclasses.replace(run, tools=[L.ToolCall("Write", value)]),
+        "agent": lambda: dataclasses.replace(run, agent=value),
+        "usage-key": lambda: dataclasses.replace(run, generations=[dataclasses.replace(gen, usage={value: 1, "total": 1})]),
+        "extra-key": lambda: dataclasses.replace(run, generations=[dataclasses.replace(gen, extra={value: 1})]),
+        "baseline": lambda: dataclasses.replace(run, baseline_id=value),
+    }[where]()
+
+
+@pytest.mark.parametrize("value", list(SENSITIVE.values()), ids=list(SENSITIVE))
+@pytest.mark.parametrize("where", ["model", "tool", "tool-status", "agent", "usage-key", "extra-key", "baseline"])
+def test_sensitive_text_never_leaves_through_a_trace_field(where: str, value: str) -> None:
+    run = _inject(where, value)
+    with MockService() as svc:
+        lf = FakeLangfuse(svc)
+        res = L.upload_run(run, client_for(svc), datasets=True)
+        sent = lf.bodies()
+        assert res.spans == 3 and lf.observations                         # the run still goes, minus the value
+        assert value not in sent and unquote(value) not in unquote(sent)
+        for part in value.split("/"):
+            if len(part) > 8:
+                assert part not in sent, part
+
+
+@pytest.mark.parametrize("change, reason", [
+    ({"experiment_id": "exp-20261017-sk-ant-api03Zx9Zx9Zx9"}, "experiment id looks sensitive"),
+    ({"experiment_id": "exp-20261017-" + "Zx9" * 12}, "experiment id looks sensitive"),
+    ({"case": SENSITIVE["anthropic-key"]}, "case looks sensitive"),
+    ({"case": SENSITIVE["github-token"]}, "case looks sensitive"),
+    ({"case": SENSITIVE["aws-key-id"]}, "case looks sensitive"),
+    ({"run_id": "A-20261016T101500Z-sk-ant-api03Zx9Zx9Zx9"}, "run id looks sensitive"),
+    ({"exit_code": f"exit /Users/vilmer/{PATH_M}"}, "exit_code is an integer"),
+    ({"num_turns": SENSITIVE["email"]}, "num_turns is an integer"),
+    ({"duration_s": "2.8s /work/x"}, "duration_s is a number"),
+])
+def test_a_run_whose_identity_or_numbers_carry_text_is_refused(change: dict[str, Any], reason: str) -> None:
+    run = dataclasses.replace(base_run(), **change)
+    with MockService() as svc:
+        FakeLangfuse(svc)
+        with pytest.raises(L.Refused, match=reason) as refused:
+            L.upload_run(run, client_for(svc), datasets=True)
+        assert svc.requests == []
+    assert all(str(v) not in str(refused.value) for v in change.values())    # the refusal never echoes it
+
+
+def test_sensitive_names_from_real_agent_output_never_leave(tmp_path: Path) -> None:
+    """The same values arriving the way they really would: Claude modelUsage keys and denied tool names,
+    a Codex MCP server/tool name, and a --model flag in the argv."""
+    claude = claude_result("ok")
+    claude["modelUsage"] = {SENSITIVE["anthropic-key"]: claude["modelUsage"]["claude-haiku-5-5"],
+                            SENSITIVE["email"]: claude["modelUsage"]["claude-haiku-5-5"]}
+    claude["permission_denials"] = [{"tool_name": SENSITIVE["abs-path"], "tool_input": {}},
+                                    {"tool_name": SENSITIVE["github-token"], "tool_input": {}}]
+    pa = write_run(tmp_path, arm="A", stdout=json.dumps(claude), sidecar={"case": "c1"})
+    events = codex_events() + [{"type": "item.completed", "item": {
+        "id": "item_9", "type": "mcp_tool_call", "server": "sk-ant-api03Zx9Zx9Zx9Zx9", "tool": "search",
+        "arguments": {}, "result": None, "status": "completed"}}]
+    codex = "\n".join(json.dumps(e) for e in events) + "\n"
+    argv = [a if a != "gpt-6-luna" else "AKIAZX9ZX9ZX9ZX9ZX9Z" for a in CODEX_ARGV]
+    pb = write_run(tmp_path, arm="B", stdout=codex, argv=argv, sidecar={"case": "c1"})
+    runs = [L.load_run_log(pa), L.load_run_log(pb)]
+    with MockService() as svc:
+        lf = FakeLangfuse(svc)
+        for run in runs:
+            L.upload_run(run, client_for(svc))
+        sent = lf.bodies()
+        assert len(lf.observations) == sum(1 + len(r.generations) + len(r.tools) for r in runs)
+        for v in (SENSITIVE["anthropic-key"], SENSITIVE["email"], SENSITIVE["abs-path"], SENSITIVE["github-token"],
+                  "sk-ant-api03Zx9Zx9Zx9Zx9", "AKIAZX9ZX9ZX9ZX9ZX9Z", *MARKERS):
+            assert v not in sent, v
+        assert L.REDACTED in {o["name"] for o in lf.observations}
+
+
+@pytest.mark.parametrize("name", ["claude-haiku-5-5", "gpt-6-luna", "us.anthropic.claude-opus-5-5", "openai/gpt-6",
+                                  "claude-3@20240229", "Write", "mcp__docs__search", "mcp:docs/search",
+                                  "collab:spawn", "command_execution", "web_search"])
+def test_ordinary_model_and_tool_names_still_pass(name: str) -> None:
+    assert not L.sensitive(name) and L._out_name(name) == name
 
 
 # ---------------------------------------------------------------- round trip and datasets

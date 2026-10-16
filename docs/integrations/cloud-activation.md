@@ -40,7 +40,13 @@ Recommended order:
 | G-LF1 | owner | Create the Langfuse Cloud **EU** org (Hobby) and one project `amem-rsi`, plus one API key pair. | — | delete the project |
 | G-LF2 | agent (popup) | `request_secret`: `AMEM_LANGFUSE_HOST=https://cloud.langfuse.com`, `AMEM_LANGFUSE_PUBLIC_KEY`, `AMEM_LANGFUSE_SECRET_KEY` | `LangfuseClient.from_env().health()` is ok | remove the keys |
 | G-LF3 | agent | Verification C2 (synthetic run logs in a temp sandbox folder) | every C2 criterion | delete the synthetic traces (`DELETE /api/public/traces`) |
-| G-LF4 | owner approves | The first real sandbox trace: the next approved sandbox run, uploaded with `amem sync run --sink langfuse` | one trace with spans, scores and the `amem_session_id` round trip | `AMEM_SYNC_LANGFUSE=off`; delete the trace |
+| G-LF4 | owner approves | Not before the final-response exclusion (default since 2026-10-17). The first real sandbox trace: the next approved sandbox run, uploaded with `amem sync run --sink langfuse` | one trace with spans, scores and the `amem_session_id` round trip | `AMEM_SYNC_LANGFUSE=off`; delete the trace |
+
+**Status 2026-10-17:** G-LF1 to G-LF3 done; C2 accepted by the owner. EU project `amem-rsi`, keys in the
+004B worktree's `.env.local` only, synthetic data only, no recurring sync. C2 (2 synthetic traces, about 20
+units): root, generation and tool spans with the `amem_session_id` round trip; a re-run sends 0 batches and a
+replay adds 0 observations; a later score updates in place; `experiment_scores` shows both arms; a wrong host
+is `unavailable` and leaves the cursor; 0 of 8 planted markers in 19.6 KB read back. The two traces are kept.
 
 ## past.dev
 

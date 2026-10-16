@@ -232,8 +232,9 @@ Langfuse have no hard cap, so watch:
 
 Data that leaves:
 - **ClickHouse:** allowlisted numbers, labels and ids; pseudonyms (the key never leaves the Mac). Never text.
-- **Langfuse:** sandbox runs only. That is the redacted final result (at most 500 characters), tool names,
-  tokens, cost and scores. Never prompts or tool inputs.
+- **Langfuse:** sandbox runs only: ids, model and tool names, tool statuses, tokens, cost and scores. Never
+  prompts, tool inputs or the agent's final response (excluded by default since 2026-10-17; a model or tool
+  name that looks like a path, credential, email or token is sent as `redacted`).
 - **past.dev:** sanitized decision records of at most 1.5 KB. No team items, paths, emails or secrets.
 - **NCM:** nothing leaves. The run uses public files only.
 
@@ -255,7 +256,7 @@ Disable:
 2. ClickHouse SQL has never run on a real server. The riskiest queries are `routine_streaks`,
    `rule_weekly_rate` (join), `skill_outcomes` and `research_runs`. C1 is the first real run.
 3. Assumptions not yet checked against live services:
-   - Langfuse: the OTLP attribute mapping on Cloud.
+   - ~~Langfuse: the OTLP attribute mapping on Cloud.~~ Verified by C2 on 2026-10-17 (see cloud-activation.md).
    - past.dev: that `sourceId` echoes our id, the deleted-id error code, and the health probe.
    - Modal: the script, torch 2.8 on the image, and the L4 wake and run times.
    C1 to C4 check each one.

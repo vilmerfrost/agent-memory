@@ -10,15 +10,19 @@ What one run becomes (all ids deterministic, so a retry finds the same records):
     trace   id = refs.trace_id(run_key)   session = experiment id   user = "rsi"   tags = [arm, kind]
             metadata (str -> str, <= 200 chars): amem_session_id = refs.session_uuid(run_key), baseline_id,
             artifact_hash, proposal_id, run_key, arm
-    spans   root (type agent): status, timing, the agent's final result (redacted, <= 500 chars)
+    spans   root (type agent): status and timing; no output (the agent's final result stays local by default)
             one generation per model (Claude) or per turn (Codex): model, usage, cost
             one tool span per tool call: the tool NAME and its status, never its input or output
     scores  check_passed (BOOLEAN), judge_winner, eval_verdict (CATEGORICAL); id = <trace id>-<name>
     dataset optional: dataset rsi-<experiment>, one item per case (id rsi-<hash>), one experiment run per arm
             (<experiment>-<arm>); only rep 0 is linked (Langfuse assumes no repetitions in an experiment)
 
-Text policy: no prompts, no tool inputs or outputs, no file contents, no paths, no stderr. The only text
-is the agent's final result string, passed through agent_memory.redact.redact and cut to 500 chars.
+Text policy: no prompts, no tool inputs or outputs, no file contents, no paths, no stderr, and by default
+no agent text at all: the final result string is parsed (redacted, <= 500 chars) but stays on the Mac. A
+caller can opt in with include_result=True (the CLI never does; it needs the owner's approval), and even
+then it is redacted and capped. Every other string that leaves is an id, a fixed label, or a model / tool
+name that passes `sensitive()` (no credential, email, token-like run or path); check() refuses a run
+whose experiment id, case or run id looks sensitive, since those are part of its identity.
 Upload happens after the run, from the stored run log, so it works even when Langfuse was down.
 
 API path (checked against the official docs on 2026-10-16, plain HTTP through integrations.http, no SDK):
@@ -140,7 +144,14 @@ _RUN_TS_RE = re.compile(r"-(\d{8}T\d{6}Z)-")                       # rsi_sandbox
 _HASH_RE = re.compile(r"[0-9a-f]{64}")
 _UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 _LABEL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}")
+_COUNT_KEY_RE = re.compile(r"[a-z][a-z_]{0,63}")                   # usage_details / counter keys
+_EMAIL_RE = re.compile(r"[^@\s/]+@[^@\s/]+\.[A-Za-z]{2,}")
+_TOKENISH_RE = re.compile(r"[A-Za-z0-9]{32,}")                     # a long unbroken run: a key, a hash, a token
+_PATH_ROOTS = frozenset({"users", "home", "root", "tmp", "private", "var", "etc", "opt", "volumes", "mnt", "srv",
+                         "work", "workspace", "sandbox", "library", "applications", "system"})
 _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
+AGENTS = ("claude", "codex")
+REDACTED = "redacted"                  # what a sensitive model or tool name becomes
 
 
 class LangfuseError(Exception):
@@ -165,8 +176,32 @@ def clean_text(text: Any) -> str | None:
     return _redact.redact(text)[:RESULT_MAX]
 
 
+def sensitive(text: str) -> bool:
+    """True for a name-shaped value that must still not leave: a credential the redactor knows, an email, a
+    long token-like run, or anything path-shaped (`~`, `..`, two or more `/`, or `<root>/...`)."""
+    if _redact.redact(text) != text or _EMAIL_RE.search(text) or _TOKENISH_RE.search(text):
+        return True
+    if "~" in text or ".." in text or text.count("/") > 1:
+        return True
+    return "/" in text and text.split("/", 1)[0].rsplit(":", 1)[-1].lower() in _PATH_ROOTS
+
+
 def _name(value: Any, default: str = "unknown") -> str:
     return value if isinstance(value, str) and _NAME_RE.fullmatch(value) else default
+
+
+def _out_name(value: Any) -> str:
+    """A model or tool name as it may leave: name-shaped and not sensitive, else `redacted` / `unknown`."""
+    v = _name(value)
+    return REDACTED if v != "unknown" and sensitive(v) else v
+
+
+def _counts(d: Any) -> dict[str, int]:
+    """usage_details and counters: lowercase keys and integers only."""
+    if not isinstance(d, Mapping):
+        return {}
+    return {k: v for k, v in d.items() if isinstance(k, str) and _COUNT_KEY_RE.fullmatch(k)
+            and isinstance(v, int) and not isinstance(v, bool)}
 
 
 def _int(value: Any) -> int:
@@ -281,7 +316,8 @@ class SandboxRun:
 
     def trace_metadata(self) -> dict[str, str]:
         """Ids only, each checked against its shape, so no free text can ride along."""
-        raw = {"amem_session_id": self.session_id, "baseline_id": _label(self.baseline_id),
+        baseline = _label(self.baseline_id)
+        raw = {"amem_session_id": self.session_id, "baseline_id": None if baseline and sensitive(baseline) else baseline,
                "artifact_hash": _label(self.artifact_hash, _HASH_RE), "proposal_id": _label(self.proposal_id, _UUID_RE),
                "run_key": self.run_key, "arm": self.arm}
         return {k: v for k, v in ((k, _meta_value(v)) for k, v in raw.items()) if v is not None}
@@ -314,6 +350,14 @@ def check(run: SandboxRun) -> None:
         run.run_key  # noqa: B018 - validates arm, case and rep
     except refs.RefError as exc:
         raise Refused(str(exc)) from None
+    for label, value in (("experiment id", run.experiment_id), ("case", run.case), ("run id", run.run_id)):
+        if sensitive(value):                                  # part of the run's identity: refuse, never echo it
+            raise Refused(f"{label} looks sensitive")
+    for label, value in (("exit_code", run.exit_code), ("num_turns", run.num_turns)):
+        if value is not None and (not isinstance(value, int) or isinstance(value, bool)):
+            raise Refused(f"{label} is an integer")
+    if not isinstance(run.duration_s, (int, float)) or isinstance(run.duration_s, bool):
+        raise Refused("duration_s is a number")
     if run.judge_winner is not None and not (run.judge_winner == "tie" or re.fullmatch(r"[A-Z]", run.judge_winner)):
         raise Refused("judge_winner is an arm letter or 'tie'")
     if run.eval_verdict is not None and run.eval_verdict not in VERDICTS:
@@ -575,14 +619,16 @@ def _span(sid: str, parent: str | None, trace: str, name: str, start: datetime, 
     return s
 
 
-def build_spans(run: SandboxRun, dataset_id: str | None = None) -> dict[str, Any]:
+def build_spans(run: SandboxRun, dataset_id: str | None = None, *, include_result: bool = False) -> dict[str, Any]:
     """The OTLP/HTTP JSON body for one run. Tool span times are ordinal (spread evenly over the run):
-    neither CLI reports per-tool timestamps in these output formats."""
+    neither CLI reports per-tool timestamps in these output formats. The root span carries the agent's
+    final result only with include_result=True (default: no output at all)."""
     key, tid = run.run_key, run.trace_id
     root = span_id(key, "root")
     start, end = run.started_at, run.ended_at
     tmeta = run.trace_metadata()
-    common: dict[str, Any] = {"langfuse.trace.name": f"rsi.{run.kind}.{run.agent}", "langfuse.session.id": run.experiment_id,
+    agent = run.agent if run.agent in AGENTS else "unknown"
+    common: dict[str, Any] = {"langfuse.trace.name": f"rsi.{run.kind}.{agent}", "langfuse.session.id": run.experiment_id,
                               "langfuse.user.id": USER_ID, "langfuse.trace.tags": [run.arm, run.kind],
                               "langfuse.environment": ENV,
                               **{f"langfuse.trace.metadata.{k}": v for k, v in tmeta.items()}}
@@ -592,27 +638,31 @@ def build_spans(run: SandboxRun, dataset_id: str | None = None) -> dict[str, Any
                        "langfuse.experiment.dataset.id": dataset_id,
                        "langfuse.experiment.item.id": dataset_item_id(run.experiment_id, run.case),
                        "langfuse.experiment.item.root_observation_id": root})
-    root_meta = {**tmeta, "run_id": run.run_id, "case": run.case, "rep": run.rep, "kind": run.kind, "agent": run.agent,
+    root_meta = {**tmeta, "run_id": run.run_id, "case": run.case, "rep": run.rep, "kind": run.kind, "agent": agent,
                  "exit_code": run.exit_code, "timed_out": run.timed_out, "duration_s": run.duration_s,
                  "num_turns": run.num_turns}
     error = ("timed out" if run.timed_out else f"exit {run.exit_code}" if run.exit_code not in (0, None)
              else "agent error" if run.is_error else None)
     spans = [_span(root, None, tid, f"rsi.{run.kind}", start, end,
-                   {**common, "langfuse.observation.type": "agent", "langfuse.observation.output": run.result,
+                   {**common, "langfuse.observation.type": "agent",
+                    "langfuse.observation.output": clean_text(run.result) if include_result else None,
                     "langfuse.observation.level": "ERROR" if error else "DEFAULT",
                     **{f"langfuse.observation.metadata.{k}": _meta_value(v) for k, v in root_meta.items()}}, error)]
     for i, g in enumerate(run.generations):
-        spans.append(_span(span_id(key, f"generation/{i}"), root, tid, g.model, start, end, {
-            **common, "langfuse.observation.type": "generation", "langfuse.observation.model.name": g.model,
-            "langfuse.observation.usage_details": json.dumps(g.usage, sort_keys=True),
-            "langfuse.observation.cost_details": json.dumps({"total": g.cost_usd}) if g.cost_usd is not None else None,
-            **{f"langfuse.observation.metadata.{k}": str(v) for k, v in g.extra.items()}}))
+        model, cost = _out_name(g.model), _float(g.cost_usd)
+        spans.append(_span(span_id(key, f"generation/{i}"), root, tid, model, start, end, {
+            **common, "langfuse.observation.type": "generation", "langfuse.observation.model.name": model,
+            "langfuse.observation.usage_details": json.dumps(_counts(g.usage), sort_keys=True),
+            "langfuse.observation.cost_details": json.dumps({"total": cost}) if cost is not None else None,
+            **{f"langfuse.observation.metadata.{k}": str(v) for k, v in _counts(g.extra).items()}}))
     step = (end - start) / len(run.tools) if run.tools else timedelta(0)
     for i, t in enumerate(run.tools):
-        bad = t.status if t.status in TOOL_FAILED else None
-        spans.append(_span(span_id(key, f"tool/{i}"), root, tid, t.name, start + step * i, start + step * (i + 1), {
+        status = t.status if t.status in TOOL_STATUSES else "unknown"
+        bad = status if status in TOOL_FAILED else None
+        spans.append(_span(span_id(key, f"tool/{i}"), root, tid, _out_name(t.name), start + step * i,
+                           start + step * (i + 1), {
             **common, "langfuse.observation.type": "tool", "langfuse.observation.level": "ERROR" if bad else "DEFAULT",
-            "langfuse.observation.metadata.status": t.status}, bad))
+            "langfuse.observation.metadata.status": status}, bad))
     return {"resourceSpans": [{"resource": {"attributes": _attrs({"service.name": "amem-rsi"})},
                                "scopeSpans": [{"scope": {"name": "agent_memory.integrations.langfuse", "version": "1"},
                                                "spans": spans}]}]}
@@ -817,10 +867,10 @@ class UploadResult:
 
 
 def upload_run(run: SandboxRun, client: LangfuseClient, *, datasets: bool = False,
-               exported: bool = False) -> UploadResult:
+               exported: bool = False, include_result: bool = False) -> UploadResult:
     """Send one stored run. Idempotent: spans only when the trace is not in Langfuse yet (and not known as
     exported: `exported` is the caller's Supabase check), scores update in place, dataset and item are
-    get-or-create / upsert by deterministic id."""
+    get-or-create / upsert by deterministic id. include_result: see build_spans (default off)."""
     check(run)
     res = UploadResult(run.trace_id)
     dataset_id = None
@@ -832,7 +882,7 @@ def upload_run(run: SandboxRun, client: LangfuseClient, *, datasets: bool = Fals
                                    {"source": "amem-rsi"})
     res.existed = exported or client.trace_exists(run.trace_id, run.started_at, run.ended_at)
     if not res.existed:
-        body = build_spans(run, dataset_id)
+        body = build_spans(run, dataset_id, include_result=include_result)
         client.export_spans(body)
         res.spans = len(body["resourceSpans"][0]["scopeSpans"][0]["spans"])
     scores = build_scores(run)
