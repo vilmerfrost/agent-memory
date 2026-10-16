@@ -21,7 +21,9 @@ from pathlib import Path
 import pytest
 
 from agent_memory import config
-from conftest import base_env, is_isolated_name, isolated_environ
+from conftest import KEYCHAIN_TRIPWIRE, SECURITY_ENV, base_env, is_isolated_name, isolated_environ
+
+SAFE_NAMES = {"AMEM_NO_DOTENV", SECURITY_ENV}       # set by conftest itself: env files off, Keychain tripwire
 
 TESTS_DIR = Path(__file__).resolve().parent
 CLOUD_NAMES = ("AMEM_SUPABASE_URL", "AMEM_BACKEND", "AMEM_SUPABASE_KEY")
@@ -90,16 +92,18 @@ def test_isolated_environ_drops_every_store_selector() -> None:
         "SUPABASE_ACCESS_TOKEN": "t",
         "HOME": "/home/x",
         "PATH": "/usr/bin",
+        SECURITY_ENV: "/usr/bin/security",
     }
     env = isolated_environ(outer)
-    assert env == {"HOME": "/home/x", "PATH": "/usr/bin", "AMEM_NO_DOTENV": "1"}
+    assert env == {"HOME": "/home/x", "PATH": "/usr/bin", "AMEM_NO_DOTENV": "1", SECURITY_ENV: KEYCHAIN_TRIPWIRE}
 
 
 def test_this_process_holds_no_isolated_names() -> None:
     # Meaningful when the suite itself runs under exported cloud variables
     # (the audit recheck): conftest removed them before collection.
-    assert [k for k in os.environ if is_isolated_name(k) and k != "AMEM_NO_DOTENV"] == []
+    assert [k for k in os.environ if is_isolated_name(k) and k not in SAFE_NAMES] == []
     assert os.environ["AMEM_NO_DOTENV"] == "1"
+    assert os.environ[SECURITY_ENV] == KEYCHAIN_TRIPWIRE
     assert config.backend() == "postgres"
     assert [n for n in CLOUD_NAMES if n in base_env()] == []
 
