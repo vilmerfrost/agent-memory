@@ -266,3 +266,14 @@ def test_two_runs_on_one_day_get_their_own_run_id(monkeypatch: pytest.MonkeyPatc
     runs = [ncm.load_results(tmp_path / "ncm-results" / rid / "results.json") for rid in seen]
     assert [r.run_id for r in runs] == seen
     assert len({ncm.to_evidence(r).ref for r in runs}) == 2                   # no upsert over the first row
+
+
+# ---------------------------------------------------------------- F8: the local copy stays out of git
+
+
+def test_the_local_results_folder_is_ignored_by_git() -> None:
+    if not (ROOT / ".git").exists():
+        pytest.skip("not a git checkout")
+    probe = subprocess.run(["git", "-C", str(ROOT), "check-ignore", "-q", "ncm-results/ncm-20261020-100000-x/results.json"],
+                           capture_output=True, text=True, timeout=30)
+    assert probe.returncode == 0, "main() writes ./ncm-results/<run_id>/ inside the repo: keep it in .gitignore"
