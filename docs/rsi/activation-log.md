@@ -367,3 +367,50 @@ Option A (Vilmer): terminal-only Apply. The phone gets Reject only. No TOTP secr
   keep the connector with full access for now.** T3 stays open (see least-privilege.md).
 - **Undo** (never automatic): delete `amem-decide` (dashboard, or the CLI after `supabase login`); `supabase login`
   undoes A4. The G3 test rows cannot be removed (append-only by design).
+
+## Phase H: real-model sandbox smoke test (2026-10-16 21:14–21:40 CEST), approved in chat
+
+- **Preparation** (no keys, no paid calls): sandbox suite 110/110 on `main` `9c4cb71`. The worker image has
+  Claude Code 2.1.295 (`--max-budget-usd`, `--tools`, no turn limit) and Codex 0.162.0 (no budget flag; its
+  bundled model list includes `gpt-6-luna`, "fast and affordable"). **Fix:** the Keychain credential provider
+  read any item; now only `rsi-sandbox/anthropic` and `rsi-sandbox/openai` (`e569df9`, a safeguard), 111/111.
+- **H1:** `git merge --ff-only e569df9` in `~/Projects/agent-memory` (21:14:36): `main` `9c4cb71` → `e569df9`.
+- **Incident during the H1 suite (21:14–21:16): the tests reached the real Keychain.** Older tests run
+  `amem db migrate`, which reads `amem-admin-db` once it exists (it has since E3). Vilmer clicked
+  **Always Allow** on the dialog, so later reads were silent. Stopped the suite at 21:16:32.
+  - Production checked: 25 migrations, the last at 17:51 UTC (E1); nothing applied since; 28 tables; no new
+    roles; RSI rows unchanged. The test calls only ran `migrate`, which had nothing to apply. The test log holds
+    no connection string.
+  - **Root cause fixed** (`a03e85a`, `d7836a5`, dev branch): every test and every CLI subprocess gets a Keychain
+    tripwire in `AMEM_ADMIN_SECURITY`, never `/usr/bin/security`, unless a test sets its own fake. Guard test
+    `test_tests_never_reach_the_real_keychain`. Re-run: 1451 passed; the 2 env-isolation tests that expected no
+    extra `AMEM_*` name were updated and pass (25/25 in both files). No Keychain dialog appeared.
+  - **Gate restored:** Vilmer ran `restore-credentials`, then `split-credentials` (Deny); item created 21:23:09.
+    `credentials-status` exit 0; the forged-decision probe 11/11 refused; the agent's read was denied (exit 128).
+  - **Not on `main` yet:** `a03e85a` and `d7836a5` (tests only), plus the docs commits after `e569df9`.
+- **H2 (Vilmer):** spend-capped keys in a new Anthropic workspace and a new OpenAI project ($5/month each),
+  stored as Keychain items `rsi-sandbox/anthropic` and `rsi-sandbox/openai`. The secrets popup was not used:
+  it writes env files, and the sandbox refuses env files for real keys.
+- **H3:** synthetic baseline `h-smoke-base` (only `.claude/CLAUDE.md` with `sandbox-ok-claude` and
+  `.codex/AGENTS.md` with `sandbox-ok-codex`), arms A and B prepared (`disableAllHooks` added), `net-up`.
+- **H4, each run 300 s / 1 GB / 1 CPU / 256 pids, task "write your status word to status.txt, reply done":**
+  - **Claude** (arm A, `claude-haiku-5-5`, `--max-budget-usd 0.25`, tools Read and Write): exit 0 in 2.8 s,
+    `is_error` false, 2 turns, **$0.00048**. `status.txt` = `sandbox-ok-claude`.
+  - **Codex, run 1** (`-s workspace-write`): 401 "Incorrect API key". OpenAI saw exactly 128 characters: the
+    `security … -w` prompt had cut the key. No charge. Vilmer re-stored it through a hex pipe (no length limit).
+  - **Codex, run 2** (`-s workspace-write`): exit 0 in 11.5 s, about $0.003. The model ran and named
+    `sandbox-ok-codex`, but every tool write failed ("Failed to write file"); Codex's own `-o` file was written.
+    So Codex's inner sandbox, not the container, blocked it.
+  - **Codex, run 3** (`-s danger-full-access`, approved): exit 0 in 6.6 s, about $0.002 (25,181 input tokens,
+    12,542 cached; 73 output). `status.txt` = `sandbox-ok-codex`, last message "done".
+  - Total spend: about **$0.006**.
+- **Proxy, all runs:** ALLOW only `api.anthropic.com:443` and `api.openai.com:443`. Denied: `chatgpt.com`,
+  `ab.chatgpt.com`, `github.com`, `api.github.com` (Codex at startup; it worked anyway).
+- **Production after H:** 25 migrations; RSI rows unchanged (1 proposal, 1 decision, 1 artifact, 0 eval
+  results, 0 decision results); both repos unchanged; `freeze-status` FROZEN; no sandbox artifact; no
+  promotion job. No A/B capability is claimed: `sandbox-replay` does not exist.
+- **Cleanup:** `cleanup --max-age-hours 0`, `recover`, `net-down`; experiment `h-smoke` and baseline
+  `h-smoke-base` deleted. 0 containers, 0 networks, 0 locks left. The two sandbox keys stay in the Keychain
+  (spend-capped) until Vilmer decides to keep or revoke them.
+- **Docs fixed:** sandbox.md: store long keys through the hex pipe, not the `-w` prompt; Codex needs
+  `-s danger-full-access` in the worker; real-key runs are now verified.

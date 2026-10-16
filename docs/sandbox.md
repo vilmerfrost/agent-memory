@@ -204,10 +204,15 @@ Production flow:
 1. Create a **dedicated sandbox API key** in a separate Anthropic workspace (and an OpenAI
    project for Codex) with a **monthly spend cap**. Never Vilmer's personal OAuth token,
    never `~/.codex/auth.json`.
-2. Store it once in the login Keychain:
-   `security add-generic-password -s rsi-sandbox -a anthropic -w` (prompts for the value).
-3. The runner fetches it per run with `--credentials keychain:rsi-sandbox/anthropic`.
-   The first fetch shows a Keychain access prompt; allow it for `security` only.
+2. Store it once in the login Keychain. **Do not use the `-w` prompt for long keys:** it keeps only the
+   first 128 characters (an OpenAI `sk-proj-` key was cut this way on 2026-10-16 and failed with 401).
+   Copy the key, then pipe it in as hex (`-U` replaces an existing item; the key never reaches argv):
+   `printf 'add-generic-password -U -s rsi-sandbox -a openai -X %s\n' "$(pbpaste | tr -d '\r\n' | xxd -p | tr -d '\n')" | security -i`,
+   then `pbcopy < /dev/null`. Same with `-a anthropic`.
+3. The runner fetches it per run with `--credentials keychain:rsi-sandbox/anthropic` (Codex:
+   `keychain:rsi-sandbox/openai --credential-name CODEX_API_KEY`). An item created by `security` trusts
+   `security`, so the fetch shows no dialog (observed 2026-10-16). Any process as the same user can read it
+   the same way: the spend cap is what bounds a leak.
 4. Rotate the key when an experiment looks wrong. The spend cap bounds the damage of a leak.
 
 ## Cleanup and recovery
@@ -275,14 +280,23 @@ answers on it (a test listener on `0.0.0.0` in the VM netns was reachable from t
 network). `net-up` creates `rsi-internal` with `com.docker.network.bridge.inhibit_ipv4=true`,
 so the bridge has no IP and the worker has no L3 path to the VM. A test guards this.
 
+**Verified with real keys (Mission 003.5 Phase H, 2026-10-16):** spend-capped sandbox keys from the real
+Keychain, a synthetic home whose `CLAUDE.md` / `AGENTS.md` held a status word, 300 s / 1 GB / 1 CPU /
+256 pids per run.
+
+- Claude Code 2.1.295, `claude-haiku-5-5`, `--max-budget-usd 0.25`, tools Read and Write: exit 0 in 2.8 s,
+  2 turns, $0.00048; it wrote exactly `sandbox-ok-claude` to `/work/status.txt`.
+- Codex 0.162.0, `gpt-6-luna`, `model_reasoning_effort=low`, **`-s danger-full-access`**: exit 0 in 6.6 s,
+  about 25k input tokens (half cached) and 73 output; it wrote exactly `sandbox-ok-codex`.
+- **Codex's own sandbox does not work in the worker.** With `-s workspace-write` the model ran and read its
+  `AGENTS.md`, but every tool write failed ("Failed to write file /work/status.txt"), while Codex itself
+  wrote its `-o` file to the same dir. Use `-s danger-full-access` inside the container: the container and
+  the proxy are the boundary (everything above still applies).
+- Proxy, all runs: ALLOW only `api.anthropic.com` / `api.openai.com`; Codex's `chatgpt.com`,
+  `ab.chatgpt.com`, `github.com` and `api.github.com` were denied, and it still worked.
+
 **Not verified:**
 
-- A real model run with a real key (out of scope: no real credential may enter the sandbox yet).
-- The Keychain provider against the real Keychain (built and unit-tested with a fake runner only).
-- Codex's own sandbox (`-s workspace-write`, Landlock/seccomp) inside the container: the dummy-key
-  run fails at auth before any command runs. Without user namespaces it may refuse to run
-  commands; the container is the real boundary, so `-s danger-full-access` inside it is a valid
-  choice. To be decided with the first real Codex experiment.
 - Kernel or Docker Desktop escapes, and side channels. Not tested; see limits.
 - IPv6 paths: the networks are IPv4-only and the worker has no IPv6 route; not probed further.
 
