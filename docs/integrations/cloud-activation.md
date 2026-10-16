@@ -25,13 +25,24 @@ Recommended order:
 
 | Step | Who | What | Accept | Undo |
 |---|---|---|---|---|
-| G-CH1 | owner | Activate the $5,000 Startup credits. Create one **Basic** service in AWS **eu-central-1** or **eu-west-1**. Set spend alerts at 50/75/90/100%. Note the credits' expiry date (Billing page). | service idles; the Billing page shows credits | delete the service |
-| G-CH2 | owner | IP access list: only the Mac's public IPv4 (the default is "anywhere"). | a request from another network is refused | edit the list |
-| G-CH3 | owner | SQL console: paste the output of `amem sync schema --sink clickhouse --cloud`. Set the `amem_writer` password (12+ characters, mixed case, a digit or symbol) in the CREATE USER line first. | 9 tables exist in `amem`; `amem_writer` has SELECT, INSERT only | `DROP DATABASE amem; DROP USER amem_writer` |
+| G-CH1 | owner approves; owner or agent clicks | In the **existing** org (BatchCortex: Scale plan, card on file): no new org, no second trial, no plan change. Create one dedicated service `amem-rsi` in AWS **eu-west-1**: Custom configuration, vertical autoscaling, **1 replica, 8 GiB min and 8 GiB max**. Then Settings › Scaling: idle after **5 min**. Billing › Actions › Add spend alerts: one amount (**$10**; alerts at 50/75/90/100%). | the service is Idle; Billing shows both credit grants unchanged and one spend alert; `My first service` untouched | delete `amem-rsi`; remove the alert |
+| G-CH2 | owner | IP access list of `amem-rsi` only: the Mac's public IPv4 (IPv4 only; the default is "anywhere"). | a request from another network is refused | edit the list |
+| G-CH3 | owner | SQL console: paste the output of `amem sync schema --sink clickhouse --cloud`. Set the `amem_writer` password (12+ characters with an uppercase letter, a lowercase letter, a digit and a special character) in the CREATE USER line first. | 9 tables exist in `amem`; `amem_writer` has SELECT, INSERT only | `DROP DATABASE amem; DROP USER amem_writer` |
 | G-CH4 | agent (popup) | `request_secret`: `AMEM_CLICKHOUSE_URL` (`https://<host>:8443`), `AMEM_CLICKHOUSE_USER=amem_writer`, `AMEM_CLICKHOUSE_KEY`, and `AMEM_PSEUDONYM_KEY` (the owner makes it with `openssl rand -hex 32`; it never leaves the Mac) | `amem evidence query --source ch rule_gap` answers `ok` with 0 refs | remove the four keys |
 | G-CH5 | agent | Verification C1 (disposable Postgres, synthetic rows) | every C1 criterion | `TRUNCATE` the tables |
 | G-CH6 | owner approves | Review `amem sync plan --sink clickhouse --replay`, then run the real backfill once: `amem sync run --sink clickhouse --replay --budget 600` | `amem sync verify --sink clickhouse --days 30` shows parity; Usage under $1 | `TRUNCATE` the tables; `AMEM_SYNC_CLICKHOUSE=off` |
 | later | owner approves | A daily sync (not every 15 min: that keeps the service awake) | — | — |
+
+**Account state 2026-10-17 (read-only check of the console, no changes):** org BatchCortex, plan Scale, card
+on file, next billing period 2026-11-01. Credits: Startup Program $5,000, Active, valid 2026-10-16 to
+2027-10-16, used $0; Trial $300, Active, valid 2026-10-06 to 2026-11-06, used $0.43 (remaining
+$299.57). Gross usage since 2026-10-06: $0.43 (compute of `My first service`), all covered by Trial credits,
+billable $0.00. The docs say trial credits are drawn first until they run out or expire; the order between
+the two grants is not documented beyond that. After both, usage is charged to the card: there is no hard cap.
+No spend alert exists. One existing service, `My first service` (AWS eu-west-1, 2 replicas, 16-120 GiB,
+idle after 15 min, IP list "anywhere", Idle): not used by amem and not changed by this plan. Scale compute
+in eu-west-1 is about $0.333 per 8 GiB-hour (us-west-2 $0.29846 times the eu-west-1/us-west-2 ratio of the
+Enterprise rates); `amem-rsi` costs that only while awake.
 
 ## Langfuse Cloud EU
 
