@@ -317,6 +317,7 @@ grant insert, update (status, change_id, result, meta, promoted_at, reverted_at)
 revoke all on function public.amem_rsi_record_decision(uuid, text, text, text) from public;
 revoke all on function public.amem_rsi_record_cli_decision(uuid, text, text, text) from public;
 revoke all on function public.rsi_insert_decision(public.rsi_proposals, text, text, text, text) from public;
+revoke all on function public.rsi_immutable() from public;
 
 -- RLS on everywhere; read policies for the two automation roles; the Supabase API roles get nothing.
 do $$
@@ -348,10 +349,14 @@ begin
   end loop;
 end $$;
 
+-- Supabase grants every new table and function to anon, authenticated and service_role BY NAME (default
+-- privileges), so `revoke ... from public` is not enough. The API roles get nothing on the RSI tables or
+-- functions. service_role (the edge function) gets exactly one thing: execute on amem_rsi_record_decision,
+-- which checks the token in SQL and runs as the owner. No direct table access, and no CLI decision path.
 do $$
 declare r text; t text;
 begin
-  foreach r in array array['anon', 'authenticated'] loop
+  foreach r in array array['anon', 'authenticated', 'service_role'] loop
     if exists (select 1 from pg_roles where rolname = r) then
       foreach t in array array['rsi_experiments', 'rsi_candidates', 'rsi_evidence', 'rsi_artifacts', 'rsi_eval_results',
                                'rsi_proposals', 'rsi_decision_tokens', 'rsi_decisions', 'rsi_decision_results',
@@ -360,6 +365,8 @@ begin
       end loop;
       execute format('revoke all on function public.amem_rsi_record_decision(uuid, text, text, text) from %I', r);
       execute format('revoke all on function public.amem_rsi_record_cli_decision(uuid, text, text, text) from %I', r);
+      execute format('revoke all on function public.rsi_insert_decision(public.rsi_proposals, text, text, text, text) from %I', r);
+      execute format('revoke all on function public.rsi_immutable() from %I', r);
     end if;
   end loop;
   if exists (select 1 from pg_roles where rolname = 'service_role') then

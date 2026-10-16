@@ -68,3 +68,27 @@ commits them (`bin/improve:953`). That made commit `e125603` (ledger only, 5 lin
   `scored=` and `deviations=`, and no `edits=` field.
 
 **Undo:** "Undo the freeze" in [freeze.md](freeze.md), using the backup above.
+
+## Phase C preparation (2026-10-16, before approval)
+
+A grant gap was found and fixed in the dev branch, before the migration was applied anywhere. Hosted
+Supabase grants every new table and function to `anon`, `authenticated` and `service_role` **by name**
+(`pg_default_acl`), so the migration's `revoke ... from public` was not enough:
+- `service_role` kept `ALL` on all `rsi_*` tables, including insert on `rsi_decisions` and
+  `rsi_decision_tokens`;
+- `service_role` kept execute on `amem_rsi_record_cli_decision`. The service key could record a
+  "terminal" decision;
+- `anon` and `authenticated` kept execute on `rsi_insert_decision` (invoker rights, so the table
+  revokes blocked it).
+
+The fix revokes everything from all three API roles. It grants `service_role` only execute on
+`amem_rsi_record_decision`. A new test recreates Supabase's default privileges on a scratch
+database. It failed before the fix and passes after it. [verify_rsi_core.sql](verify_rsi_core.sql)
+is the reviewed post-migration check; it leaves nothing behind (ROLLBACK). Suite: 1432 passed.
+
+Hosted baseline before the migration:
+- 22 migrations; `rsi_core` not applied;
+- security advisors: INFO only (16 tables with RLS and no policy, the intended lockdown);
+- `anon` and `authenticated` can read 0 of 16 tables; `service_role` can read 16 of 16;
+- 0 policies;
+- the latest physical backup is 2026-10-16 03:44 UTC; PITR is off.

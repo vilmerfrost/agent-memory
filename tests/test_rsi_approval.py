@@ -604,3 +604,53 @@ def test_rollback_sql_reverses_the_migration_and_it_reapplies(pg_url: str) -> No
     finally:
         with psycopg.connect(pg_url, autocommit=True) as conn:
             conn.execute("drop database if exists rsi_rollback with (force)")
+
+
+def test_supabase_api_roles_get_nothing_but_the_phone_function(pg_url: str) -> None:
+    """Hosted Supabase grants every new table and function to anon, authenticated and service_role by name
+    (default privileges). Recreate that on a scratch database, migrate, and check what each API role can do."""
+    roles = ("anon", "authenticated", "service_role")
+    with psycopg.connect(pg_url, autocommit=True) as conn:
+        conn.execute("drop database if exists rsi_supabase")
+        conn.execute("create database rsi_supabase")
+        for r in roles:
+            conn.execute(f"do $$ begin if not exists (select 1 from pg_roles where rolname = '{r}') then create role {r} nologin; end if; end $$")
+    url = pg_url.rsplit("/", 1)[0] + "/rsi_supabase"
+    try:
+        with psycopg.connect(url, autocommit=True) as conn:
+            for kind in ("tables", "functions", "sequences"):
+                conn.execute(f"alter default privileges in schema public grant all on {kind} to anon, authenticated, service_role")
+        assert subprocess.run([AMEM, "db", "migrate"], env=base_env(AMEM_DB_URL=url), capture_output=True).returncode == 0
+        with psycopg.connect(url) as conn:
+            tables = [r[0] for r in conn.execute("select tablename from pg_tables where tablename like 'rsi\\_%%'")]
+            assert len(tables) == 10
+            for r in roles:
+                for t in tables:
+                    for priv in ("select", "insert", "update", "delete", "truncate"):
+                        assert not conn.execute("select has_table_privilege(%s, %s, %s)", (r, f"public.{t}", priv)).fetchone()[0], (r, t, priv)
+            fns = {"amem_rsi_record_decision(uuid,text,text,text)": {"service_role"},
+                   "amem_rsi_record_cli_decision(uuid,text,text,text)": set(),
+                   "rsi_insert_decision(public.rsi_proposals,text,text,text,text)": set(),
+                   "rsi_immutable()": set()}
+            for fn, allowed in fns.items():
+                for r in roles:
+                    can = conn.execute("select has_function_privilege(%s, %s, 'execute')", (r, f"public.{fn}")).fetchone()[0]
+                    assert can == (r in allowed), (r, fn, can)
+            for r in ("rsi_reader", "rsi_writer"):                       # the automation roles: no decision path
+                assert not conn.execute("select has_table_privilege(%s, 'public.rsi_decisions', 'insert')", (r,)).fetchone()[0]
+                for fn in ("amem_rsi_record_decision(uuid,text,text,text)", "amem_rsi_record_cli_decision(uuid,text,text,text)"):
+                    assert not conn.execute("select has_function_privilege(%s, %s, 'execute')", (r, f"public.{fn}")).fetchone()[0], (r, fn)
+        notices: list[str] = []                                          # the reviewed post-migration check
+        with psycopg.connect(url, autocommit=True) as conn:
+            conn.add_notice_handler(lambda d: notices.append(d.message_primary))
+            conn.execute((Path(__file__).resolve().parents[1] / "docs" / "rsi" / "verify_rsi_core.sql").read_text())
+            assert "rsi_core verify: OK" in notices
+            assert conn.execute("select count(*) from rsi_artifacts").fetchone() == (0,)     # rolled back
+        with psycopg.connect(url) as conn:                               # the phone function still works as service_role
+            conn.execute("set role service_role")
+            assert conn.execute("select amem_rsi_record_decision(gen_random_uuid(), 'apply', %s, %s)", ("0" * 64, "x" * 30)).fetchone()[0] in ("missing", "denied")
+    finally:
+        with psycopg.connect(pg_url, autocommit=True) as conn:
+            conn.execute("drop database if exists rsi_supabase with (force)")
+            for r in roles:
+                conn.execute(f"drop role if exists {r}")
