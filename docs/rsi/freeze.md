@@ -1,10 +1,11 @@
-# Production freeze procedure (prepared, NOT executed)
+# Production freeze procedure
 
 Goal: stop **autonomous improvement writes** (W1–W4 in [writers.md](writers.md)). Ingestion,
 observation, scoring, the deviation scan and every protective rollback (P1–P7) keep running.
 
-Status on 2026-10-16: not executed. It needs Vilmer's approval. Three steps, about 5 minutes. All
-of them use controls that already exist, so no new code has to be merged first.
+Status: **executed 2026-10-16 18:10–18:13 CEST** after Vilmer's approval (commits `afcb14a`,
+`319fe0a`; record in [activation-log.md](activation-log.md)). All steps use controls that already
+exist, so no new code had to be merged first.
 
 **Deadline:** before **2026-10-17 09:20** (the next `amem-daily` with live edits), and before
 2026-10-18 08:00 (`workflow-improve-weekly`).

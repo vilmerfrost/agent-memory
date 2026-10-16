@@ -4,10 +4,8 @@ Mission 003 built and tested everything below. **None of it is active.** Each st
 production, so each one needs your explicit approval when you run it. Do them in order. Stop at any
 failed check.
 
-Status on 2026-10-16:
-- Production is **not frozen**. `amem rsi freeze-status` prints `NOT FROZEN`.
-- The existing automatic writers are still active: amem-daily edits (W1, daily 09:20), improve via
-  amem-daily (W2), and the `ab-lessons-monthly` desktop task (W3). See [writers.md](writers.md).
+Status: step 1 (freeze) done on 2026-10-16. `amem rsi freeze-status` prints `FROZEN`. Every other
+step is still open. Progress and evidence: [activation-log.md](activation-log.md).
 
 ## Checklist
 
