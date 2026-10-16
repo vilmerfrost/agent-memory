@@ -124,3 +124,15 @@ Hosted baseline before the migration:
   FAIL line. It upserted 4 sessions active after the migration, on the new schema, with the main code.
 - **Undo**, if ever needed (never run automatically): revert the code first (Phase D), export `rsi_*`,
   then run [rollback_rsi_core.sql](rollback_rsi_core.sql).
+
+## Phase D preparation (2026-10-16, no production change)
+
+- agent-config: `main` (`319fe0a`) and `rsi/m003-stage` change disjoint files, so the trial merge is clean.
+  - The legacy `improve e2e` failed with `IndexError`, on frozen `main` as well. The cause: it copied the
+    production `criteria.json` (cap 0) into its sandbox.
+  - Fix `d7c6ea8`: the e2e pins its sandbox criteria (no cap, legacy mode). The assertions are unchanged.
+  - On the trial merge (`63232f7`): selftest pass, e2e-promote 30/30, e2e 49/49, e2e 49/49 again with
+    `apply_mode: "stage"`, ab-lesson selftest 11/11.
+  - With the merged code and the frozen criteria, `apply --dry-run` is still refused (weekly cap).
+- agent-memory: `main` (`32ea623`) is an ancestor of `rsi/m003-integration`, so the merge is a
+  fast-forward. Full suite on `601ca55` with the merged improve: 1432 passed. Edge function: 7/7.
