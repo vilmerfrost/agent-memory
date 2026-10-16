@@ -216,3 +216,15 @@ def test_a_failed_volume_commit_is_a_limitation(monkeypatch: pytest.MonkeyPatch,
     run = ncm.parse_results(mod.evaluate.local(RUN_ID, EXP))                  # returned, not raised
     assert run.status == "ok"
     assert "the Modal Volume commit failed (RuntimeError): only the local copy is certain" in run.limitations
+
+
+def test_a_timed_out_evaluation_logs_text_not_bytes(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """subprocess.run(text=True) still puts raw bytes on TimeoutExpired.stdout/stderr (POSIX)."""
+    expired = subprocess.TimeoutExpired(["python", "evaluate.py"], 480, output=b"shard 1/4 done\n",
+                                        stderr=b"warn: slow \xff\n")
+    mod = in_container(monkeypatch, tmp_path, expired)
+    run = ncm.parse_results(mod.evaluate.local(RUN_ID, EXP))
+    assert run.status == "failed" and run.reason == "evaluate.py timed out" and run.metrics == {}
+    assert "evaluation stopped at the 480s cap" in run.limitations
+    log = (tmp_path / RUN_ID / "evaluate.log").read_text()
+    assert log == "timed out after 480s\nshard 1/4 done\n\n--- stderr ---\nwarn: slow �\n"

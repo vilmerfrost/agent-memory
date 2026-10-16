@@ -86,6 +86,10 @@ def _run(cmd: list[str], cwd: str = "/ncm", timeout: int = STEP_TIMEOUT_S) -> su
     return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout)
 
 
+def _text(output: bytes | str | None) -> str:
+    return output.decode("utf-8", "replace") if isinstance(output, bytes) else output or ""
+
+
 @app.function(image=image, gpu=GPU, timeout=TIMEOUT_S, startup_timeout=STARTUP_TIMEOUT_S,
               scaledown_window=SCALEDOWN_S, max_containers=MAX_CONTAINERS, retries=0, region=REGION,
               volumes={RESULTS_DIR: volume}, block_network=True)
@@ -102,9 +106,9 @@ def evaluate(run_id: str, experiment_id: str | None) -> dict:
         proc = _run(W.EVAL_COMMAND.format(out=out).split(), timeout=EVAL_TIMEOUT_S)
         stdout, code = proc.stdout, proc.returncode
         log = proc.stdout + "\n--- stderr ---\n" + proc.stderr
-    except subprocess.TimeoutExpired as exc:
+    except subprocess.TimeoutExpired as exc:   # its stdout/stderr are raw bytes even with text=True
         stdout, code = "", None
-        log = f"timed out after {EVAL_TIMEOUT_S}s\n{exc.stdout or ''}"
+        log = f"timed out after {EVAL_TIMEOUT_S}s\n{_text(exc.stdout)}\n--- stderr ---\n{_text(exc.stderr)}"
         extra.append(f"evaluation stopped at the {EVAL_TIMEOUT_S}s cap")
     pathlib.Path(out, "evaluate.log").write_text(log[-200_000:])
     res = W.build_results(run_id=run_id, experiment_id=experiment_id, stdout=stdout, exit_code=code,
