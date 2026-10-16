@@ -106,4 +106,4 @@ and can read the superuser `AMEM_DB_URL` can insert a decision row. What stops a
 
 The full fix is a least-privilege login role for the worker (member of `rsi_writer`, no insert on
 `rsi_decisions`). The roles exist. Creating the login and moving the worker to it are activation
-steps ([activation.md](activation.md), step 6).
+steps ([activation.md](activation.md), step 7).

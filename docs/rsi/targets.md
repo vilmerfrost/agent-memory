@@ -56,7 +56,7 @@ Each step checks the file's SHA-256 against the plan first, and stops if the fil
 runs both scripts on a fixture HOME and proves an exact round trip.
 
 Running `apply.sh` on the real HOME relinks live global instructions. That needs separate approval
-(activation step 4).
+(activation step 5).
 
 ## Freeze check (`amem rsi freeze-status`)
 
