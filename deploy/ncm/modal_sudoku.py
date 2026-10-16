@@ -101,7 +101,9 @@ def evaluate(run_id: str, experiment_id: str | None) -> dict:
     commit = _run(["git", "rev-parse", "HEAD"]).stdout.strip()
     sha = _run(["sha256sum", *W.CHECKPOINT_FILES], cwd="/ncm/artifacts").stdout
     sha += _run(["sha256sum", *W.DATASET_FILES], cwd="/ncm/data").stdout
-    extra: list[str] = []
+    freeze = _run(["python", "-m", "pip", "freeze"]).stdout                # the whole environment, beyond W.PIP
+    pathlib.Path(out, "pip-freeze.txt").write_text(freeze)
+    extra: list[str] = [W.freeze_line(freeze)]
     try:
         proc = _run(W.EVAL_COMMAND.format(out=out).split(), timeout=EVAL_TIMEOUT_S)
         stdout, code = proc.stdout, proc.returncode

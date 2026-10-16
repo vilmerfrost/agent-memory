@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import json
+import re
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -78,6 +80,18 @@ def test_a_given_failure_wins_over_everything_else() -> None:
     assert run.status == "failed" and run.metrics == {}                       # the stdout row is ignored
     assert run.reason == "the Modal call raised RemoteError: container lost"   # one line
     assert len(build(failure="x" * 900)["reason"]) == 300
+
+
+def test_the_eval_environment_is_pinned_exactly() -> None:
+    names = {p.split("==")[0] for p in W.PIP}
+    assert all(re.fullmatch(r"[A-Za-z0-9_.-]+==\d[0-9A-Za-z.]*", p) for p in W.PIP), W.PIP   # no ranges, no extras
+    assert {"torch", "transformers", "huggingface_hub", "hydra-core", "omegaconf"} <= names
+    assert W.build_commands()[1] == "pip install " + " ".join(W.PIP)
+    freeze = "torch==2.8.0\ntransformers==4.57.1\n"
+    line = W.freeze_line(freeze)
+    assert line == f"pip freeze sha256 {hashlib.sha256(freeze.encode()).hexdigest()} (pip-freeze.txt in the run folder)"
+    assert W.freeze_line("") == W.freeze_line(" \n") == "pip freeze was not recorded"
+    assert line in ncm.parse_results(build(extra_limitations=[line])).limitations   # fits the contract
 
 
 def test_parsers_and_cost() -> None:

@@ -20,6 +20,7 @@ region-selection docs, 2026-10-16). `usd` here is that arithmetic over the funct
 
 from __future__ import annotations
 
+import hashlib
 import re
 from collections.abc import Mapping, Sequence
 from typing import Any
@@ -38,8 +39,11 @@ DATASET_FILES = {"sudoku/easy/puzzles.pickle": "403353dd5d11e49d42627aee84c7b1ce
 PINNED_SHA256 = {**CHECKPOINT_FILES, **DATASET_FILES}
 GPU_USD_PER_S = {"T4": 0.000164, "L4": 0.000222, "A10": 0.000306}
 REGION_MULTIPLIER = {"": 1.0, "eu": 1.15}
-PIP = ("torch==2.8.0", "numpy", "omegaconf", "hydra-core", "transformers>=4.51", "huggingface_hub[cli]", "regex",
-       "rouge_score", "sacrebleu")
+# Exact pins (Mission 004C), chosen offline: the image build is their first check. The repo pins nothing and asks
+# for transformers>=4.51; 4.57.1 is the 4.x line, which needs huggingface_hub<1.0 (0.35.x ships the `hf` CLI and has
+# a `cli` extra only for interactive prompts, so none is asked for). pip freeze in the container records the rest.
+PIP = ("torch==2.8.0", "numpy==2.2.6", "omegaconf==2.3.0", "hydra-core==1.3.2", "transformers==4.57.1",
+       "huggingface_hub==0.35.3", "regex==2024.11.6", "rouge_score==0.1.2", "sacrebleu==2.5.1")
 EVAL_COMMAND = ("python evaluate.py --config config/eval/sudoku-easy.yaml --checkpoint-dir artifacts/sudoku/easy "
                 "--data-dir data/sudoku/easy --gpus 0 --out {out}")
 SUDOKU_RE = re.compile(r"solved %\s+solved\s+cell %\s+valid %\s*\n\s*([\d.]+)\s+(\d+)/(\d+)\s+([\d.]+)\s+([\d.]+)")
@@ -47,7 +51,7 @@ _SHA_LINE = re.compile(r"^([0-9a-f]{64})\s+\*?(\S+)$")
 _GPU_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9 ._-]{0,40}")
 LIMITATIONS = (
     "metrics are read from stdout, rounded to 0.01%",
-    "torch==2.8.0 is our pin; the repo pins no versions",
+    "every pip version is our pin (ncm_worker.PIP); the repo pins none",
     "no seeds are set; sudoku decoding is greedy, so only GPU kernel differences can change results",
     "usd is per-second price arithmetic over wall time, not the provider's bill",
 )
@@ -57,13 +61,21 @@ def build_commands(out: str = "/results/<run_id>") -> list[str]:
     """The exact commands, in order: image build (clone, pins, downloads), then the GPU step."""
     return [
         f"git clone {REPO} /ncm && git -C /ncm checkout {REPO_COMMIT}",
-        "pip install " + " ".join(f'"{p}"' if ">" in p or "[" in p else p for p in PIP),
+        "pip install " + " ".join(PIP),                                      # exact pins: nothing to quote
         f"hf download {CHECKPOINT_REPO} {' '.join(CHECKPOINT_FILES)} sudoku/easy/config.yaml "
         f"--revision {CHECKPOINT_REVISION} --local-dir /ncm/artifacts",
         f"hf download {DATASET_REPO} {' '.join(DATASET_FILES)} --repo-type dataset "
         f"--revision {DATASET_REVISION} --local-dir /ncm/data",
         "cd /ncm && " + EVAL_COMMAND.format(out=out),
     ]
+
+
+def freeze_line(freeze_text: str) -> str:
+    """One `limitations` line that names the container's whole Python environment by the hash of `pip freeze`.
+    (results.json has no field for it; the freeze itself is pip-freeze.txt next to results.json.)"""
+    if not (freeze_text or "").strip():
+        return "pip freeze was not recorded"
+    return f"pip freeze sha256 {hashlib.sha256(freeze_text.encode()).hexdigest()} (pip-freeze.txt in the run folder)"
 
 
 def parse_sudoku(stdout: str) -> dict[str, float] | None:

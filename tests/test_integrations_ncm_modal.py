@@ -168,6 +168,7 @@ def test_a_raising_modal_call_still_writes_a_failed_results_file(monkeypatch: py
 
 RUN_ID = "ncm-20261020-010203-sudoku-easy"
 METRICS_ROW = "solved %   solved  cell %  valid %\n    99.50 1990/2000   99.91   100.00\n"
+FREEZE = "".join(f"{p}\n" for p in W.PIP)
 
 
 def fake_run(evaluation: str | BaseException) -> Any:
@@ -179,6 +180,8 @@ def fake_run(evaluation: str | BaseException) -> Any:
             out = W.REPO_COMMIT + "\n"
         elif cmd[0] == "sha256sum":
             out = "".join(f"{W.PINNED_SHA256[f]}  {f}\n" for f in cmd[1:])
+        elif cmd == ["python", "-m", "pip", "freeze"]:
+            out = FREEZE
         elif cmd[:2] == ["python", "evaluate.py"]:
             if isinstance(evaluation, BaseException):
                 raise evaluation
@@ -208,6 +211,9 @@ def test_an_ok_evaluation_writes_and_commits(monkeypatch: pytest.MonkeyPatch, tm
     assert run.status == "ok" and run.metrics["solved_rate"] == 0.995 and mod.volume.commits == 1
     assert ncm.load_results(tmp_path / RUN_ID / "results.json") == run
     assert run.commands[-1].endswith(f"--out {tmp_path / RUN_ID}")
+    assert (tmp_path / RUN_ID / "pip-freeze.txt").read_text() == FREEZE      # F6: the environment, by hash
+    assert W.freeze_line(FREEZE) in run.limitations
+    assert ("pip_install", tuple(W.PIP)) in mod.image.layers
 
 
 def test_a_failed_volume_commit_is_a_limitation(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

@@ -65,3 +65,8 @@ billed on max(request, usage)); the `eu` region multiplies everything by 1.15:
 The script sets no CPU or memory limit, so the last two rows are an assumption: 4 cores and 12 GiB would
 still stay under $0.25. `tests/test_integrations_ncm_worker.py` recomputes this table from the script's
 constants. If sudoku-easy needs more than 480 s of evaluation, the run is `failed` ("evaluate.py timed out").
+
+Environment: every pip package is pinned exactly in `ncm_worker.PIP` (torch 2.8.0, transformers 4.57.1,
+huggingface_hub 0.35.3, hydra-core 1.3.2, omegaconf 2.3.0, numpy, regex, rouge_score, sacrebleu). The pins were
+chosen offline; the image build (no GPU) is their first check. The GPU function also writes `pip-freeze.txt`
+next to results.json and puts its sha256 in `limitations` (results.json has no field for it).
