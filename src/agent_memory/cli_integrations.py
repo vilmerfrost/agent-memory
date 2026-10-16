@@ -8,15 +8,15 @@
 Not wired into any routine. An adapter without its settings (URL, keys) answers `unavailable`, so these
 commands cannot send anything before activation (docs/integrations/activation.md).
 
-Adapters load lazily through ADAPTERS, so one missing or broken adapter never breaks the others. Each adapter
-module exposes `sink_from_env()` and/or `retriever_from_env()`; ClickHouse also `verify(conn, days)`.
+Adapters load lazily (the factories below import on use), so one missing or broken adapter never breaks the
+others. Each factory builds the adapter from its env settings; unset settings mean `unavailable`.
 """
 
 from __future__ import annotations
 
 import argparse
-import importlib
 import json
+import os
 import sys
 from typing import Any
 
@@ -25,14 +25,33 @@ import psycopg
 from agent_memory import store
 from agent_memory.integrations import evidence as E, sync
 
-# name -> module; source code -> name
-ADAPTERS = {"clickhouse": "agent_memory.integrations.clickhouse", "langfuse": "agent_memory.integrations.langfuse",
-            "pastdev": "agent_memory.integrations.pastdev"}
 SOURCE_ADAPTER = {"ch": "clickhouse", "lf": "langfuse", "pd": "pastdev"}
 
 
-def _module(name: str) -> Any:
-    return importlib.import_module(ADAPTERS[name])
+def sink_for(name: str) -> sync.Sink:
+    if name == "clickhouse":
+        from agent_memory.integrations import clickhouse
+        return clickhouse.ClickHouseSink()
+    if name == "langfuse":
+        from agent_memory.integrations import langfuse
+        return langfuse.LangfuseSink(langfuse.LangfuseClient.from_env(), os.environ.get("RSI_SANDBOX_DIR") or None)
+    if name == "pastdev":
+        from agent_memory.integrations import pastdev
+        return pastdev.sink_from_env()
+    raise KeyError(name)
+
+
+def retriever_for(name: str) -> E.Retriever:
+    if name == "clickhouse":
+        from agent_memory.integrations import clickhouse
+        return clickhouse.ClickHouseRetriever()
+    if name == "langfuse":
+        from agent_memory.integrations import langfuse
+        return langfuse.LangfuseRetriever(langfuse.LangfuseClient.from_env())
+    if name == "pastdev":
+        from agent_memory.integrations import pastdev
+        return pastdev.retriever_from_env()
+    raise KeyError(name)
 
 
 def _out(args: argparse.Namespace, obj: Any, line: str, code: int = 0) -> int:
@@ -42,8 +61,8 @@ def _out(args: argparse.Namespace, obj: Any, line: str, code: int = 0) -> int:
 
 def cmd_sync_run(args: argparse.Namespace) -> int:
     try:
-        sink = _module(args.sink).sink_from_env()
-    except (ImportError, AttributeError) as exc:
+        sink = sink_for(args.sink)
+    except (ImportError, AttributeError, KeyError) as exc:
         print(f"amem: sync run: adapter {args.sink} not available: {type(exc).__name__}", file=sys.stderr)
         return 2
     try:
@@ -70,21 +89,23 @@ def cmd_sync_status(args: argparse.Namespace) -> int:
 
 def cmd_sync_verify(args: argparse.Namespace) -> int:
     try:
-        mod = _module(args.sink)
-        verify = mod.verify
-        sink = mod.sink_from_env()
-    except (ImportError, AttributeError):
+        from agent_memory.integrations import clickhouse
+    except ImportError:
         print(f"amem: sync verify: no verify for {args.sink}", file=sys.stderr)
         return 2
+    from agent_memory.integrations import http
+    if not clickhouse.ClickHouseSink().health().ok:
+        print(f"amem: sync verify: {args.sink} unavailable", file=sys.stderr)
+        return 1
     try:
         with store.connect() as conn:
-            rep = verify(conn, args.days, sink=sink)
-    except psycopg.Error as exc:
+            rep = clickhouse.verify(conn, args.days)
+    except (psycopg.Error, http.HttpError, ValueError) as exc:
         print(f"amem: sync verify failed: {type(exc).__name__}", file=sys.stderr)
         return 1
-    obj = rep if isinstance(rep, dict) else rep.__dict__
-    return _out(args, obj, f"sync verify {args.sink}: parity={obj.get('parity')} days={args.days}",
-                0 if obj.get("parity") else 1)
+    obj = rep.to_json()
+    return _out(args, obj, f"sync verify {args.sink}: parity={obj.get('parity')} days={args.days} "
+                           f"mismatches={len(rep.mismatches())}", 0 if rep.parity else 1)
 
 
 def _params(pairs: list[str]) -> dict[str, str]:
@@ -107,8 +128,8 @@ def cmd_evidence_query(args: argparse.Namespace) -> int:
         r: Any = E.SupabaseRetriever(store.connect)
     else:
         try:
-            r = _module(SOURCE_ADAPTER[args.source]).retriever_from_env()
-        except (ImportError, AttributeError) as exc:
+            r = retriever_for(SOURCE_ADAPTER[args.source])
+        except (ImportError, AttributeError, KeyError) as exc:
             print(f"amem: evidence query: source {args.source} not available: {type(exc).__name__}", file=sys.stderr)
             return 2
     res = E.run_query(r, args.query, params)
