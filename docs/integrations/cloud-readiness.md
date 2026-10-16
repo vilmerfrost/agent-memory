@@ -186,7 +186,7 @@ first (G-*-5). Recurring sync stays off.
 
 ## E. Shared intelligence
 
-`amem evidence ask <question>` answers the brief's six questions:
+`amem evidence ask <question>` answers the brief's six questions, plus one added in Mission 004C:
 - recurring_failures
 - best_combinations
 - attempted_before
