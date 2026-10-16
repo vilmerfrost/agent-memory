@@ -970,6 +970,7 @@ _PICK_SQL = """
 select s.* from sessions s
 where s.scanned_at is null
   and s.kind <> 'eval'
+  and coalesce(s.env, 'prod') <> 'sandbox'
   and s.transcript_bytes >= %(min_bytes)s
   and coalesce((s.meta ->> 'tool_calls')::int, 0) + coalesce((s.meta ->> 'prompts')::int, 0) >= %(min_activity)s
   and coalesce(s.started_at, s.created_at) >= %(since)s

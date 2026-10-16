@@ -59,6 +59,7 @@ from agent_memory import (
 from agent_memory.sessions_ingest import agent_config_dir
 
 LIVE_ENV = "AMEM_EDITS_LIVE"
+STAGE_ENV = "AMEM_EDITS_MODE"   # "stage" = RSI V1 approval-first: improve stage + a proposal, never improve apply
 IMPROVE_ENV = "AMEM_IMPROVE_BIN"
 VERDICTS = ("edit_instruction", "enforce")
 DEFAULT_MIN_CONFIDENCE = 0.6
@@ -69,6 +70,12 @@ IMPROVE_STATUSES = ("kept", "trial", "auto-reverted", "refused")
 # Exit codes the contract allows per status (auto-reverted: 0; today's improve exits 1).
 _EXIT_OK = {"kept": {0}, "trial": {0}, "auto-reverted": {0, 1}, "refused": {2}}
 REASON_MAX = 300
+
+
+def stage_mode() -> bool:
+    """AMEM_EDITS_MODE=stage: the edit becomes a staged proposal (docs/rsi/approval.md); production is untouched."""
+    config.load_env()
+    return os.environ.get(STAGE_ENV, "").strip() == "stage"
 
 
 def live() -> bool:
@@ -408,6 +415,7 @@ class Report:
                     + (f" deferred={self.deferred}" if self.deferred else ""))
         return (f"edits: edits={self.edits} kept={self.kept} reverted={self.reverted} refused={self.count('refused')} "
                 f"suggested={self.suggested} skipped={self.count('skipped')} errors={self.errors}"
+                + (f" staged={self.count('staged')}" if self.count("staged") else "")
                 + (f" deferred={self.deferred}" if self.deferred else ""))
 
 
@@ -548,6 +556,8 @@ def _edit(db: _Db, p: _Plan, *, days: int, timeout: float) -> Outcome:
         return out
     out.why, out.summary = proposal.why, proposal.summary
     out.kind, out.kind_reason, out.kind_writer = proposal.kind, proposal.kind_shown, proposal.kind_writer
+    if stage_mode():
+        return _stage_edit(db, p, proposal, out)
     edit_id = insert_edit(conn, c, status="proposed", target=p.target, sha_before=p.sha, why=proposal.why,
                           summary=proposal.summary,
                           meta={"topic": proposal.topic, "kind": proposal.kind, "kind_reason": proposal.kind_reason,
@@ -601,6 +611,56 @@ def _edit(db: _Db, p: _Plan, *, days: int, timeout: float) -> Outcome:
         _loud(f"edits: {out.reason}")
         return out
     out.status, out.improve_id, out.reason = result.status, result.id, result.reason or proposal.summary
+    return out
+
+
+def _stage_edit(db: _Db, p: _Plan, proposal: Any, out: Outcome) -> Outcome:
+    """Approval-first: a baseline of the target, `improve stage` (artifact + static evaluation), a proposal
+    row. The production file is only read. Promotion needs a human decision and the sandbox evaluation."""
+    from agent_memory import rsi_approval, rsi_targets   # local import: rsi_approval imports this module
+
+    c, conn = p.cand, db.conn
+    assert p.target is not None
+    try:
+        bid, bdir = rsi_targets.create_baseline([p.target])
+    except (rsi_targets.BaselineError, OSError) as exc:
+        out.reason = _one_line(f"stage: baseline refused: {exc}")
+        return out
+    key = rsi_targets.tilde(p.target)
+    exp = f"exp-{datetime.now(UTC):%Y%m%d}-edit-{file_sha(key + c['rule_id'])[:8]}"
+    fd, tmp = tempfile.mkstemp(prefix="amem-stage-", suffix=p.target.suffix or ".md")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(proposal.new_text)
+        rid = improve_rule_id(c["instruction_source"], c["rule_id"])
+        proc = _improve(["stage", "--json", "--experiment", exp, "--baseline", str(bdir), "--change", f"{key}={tmp}",
+                         "--rule-id", f"{key}={rid}", "--kind", "edit_instruction"])
+    except Exception as exc:  # noqa: BLE001 - staging never writes production; any failure is this candidate's error
+        out.reason = _one_line(f"improve stage: {type(exc).__name__}: {exc}")
+        return out
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+    res = next((json.loads(ln) for ln in reversed(proc.stdout.strip().splitlines()) if ln.startswith("{")), {})
+    if res.get("status") != "staged":
+        out.status, out.reason = "refused", _one_line(f"improve stage refused: {res.get('reason') or proc.returncode}")
+        insert_edit(conn, c, status="refused", target=p.target, sha_before=p.sha, why=proposal.why,
+                    summary=proposal.summary, meta={"mode": "stage", "stage": res})
+        return out
+    h = res["artifact_hash"]
+    pid = rsi_approval.create_proposal(
+        conn, Path(res["artifact_dir"]), title=f"Edit {c.get('rule_title') or c['rule_id']}", summary=proposal.summary,
+        rationale={"why": proposal.why, "tests": "static checks passed; sandbox replay pending", "kind": proposal.kind},
+        risk={"level": "low" if p.target.suffix == ".md" else "medium"}, confidence=_conf(c),
+        expected={"effect": f"fewer deviations on {c['instruction_source']} / {c['rule_id']}"},
+        evidence_refs=[f"amem:deviation/{d}" for d in (c.get("deviation_ids") or [])][:20])
+    out.edit_id = insert_edit(conn, c, status="staged", target=p.target, sha_before=p.sha, why=proposal.why,
+                              summary=proposal.summary,
+                              meta={"mode": "stage", "proposal_id": pid, "artifact_hash": h, "baseline_id": bid,
+                                    "experiment_id": exp, "kind": proposal.kind, "writer_model": edits_writer.writer_model()})
+    out.status, out.reason = "staged", f"staged as proposal {pid} (artifact {h[:12]}); awaiting a human decision"
     return out
 
 

@@ -57,6 +57,7 @@ select d.id, d.session_id, d.instruction_source, d.instruction_ref, d.rule_id, d
 from deviations d
 join sessions s using (session_id)
 where d.created_at >= %(since)s
+  and coalesce(s.env, 'prod') <> 'sandbox'
   and (d.jev_verdict = 'edit_instruction'
        or (coalesce(s.category, s.kind) = 'worker'
            and (coalesce((s.outcome_evidence ->> 'report_blocked')::int, 0) > 0

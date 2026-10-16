@@ -418,3 +418,6 @@ enabled = true
 # token is the auth (checked against edits.undo_token_hash by the function).
 [functions.amem-undo]
 verify_jwt = false
+
+[functions.amem-decide]
+verify_jwt = false

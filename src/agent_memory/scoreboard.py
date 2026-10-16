@@ -51,6 +51,7 @@ order by created_at desc, id
 _DEV_SQL = """
 select count(*) from deviations d join sessions s using (session_id)
 where d.instruction_source = %(src)s and d.rule_id = %(rule)s
+  and coalesce(s.env, 'prod') <> 'sandbox'
   and coalesce(s.started_at, s.created_at) >= %(lo)s and coalesce(s.started_at, s.created_at) < %(hi)s
   and (not %(after)s or d.instruction_sha is null or d.instruction_sha is distinct from %(sha)s)
 """
@@ -58,6 +59,7 @@ where d.instruction_source = %(src)s and d.rule_id = %(rule)s
 _SESSIONS_SQL = """
 select count(*) from sessions s
 where s.scanned_at is not null and s.kind <> 'eval' and s.instructions ? %(src)s
+  and coalesce(s.env, 'prod') <> 'sandbox'
   and coalesce(s.started_at, s.created_at) >= %(lo)s and coalesce(s.started_at, s.created_at) < %(hi)s
 """
 
@@ -68,6 +70,7 @@ select s.outcome, s.active_seconds,
             else s.tokens_input + s.tokens_output + s.tokens_cache_read + s.tokens_cache_creation end as tokens
 from sessions s
 where s.kind <> 'eval' and s.instructions ? %(src)s
+  and coalesce(s.env, 'prod') <> 'sandbox'
   and coalesce(s.started_at, s.created_at) >= %(lo)s and coalesce(s.started_at, s.created_at) < %(hi)s
 """
 

@@ -256,6 +256,7 @@ def compute_scores(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 _CALL_ROWS_SQL = """
 select c.skill, c.project, c.session_id, s.project as session_project, s.category, s.outcome
 from skill_calls c left join sessions s on s.session_id = c.session_id
+where coalesce(s.env, 'prod') <> 'sandbox'
 """
 
 

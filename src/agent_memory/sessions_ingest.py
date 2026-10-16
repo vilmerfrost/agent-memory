@@ -873,9 +873,10 @@ PROFILE_COLS = ("model", "model_last", "effort", "effort_last", "efforts", "dura
                 "api_seconds", "tool_seconds", "lines_added", "lines_removed")
 _KEEP_COLS = ("title", *PROFILE_COLS, "outcome", "outcome_evidence")
 _ALL_COLS = ("session_id", "tool", "kind", "repo", "project_dir", "started_at", "ended_at", "transcript_bytes",
-             "skills", "instructions", "meta", *_TOKEN_COLS, "last_activity_at", "category", "project", *_KEEP_COLS)
+             "skills", "instructions", "meta", *_TOKEN_COLS, "last_activity_at", "category", "project", "env",
+             "experiment_id", *_KEEP_COLS)
 _FACT_COLS = ("tool", "kind", "repo", "project_dir", "started_at", "ended_at", "transcript_bytes", "skills",
-              "instructions", "category", "project")
+              "instructions", "category", "project", "env", "experiment_id")
 _TOKENS_DIFFER = (f"({', '.join('sessions.' + c for c in _TOKEN_COLS)}) is distinct from "
                   f"({', '.join('excluded.' + c for c in _TOKEN_COLS)})")
 _KEPT_DIFFER = (f"({', '.join(f'coalesce(excluded.{c}, sessions.{c})' for c in _KEEP_COLS)}) is distinct from "
@@ -943,6 +944,33 @@ def outcome_values(signals: dict[str, int] | None, end: str | None, last: dateti
     return {"outcome": name, "outcome_evidence": Jsonb(evidence)}
 
 
+def rsi_sandbox_dir() -> Path:
+    """The RSI experiment sandbox root (docs/sandbox.md): RSI_SANDBOX_DIR, default ~/sandbox."""
+    return Path(os.environ.get("RSI_SANDBOX_DIR") or Path.home() / "sandbox").expanduser()
+
+
+_EXPERIMENT_RE = re.compile(r"/experiments/([a-z0-9][a-z0-9-]{2,60})(/|$)")
+
+
+def env_values(r: SessionRow) -> dict[str, Any]:
+    """`env` and `experiment_id` (docs/rsi/spec.md). sandbox: the transcript or a cwd it visited is under the
+    RSI sandbox root (or ingest was told so: meta.env); eval: kind eval; cloud: a cloud: id; else prod.
+    Sandbox sessions never count in production evaluations (deviation scan, scoreboard, skill scores)."""
+    root = str(rsi_sandbox_dir())
+    places = [str(r.path or "")] + [c for c in (r.meta.get("cwds") or []) if isinstance(c, str)]
+    places.append(str(r.meta.get("cwd") or ""))
+    sandbox = r.meta.get("env") == "sandbox" or any(p == root or p.startswith(root + "/") for p in places if p)
+    env = "sandbox" if sandbox else "eval" if r.kind == "eval" else "cloud" if r.session_id.startswith("cloud:") else "prod"
+    exp = r.meta.get("experiment_id") if isinstance(r.meta.get("experiment_id"), str) else None
+    if sandbox and not exp:
+        for p in places:
+            m = _EXPERIMENT_RE.search(p) if p.startswith(root) else None
+            if m:
+                exp = m.group(1)
+                break
+    return {"env": env, "experiment_id": exp if sandbox else None}
+
+
 def _params(r: SessionRow, now: datetime | None = None) -> dict[str, Any]:
     tv = token_values(r.tokens)
     last = _last_activity(r)
@@ -952,6 +980,7 @@ def _params(r: SessionRow, now: datetime | None = None) -> dict[str, Any]:
             "transcript_bytes": r.transcript_bytes, "skills": Jsonb(r.skills),
             "instructions": Jsonb(r.instructions), "meta": Jsonb(r.meta), **dict(zip(_TOKEN_COLS, tv)),
             "last_activity_at": last, "category": category, "project": project, "title": r.title,
+            **env_values(r),
             **profile_values(r.profile), **outcome_values(r.signals, r.end, last, now, r.kind, r.commits)}
 
 
