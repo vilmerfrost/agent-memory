@@ -31,9 +31,10 @@ mismatch fails the batch); that GET /ingest/<nil uuid> answers 404 with a valid 
 
 Mapping (blueprint): id = the amem: ref, timestamp = the record time, label = the kind, identity = "rsi",
 no metadata (past.dev feeds metadata to memory extraction). The batch idempotencyKey is sha256 over the
-canonical items (so the 409 rule can never fire), plus each item's last deletion time, the table's failure
-count and, on --replay, the run time: a re-send after a deletion or a failed ingestion is a new request.
-Each record's own sha256(content) is kept in its rsi_evidence link (metrics.sha256).
+canonical items (so the 409 rule can never fire) and the table's failure count. It is content-based
+(Mission 004C, F5): a --replay of unchanged records sends the same key, so past.dev answers the stored
+receipt and ingests nothing new. Each record's own sha256(content) is kept in its rsi_evidence link
+(metrics.sha256).
 
 Watermarks: proposals, experiments and edits change status after they are first written and have no
 updated_at column, so change detection is by content: a record is sent when its link is missing or holds
@@ -450,7 +451,7 @@ class PastDevSink:
                 part = todo[i:i + self.batch_max]
                 items = [{"id": rec.ref, "content": content, "timestamp": _ts(rec.at), "label": rec.fields["kind"],
                           "identity": IDENTITY} for rec, content, _, _ in part]
-                key = _sha({"items": items, "attempt": attempts, "replay": now if replay else None})
+                key = _sha({"items": items, "attempt": attempts})          # content-based: a replay is the same key
                 evs = []
                 for rec, content, sha, _ in part:
                     f = _fields(content)

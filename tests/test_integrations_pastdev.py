@@ -336,7 +336,7 @@ def test_sync_sends_sanitized_records_with_the_contract_shape(db: Db, pdev: Fake
         assert set(req.json) == {"items", "idempotencyKey"} and len(req.json["items"]) <= PD.BATCH_MAX
         items = req.json["items"]
         assert req.json["idempotencyKey"] == sha256(json.dumps(
-            {"items": items, "attempt": 0, "replay": None},
+            {"items": items, "attempt": 0},
             sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()
         for it in items:
             assert set(it) == {"id", "content", "timestamp", "label", "identity"}          # no metadata
@@ -385,17 +385,21 @@ def test_second_run_sends_only_changed_records_and_same_id_replaces(db: Db, pdev
     assert "hypothesis: quote every zsh glob" in pdev.points[refs_["proposal"]]["content"]
 
 
-def test_unchanged_resend_is_success(db: Db, pdev: FakePastDev) -> None:
+def test_a_replay_of_unchanged_records_sends_nothing_new(db: Db, pdev: FakePastDev) -> None:
+    """Mission 004C (F5): the key is content-based, so a replay repeats the first run's keys and past.dev answers
+    the stored receipts: no new ingestion, nothing billed."""
     refs_ = seed(db)
     with psycopg.connect(db.app) as conn:
         sync.run(sink(pdev), conn, environ={})
-        polls = len(pdev.svc.requests_to("GET", "/api/v1/ingest/"))
-        rep = sync.run(sink(pdev), conn, replay=True, environ={})           # everything again, a fresh key
+        first = [r.json["idempotencyKey"] for r in pdev.ingest_requests()]
+        receipts, points = len(pdev.keys), json.dumps(pdev.points, sort_keys=True)
+        later = sink(pdev, now=lambda: datetime.now(UTC) + timedelta(hours=1))      # another run time
+        rep = sync.run(later, conn, replay=True, environ={})
     assert rep.status == "ok" and rep.rows == len(SENT)
-    keys = [r.json["idempotencyKey"] for r in pdev.ingest_requests()]
-    assert len(set(keys)) == len(keys)
-    assert len(pdev.svc.requests_to("GET", "/api/v1/ingest/")) == polls + 1     # health only: unchanged needs no poll
-    assert {ln["metrics"]["status"] for ln in links(db).values()} == {"unchanged"}
+    again = [r.json["idempotencyKey"] for r in pdev.ingest_requests()[len(first):]]
+    assert sorted(again) == sorted(first)                                # the same content: the same keys
+    assert len(pdev.keys) == receipts and json.dumps(pdev.points, sort_keys=True) == points   # nothing new ingested
+    assert {ln["metrics"]["status"] for ln in links(db).values()} == {"completed"}
     assert links(db)[f"past:{refs_['proposal']}"]["metrics"]["sha256"]
 
 
