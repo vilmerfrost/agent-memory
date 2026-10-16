@@ -10,6 +10,7 @@ import importlib.util
 import subprocess
 import sys
 import types
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -234,3 +235,34 @@ def test_a_timed_out_evaluation_logs_text_not_bytes(monkeypatch: pytest.MonkeyPa
     assert "evaluation stopped at the 480s cap" in run.limitations
     log = (tmp_path / RUN_ID / "evaluate.log").read_text()
     assert log == "timed out after 480s\nshard 1/4 done\n\n--- stderr ---\nwarn: slow �\n"
+
+
+# ---------------------------------------------------------------- F7: one folder and one evidence row per run
+
+
+def test_two_runs_on_one_day_get_their_own_run_id(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    mod = load_script(monkeypatch)
+    monkeypatch.chdir(tmp_path)
+    times = [datetime(2026, 10, 20, 10, 0, 0, tzinfo=UTC), datetime(2026, 10, 20, 15, 30, 5, tzinfo=UTC)]
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz: Any = None) -> datetime:                           # type: ignore[override]
+            return times.pop(0) if times else datetime(2026, 10, 20, 23, 59, 59, tzinfo=UTC)
+
+    seen: list[str] = []
+
+    def remote(run_id: str, experiment_id: str | None) -> dict[str, Any]:
+        seen.append(run_id)
+        sha = "".join(f"{h}  {f}\n" for f, h in W.PINNED_SHA256.items())
+        return W.build_results(run_id=run_id, experiment_id=experiment_id, stdout=METRICS_ROW, exit_code=0,
+                               repo_commit=W.REPO_COMMIT, sha256sum_text=sha, seconds=60.0)
+
+    monkeypatch.setattr(mod, "datetime", Clock)
+    monkeypatch.setattr(mod.evaluate, "remote", remote)
+    mod.main(experiment_id=EXP)
+    mod.main(experiment_id=EXP)
+    assert seen == ["ncm-20261020-100000-sudoku-easy", "ncm-20261020-153005-sudoku-easy"]
+    runs = [ncm.load_results(tmp_path / "ncm-results" / rid / "results.json") for rid in seen]
+    assert [r.run_id for r in runs] == seen
+    assert len({ncm.to_evidence(r).ref for r in runs}) == 2                   # no upsert over the first row

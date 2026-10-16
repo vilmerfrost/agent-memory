@@ -144,7 +144,7 @@ def _call_failed(run_id: str, experiment_id: str | None, exc: Exception, started
 @app.local_entrypoint()
 def main(experiment_id: str = "") -> None:
     started, t0 = datetime.now(UTC), time.monotonic()
-    run_id = f"ncm-{started:%Y%m%d}-sudoku-easy"
+    run_id = f"ncm-{started:%Y%m%d-%H%M%S}-sudoku-easy"   # to the second: a later run never reuses a folder or row
     try:
         res = evaluate.remote(run_id, experiment_id or None)
     except Exception as exc:          # still one results.json, so the run is recorded as failed, never lost
