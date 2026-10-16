@@ -9,7 +9,7 @@
     amem sync plan --sink clickhouse|langfuse|pastdev [--replay] [--tables T1,T2] [--since DATE] [--json]
                                                                 (dry run; read-only, sends nothing)
     amem evidence query --source sb|ch|lf|pd <named-query> [--param k=v ...] [--json]
-    amem evidence ask <question> [--param k=v ...] [--record] [--json]     (questions.py: the six questions)
+    amem evidence ask <question> [--param k=v ...] [--record] [--json]     (questions.py: the investigator questions)
     amem evidence questions
     amem evidence record-ncm <results.json> [--dry-run] [--json]          (one NCM research run -> rsi_evidence)
 
@@ -287,7 +287,7 @@ def cmd_evidence_ask(args: argparse.Namespace) -> int:
     lines += [f"  [{f['status']}] {f['service']} {f['type']} {f['ref']} -> {f['supabase_ref'] or '-'} "
               f"{f['timestamp'] or ''} {f['measure']}" for f in ans.findings]
     if args.record:
-        lines.append(f"  recorded {len(recorded)} linked external finding(s) in rsi_evidence")
+        lines.append(f"  recorded {len(recorded)} rsi_evidence row(s) (linked findings plus the answer)")
     return _out(args, obj, "\n".join(lines))
 
 
@@ -370,10 +370,10 @@ def register(sub: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
 
     p = sub.add_parser("evidence", help="the evidence facade (named queries only)")
     e = p.add_subparsers(dest="evidence_command", required=True)
-    q = e.add_parser("ask", help="one of the investigator's six questions, across every source (Supabase first)")
+    q = e.add_parser("ask", help="one of the investigator questions, across every source (Supabase first)")
     q.add_argument("question")
     q.add_argument("--param", action="append", default=[], metavar="K=V")
-    q.add_argument("--record", action="store_true", help="store linked external findings in rsi_evidence")
+    q.add_argument("--record", action="store_true", help="store linked external findings and one answer row in rsi_evidence")
     q.add_argument("--json", action="store_true")
     q.set_defaults(func=cmd_evidence_ask)
     q = e.add_parser("record-ncm", help="store one NCM results.json as an ncm:run evidence row")
@@ -381,7 +381,7 @@ def register(sub: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
     q.add_argument("--dry-run", action="store_true")
     q.add_argument("--json", action="store_true")
     q.set_defaults(func=cmd_evidence_record_ncm)
-    q = e.add_parser("questions", help="list the six questions and their params")
+    q = e.add_parser("questions", help="list the investigator questions and their params")
     q.set_defaults(func=cmd_evidence_questions)
     q = e.add_parser("query", help="run one named query against one source")
     q.add_argument("--source", required=True, choices=["sb", "ch", "lf", "pd"])
