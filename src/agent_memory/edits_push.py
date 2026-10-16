@@ -56,7 +56,7 @@ def token_hash(token: str) -> str:
 
 def project_url() -> str | None:
     """AMEM_SUPABASE_URL, else the hosted project URL derived from AMEM_DB_URL
-    (`db.<ref>.supabase.co`, or a pooler DSN whose user is `postgres.<ref>`)."""
+    (`db.<ref>.supabase.co`, or a pooler DSN whose user is `postgres.<ref>` or `amem_app.<ref>`)."""
     base = config.supabase_url()
     if base:
         return base
@@ -72,8 +72,8 @@ def project_url() -> str | None:
     ref = None
     if host.startswith("db.") and host.endswith(".supabase.co"):
         ref = host[3:-len(".supabase.co")]
-    elif host.endswith(".pooler.supabase.com") and user.startswith("postgres."):
-        ref = user.split(".", 1)[1]
+    elif host.endswith(".pooler.supabase.com") and user.split(".", 1)[0] in ("postgres", "amem_app") and "." in user:
+        ref = user.split(".", 1)[1]                  # amem_app.<ref> after `amem admin split-credentials`
     if not ref or not ref.isalnum():
         return None
     return f"https://{ref}.supabase" + ".co"

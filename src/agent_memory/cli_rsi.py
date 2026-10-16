@@ -107,7 +107,13 @@ def cmd_decide(args: argparse.Namespace) -> int:
     if (code := _write_guard("rsi decide")) is not None:
         return code
     try:
-        with store.connect() as conn:
+        from agent_memory import credentials
+        admin = credentials.admin_db_url() if credentials.admin_present() else None   # dialog once split
+    except credentials.AdminUnavailable as exc:
+        print(f"amem: rsi decide: {exc}", file=sys.stderr)
+        return 2
+    try:
+        with store.connect(admin) as conn:
             row = conn.execute("select artifact_hash, title, status from rsi_proposals where id::text = %s",
                                (args.proposal,)).fetchone()
             if row is None:
@@ -134,6 +140,56 @@ def cmd_decide(args: argparse.Namespace) -> int:
         return 1
     print(f"rsi decide: {res} (the promotion worker acts within minutes)")
     return 0 if res in ("recorded", "already") else 1
+
+
+def cmd_decide_page(args: argparse.Namespace) -> int:
+    url = args.url or AP.decide_url()
+    if not url:
+        print("amem: rsi decide-page: no decide URL (set AMEM_RSI_DECIDE_URL or pass --url)", file=sys.stderr)
+        return 1
+    try:
+        html = AP.render_decide_page(url)
+    except (ValueError, OSError) as exc:
+        print(f"amem: rsi decide-page: {exc}", file=sys.stderr)
+        return 1
+    args.out.mkdir(parents=True, exist_ok=True)
+    (args.out / "index.html").write_text(html, encoding="utf-8")
+    print(f"rsi decide-page: wrote {args.out / 'index.html'} (endpoint {url}). Host it over HTTPS and set "
+          "AMEM_RSI_DECIDE_PAGE to its URL; pass the same origin to `amem rsi totp-enroll --origin`.")
+    return 0
+
+
+def cmd_totp_enroll(args: argparse.Namespace) -> int:
+    """Create the TOTP secret, show it once for the authenticator, confirm one code, then store it as the
+    amem-decide function secret RSI_TOTP_SECRET (rsi_totp.set_function_secrets). Vilmer's terminal only."""
+    import shutil
+    import subprocess
+
+    from agent_memory import rsi_totp
+    if AP.agent_session_reason() or not sys.stdin.isatty() or not sys.stdout.isatty():
+        print("amem: rsi totp-enroll: refused outside Vilmer's own terminal (agent session or no TTY)", file=sys.stderr)
+        return 2
+    secret = rsi_totp.new_secret()
+    uri = rsi_totp.otpauth_uri(secret)
+    qr = shutil.which("qrencode")
+    if qr:
+        subprocess.run([qr, "-t", "ansiutf8"], input=uri.encode(), check=False)   # stdin: the secret stays out of argv
+    print(f"Add this to your authenticator app (scan the QR code, or enter the key by hand):\n  {secret}")
+    typed = input("Type the 6-digit code it shows now: ").strip()
+    if rsi_totp.verify(secret, typed) is None:
+        print("amem: rsi totp-enroll: that code does not match; nothing was set", file=sys.stderr)
+        return 1
+    if args.no_set:
+        print("Code confirmed. Not stored (--no-set): store RSI_TOTP_SECRET on amem-decide yourself.")
+        return 0
+    values = {"RSI_TOTP_SECRET": secret, **({"RSI_DECIDE_ORIGIN": args.origin} if args.origin else {})}
+    code = rsi_totp.set_function_secrets(values, project_ref=args.project_ref)
+    if code != 0:
+        print(f"amem: rsi totp-enroll: the Supabase CLI refused (exit {code}); log in first, then run this again",
+              file=sys.stderr)
+        return 1
+    print("rsi totp-enroll: done. Phone Apply / Undo now need a code from your authenticator.")
+    return 0
 
 
 def cmd_decide_poll(args: argparse.Namespace) -> int:
@@ -243,6 +299,17 @@ def register(sub: argparse._SubParsersAction) -> None:
     p.add_argument("--hash")
     p.add_argument("--reason")
     p.set_defaults(func=cmd_decide)
+
+    p = s.add_parser("decide-page", help="write the static decide page (Apply needs a TOTP code) for hosting")
+    p.add_argument("--out", type=Path, required=True)
+    p.add_argument("--url", default=None, help="the amem-decide URL (default: AMEM_RSI_DECIDE_URL or the project URL)")
+    p.set_defaults(func=cmd_decide_page)
+
+    p = s.add_parser("totp-enroll", help="Vilmer's terminal only: the TOTP secret for phone Apply / Undo")
+    p.add_argument("--project-ref", default=None)
+    p.add_argument("--origin", default=None, help="the decide page origin, stored as RSI_DECIDE_ORIGIN (CORS)")
+    p.add_argument("--no-set", action="store_true", help="confirm a code only; store nothing")
+    p.set_defaults(func=cmd_totp_enroll)
 
     p = s.add_parser("decide-poll", help="the single promotion worker: handle pending decisions")
     p.add_argument("--no-push", action="store_true")

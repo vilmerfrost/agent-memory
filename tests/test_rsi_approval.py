@@ -341,11 +341,12 @@ def test_push_payload_has_bound_actions_and_no_secrets(rdb: str, sandbox: Path, 
         p = conn.execute("select * from rsi_proposals where id = %s", (pid,)).fetchone()
         cols = [c.name for c in conn.execute("select * from rsi_proposals limit 0").description]
     pay = AP.proposal_payload("topic-x", dict(zip(cols, p)), tok, "https://fn.example.test/functions/v1/amem-decide")
-    labels = [a["label"] for a in pay["actions"]]
-    assert labels == ["Apply", "Reject"]
-    bodies = [json.loads(a["body"]) for a in pay["actions"]]
-    assert all(b["proposal_id"] == pid and b["artifact_hash"] == h for b in bodies)
-    assert bodies[0]["token"] == tok["apply"] and bodies[1]["token"] == tok["reject"]
+    # Phone Apply needs the TOTP decide page (least-privilege.md A3): without one, only Reject is a button and
+    # the apply token appears nowhere; Apply is the terminal command in the message.
+    assert [a["label"] for a in pay["actions"]] == ["Reject"]
+    (body,) = [json.loads(a["body"]) for a in pay["actions"]]
+    assert body["proposal_id"] == pid and body["artifact_hash"] == h and body["token"] == tok["reject"]
+    assert tok["apply"] not in json.dumps(pay) and f"amem rsi decide {pid} apply" in pay["message"]
     assert "Why: 8 deviations" in pay["message"] and "Files: x.md" in pay["message"] and "Risk: low" in pay["message"]
 
 
@@ -503,8 +504,13 @@ REPO = os.environ.get("RSI_TEST_IMPROVE_REPO")
 
 @pytest.mark.skipif(not REPO, reason="set RSI_TEST_IMPROVE_REPO to an agent-config checkout with improve stage/promote")
 def test_cross_repo_stage_approve_promote_undo(rdb: str, sandbox: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Real improve (stage, promote, revert-change) + real Postgres + real `amem rsi verify-decision`, in a fake HOME."""
+    """Real improve (stage, promote, revert-change) + real Postgres + real `amem rsi verify-decision`, in a fake HOME.
+    Everything runs as amem_app (least-privilege.md A1) except the two decisions, which are recorded the way the
+    edge function records them (service role -> the TOTP-gated function, with a verified step)."""
     repo = Path(REPO or "")
+    with psycopg.connect(rdb, autocommit=True) as conn:
+        conn.execute("alter role amem_app with login password 'cross-repo-pw-0123456789'")
+    app = rdb.replace("postgres:postgres@", "amem_app:cross-repo-pw-0123456789@", 1)
     home = tmp_path / "home"
     ac = home / "agent-config"
     for d in (ac / "lib", ac / "improve", ac / "agents", home / ".claude" / "parent", home / ".claude" / "projects"):
@@ -524,7 +530,7 @@ def test_cross_repo_stage_approve_promote_undo(rdb: str, sandbox: Path, tmp_path
         subprocess.run(["git", "-C", str(ac), "config", k, v], check=True)
     subprocess.run(["git", "-C", str(ac), "add", "-A"], check=True)
     subprocess.run(["git", "-C", str(ac), "commit", "-qm", "base"], check=True)
-    env = base_env(AMEM_DB_URL=rdb, HOME=str(home), IMPROVE_AC=str(ac), ROUTINE_STATE=str(home / ".claude" / "parent"),
+    env = base_env(AMEM_DB_URL=app, HOME=str(home), IMPROVE_AC=str(ac), ROUTINE_STATE=str(home / ".claude" / "parent"),
                    RSI_SANDBOX_DIR=str(sandbox), PYTHONDONTWRITEBYTECODE="1", IMPROVE_AMEM=shlex.quote(AMEM),
                    AMEM_AGENT_CONFIG_DIR=str(ac))
     env = {k: v for k, v in env.items() if k not in AP.AGENT_ENV and not (k.startswith("CODEX_") and k != "CODEX_HOME")}
@@ -546,8 +552,8 @@ def test_cross_repo_stage_approve_promote_undo(rdb: str, sandbox: Path, tmp_path
            "suite": "sandbox-replay", "suite_version": "1", "model": "none", "effort": "none", "verdict": "pass",
            "started_at": "2026-10-16T00:00:00+00:00", "finished_at": "2026-10-16T00:00:01+00:00", "runner": "test", "results": {}}
     (adir / "evals" / "sandbox-replay.json").write_bytes(RA.canonical(rec) + b"\n")
-    pid = proposal(rdb, adir, title="Closing line as a contract")
-    assert AP.decide_poll(db_url=rdb, push=False).handled == [] and claude_md.read_text() == original   # no decision: no change
+    pid = proposal(app, adir, title="Closing line as a contract")
+    assert AP.decide_poll(db_url=app, push=False).handled == [] and claude_md.read_text() == original   # no decision: no change
     forged = tmp_path / "forged.json"                                              # well-formed, but not in the DB
     forged.write_text(json.dumps({"format": RA.DECISION_FORMAT, "decision_id": "00000000-0000-0000-0000-000000000001",
                                   "proposal_id": pid, "action": "apply", "artifact_hash": h,
@@ -558,15 +564,16 @@ def test_cross_repo_stage_approve_promote_undo(rdb: str, sandbox: Path, tmp_path
     res = json.loads(r.stdout.strip().splitlines()[-1])
     assert r.returncode != 0 and res["status"] == "refused" and "decision" in res.get("reason", ""), r.stdout + r.stderr
     assert claude_md.read_text() == original                                       # a forged approval changes nothing
-    with psycopg.connect(rdb) as conn:
+    with psycopg.connect(app) as conn:                                             # the push, as amem_app
         tok = AP.issue_tokens(conn, pid, h, ("apply", "reject", "undo"))
-        assert AP.record_phone_decision(conn, pid, "apply", h, tok["apply"]) == "recorded"
-    rep = AP.decide_poll(db_url=rdb, push=False)
+    with psycopg.connect(rdb) as conn:                                             # the edge function
+        assert AP.record_phone_decision(conn, pid, "apply", h, tok["apply"], 70_000_001, phone=True) == "recorded"
+    rep = AP.decide_poll(db_url=app, push=False)
     assert [x["result"] for x in rep.handled] == ["promoted"], rep.handled
     assert claude_md.read_text() == new.read_text()                                # exactly the approved bytes
     with psycopg.connect(rdb) as conn:
-        assert AP.record_phone_decision(conn, pid, "undo", h, tok["undo"]) == "recorded"
-    rep = AP.decide_poll(db_url=rdb, push=False)
+        assert AP.record_phone_decision(conn, pid, "undo", h, tok["undo"], 70_000_002, phone=True) == "recorded"
+    rep = AP.decide_poll(db_url=app, push=False)
     assert [x["result"] for x in rep.handled] == ["reverted"], rep.handled
     assert claude_md.read_text() == original                                       # undo restored the exact bytes
     ledger = (ac / "improve" / "ledger.jsonl").read_text()
@@ -576,14 +583,30 @@ def test_cross_repo_stage_approve_promote_undo(rdb: str, sandbox: Path, tmp_path
 # --------------------------------------------------------------------------- rollback
 
 
-def test_rollback_sql_reverses_the_migration_and_it_reapplies(pg_url: str) -> None:
+RSI_CORE = "20261022010000_rsi_core.sql"
+
+
+def migrations_upto(tmp_path: Path, last: str) -> Path:
+    """A migrations dir with the files up to and including `last` (the state a phase was verified in)."""
+    src = Path(__file__).resolve().parents[1] / "supabase" / "migrations"
+    out = tmp_path / f"migrations-upto-{last.split('_')[0]}"
+    out.mkdir()
+    for f in sorted(src.glob("*.sql")):
+        if f.name <= last:
+            shutil.copy(f, out / f.name)
+    return out
+
+
+def test_rollback_sql_reverses_the_migration_and_it_reapplies(pg_url: str, tmp_path: Path) -> None:
     """docs/rsi/rollback_rsi_core.sql on a scratch database: RSI objects gone, the rest intact, migrate again works."""
+    upto = migrations_upto(tmp_path, RSI_CORE)
     with psycopg.connect(pg_url, autocommit=True) as conn:
         conn.execute("drop database if exists rsi_rollback")
         conn.execute("create database rsi_rollback")
     url = pg_url.rsplit("/", 1)[0] + "/rsi_rollback"
     try:
-        assert subprocess.run([AMEM, "db", "migrate"], env=base_env(AMEM_DB_URL=url), capture_output=True).returncode == 0
+        assert subprocess.run([AMEM, "db", "migrate", "--dir", str(upto)], env=base_env(AMEM_DB_URL=url),
+                              capture_output=True).returncode == 0
         sql = (Path(__file__).resolve().parents[1] / "docs" / "rsi" / "rollback_rsi_core.sql").read_text()
         with psycopg.connect(url) as conn:
             conn.execute("insert into edits (instruction_source, rule_id, status) values ('t', 'r', 'staged')")
@@ -598,7 +621,8 @@ def test_rollback_sql_reverses_the_migration_and_it_reapplies(pg_url: str) -> No
             cols = {r[0] for r in conn.execute("select column_name from information_schema.columns where table_name = 'sessions'")}
             assert "env" not in cols and "experiment_id" not in cols and "session_id" in cols
             assert conn.execute("select count(*) from edits").fetchone() == (1,)
-        assert subprocess.run([AMEM, "db", "migrate"], env=base_env(AMEM_DB_URL=url), capture_output=True).returncode == 0
+        assert subprocess.run([AMEM, "db", "migrate", "--dir", str(upto)], env=base_env(AMEM_DB_URL=url),
+                              capture_output=True).returncode == 0
         with psycopg.connect(url) as conn:
             assert conn.execute("select count(*) from pg_tables where tablename like 'rsi\\_%%'").fetchone()[0] == 10
     finally:
@@ -606,9 +630,11 @@ def test_rollback_sql_reverses_the_migration_and_it_reapplies(pg_url: str) -> No
             conn.execute("drop database if exists rsi_rollback with (force)")
 
 
-def test_supabase_api_roles_get_nothing_but_the_phone_function(pg_url: str) -> None:
+def test_supabase_api_roles_get_nothing_but_the_phone_function(pg_url: str, tmp_path: Path) -> None:
     """Hosted Supabase grants every new table and function to anon, authenticated and service_role by name
-    (default privileges). Recreate that on a scratch database, migrate, and check what each API role can do."""
+    (default privileges). Recreate that on a scratch database, migrate up to rsi_core (the state Phase C
+    verified) and check what each API role can do. The later state: tests/test_least_privilege.py."""
+    upto = migrations_upto(tmp_path, RSI_CORE)
     roles = ("anon", "authenticated", "service_role")
     with psycopg.connect(pg_url, autocommit=True) as conn:
         conn.execute("drop database if exists rsi_supabase")
@@ -620,7 +646,8 @@ def test_supabase_api_roles_get_nothing_but_the_phone_function(pg_url: str) -> N
         with psycopg.connect(url, autocommit=True) as conn:
             for kind in ("tables", "functions", "sequences"):
                 conn.execute(f"alter default privileges in schema public grant all on {kind} to anon, authenticated, service_role")
-        assert subprocess.run([AMEM, "db", "migrate"], env=base_env(AMEM_DB_URL=url), capture_output=True).returncode == 0
+        assert subprocess.run([AMEM, "db", "migrate", "--dir", str(upto)], env=base_env(AMEM_DB_URL=url),
+                              capture_output=True).returncode == 0
         with psycopg.connect(url) as conn:
             tables = [r[0] for r in conn.execute("select tablename from pg_tables where tablename like 'rsi\\_%%'")]
             assert len(tables) == 10

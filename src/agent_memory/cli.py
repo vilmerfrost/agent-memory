@@ -20,6 +20,7 @@ from agent_memory import cli_edits
 from agent_memory import cli_handoffs
 from agent_memory import cli_evals
 from agent_memory import cli_rsi
+from agent_memory import cli_admin
 from agent_memory import dedupe
 from agent_memory import cli_lessons
 from agent_memory import cli_scoring
@@ -134,8 +135,13 @@ def cmd_ingest_routines_log(args: argparse.Namespace) -> int:
 def cmd_db_migrate(args: argparse.Namespace) -> int:
     if (code := _remote_guard("postgres")) is not None:
         return code
+    from agent_memory import credentials
     try:
-        applied = store.migrate(migrations_dir=args.dir)
+        admin = {"db_url": credentials.admin_db_url()} if credentials.admin_present() else {}   # dialog once split
+        applied = store.migrate(migrations_dir=args.dir, **admin)
+    except credentials.AdminUnavailable as exc:
+        print(f"amem: migrate refused: {exc}", file=sys.stderr)
+        return 2
     except (psycopg.Error, config.BackendError) as exc:
         print(f"amem: migrate failed: {type(exc).__name__}: {exc}".strip(), file=sys.stderr)
         return 1
@@ -193,6 +199,7 @@ def build_parser() -> argparse.ArgumentParser:
     cli_handoffs.register(sub)
     cli_evals.register(sub)
     cli_rsi.register(sub)
+    cli_admin.register(sub)
     cli_archive.register(sub)
 
     # Handled in main() before parsing: every argument goes to amem_digest as is.

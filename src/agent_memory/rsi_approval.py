@@ -102,18 +102,20 @@ def issue_tokens(conn: psycopg.Connection, proposal_id: str, artifact_hash: str,
     out = {}
     for a in actions:
         tok = secrets.token_urlsafe(24)
-        row = conn.execute(
-            "insert into rsi_decision_tokens (proposal_id, action, token_hash, expires_at) values (%s, %s, %s, now() + %s) "
-            "on conflict (proposal_id, action) do update set token_hash = excluded.token_hash, expires_at = excluded.expires_at "
-            "where rsi_decision_tokens.used_at is null returning 1",
-            (proposal_id, a, token_hash(tok, proposal_id, artifact_hash, a), ttl)).fetchone()
-        if row:
+        armed = conn.execute("select amem_rsi_arm_token(%s, %s, %s, %s)",       # insert, or re-arm while unused
+                             (proposal_id, a, token_hash(tok, proposal_id, artifact_hash, a), ttl)).fetchone()[0]
+        if armed:
             out[a] = tok
     return out
 
 
-def record_phone_decision(conn: psycopg.Connection, proposal_id: str, action: str, artifact_hash: str, token: str) -> str:
-    """What the edge function does (tests and the local stack): the SQL function checks the token."""
+def record_phone_decision(conn: psycopg.Connection, proposal_id: str, action: str, artifact_hash: str, token: str,
+                          totp_step: int | None = None, *, phone: bool = False) -> str:
+    """What the edge function does (tests and the local stack). phone=True calls the TOTP-gated function the
+    deployed edge function uses (Apply / Undo need a verified step); otherwise the owner-only token function."""
+    if phone:
+        return conn.execute("select amem_rsi_record_phone_decision(%s, %s, %s, %s, %s)",
+                            (proposal_id, action, artifact_hash, token, totp_step)).fetchone()[0]
     return conn.execute("select amem_rsi_record_decision(%s, %s, %s, %s)",
                         (proposal_id, action, artifact_hash, token)).fetchone()[0]
 
@@ -285,7 +287,7 @@ def _apply(conn: psycopg.Connection, d: dict[str, Any], push: bool, notify: dict
         conn.execute("update rsi_proposals set status = 'promoted', change_id = %s, promoted_at = coalesce(promoted_at, now()), "
                      "result = %s where id = %s", (res.get("id"), status, d["proposal_id"]))
         _result(conn, d["id"], "promoted", handled=True, change_id=res.get("id"))
-        _notify(push, notify, f"Applied: {d['title']}", f"Promoted as {res.get('id')}. Undo stays available.")
+        _notify_applied(conn, push, notify, d, res.get("id"))
         return {"decision": str(d["id"]), "result": "promoted", "change_id": res.get("id")}
     if code == 75 or "busy" in (res.get("reason") or "") or code in (124, 127):
         conn.execute("update rsi_proposals set status = 'approved' where id = %s and status = 'promoting'", (d["proposal_id"],))
@@ -317,6 +319,25 @@ def _undo(conn: psycopg.Connection, d: dict[str, Any], push: bool, notify: dict[
         return {"decision": str(d["id"]), "result": "conflict"}
     _result(conn, d["id"], "retry", handled=d["attempts"] + 1 >= MAX_ATTEMPTS, detail=res.get("reason") or err)
     return {"decision": str(d["id"]), "result": "retry"}
+
+
+def _notify_applied(conn: psycopg.Connection, push: bool, notify: dict[str, str] | None, d: dict[str, Any],
+                    change_id: str | None) -> None:
+    """'Applied' push. With a decide page: an Undo button (TOTP-gated, its own token). Else: the terminal command."""
+    title, body = f"Applied: {d['title']}", f"Promoted as {change_id}."
+    page = decide_page()
+    if not push:
+        return
+    if not page:
+        edits_push.push_note(title, body + f" Undo: `amem rsi decide {d['proposal_id']} undo` in your terminal.", notify)
+        return
+    tok = issue_tokens(conn, str(d["proposal_id"]), d["artifact_hash"], ("undo",))
+    p = {"id": d["proposal_id"], "artifact_hash": d["artifact_hash"], "title": d["title"]}
+    actions = ([{"action": "view", "label": "Undo", "url": page_link(page, p, "undo", tok["undo"]), "clear": True}]
+               if "undo" in tok else [])
+    edits_push._publish(lambda topic: {"topic": topic, "title": title, "message": body, "priority": 3,
+                                       "tags": ["white_check_mark"], **({"actions": actions} if actions else {})},
+                        title, body, notify)
 
 
 def _notify(push: bool, notify: dict[str, str] | None, title: str, body: str) -> None:
@@ -367,8 +388,39 @@ def decide_url() -> str | None:
     return f"{base}/functions/v1/amem-decide" if base else None
 
 
-def proposal_payload(topic: str, p: dict[str, Any], tokens: dict[str, str], url: str | None) -> dict[str, Any]:
-    """One ntfy message per proposal: what, why, tests, risk, files, expected, with Apply / Reject."""
+def decide_page() -> str | None:
+    """The static decide page (docs/rsi/least-privilege.md, A3) where Apply needs a TOTP code. None: no phone Apply."""
+    config.load_env()
+    v = os.environ.get("AMEM_RSI_DECIDE_PAGE", "").strip()
+    return v if v.startswith("https://") else None
+
+
+PAGE_TEMPLATE = config.REPO_ROOT / "web" / "rsi-decide" / "index.html"
+
+
+def render_decide_page(url: str) -> str:
+    """The static decide page with its one allowed endpoint filled in (CSP connect-src + fetch target)."""
+    from urllib.parse import urlsplit
+    parts = urlsplit(url)
+    if parts.scheme != "https" or not parts.hostname or parts.query or parts.fragment:
+        raise ValueError("the decide URL must be a plain https:// URL")
+    origin = f"https://{parts.hostname}" + (f":{parts.port}" if parts.port else "")
+    html = PAGE_TEMPLATE.read_text(encoding="utf-8")
+    return html.replace("__AMEM_DECIDE_ORIGIN__", origin).replace("__AMEM_DECIDE_URL__", url)
+
+
+def page_link(page: str, p: dict[str, Any], action: str, token: str) -> str:
+    """Everything after `#`: the browser never sends the fragment to a server, so the token stays out of logs."""
+    from urllib.parse import urlencode
+    frag = urlencode({"p": str(p["id"]), "h": p["artifact_hash"], "a": action, "t": token, "n": str(p.get("title") or "")[:80]})
+    return f"{page.split('#')[0]}#{frag}"
+
+
+def proposal_payload(topic: str, p: dict[str, Any], tokens: dict[str, str], url: str | None,
+                     page: str | None = None) -> dict[str, Any]:
+    """One ntfy message per proposal: what, why, tests, risk, files, expected. Reject is one tap (it can only
+    stop a change). Apply opens the decide page, which needs the TOTP code; without a page, Apply is the
+    terminal only (`amem rsi decide <id> apply`)."""
     lines = [p.get("summary") or "", f"Why: {(p.get('rationale') or {}).get('why', '')}".rstrip(": "),
              f"Tests: {(p.get('rationale') or {}).get('tests', 'see brief')}",
              f"Risk: {(p.get('risk') or {}).get('level', '?')} · confidence {p.get('confidence') if p.get('confidence') is not None else '?'}",
@@ -378,19 +430,26 @@ def proposal_payload(topic: str, p: dict[str, Any], tokens: dict[str, str], url:
     payload: dict[str, Any] = {"topic": topic, "title": f"Proposal: {p['title']}"[:120],
                                "message": redact.redact("\n".join(ln for ln in lines if ln.strip()))[:3500],
                                "priority": 3, "tags": ["test_tube"]}
-    if url:
-        payload["actions"] = [
-            {"action": "http", "label": label, "url": url, "method": "POST", "headers": {"Content-Type": "application/json"},
-             "body": json.dumps({"proposal_id": str(p["id"]), "artifact_hash": p["artifact_hash"], "action": a, "token": tokens[a]}),
-             "clear": True}
-            for a, label in (("apply", "Apply"), ("reject", "Reject")) if a in tokens]
+    actions: list[dict[str, Any]] = []
+    if page and "apply" in tokens:
+        actions.append({"action": "view", "label": "Review & apply", "url": page_link(page, p, "apply", tokens["apply"]),
+                        "clear": True})
+    if url and "reject" in tokens:
+        actions.append({"action": "http", "label": "Reject", "url": url, "method": "POST",
+                        "headers": {"Content-Type": "application/json"},
+                        "body": json.dumps({"proposal_id": str(p["id"]), "artifact_hash": p["artifact_hash"],
+                                            "action": "reject", "token": tokens["reject"]}), "clear": True})
+    if actions:
+        payload["actions"] = actions
+    if not page:
+        payload["message"] = (payload["message"] + f"\nApply: run `amem rsi decide {p['id']} apply` in your terminal.")[:3800]
     return payload
 
 
 def push_proposals(*, db_url: str | None = None, push: bool = True, notify: dict[str, str] | None = None) -> list[str]:
     """For each staged proposal without live tokens: new tokens + one push. Returns the push results."""
     out = []
-    url = decide_url()
+    url, page = decide_url(), decide_page()
     with store.connect(db_url) as conn, conn.cursor(row_factory=dict_row) as cur:
         cur.execute("select * from rsi_proposals p where status = 'staged' and expires_at > now() and not exists "
                     "(select 1 from rsi_decision_tokens t where t.proposal_id = p.id and t.expires_at > now()) order by created_at")
@@ -399,7 +458,7 @@ def push_proposals(*, db_url: str | None = None, push: bool = True, notify: dict
             if not push:
                 out.append("off")
                 continue
-            res = edits_push._publish(lambda topic, p=p, tokens=tokens: proposal_payload(topic, p, tokens, url),
+            res = edits_push._publish(lambda topic, p=p, tokens=tokens: proposal_payload(topic, p, tokens, url, page),
                                       f"Proposal: {p['title']}", f"amem rsi show {p['id']}", notify)
             conn.execute("update rsi_proposals set meta = meta || %s where id = %s", (Jsonb({"push": res}), p["id"]))
             out.append(res)

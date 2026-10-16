@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="referrer" content="no-referrer">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src __AMEM_DECIDE_ORIGIN__; base-uri 'none'; form-action 'none'">
+<title>RSI Decision</title>
+<!-- Static decide page (docs/rsi/least-privilege.md, A3). `amem rsi decide-page --out DIR` fills in the endpoint.
+     The token arrives in the URL fragment, which the browser never sends to a server; the page removes it
+     from the address bar at once. Nothing is loaded from anywhere else. -->
+<style>
+:root {
+  --bg: #e9ebec; --surface: #f5f5f4; --line: #d6d6d2; --ink: #26292d; --ink-2: #5a5f66; --frost: #5f93bb;
+  --frost-ink: #2f5d80; --ok: #2f7a4f; --bad: #9b3a32; color-scheme: light;
+  --sans: -apple-system, "SF Pro Text", "Helvetica Neue", Arial, sans-serif;
+  --mono: ui-monospace, "SF Mono", Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --bg: #15181b; --surface: #1d2125; --line: #33393f; --ink: #e3e5e7; --ink-2: #a5abb1; --frost: #7fb0d6;
+  --frost-ink: #9cc7e8; --ok: #6cc28f; --bad: #e07a70; color-scheme: dark; } }
+:root[data-theme="dark"] {
+  --bg: #15181b; --surface: #1d2125; --line: #33393f; --ink: #e3e5e7; --ink-2: #a5abb1; --frost: #7fb0d6;
+  --frost-ink: #9cc7e8; --ok: #6cc28f; --bad: #e07a70; color-scheme: dark; }
+* { box-sizing: border-box; }
+body { margin: 0; min-height: 100vh; background: var(--bg); color: var(--ink); font: 16px/1.5 var(--sans);
+  display: grid; place-items: center;
+  padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-block: max(24px, env(safe-area-inset-top, 0px)) max(24px, env(safe-area-inset-bottom, 0px)); }
+main { width: 100%; max-width: 420px; background: var(--surface); border: 1px solid var(--line); border-radius: 14px;
+  padding: 24px 22px; display: grid; gap: 16px; }
+.eyebrow { font: 500 11px/1 var(--mono); letter-spacing: .08em; text-transform: uppercase; color: var(--ink-2); }
+h1 { margin: 0; font-size: 20px; line-height: 1.25; font-weight: 600; text-wrap: balance; }
+dl { margin: 0; display: grid; grid-template-columns: auto 1fr; gap: 6px 12px; font-size: 13px; }
+dt { color: var(--ink-2); }
+dd { margin: 0; font-family: var(--mono); overflow-wrap: anywhere; }
+label { font-size: 13px; color: var(--ink-2); display: grid; gap: 6px; }
+input { font: 600 28px/1 var(--mono); letter-spacing: .35em; text-align: center; padding: 12px 8px; width: 100%;
+  border: 1px solid var(--line); border-radius: 10px; background: var(--bg); color: var(--ink); }
+input:focus-visible, button:focus-visible { outline: 2px solid var(--frost); outline-offset: 2px; }
+button { font: 600 16px/1 var(--sans); padding: 14px; border-radius: 10px; border: 1px solid var(--frost);
+  background: var(--frost); color: #fff; cursor: pointer; }
+button:disabled { opacity: .5; cursor: default; }
+#msg { min-height: 1.5em; font-size: 14px; }
+#msg.ok { color: var(--ok); } #msg.bad { color: var(--bad); }
+.note { font-size: 12px; color: var(--ink-2); margin: 0; }
+</style>
+</head>
+<body>
+<main>
+  <div class="eyebrow">agent-memory · RSI decision</div>
+  <h1 id="title">Loading…</h1>
+  <dl>
+    <dt>Action</dt><dd id="action">–</dd>
+    <dt>Artifact</dt><dd id="hash">–</dd>
+    <dt>Proposal</dt><dd id="pid">–</dd>
+  </dl>
+  <form id="f" autocomplete="off">
+    <label for="code">Code from your authenticator
+      <input id="code" name="code" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" autocomplete="one-time-code" required>
+    </label>
+  </form>
+  <button id="go" type="submit" form="f" disabled>Confirm</button>
+  <p id="msg" role="status" aria-live="polite"></p>
+  <p class="note">Check the artifact hash against the morning brief. The code works once, for 30 seconds.</p>
+</main>
+<script>
+(function () {
+  var DECIDE_URL = "__AMEM_DECIDE_URL__";
+  var q = new URLSearchParams(location.hash.slice(1));
+  try { history.replaceState(null, "", location.pathname); } catch (e) {}
+  var p = q.get("p") || "", h = q.get("h") || "", a = q.get("a") || "", t = q.get("t") || "", n = q.get("n") || "";
+  var ok = /^[0-9a-f-]{36}$/i.test(p) && /^[0-9a-f]{64}$/.test(h) && (a === "apply" || a === "undo") && t.length >= 16;
+  var $ = function (id) { return document.getElementById(id); };
+  var msg = $("msg"), go = $("go"), code = $("code");
+  if (!ok || DECIDE_URL.indexOf("https://") !== 0) {
+    $("title").textContent = "This link is incomplete";
+    msg.textContent = "Open the link from the notification again, or decide in the terminal.";
+    msg.className = "bad"; code.disabled = true; return;
+  }
+  $("title").textContent = n || "Proposal";
+  $("action").textContent = a === "apply" ? "Apply this change" : "Undo this change";
+  $("hash").textContent = h.slice(0, 12) + "…" + h.slice(-4);
+  $("pid").textContent = p.slice(0, 8);
+  go.textContent = a === "apply" ? "Apply" : "Undo";
+  code.addEventListener("input", function () {
+    code.value = code.value.replace(/[^0-9]/g, "").slice(0, 6);
+    go.disabled = code.value.length !== 6;
+    if (msg.className === "bad") { msg.textContent = ""; msg.className = ""; }
+  });
+  $("f").addEventListener("submit", function (ev) {
+    ev.preventDefault();
+    if (code.value.length !== 6) { msg.textContent = "Enter the 6-digit code first."; msg.className = "bad"; return; }
+    go.disabled = true; msg.textContent = "Sending…"; msg.className = "";
+    fetch(DECIDE_URL, { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ proposal_id: p, artifact_hash: h, action: a, token: t, totp: code.value }) })
+      .then(function (r) { return r.text().then(function (s) { return [r.status, s]; }); })
+      .then(function (x) {
+        msg.textContent = x[1]; msg.className = x[0] === 200 ? "ok" : "bad";
+        if (x[0] === 200) { code.disabled = true; } else { go.disabled = false; code.value = ""; code.focus(); }
+      })
+      .catch(function () { msg.textContent = "No connection. Try again."; msg.className = "bad"; go.disabled = false; });
+  });
+  code.focus();
+})();
+</script>
+</body>
+</html>
