@@ -45,3 +45,23 @@ Rules from the blueprint (section G2) that `ncm.py` enforces:
 - Only the task's own metrics are accepted; unknown fields are errors, not ignored.
 
 Estimates (blueprint, not measured): sudoku-easy 5–10 GPU-minutes (< $0.15); TinyStories 0.25–0.5 GPU-hours.
+
+## N2 per-run worst case (deploy/ncm/modal_sudoku.py)
+
+Modal bills a container from start to stop. The GPU function caps every phase: `startup_timeout=120`,
+`timeout=600`, `scaledown_window=2`, plus `max_containers=1` and `retries=0`. The evaluation itself stops at
+`EVAL_TIMEOUT_S=480`, so the container still writes a `failed` results.json before the 600 s cap.
+
+Longest billed time: 120 + 600 + 2 = **722 s**. Prices (modal.com/pricing, 2026-10-16; CPU and memory are
+billed on max(request, usage)); the `eu` region multiplies everything by 1.15:
+
+| Part | Arithmetic | USD |
+|---|---|---|
+| L4 GPU | 722 s × $0.000222/s × 1.15 | 0.1843 |
+| CPU, at most 2 physical cores (assumed) | 722 s × 2 × $0.0000131/s × 1.15 | 0.0218 |
+| Memory, at most 8 GiB (assumed) | 722 s × 8 × $0.00000222/s × 1.15 | 0.0147 |
+| **Worst case per run** | | **~0.22** |
+
+The script sets no CPU or memory limit, so the last two rows are an assumption: 4 cores and 12 GiB would
+still stay under $0.25. `tests/test_integrations_ncm_worker.py` recomputes this table from the script's
+constants. If sudoku-easy needs more than 480 s of evaluation, the run is `failed` ("evaluate.py timed out").

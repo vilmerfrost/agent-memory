@@ -77,7 +77,7 @@ def test_parsers_and_cost() -> None:
     assert W.parse_sudoku(merge_output(2000, 2000, 100.0, 100.0)) == {"solved_rate": 1.0, "cell_rate": 1.0, "valid_rate": 1.0}
     assert W.parse_sudoku("solved %   solved  cell %  valid %\n  50.00  1/2  101.00  100.00") is None
     assert W.parse_sha256sum(f"{'a' * 64}  ./x/y.pt\n{'b' * 64} *z.pt\nnoise\n") == {"x/y.pt": "a" * 64, "z.pt": "b" * 64}
-    assert W.gpu_cost(900, "L4", "eu") == {"gpu_minutes": 15.0, "usd": 0.2298}     # the timeout cap
+    assert W.gpu_cost(722, "L4", "eu") == {"gpu_minutes": 12.033, "usd": 0.1843}   # start + run + idle caps
     assert build(gpu_name="L4\n; rm -rf /")["hardware"]["gpu"] == "L4"          # a strange name falls back
 
 
@@ -89,23 +89,52 @@ def test_contract_checks_the_optional_fields() -> None:
             ncm.parse_results({**ok, **bad})
 
 
+CPU_USD_PER_CORE_S, MEM_USD_PER_GIB_S = 0.0000131, 0.00000222    # modal.com/pricing; billed on max(request, usage)
+
+
+def script_constants() -> dict[str, Any]:
+    """Module-level constants of the Modal script, both `X = 1` and `X, Y = 1, 2`."""
+    consts: dict[str, Any] = {}
+    for n in ast.parse(SCRIPT.read_text()).body:
+        if not isinstance(n, ast.Assign):
+            continue
+        for t in n.targets:
+            if isinstance(t, ast.Name) and isinstance(n.value, ast.Constant):
+                consts[t.id] = n.value.value
+            elif isinstance(t, ast.Tuple) and isinstance(n.value, ast.Tuple):
+                consts.update({e.id: v.value for e, v in zip(t.elts, n.value.elts, strict=True)
+                               if isinstance(e, ast.Name) and isinstance(v, ast.Constant)})
+    return consts
+
+
 def test_the_modal_script_caps_cost_and_blocks_the_network() -> None:
+    c = script_constants()
+    assert (c["GPU"], c["REGION"]) == ("L4", "eu")
+    assert (c["TIMEOUT_S"], c["STARTUP_TIMEOUT_S"], c["SCALEDOWN_S"], c["MAX_CONTAINERS"]) == (600, 120, 2, 1)
+    assert c["EVAL_TIMEOUT_S"] == 480
+    assert c["EVAL_TIMEOUT_S"] + 5 * c["STEP_TIMEOUT_S"] < c["TIMEOUT_S"]   # five helper commands: a failed result is still written
     tree = ast.parse(SCRIPT.read_text())
-    consts = {t.id: n.value.value for n in tree.body if isinstance(n, ast.Assign) and isinstance(n.value, ast.Constant)
-              for t in n.targets if isinstance(t, ast.Name)}
-    if not consts:                                                            # GPU, REGION, ... = "L4", "eu", ...
-        for n in tree.body:
-            if isinstance(n, ast.Assign) and isinstance(n.targets[0], ast.Tuple):
-                consts.update({t.id: v.value for t, v in zip(n.targets[0].elts, n.value.elts, strict=True)})
-    assert (consts["GPU"], consts["REGION"], consts["TIMEOUT_S"]) == ("L4", "eu", 900)
-    assert consts["EVAL_TIMEOUT_S"] < consts["TIMEOUT_S"]                     # a failed result is still written
     (fn,) = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "evaluate"]
     kw = {k.arg: k.value for k in fn.decorator_list[0].keywords}
     assert isinstance(kw["retries"], ast.Constant) and kw["retries"].value == 0
     assert isinstance(kw["block_network"], ast.Constant) and kw["block_network"].value is True
-    assert {"gpu", "timeout", "region", "volumes", "image"} <= set(kw)
+    assert {k: v.id for k, v in kw.items() if isinstance(v, ast.Name)} == {
+        "image": "image", "gpu": "GPU", "timeout": "TIMEOUT_S", "startup_timeout": "STARTUP_TIMEOUT_S",
+        "scaledown_window": "SCALEDOWN_S", "max_containers": "MAX_CONTAINERS", "region": "REGION"}
+    assert "volumes" in kw
     text = SCRIPT.read_text()
     assert "secret" not in text.lower().replace("no amem data, credentials", "")   # no Modal secrets are mounted
+
+
+def test_the_worst_case_run_costs_at_most_25_cents() -> None:
+    """Modal bills a container from start to stop: at most startup_timeout + timeout + scaledown_window. CPU
+    and memory are billed too (assumed at most 2 physical cores and 8 GiB), all times the eu multiplier."""
+    c = script_constants()
+    billed_s = c["STARTUP_TIMEOUT_S"] + c["TIMEOUT_S"] + c["SCALEDOWN_S"]
+    gpu = W.gpu_cost(billed_s, c["GPU"], c["REGION"])
+    cpu_mem = billed_s * (2 * CPU_USD_PER_CORE_S + 8 * MEM_USD_PER_GIB_S) * W.REGION_MULTIPLIER[c["REGION"]]
+    assert billed_s == 722 and gpu == {"gpu_minutes": 12.033, "usd": 0.1843}
+    assert round(cpu_mem, 4) == 0.0365 and round(gpu["usd"] + cpu_mem, 4) == 0.2208 <= 0.25
 
 
 # ---------------------------------------------------------------- record-ncm (disposable Postgres, amem_app)

@@ -128,3 +128,14 @@ def test_the_worker_path_from_the_checkout_and_from_the_container(monkeypatch: p
     assert mod._worker_path("/root/modal_sudoku.py") == Path("/root/ncm_worker.py")
     assert mod._worker_path("/modal_sudoku.py") == Path("/root/ncm_worker.py")
     assert ("add_local_file", (WORKER, "/root/ncm_worker.py")) in mod.image.layers
+
+
+# ---------------------------------------------------------------- F2: what the GPU function asks of Modal
+
+
+def test_the_gpu_function_is_capped(monkeypatch: pytest.MonkeyPatch) -> None:
+    kw = load_script(monkeypatch).evaluate.kw
+    assert {k: kw[k] for k in ("gpu", "region", "timeout", "startup_timeout", "scaledown_window", "max_containers",
+                               "retries", "block_network")} == {
+        "gpu": "L4", "region": "eu", "timeout": 600, "startup_timeout": 120, "scaledown_window": 2,
+        "max_containers": 1, "retries": 0, "block_network": True}

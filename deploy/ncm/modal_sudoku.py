@@ -8,10 +8,13 @@ Before the first run (docs/integrations/cloud-activation.md, NCM steps):
 Run (after approval), from the repo root:
     modal run deploy/ncm/modal_sudoku.py --experiment-id exp-YYYYMMDD-ncm
 
-What it spends: one L4 in the `eu` region ($0.000222/s x 1.15). The GPU function has timeout=900 s and
-retries=0, so one run costs at most ~$0.23 of GPU time (estimate ~$0.05). Downloads happen at image build, which
-runs without a GPU. The GPU function runs with block_network=True: it needs nothing from the internet and can
-send nothing anywhere. It receives no amem data, credentials or session content: only public files.
+What it spends: one L4 in the `eu` region ($0.000222/s x 1.15), plus its CPU and memory (also x 1.15). Modal
+bills a container from start to stop, so the GPU function caps all three phases: startup_timeout=120 s,
+timeout=600 s, scaledown_window=2 s (722 s at most), with max_containers=1 and retries=0. Worst case ~$0.22 (GPU
+$0.184 plus ~$0.037 for at most 2 cores and 8 GiB; arithmetic in docs/integrations/ncm-track.md); estimate
+~$0.05. Downloads happen at image build, which runs without a GPU. The GPU function runs with
+block_network=True: it needs nothing from the internet and can send nothing anywhere. It receives no amem data,
+credentials or session content: only public files.
 
 What it writes: results.json (the Mission 004A contract, built by integrations/ncm_worker.py) and the raw
 evaluation log in the Modal Volume `amem-ncm-results`, and a local copy under ./ncm-results/<run_id>/.
@@ -21,6 +24,8 @@ Checked against the modal 1.6.2 source (2026-10-16): Image.debian_slim(python_ve
 .pip_install, .run_commands, .add_local_file(local, remote, copy=False) (must be the last layer),
 App.function(image=, gpu=, timeout=, retries=, region=, volumes=, block_network=), Volume.from_name(
 create_if_missing=True), Volume.commit(), App.local_entrypoint(), Function.remote(), modal.is_local().
+Added in Mission 004C from the 2026-10-17 review, not re-read in the source (no network in that mission):
+App.function(startup_timeout=, scaledown_window=, max_containers=).
 """
 
 from __future__ import annotations
@@ -59,7 +64,10 @@ def _load_worker():  # one file by path: putting its folder on sys.path would sh
 
 
 W = _load_worker()
-GPU, REGION, TIMEOUT_S, EVAL_TIMEOUT_S = "L4", "eu", 900, 780
+GPU, REGION = "L4", "eu"
+# Modal bills a container from start to stop, so all three bound the bill: start <= 120 s, run <= 600 s, idle 2 s.
+TIMEOUT_S, STARTUP_TIMEOUT_S, SCALEDOWN_S, MAX_CONTAINERS = 600, 120, 2, 1
+EVAL_TIMEOUT_S, STEP_TIMEOUT_S = 480, 20      # 480 + 5 helper steps x 20 < 600: the container writes a failed result
 
 image = (
     modal.Image.debian_slim(python_version="3.11")
@@ -73,12 +81,13 @@ app = modal.App("amem-ncm-sudoku")
 volume = modal.Volume.from_name("amem-ncm-results", create_if_missing=True)
 
 
-def _run(cmd: list[str], cwd: str = "/ncm", timeout: int = 60) -> subprocess.CompletedProcess[str]:
+def _run(cmd: list[str], cwd: str = "/ncm", timeout: int = STEP_TIMEOUT_S) -> subprocess.CompletedProcess[str]:
     return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout)
 
 
-@app.function(image=image, gpu=GPU, timeout=TIMEOUT_S, retries=0, region=REGION, volumes={"/results": volume},
-              block_network=True)
+@app.function(image=image, gpu=GPU, timeout=TIMEOUT_S, startup_timeout=STARTUP_TIMEOUT_S,
+              scaledown_window=SCALEDOWN_S, max_containers=MAX_CONTAINERS, retries=0, region=REGION,
+              volumes={"/results": volume}, block_network=True)
 def evaluate(run_id: str, experiment_id: str | None) -> dict:
     started, t0 = datetime.now(UTC), time.monotonic()
     out = f"/results/{run_id}"
