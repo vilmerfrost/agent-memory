@@ -136,3 +136,41 @@ Hosted baseline before the migration:
   - With the merged code and the frozen criteria, `apply --dry-run` is still refused (weekly cap).
 - agent-memory: `main` (`32ea623`) is an ancestor of `rsi/m003-integration`, so the merge is a
   fast-forward. Full suite on `601ca55` with the merged improve: 1432 passed. Edge function: 7/7.
+
+## Phase D: merges (2026-10-16 18:48 CEST), approved in chat (local only, no push)
+
+| # | Repo | Change | Result |
+|---|------|--------|--------|
+| D1 | `~/agent-config` | `git merge --no-ff rsi/m003-stage` | `f87355e`; tree identical to the tested trial merge `63232f7` |
+| D2 | `~/Projects/agent-memory` | `git merge --ff-only rsi/m003-integration`, `uv sync` | `06322c2`; added cryptography 50.0.2, cffi 2.1.1, pycparser 3.11 |
+
+Both ran right after the 18:47:59 ingest run. Nothing was pushed: `origin/main` stays at `907d780` / `32ea623`.
+
+**Verification:**
+- Both live trees are clean on `f87355e` / `06322c2`. The only untracked item is the pre-existing `docs/ideas/`.
+- Selftests on the live code (temporary state):
+  - `improve` selftest pass, e2e-promote 30/30, e2e 49/49;
+  - ab-lesson selftest 11/11;
+  - agent-memory full suite 1432 passed (with the live merged improve).
+- `amem rsi freeze-status` prints `FROZEN`.
+- Unattended improvement writes stay off:
+  - `improve apply --dry-run` is refused (weekly cap);
+  - the loaded amem-daily job has no edits flags;
+  - `apply_mode` is unset, so ab-lesson cannot write;
+  - its task is disabled.
+- The new commands work:
+  - `amem rsi --help` lists 11 subcommands;
+  - `amem rsi targets` finds 47 files, 9 not in git;
+  - `amem archive status` reports initialized=no and key=no. It wrote nothing and made no Keychain call.
+- Ingestion on the new code: the 19:03:14 amem-ingest run exited 0 (runs 225), with no FAIL line.
+  - Every session active since the merge is tagged.
+  - `env = eval` matches `kind = eval` exactly (144).
+  - `env = prod` covers chat 20, parent 6, routine 4 and worker 84.
+  - No session was tagged sandbox or cloud.
+- The promotion worker stays disabled:
+  - no launchd job or task runs `decide-poll`;
+  - `rsi_decisions`, `rsi_proposals` and `rsi_decision_tokens` are empty.
+
+**Undo:**
+- D1: `git -C ~/agent-config revert -m 1 f87355e`, or a reset to `319fe0a` (nothing is pushed).
+- D2: `git -C ~/Projects/agent-memory reset --hard 32ea623 && uv sync`.
