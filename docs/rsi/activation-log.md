@@ -272,3 +272,27 @@ Branch `rsi/m0035-e`, commit `c079c04`. Suite 1451 passed; edge function 12/12. 
 - **Still open:** T2 (Supabase CLI token) and T3 (the connector runs as `postgres`) until Phase G (A4, A5).
   Until then the decision-record boundary is not complete.
 - **Undo** (never automatic): Vilmer runs `.venv/bin/amem admin restore-credentials` and clicks Allow once.
+
+## Phase F: transcript archive (2026-10-16 20:40–20:43 CEST), approved in chat (F1–F3, no schedule, no prune)
+
+- **Preflight** (read-only): `archive run --dry-run` counted 2093 files, 1.90 GB, 0 errors. 407 GB free.
+  No archive and no key existed. The session file count had fallen from 276 to 260 that day: Claude Code
+  was already deleting old transcripts.
+- **F1, `amem archive init`** (20:40:01): Keychain item `amem-archive` / `k1` and
+  `~/Library/Application Support/amem-archive` (dir 700, files 600). No value printed.
+- **F2, key export:** Vilmer ran `amem archive key-export` in his own terminal and stored the recovery
+  string in his password manager. The agent never saw it.
+- **F3, first `amem archive run`** (20:41:57, 29 s): 2093 versions, 1376 sessions, 2066 objects,
+  1.90 GB read, 636 MB stored (613 MB on disk), 0 skipped, 0 errors.
+- **`amem archive verify`:** ok. 2095 manifest lines, 2066 objects checked, 0 missing, 0 bad, 0 chain breaks,
+  0 index problems, 0 orphans.
+- **Restore test:** one finished Claude session (810 kB, last changed more than 2 days earlier) restored
+  into a scratch folder outside every source root. Same sha256, same relative path, same mtime, mode 600.
+  The plaintext copy was deleted afterwards. Only hashes and counts were printed.
+- **Kind: safeguard.** The encryption protects copies of the archive off this Mac (backups, disk images).
+  The key item has the default ACL, so the future daily run can read it without a dialog, and so can any
+  process that runs as `vilmerfrost`. Such a process can also read the source transcripts directly.
+- **Not done (each needs its own approval):** a daily schedule for `archive run`; `prune`.
+  Until a schedule exists, transcripts that Claude Code deletes after today are not archived.
+- **Undo** (never automatic, Vilmer runs it): delete `~/Library/Application Support/amem-archive` and the
+  Keychain item `amem-archive` / `k1`. The sources are never changed.
