@@ -37,7 +37,7 @@ def sink_for(name: str) -> sync.Sink:
         return langfuse.LangfuseSink(langfuse.LangfuseClient.from_env(), os.environ.get("RSI_SANDBOX_DIR") or None)
     if name == "pastdev":
         from agent_memory.integrations import pastdev
-        return pastdev.sink_from_env()
+        return pastdev.PastDevSink()
     raise KeyError(name)
 
 
@@ -50,7 +50,7 @@ def retriever_for(name: str) -> E.Retriever:
         return langfuse.LangfuseRetriever(langfuse.LangfuseClient.from_env())
     if name == "pastdev":
         from agent_memory.integrations import pastdev
-        return pastdev.retriever_from_env()
+        return pastdev.PastDevRetriever(store.connect)       # re-reads recalled refs from Supabase
     raise KeyError(name)
 
 
