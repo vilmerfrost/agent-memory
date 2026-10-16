@@ -79,6 +79,7 @@ if modal.is_local():                     # the worker file is mounted at contain
     image = image.add_local_file(_LOCAL, str(_REMOTE))
 app = modal.App("amem-ncm-sudoku")
 volume = modal.Volume.from_name("amem-ncm-results", create_if_missing=True)
+RESULTS_DIR = "/results"                 # the volume's mount point in the container
 
 
 def _run(cmd: list[str], cwd: str = "/ncm", timeout: int = STEP_TIMEOUT_S) -> subprocess.CompletedProcess[str]:
@@ -87,10 +88,10 @@ def _run(cmd: list[str], cwd: str = "/ncm", timeout: int = STEP_TIMEOUT_S) -> su
 
 @app.function(image=image, gpu=GPU, timeout=TIMEOUT_S, startup_timeout=STARTUP_TIMEOUT_S,
               scaledown_window=SCALEDOWN_S, max_containers=MAX_CONTAINERS, retries=0, region=REGION,
-              volumes={"/results": volume}, block_network=True)
+              volumes={RESULTS_DIR: volume}, block_network=True)
 def evaluate(run_id: str, experiment_id: str | None) -> dict:
     started, t0 = datetime.now(UTC), time.monotonic()
-    out = f"/results/{run_id}"
+    out = f"{RESULTS_DIR}/{run_id}"
     pathlib.Path(out).mkdir(parents=True, exist_ok=True)
     gpu_name = _run(["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"]).stdout.strip().splitlines()[:1]
     commit = _run(["git", "rev-parse", "HEAD"]).stdout.strip()
@@ -113,7 +114,11 @@ def evaluate(run_id: str, experiment_id: str | None) -> dict:
                           finished_at=datetime.now(UTC).isoformat(timespec="seconds"), out=out,
                           extra_limitations=extra)
     pathlib.Path(out, "results.json").write_text(json.dumps(res, indent=2, sort_keys=True))
-    volume.commit()
+    try:
+        volume.commit()
+    except Exception as exc:          # the result still goes back to main(), which keeps the local copy
+        res["limitations"] = [*res["limitations"][:9], f"the Modal Volume commit failed ({type(exc).__name__}): "
+                                                       "only the local copy is certain"]     # the contract keeps 10
     return res
 
 

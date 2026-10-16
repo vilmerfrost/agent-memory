@@ -7,6 +7,7 @@ container's commands (`nvidia-smi`, `sha256sum`, `evaluate.py`, ...) are faked t
 from __future__ import annotations
 
 import importlib.util
+import subprocess
 import sys
 import types
 from pathlib import Path
@@ -161,3 +162,57 @@ def test_a_raising_modal_call_still_writes_a_failed_results_file(monkeypatch: py
     assert run.reason == "the Modal call raised TimeoutError: Function timed out after 600 seconds"
     assert run.provider == "modal" and run.cost["usd"] >= 0 and run.hardware["gpu"] == "L4"
     assert any("local entrypoint" in x for x in run.limitations)
+
+
+# ---------------------------------------------------------------- F4, F5: the GPU function's own failure paths
+
+RUN_ID = "ncm-20261020-010203-sudoku-easy"
+METRICS_ROW = "solved %   solved  cell %  valid %\n    99.50 1990/2000   99.91   100.00\n"
+
+
+def fake_run(evaluation: str | BaseException) -> Any:
+    """The container's commands, faked: the pinned commit and hashes, and `evaluation` for evaluate.py."""
+    def _run(cmd: list[str], cwd: str = "/ncm", timeout: int = 20) -> subprocess.CompletedProcess[str]:
+        if cmd[0] == "nvidia-smi":
+            out = "NVIDIA L4\n"
+        elif cmd[:2] == ["git", "rev-parse"]:
+            out = W.REPO_COMMIT + "\n"
+        elif cmd[0] == "sha256sum":
+            out = "".join(f"{W.PINNED_SHA256[f]}  {f}\n" for f in cmd[1:])
+        elif cmd[:2] == ["python", "evaluate.py"]:
+            if isinstance(evaluation, BaseException):
+                raise evaluation
+            out = evaluation
+        else:
+            raise AssertionError(f"unexpected command {cmd}")
+        return subprocess.CompletedProcess(cmd, 0, out, "")
+    return _run
+
+
+class _BrokenVolume:
+    def commit(self) -> None:
+        raise RuntimeError("volume backend unavailable")
+
+
+def in_container(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, evaluation: str | BaseException) -> Any:
+    mod = load_script(monkeypatch)
+    monkeypatch.setattr(mod, "RESULTS_DIR", str(tmp_path))
+    monkeypatch.setattr(mod, "_run", fake_run(evaluation))
+    return mod
+
+
+def test_an_ok_evaluation_writes_and_commits(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    mod = in_container(monkeypatch, tmp_path, METRICS_ROW)
+    res = mod.evaluate.local(RUN_ID, EXP)
+    run = ncm.parse_results(res)
+    assert run.status == "ok" and run.metrics["solved_rate"] == 0.995 and mod.volume.commits == 1
+    assert ncm.load_results(tmp_path / RUN_ID / "results.json") == run
+    assert run.commands[-1].endswith(f"--out {tmp_path / RUN_ID}")
+
+
+def test_a_failed_volume_commit_is_a_limitation(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    mod = in_container(monkeypatch, tmp_path, METRICS_ROW)
+    monkeypatch.setattr(mod, "volume", _BrokenVolume())
+    run = ncm.parse_results(mod.evaluate.local(RUN_ID, EXP))                  # returned, not raised
+    assert run.status == "ok"
+    assert "the Modal Volume commit failed (RuntimeError): only the local copy is certain" in run.limitations
