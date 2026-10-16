@@ -44,6 +44,15 @@ idle after 15 min, IP list "anywhere", Idle): not used by amem and not changed b
 in eu-west-1 is about $0.333 per 8 GiB-hour (us-west-2 $0.29846 times the eu-west-1/us-west-2 ratio of the
 Enterprise rates); `amem-rsi` costs that only while awake.
 
+**G-CH1 done 2026-10-17 (owner approval of the same day; the IP list part of G-CH2 was included in it):**
+service `amem-rsi`, id `ff3ccf61-f3e4-41e1-a72c-e853ca2582ef`, AWS eu-west-1, Scale plan (unchanged), version
+26.6, Regular channel; Custom, vertical autoscaling, 1 replica, pinned at 8 GiB / 2 vCPU; idle after 5 min;
+IP access list: 1 specific location (the Mac's public IPv4, 158.174.186.218, same from the browser and the
+shell); crash reports off; daily backup kept 1 day (default). Organization spend alert: $100 per billing
+period, alerts at $50/$75/$90/$100 by email and UI (org-wide: it counts every service, including `My first
+service`). Untouched: the org, the plan, the credits, `My first service`. No database user, no data. Next
+steps (G-CH3 onward) need their own approval.
+
 ## Langfuse Cloud EU
 
 | Step | Who | What | Accept | Undo |
