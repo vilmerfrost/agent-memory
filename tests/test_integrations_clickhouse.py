@@ -23,7 +23,7 @@ import pytest
 from psycopg import sql
 from psycopg.types.json import Jsonb
 
-from agent_memory.integrations import clickhouse as CH, evidence as E, sync
+from agent_memory.integrations import clickhouse as CH, egress, evidence as E, sync
 from integrations_mock import MockService, Request
 
 APP_PW = "ch-test-pw-0123456789"
@@ -643,6 +643,130 @@ def test_retriever_and_sink_unavailable_when_unconfigured_or_down(app: str) -> N
         rep = sync.run(CH.ClickHouseSink(down), conn, environ={})
         assert rep.status == "unavailable" and sync.load(conn, "clickhouse").get("watermarks") is None
         assert sync.run(CH.ClickHouseSink(down), conn, environ={"AMEM_SYNC_CLICKHOUSE": "off"}).status == "off"
+
+
+# ---------------------------------------------------------------- Mission 004C (F1): repo-scoped deviation sources
+
+
+def _wire(fake: FakeClickHouse) -> str:
+    return "\n".join(f"{r.method} {r.path} {json.dumps(r.query)} {json.dumps(r.headers)} "
+                     f"{r.body.decode('utf-8', 'replace')}" for r in fake.svc.requests)
+
+
+def test_team_repo_rules_never_leave_and_own_repo_sources_are_pseudonyms(seed: Seed, pg_url: str, app: str,
+                                                                         fake: FakeClickHouse) -> None:
+    with psycopg.connect(pg_url) as conn:
+        team = seed.session(conn, "chs-team", repo="pipeline-poc", project="pipeline-poc",
+                            meta=Jsonb({"team": True, "note": seed.mk("tmeta")}))
+        t1 = seed.deviation(conn, team, "claude-md:pipeline-poc", "pipeline-poc-deploy-gate", 0.2, 0.9)
+        t2 = seed.deviation(conn, team, "agents-md:pipeline-poc", "pipeline-poc-review", 0.2, 0.9)
+        tg = seed.deviation(conn, team, "claude-md:global", "explaining/core-rule", 0.2, 0.9)   # the owner's own rule
+        own = [seed.deviation(conn, "chs-1", "claude-md:agent-memory", "own-rule", f, 0.9) for f in (0.1, 0.2, 0.3)]
+    with psycopg.connect(app) as conn:
+        assert sync.run(CH.ClickHouseSink(client_for(fake.svc.url)), conn, replay=True, environ={}).status == "ok"
+    wire = _wire(fake)
+    assert "pipeline-poc" not in wire and "agent-memory" not in wire
+    devs = fake.by_id("deviations")
+    assert (devs[t1]["instruction_source"], devs[t1]["rule_id"]) == ("claude-md:team", None)
+    assert (devs[t2]["instruction_source"], devs[t2]["rule_id"]) == ("agents-md:team", None)
+    assert (devs[tg]["instruction_source"], devs[tg]["rule_id"]) == ("claude-md:global", "explaining/core-rule")
+    pseudo = CH.pseudonym("agent-memory")
+    assert pseudo and all((devs[d]["instruction_source"], devs[d]["rule_id"]) == (f"claude-md:{pseudo}", "own-rule")
+                          for d in own)
+    # the named queries still take the Mac's names: the rule param is translated before it leaves
+    r = CH.ClickHouseRetriever(client_for(fake.svc.url))
+    (gap,) = E.gather("rule_gap", {"rule": "claude-md:agent-memory:own-rule", "min_n": "3"}, [r])
+    assert fake.svc.requests[-1].q("param_rule") == f"claude-md:{pseudo}:own-rule"
+    assert gap.status == "ok" and [e.ref for e in gap.refs] == [f"ch:q.rule_gap/claude-md:{pseudo}:own-rule"]
+    (rate,) = E.gather("rule_weekly_rate", {"rule": "claude-md:agent-memory:own-rule"}, [r])
+    assert fake.svc.requests[-1].q("param_rule") == f"claude-md:{pseudo}:own-rule"
+    assert rate.status == "ok" and sum(e.metrics["n_deviations"] for e in rate.refs) == 3
+    (again,) = E.gather("rule_gap", {"rule": f"claude-md:{pseudo}:own-rule", "min_n": "3"}, [r])   # an answer's key
+    assert [e.ref for e in again.refs] == [e.ref for e in gap.refs]
+    (glob,) = E.gather("rule_gap", {"rule": "claude-md:global:explaining/core-rule"}, [r])
+    assert fake.svc.requests[-1].q("param_rule") == "claude-md:global:explaining/core-rule" and glob.refs
+    assert "pipeline-poc" not in _wire(fake) and "agent-memory" not in _wire(fake)
+
+
+def test_rule_param_and_repo_scoped(monkeypatch: pytest.MonkeyPatch) -> None:
+    from agent_memory import deviations
+
+    for s in ("claude-md:global", "agents-md:global", "claude-md:x", "agents-md:pipeline-poc", "skill:dispatch",
+              "parent-md", "claude-md", "routine:daily", "agent:worker"):
+        assert CH.repo_scoped(s) == deviations.repo_scoped(s), s
+    assert CH.rule_param("skill:dispatch:spawn") == "skill:dispatch:spawn"
+    assert CH.rule_param("claude-md:team:unknown") == "claude-md:team:unknown"
+    assert CH.rule_param("agents-md:x") == f"agents-md:{CH.pseudonym('x')}"
+    monkeypatch.delenv(CH.PSEUDONYM_ENV)
+    with pytest.raises(ValueError, match=CH.PSEUDONYM_ENV):
+        CH.rule_param("claude-md:agent-memory:own-rule")
+    assert CH.source_value("claude-md:agent-memory") is None and CH.source_value("claude-md:global") == "claude-md:global"
+
+
+# ---------------------------------------------------------------- Mission 004C (F3): the egress deny list
+
+
+def test_denied_and_email_shaped_values_never_leave(seed: Seed, pg_url: str, app: str, fake: FakeClickHouse,
+                                                    monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(egress.DENY_ENV, "Acme-Secret, globex")
+    with psycopg.connect(pg_url) as conn:
+        seed.session(conn, "chs-team", repo="pipeline-poc", project="pipeline-poc", meta=Jsonb({"team": True}))
+        # the same repo on a session ingestion did not flag, an email-shaped label, a denied row key
+        stray = seed.session(conn, "chs-stray", repo="pipeline-poc", project="pipeline-poc", model="vilmer@example.com")
+        seed.session(conn, "chs-acme-secret-1")
+        seed.run(conn, "pipeline-poc-nightly", "pass", 30, 5)
+        seed.run(conn, "globex-sync", "pass", 20, 5)
+        seed.ins(conn, "skill_calls", ts=seed.now, skill="acme-secret-helper", invoked_by="me", agent="claude",
+                 project="x", source_key=seed.mk("skey"), session_id=stray)
+    with psycopg.connect(app) as conn:
+        assert sync.run(CH.ClickHouseSink(client_for(fake.svc.url)), conn, replay=True, environ={}).status == "ok"
+    wire = _wire(fake).lower()
+    for term in ("pipeline-poc", "acme-secret", "globex", "vilmer@example.com"):
+        assert term not in wire, term
+    sessions = fake.by_id("sessions")
+    assert "chs-acme-secret-1" not in sessions                                   # a denied row key: the row is dropped
+    assert (sessions["chs-stray"]["repo"], sessions["chs-stray"]["project"], sessions["chs-stray"]["model"]) == \
+        (None, None, None)
+    assert sessions["chs-team"]["repo"] == "team"
+    assert sessions["chs-1"]["repo"] == CH.pseudonym("agent-memory") and sessions["chs-1"]["model"] == "claude-test-1"
+    assert sorted(r["routine"] or "-" for r in fake.final("runs")) == ["-", "-", *["chtest-daily"] * 4, "chtest-ok"]
+    assert sorted(k["skill"] or "-" for k in fake.final("skill_calls")) == ["-", "dispatch"]
+    t = next(t for t in CH.TABLES if t.name == "runs")
+    deny = egress.env_terms({egress.DENY_ENV: "acme"})
+    assert CH.map_row(t, {"id": "r-acme-1", "routine": "x"}, 1, deny) is None
+    assert CH.map_row(t, {"id": "r1", "routine": "ACME-daily", "source": "a@b.co"}, 1, deny)["routine"] is None
+
+
+# ---------------------------------------------------------------- Mission 004C (F4): --tables and --since
+
+
+def test_sink_narrowed_to_tables_and_since(seed: Seed, pg_url: str, app: str, fake: FakeClickHouse) -> None:
+    old = seed.ids["runs"][0]
+    with psycopg.connect(pg_url) as conn:
+        conn.execute("update runs set created_at = now() - interval '10 days', started_at = now() - interval '10 days', "
+                     "finished_at = now() - interval '10 days' where id = %s", (old,))
+    since = datetime.now(UTC) - timedelta(days=5)
+    sink = CH.ClickHouseSink(client_for(fake.svc.url), tables=CH.tables_named(["skill_calls", "runs"]), since=since)
+    assert [t.name for t in sink.tables] == ["runs", "skill_calls"]
+    with psycopg.connect(app) as conn:
+        rep = sync.run(sink, conn, replay=True, environ={})
+        assert rep.status == "ok" and set(sync.load(conn, "clickhouse")["watermarks"]) == {"runs", "skill_calls"}
+    assert {r.q("query").split()[2] for r in fake.inserts()} == {"amem.runs", "amem.skill_calls"}
+    runs = fake.by_id("runs")
+    assert old not in runs and len(runs) == len(seed.ids["runs"]) - 1 and len(fake.by_id("skill_calls")) == 1
+    with psycopg.connect(app) as conn:
+        assert sync.run(CH.ClickHouseSink(client_for(fake.svc.url)), conn, environ={}).status == "ok"
+        assert old not in fake.by_id("runs")                                # behind the cursor, as documented
+        marks = sync.load(conn, "clickhouse")["watermarks"]
+        assert set(marks) == set(TABLES)
+        # a narrowed replay without --since sends the old row, and keeps the other tables' cursors
+        sync.run(CH.ClickHouseSink(client_for(fake.svc.url), tables=CH.tables_named(["runs"])), conn, replay=True,
+                 environ={})
+        after = sync.load(conn, "clickhouse")["watermarks"]
+    assert old in fake.by_id("runs") and set(after) == set(TABLES)
+    assert {t: m for t, m in after.items() if t != "runs"} == {t: m for t, m in marks.items() if t != "runs"}
+    with pytest.raises(ValueError, match="unknown table.*nope"):
+        CH.tables_named(["runs", "nope"])
 
 
 def test_config_from_env_never_shows_the_key() -> None:

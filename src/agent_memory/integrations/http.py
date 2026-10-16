@@ -73,8 +73,11 @@ class Response:
 
 def request(method: str, url: str, *, headers: Mapping[str, str] | None = None, body: Any = None,
             timeout: float = 10.0, retries: int = 2, backoff: float = 0.5,
-            sleep: Callable[[float], None] = time.sleep, ok: Callable[[int], bool] = lambda s: 200 <= s < 300) -> Response:
-    """One request. `body`: bytes, str, or anything json.dumps takes (sent as application/json)."""
+            sleep: Callable[[float], None] = time.sleep, ok: Callable[[int], bool] = lambda s: 200 <= s < 300,
+            final: Callable[[Response], bool] | None = None) -> Response:
+    """One request. `body`: bytes, str, or anything json.dumps takes (sent as application/json).
+    `final(response)` true: an answer the caller knows a retry cannot change (past.dev's 429 with a cap-reached
+    code), raised at once, even for a status that is otherwise retried."""
     if not plain_http_ok(url):
         raise HttpError(None, "refused: plain http only to localhost")
     hdrs = dict(headers or {})
@@ -103,7 +106,7 @@ def request(method: str, url: str, *, headers: Mapping[str, str] | None = None, 
             continue
         if ok(resp.status):
             return resp
-        if resp.status in RETRY_STATUSES and attempt < retries:
+        if resp.status in RETRY_STATUSES and attempt < retries and not (final is not None and final(resp)):
             wait = retry_after(resp.headers)
             if wait is not None and wait > MAX_RETRY_AFTER_S:
                 raise HttpError(resp.status, f"Retry-After {wait:.0f}s is over {MAX_RETRY_AFTER_S:.0f}s")

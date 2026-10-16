@@ -1,12 +1,13 @@
 """`amem sync ...` and `amem evidence query ...` (Mission 004A; blueprint Appendix 2).
 
-    amem sync run --sink clickhouse|langfuse|pastdev [--budget S] [--replay] [--json]
+    amem sync run --sink clickhouse|langfuse|pastdev [--budget S] [--replay] [--tables T1,T2] [--since DATE] [--json]
     amem sync status [--json]
     amem sync verify --sink clickhouse [--days N] [--json]
     amem sync schema --sink clickhouse [--cloud] [--db NAME] [--part all|admin|writer] [--hash-from-env]
                                                                 (prints SQL for the owner; sends nothing)
     amem sync grants --sink clickhouse [--json]   (as the writer: probes read/insert allowed, DDL/users denied)
-    amem sync plan --sink clickhouse|langfuse|pastdev [--replay] [--json]   (dry run; read-only, sends nothing)
+    amem sync plan --sink clickhouse|langfuse|pastdev [--replay] [--tables T1,T2] [--since DATE] [--json]
+                                                                (dry run; read-only, sends nothing)
     amem evidence query --source sb|ch|lf|pd <named-query> [--param k=v ...] [--json]
     amem evidence ask <question> [--param k=v ...] [--record] [--json]     (questions.py: the six questions)
     amem evidence questions
@@ -25,6 +26,7 @@ import argparse
 import json
 import os
 import sys
+from datetime import UTC, date, datetime
 from typing import Any
 
 import psycopg
@@ -35,17 +37,58 @@ from agent_memory.integrations import evidence as E, sync
 SOURCE_ADAPTER = {"ch": "clickhouse", "lf": "langfuse", "pd": "pastdev"}
 
 
-def sink_for(name: str) -> sync.Sink:
+def sink_for(name: str, tables: list[str] | None = None, since: datetime | None = None) -> sync.Sink:
+    """The sink, narrowed to `tables` and to rows since `since` when given (Mission 004C, F4). Raises
+    ValueError for a table the sink does not have."""
     if name == "clickhouse":
         from agent_memory.integrations import clickhouse
-        return clickhouse.ClickHouseSink()
+        return clickhouse.ClickHouseSink(tables=clickhouse.tables_named(tables) if tables else clickhouse.TABLES,
+                                         since=since)
     if name == "langfuse":
         from agent_memory.integrations import langfuse
-        return langfuse.LangfuseSink(langfuse.LangfuseClient.from_env(), os.environ.get("RSI_SANDBOX_DIR") or None)
+        if tables and set(tables) != {langfuse.TABLE}:
+            raise ValueError(f"unknown table(s) for langfuse: {', '.join(sorted(set(tables) - {langfuse.TABLE}))} "
+                             f"(known: {langfuse.TABLE})")
+        return langfuse.LangfuseSink(langfuse.LangfuseClient.from_env(), os.environ.get("RSI_SANDBOX_DIR") or None,
+                                     since=since)
     if name == "pastdev":
         from agent_memory.integrations import pastdev
-        return pastdev.PastDevSink()
+        return pastdev.PastDevSink(tables=tables, since=since)
     raise KeyError(name)
+
+
+def _tables_arg(text: str) -> list[str]:
+    names = [t.strip() for t in text.split(",") if t.strip()]
+    if not names:
+        raise argparse.ArgumentTypeError("--tables takes table names separated by commas")
+    return names
+
+
+def _since_arg(text: str) -> datetime:
+    try:
+        d = date.fromisoformat(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"--since takes a date YYYY-MM-DD, got {text!r}") from None
+    return datetime(d.year, d.month, d.day, tzinfo=UTC)
+
+
+def _scoped_sink(args: argparse.Namespace, cmd: str) -> sync.Sink | None:
+    try:
+        return sink_for(args.sink, args.tables, args.since)
+    except ValueError as exc:
+        print(f"amem: sync {cmd}: {exc}", file=sys.stderr)
+    except (ImportError, AttributeError, KeyError) as exc:
+        print(f"amem: sync {cmd}: adapter {args.sink} not available: {type(exc).__name__}", file=sys.stderr)
+    return None
+
+
+def _scope(args: argparse.Namespace) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    if args.tables:
+        out["tables"] = args.tables
+    if args.since:
+        out["since"] = args.since.date().isoformat()
+    return out
 
 
 def retriever_for(name: str) -> E.Retriever:
@@ -67,10 +110,8 @@ def _out(args: argparse.Namespace, obj: Any, line: str, code: int = 0) -> int:
 
 
 def cmd_sync_run(args: argparse.Namespace) -> int:
-    try:
-        sink = sink_for(args.sink)
-    except (ImportError, AttributeError, KeyError) as exc:
-        print(f"amem: sync run: adapter {args.sink} not available: {type(exc).__name__}", file=sys.stderr)
+    sink = _scoped_sink(args, "run")
+    if sink is None:
         return 2
     try:
         with store.connect() as conn:
@@ -78,7 +119,9 @@ def cmd_sync_run(args: argparse.Namespace) -> int:
     except psycopg.Error as exc:
         print(f"amem: sync run failed: {type(exc).__name__}", file=sys.stderr)
         return 1
-    return _out(args, rep.__dict__, rep.line(), 1 if rep.status == "failed" else 0)
+    scope = _scope(args)
+    obj = {**rep.__dict__, **({"scope": scope} if scope else {})}
+    return _out(args, obj, rep.line(), 1 if rep.status == "failed" else 0)
 
 
 def cmd_sync_status(args: argparse.Namespace) -> int:
@@ -119,10 +162,8 @@ def cmd_sync_verify(args: argparse.Namespace) -> int:
 
 def cmd_sync_plan(args: argparse.Namespace) -> int:
     """What a run (or a --replay backfill) would send. Read-only connection; the provider is never called."""
-    try:
-        sink = sink_for(args.sink)
-    except (ImportError, AttributeError, KeyError) as exc:
-        print(f"amem: sync plan: adapter {args.sink} not available: {type(exc).__name__}", file=sys.stderr)
+    sink = _scoped_sink(args, "plan")
+    if sink is None:
         return 2
     try:
         with store.connect() as conn:
@@ -130,9 +171,13 @@ def cmd_sync_plan(args: argparse.Namespace) -> int:
     except psycopg.Error as exc:
         print(f"amem: sync plan failed: {type(exc).__name__}", file=sys.stderr)
         return 1
+    scope = _scope(args)
+    if scope:
+        out["scope"] = scope
     lines = [f"plan {out['sink']}{' (replay)' if out['replay'] else ''}: {out['rows']} rows in {out['requests']} "
              f"requests, {out['days_at_limit']} day(s) at the client-side limit"
-             + (f", ~{out['cost']} credits" if "cost" in out else "")]
+             + (f", ~{out['cost']} credits" if "cost" in out else "")
+             + (f" [scope {json.dumps(scope, sort_keys=True)}]" if scope else "")]
     lines += [f"  {t}: {v['rows']} rows, {v['batches']} batches, {v['bytes']} bytes" for t, v in sorted(out["tables"].items())]
     return _out(args, out, "\n".join(lines))
 
@@ -275,6 +320,16 @@ def cmd_evidence_record_ncm(args: argparse.Namespace) -> int:
                            f"metrics={json.dumps(run.metrics, sort_keys=True)}")
 
 
+def _scope_args(q: argparse.ArgumentParser) -> None:
+    q.add_argument("--tables", type=_tables_arg, default=None, metavar="T1,T2",
+                   help="only these source tables (clickhouse: its tables; langfuse: sandbox_runs; pastdev: "
+                        "rsi_proposals, rsi_decisions, rsi_experiments, edits, lesson_candidates)")
+    q.add_argument("--since", type=_since_arg, default=None, metavar="YYYY-MM-DD",
+                   help="only rows changed on or after this UTC date. clickhouse/langfuse: older rows fall behind "
+                        "the cursor (a later --replay without --since sends them); pastdev: older records wait "
+                        "for a run without --since. Retractions and ingestion checks are never narrowed")
+
+
 def register(sub: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
     p = sub.add_parser("sync", help="push Supabase evidence to ClickHouse / Langfuse / past.dev (docs/integrations/)")
     s = p.add_subparsers(dest="sync_command", required=True)
@@ -282,6 +337,7 @@ def register(sub: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
     q.add_argument("--sink", required=True, choices=sync.SINKS)
     q.add_argument("--budget", type=float, default=60.0, help="seconds; stops between batches")
     q.add_argument("--replay", action="store_true", help="start from no cursor (backfill; pushes are idempotent)")
+    _scope_args(q)
     q.add_argument("--json", action="store_true")
     q.set_defaults(func=cmd_sync_run)
     q = s.add_parser("status", help="each sink's cursor, last success, failing and dead tables")
@@ -295,6 +351,7 @@ def register(sub: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
     q = s.add_parser("plan", help="dry run: what a run or a --replay backfill would send (read-only)")
     q.add_argument("--sink", required=True, choices=sync.SINKS)
     q.add_argument("--replay", action="store_true")
+    _scope_args(q)
     q.add_argument("--json", action="store_true")
     q.set_defaults(func=cmd_sync_plan)
     q = s.add_parser("schema", help="print the sink's DDL and least-privilege user SQL (sends nothing)")

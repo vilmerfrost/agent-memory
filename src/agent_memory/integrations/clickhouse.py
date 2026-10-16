@@ -9,6 +9,9 @@ selected from Supabase: no titles, summaries, what/why/how, prompts, reasons, re
 (model, project, rule id, status ...) must match LABEL_RE (no spaces, at most 128 chars) or it ships as
 null, so free text in a label column cannot leak. A row whose key is not a valid ref id is dropped, so
 `ch:<table>/<id>` always maps 1:1 to `amem:<entity>/<id>` and no rsi_evidence link is written per row.
+Mission 004C: a label, id or pseudonym value that matches the egress deny list (egress.py: AMEM_EGRESS_DENY
+plus every team repo and project in Supabase) or is email-shaped ships as null, and a row whose key does
+is dropped; a deviation's repo-scoped instruction source is masked (see REPO_PREFIXES).
 
 Shape. Database `amem` (AMEM_CLICKHOUSE_DB), one `ReplacingMergeTree(version)` table per entity,
 `ORDER BY id`, `SETTINGS non_replicated_deduplication_window = 1000` (a plain MergeTree keeps no insert
@@ -91,7 +94,7 @@ from psycopg import sql
 from psycopg.rows import dict_row
 
 from agent_memory import config as amem_config
-from agent_memory.integrations import http, refs
+from agent_memory.integrations import egress, http, refs
 from agent_memory.integrations.evidence import EvidenceRef, Health, NamedQuery
 from agent_memory.integrations.sync import Batch
 
@@ -263,6 +266,56 @@ def pseudonym(value: str, environ: Mapping[str, str] | None = None) -> str | Non
     return "p_" + hmac.new(key.encode("utf-8"), value.encode("utf-8"), hashlib.sha256).hexdigest()[:16]
 
 
+# Mission 004C (F1): a deviation's instruction source names a repo when it is a repo's own file
+# (`claude-md:<repo>`, `agents-md:<repo>`; deviations.repo_scoped), and its rule_id is a slug of a heading in
+# that file. A team row sends `<prefix>:team` and no rule_id; any other repo-scoped source sends
+# `<prefix>:<pseudonym of the repo>` (no key: null). Global, skill, agent and routine sources stay as they are.
+REPO_PREFIXES = ("claude-md", "agents-md")
+_GLOBAL_SOURCES = frozenset(f"{p}:global" for p in REPO_PREFIXES)
+_PSEUDO_RE = re.compile(r"p_[0-9a-f]{16}")
+
+
+def repo_scoped(source: str) -> bool:
+    """deviations.repo_scoped (that module imports the whole ingest stack, so the rule is repeated here)."""
+    return source.startswith(tuple(f"{p}:" for p in REPO_PREFIXES)) and source not in _GLOBAL_SOURCES
+
+
+_DEV_REPO_SCOPED = ("((starts_with(instruction_source, 'claude-md:') or starts_with(instruction_source, 'agents-md:')) "
+                    "and instruction_source not in ('claude-md:global', 'agents-md:global'))")
+_DEV_TEAM = ("(meta ->> 'team' = 'true' or exists (select 1 from sessions s where s.session_id = deviations.session_id "
+             "and s.meta ->> 'team' = 'true'))")
+_DEV_SOURCE = (f"case when {_DEV_REPO_SCOPED} and {_DEV_TEAM} then split_part(instruction_source, ':', 1) || ':team' "
+               "else instruction_source end")
+_DEV_RULE = f"case when {_DEV_REPO_SCOPED} and {_DEV_TEAM} then null else rule_id end"
+
+
+def source_value(source: str, environ: Mapping[str, str] | None = None) -> str | None:
+    """An instruction source as ClickHouse holds it: a repo-scoped source's repo becomes its pseudonym."""
+    if not repo_scoped(source):
+        return source
+    prefix, repo = source.split(":", 1)
+    if repo == "team" or _PSEUDO_RE.fullmatch(repo):
+        return source
+    p = pseudonym(repo, environ)
+    return f"{prefix}:{p}" if p else None
+
+
+def rule_param(rule: str, environ: Mapping[str, str] | None = None) -> str:
+    """A rule key (`<source>:<rule_id>`) as ClickHouse holds it, so `rule` filters keep working on the Mac's
+    names: `claude-md:agent-memory:x` -> `claude-md:p_...:x`. A key that already holds a pseudonym (from an
+    earlier answer), `team` or `global` is sent as it is. Raises ValueError without a pseudonym key."""
+    prefix, sep, rest = rule.partition(":")
+    if not sep or prefix not in REPO_PREFIXES:
+        return rule
+    repo, sep2, tail = rest.partition(":")
+    if repo in ("global", "team") or _PSEUDO_RE.fullmatch(repo):
+        return rule
+    p = pseudonym(repo, environ)
+    if p is None:
+        raise ValueError(f"{PSEUDONYM_ENV} is not set: cannot filter by a repo's rule")
+    return f"{prefix}:{p}{sep2}{tail}"
+
+
 _NCM_FLOATS = {m: m for m in ("solved_rate", "cell_rate", "valid_rate", "rouge1", "rouge2", "gen_ppl",
                                 "sacrebleu_cased", "sacrebleu_lower", "chrf", "length_ratio", "unigram_entropy")}
 _NCM_FLOATS.update({"rouge_l": "rougeL", "cost_usd": "cost_usd", "gpu_minutes": "cost_gpu_minutes",
@@ -285,9 +338,10 @@ TABLES: tuple[Table, ...] = (
           _cols("id:id label:routine,source,status ts:started_at,finished_at,created_at float:duration_s",
                 duration_s="extract(epoch from finished_at - started_at)")),
     Table("deviations", "id", "created_at", "created_at",
-          _cols("id:id,session_id label:instruction_source,rule_id id:instruction_sha int:turn "
+          _cols("id:id,session_id source:instruction_source label:rule_id id:instruction_sha int:turn "
                 "float:followed_grade,result_grade,objective_result label:result_outcome,jev_verdict "
-                "float:jev_confidence label:jev_mode,writer_model ts:created_at")),
+                "float:jev_confidence label:jev_mode,writer_model ts:created_at",
+                instruction_source=_DEV_SOURCE, rule_id=_DEV_RULE)),
     Table("scores", "id", "created_at", "created_at",
           _cols("id:id,run_id label:question,kind float:value_num,confidence label:jev_mode ts:created_at")),
     Table("skill_calls", "id", "created_at", "created_at",
@@ -318,8 +372,18 @@ TABLES: tuple[Table, ...] = (
 TABLE_NAMES = frozenset(t.name for t in TABLES)
 _TABLE = {t.name: t for t in TABLES}
 
+
+def tables_named(names: Sequence[str]) -> tuple[Table, ...]:
+    """The tables a sync is narrowed to (`--tables`), in TABLES order. Raises ValueError on an unknown name."""
+    unknown = sorted(set(names) - TABLE_NAMES)
+    if unknown:
+        known = ", ".join(t.name for t in TABLES)
+        raise ValueError(f"unknown table(s) for clickhouse: {', '.join(unknown)} (known: {known})")
+    return tuple(t for t in TABLES if t.name in set(names))
+
+
 _CH_TYPES = {"id": "Nullable(String)", "label": "LowCardinality(Nullable(String))",
-             "pseudo": "LowCardinality(Nullable(String))",
+             "pseudo": "LowCardinality(Nullable(String))", "source": "LowCardinality(Nullable(String))",
              "ts": "Nullable(DateTime64(6, 'UTC'))", "int": "Nullable(Int64)", "float": "Nullable(Float64)",
              "bool": "Nullable(Bool)"}
 
@@ -442,17 +506,23 @@ def _is_id(s: str) -> bool:
     return refs.is_ref(f"ch:x/{s}")
 
 
-def _value(kind: str, v: Any) -> Any:
+_TEXT_KINDS = frozenset({"label", "pseudo", "source", "id"})
+
+
+def _value(kind: str, v: Any, deny: egress.Deny = egress.NONE) -> Any:
     if v is None:
         return None
+    if kind in _TEXT_KINDS:             # Mission 004C (F3): a denied or email-shaped value never leaves, as is
+        s = str(v)                      # or as a pseudonym: it ships as null
+        if deny.match(s) or egress.email_like(s):
+            return None
     if kind == "label":
-        s = str(v)
         return s if LABEL_RE.fullmatch(s) else None
     if kind == "pseudo":                # label-shaped only: free text stays null, as for labels
-        s = str(v)
         return pseudonym(s) if LABEL_RE.fullmatch(s) else None
+    if kind == "source":                # a label whose repo part becomes a pseudonym (F1)
+        return source_value(s) if LABEL_RE.fullmatch(s) else None
     if kind == "id":
-        s = str(v)
         return s if _is_id(s) else None
     if kind == "ts":
         return v.astimezone(UTC).strftime("%Y-%m-%d %H:%M:%S.%f")
@@ -466,9 +536,10 @@ def _value(kind: str, v: Any) -> Any:
     raise ValueError(f"unknown column kind {kind!r}")
 
 
-def map_row(t: Table, raw: Mapping[str, Any], version: int) -> dict[str, Any] | None:
-    """The allowlist mapper: only t.cols, each coerced by kind; None when the key is not a valid id."""
-    out = {c.name: _value(c.kind, raw.get(c.name)) for c in t.cols}
+def map_row(t: Table, raw: Mapping[str, Any], version: int, deny: egress.Deny = egress.NONE) -> dict[str, Any] | None:
+    """The allowlist mapper: only t.cols, each coerced by kind; None when the key is not a valid id, or is
+    denied or email-shaped (egress)."""
+    out = {c.name: _value(c.kind, raw.get(c.name), deny) for c in t.cols}
     if not out.get("id"):
         return None
     out["version"] = version
@@ -523,14 +594,24 @@ class ClickHouseSink:
     name = "clickhouse"
 
     def __init__(self, client: Client | None = None, *, batch_size: int = BATCH_SIZE, lookback_days: int | None = None,
-                 now: Callable[[], datetime] | None = None, tables: Sequence[Table] = TABLES, auto_schema: bool = True):
+                 now: Callable[[], datetime] | None = None, tables: Sequence[Table] = TABLES, auto_schema: bool = True,
+                 since: datetime | None = None):
         self.client = client if client is not None else Client()
         self.batch_size = batch_size
         self.lookback_days = self.client.cfg.lookback_days if lookback_days is None else lookback_days
         self._now = now or (lambda: datetime.now(UTC))
         self.tables = tuple(tables)
+        # Mission 004C (F4, `--since`): only rows that changed at or after this time. Older rows are skipped and
+        # fall behind the cursor; a later --replay without --since sends them.
+        self.since = since
         self.auto_schema = auto_schema and not self.client.cfg.cloud      # Cloud: the owner runs the DDL once
         self._schema_ready = False
+        self.deny = egress.NONE         # the egress deny list, read at the start of every batches() call
+
+    @property
+    def replay_scope(self) -> frozenset[str] | None:
+        """The cursors a --replay starts over (sync.run): only these tables when narrowed with --tables."""
+        return None if set(self.tables) == set(TABLES) else frozenset(t.name for t in self.tables)
 
     def health(self) -> Health:
         if self.client.cfg.problem:
@@ -546,11 +627,14 @@ class ClickHouseSink:
 
     def batches(self, conn: psycopg.Connection, watermarks: Mapping[str, str], *, replay: bool) -> Iterator[Batch]:
         version = next_version()
+        self.deny = egress.load(conn)
         since = None if replay or self.lookback_days <= 0 else self._now() - timedelta(days=self.lookback_days)
+        if since is not None and self.since is not None:
+            since = max(since, self.since)
         for t in self.tables:
             mark = None if replay else parse_mark(watermarks.get(t.name))
             last = mark
-            for rows in self._pages(conn, t, after=mark):
+            for rows in self._pages(conn, t, after=mark, since=self.since):
                 last = (rows[-1]["_changed"], rows[-1]["_key"])
                 yield self._batch(t, rows, version, last)
             if since is not None and t.lookback and mark is not None:
@@ -591,7 +675,7 @@ class ClickHouseSink:
             after = (rows[-1]["_changed"], rows[-1]["_key"])
 
     def _batch(self, t: Table, rows: Sequence[Mapping[str, Any]], version: int, mark: Mark) -> Batch:
-        mapped = [m for m in (map_row(t, r, version) for r in rows) if m is not None]
+        mapped = [m for m in (map_row(t, r, version, self.deny) for r in rows) if m is not None]
         return Batch(t.name, mapped, format_mark(mark), key=token_of(t.name, body_of(mapped)) if mapped else "")
 
     def split(self, batch: Batch) -> list[Batch]:
@@ -830,6 +914,8 @@ class ClickHouseRetriever:
             if pseudo is None:
                 raise ValueError(f"{PSEUDONYM_ENV} is not set: cannot filter by project")
             p["project"] = pseudo
+        if p.get("rule"):               # the same for a repo-scoped rule key (F1)
+            p["rule"] = rule_param(p["rule"])
         limit = int(p.pop("limit"))
         observed = self._now().astimezone(UTC).isoformat(timespec="seconds")
         out: list[EvidenceRef] = []

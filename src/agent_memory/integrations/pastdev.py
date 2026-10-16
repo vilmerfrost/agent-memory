@@ -3,9 +3,11 @@
 past.dev is an external SaaS. It receives only the sanitized decision records built here (sanitize.py):
 one per proposal, decision or rejection, experiment, edit and lesson decision, each at most CAP_BYTES. No
 transcripts, file contents, prompts, paths, emails, hosts, secrets, ids other than the record's own
-`amem:` ref, and nothing from a team repo. One past.dev project is dedicated to RSI; its project key
-(`past_sk_...`) is read from AMEM_PASTDEV_KEY only (this module never reads an env file). Without a key,
-everything here is `unavailable`. AMEM_PASTDEV=off stops the sink (sync.switched_off) and the retriever.
+`amem:` ref, nothing from a team repo, and nothing that names a term on the egress deny list (egress.py:
+AMEM_EGRESS_DENY plus every team repo and project, read at the start of each run). One past.dev project is
+dedicated to RSI; its project key (`past_sk_...`) is read from AMEM_PASTDEV_KEY only (this module never
+reads an env file). Without a key, everything here is `unavailable`. AMEM_PASTDEV=off stops the sink
+(sync.switched_off) and the retriever.
 
 API, checked on 2026-10-16 against the official docs:
   https://past.dev/docs/memory-api                  base URL, `Authorization: Bearer past_sk_...`, ingest + poll + recall
@@ -19,26 +21,41 @@ Verified there:
   batch: an item has no idempotencyKey. Same key + different body = 409 idempotency-conflict; keys never expire.
 - GET /ingest/{ingestionId} -> {status: processing|completed|failed, settled, blocked, readiness, failure}.
   Polls are free and outside the per-minute limit. 404 for an unknown id.
+- POST /ingest/{ingestionId}/retry -> 202 queued: re-runs a failed ingestion, free (Mission 004B).
 - POST /recall {query, identity (required), limit 1-200, occurredFrom, occurredTo} -> results[] with
   rank and sources[] = {sourceId, occurredAt, label, metadata, excerpts}.
-- POST /data-points/delete {ids: [...]} (1-1000) -> 202 {operationId, ids}; 404 when any id is not a live
-  data point, and then nothing is deleted.
-- 500 requests/min per key (Pay as you go); a 429 has no body; wait 1 s and double.
+- POST /data-points/delete {ids: [...]} (1-1000) -> 202 {operationId, ids}; 404 code data-point-not-found
+  when any id is not a live data point, and then nothing is deleted.
+- 500 requests/min per key (Pay as you go); that 429 has no body; wait 1 s and double. A 429 with a JSON
+  body code project-cap-reached or spend-cap-reached is a credit cap: never retried (Mission 004C).
+
+Ingestion state (Mission 004C, G-PD0, against the spec of 2026-10-17). A re-send of content past.dev already
+holds is answered `200 unchanged`, even when its first ingestion failed, so a record is never re-sent to
+recover; it is followed by its ingestion id, kept in its rsi_evidence link (metrics.ingestion_id):
+  completed   sent. Only a completed ingestion (or an all-unchanged receipt) counts as sent.
+  queued      still running when the poll budget ran out, or failed and retried: the next run checks it by
+              its id (a `ingestions` batch: one free GET, no content leaves) instead of sending it again.
+  failed      a failed ingestion gets the free POST .../retry, at most once per run and MAX_FREE_RETRIES in
+              all; then it is dead-lettered (status failed).
+  rejected    content-rejected: dead-lettered at once (past.dev batches are atomic, so every item of that
+              ingestion), not split and re-sent.
+A dead-lettered record is sent again only when its content changes.
 Not verified (assumed): that `sourceId` echoes our `id` byte for byte (the docs say it is trimmed; a
 mismatch fails the batch); that GET /ingest/<nil uuid> answers 404 with a valid key and 401/403 without
 (the health check); that a recall `source.label` is the label we sent.
 
 Mapping (blueprint): id = the amem: ref, timestamp = the record time, label = the kind, identity = "rsi",
 no metadata (past.dev feeds metadata to memory extraction). The batch idempotencyKey is sha256 over the
-canonical items (so the 409 rule can never fire), plus each item's last deletion time, the table's failure
-count and, on --replay, the run time: a re-send after a deletion or a failed ingestion is a new request.
-Each record's own sha256(content) is kept in its rsi_evidence link (metrics.sha256).
+canonical items only (so the 409 rule can never fire). It is content-based (Mission 004C, F5): a --replay of
+unchanged records sends the same key, so past.dev answers the stored receipt and ingests nothing new, and a
+re-send after a lost response is the same request. Each record's own sha256(content) is kept in its
+rsi_evidence link (metrics.sha256).
 
 Watermarks: proposals, experiments and edits change status after they are first written and have no
 updated_at column, so change detection is by content: a record is sent when its link is missing or holds
 another sha256. The watermark (`<record time>|<ref>` of the last record pushed) shows how far a table got.
 A link whose record is gone or now refused (a team item, a secret) is retracted first: deleted at past.dev
-and marked deleted. --replay re-sends every record that is not retired.
+and marked deleted. --replay re-sends every completed record that is not retired (same keys: see above).
 
 Deletion is final (Mission 004B). The docs: "A deleted id cannot be sent again; use a new id." The id is
 the record's amem: ref, so a record whose link is marked deleted is retired: never sent again, listed in
@@ -46,8 +63,9 @@ the record's amem: ref, so a record whose link is marked deleted is retired: nev
 
 Cost (Mission 004B, from the pricing page and the spec): 1 credit per 350 UTF-8 bytes of content, rounded
 up per item, at least 1 (local_credits); recall 0.1 credit. Credits are prepaid: at zero, sends answer 402
-out-of-credits and nothing is billed. A project credit cap (console) answers 429 project-cap-reached. The
-sync loop stops a run as `capped` on either (sync.provider_cap). POST /ingest/estimate prices a send
+out-of-credits and nothing is billed. A project credit cap (console) answers 429 project-cap-reached (a spend
+cap: spend-cap-reached), which is not retried. The sync loop stops a run as `capped` on either
+(sync.provider_cap). POST /ingest/estimate prices a send
 without writing or spending, but it still uploads the content, so it runs only where sending is approved;
 GET /usage reads the month's balance and the project's spend and cap.
 """
@@ -69,7 +87,7 @@ import psycopg
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
-from agent_memory.integrations import http, refs, sync
+from agent_memory.integrations import egress, http, refs, sync
 from agent_memory.integrations.evidence import EvidenceRef, Health, NamedQuery, run_query, usable
 from agent_memory.integrations.sanitize import KIND_ENTITY, KINDS, SAFE_REF_ID, sanitize_record, scrub_text, secret_like
 
@@ -84,7 +102,14 @@ POLL_S = 10.0
 NIL_INGESTION = "00000000-0000-0000-0000-000000000000"
 TABLES = ("rsi_proposals", "rsi_decisions", "rsi_experiments", "edits", "lesson_candidates")
 RETRACT = "retractions"
+CHECK = "ingestions"           # batches that check a still-running ingestion by its id (no rows, no content)
 FAILURE_CODES = ("model-unavailable", "model-response-unreadable", "index-unavailable", "content-rejected", "internal")
+COMPLETED, QUEUED, FAILED, REJECTED = "completed", "queued", "failed", "rejected"     # link statuses
+SENT = frozenset({COMPLETED, "unchanged"})      # "unchanged": a link written before Mission 004C
+DEAD = frozenset({FAILED, REJECTED})
+MAX_FREE_RETRIES = 3
+CAP_CODES = ("project-cap-reached", "spend-cap-reached")
+NOT_LIVE = "data-point-not-found"
 
 
 # ---------------------------------------------------------------- config and HTTP
@@ -119,7 +144,7 @@ class Client:
         return http.request(method, self.cfg.base_url + path, body=body, timeout=self.timeout,
                             headers={"Authorization": f"Bearer {self.cfg.key}", "Accept": "application/json"},
                             retries=self.retries if retries is None else retries, backoff=1.0, sleep=self.sleep,
-                            ok=ok or (lambda s: 200 <= s < 300))
+                            ok=ok or (lambda s: 200 <= s < 300), final=cap_reached)
 
     def health(self) -> Health:
         try:
@@ -135,7 +160,7 @@ class Client:
         return _obj(self._call("GET", f"/ingest/{uuid.UUID(ingestion_id)}").json())
 
     def retry_ingestion(self, ingestion_id: str) -> dict[str, Any]:
-        """POST /ingest/{id}/retry: free; re-runs a failed ingestion (docs: api-reference, 2026-10-16)."""
+        """POST /ingest/{id}/retry: free; re-runs a failed ingestion and answers 202 queued (spec, 2026-10-17)."""
         return _obj(self._call("POST", f"/ingest/{uuid.UUID(ingestion_id)}/retry", {}).json())
 
     def recall(self, body: dict[str, Any]) -> dict[str, Any]:
@@ -165,6 +190,25 @@ def _obj(v: Any) -> dict[str, Any]:
     if not isinstance(v, dict):
         raise http.HttpError(None, "past.dev: expected a JSON object")
     return v
+
+
+def cap_reached(resp: http.Response) -> bool:
+    """A 429 whose JSON body names a reached credit cap. The per-minute rate limit's 429 has no body, so it is
+    still retried; a cap is final (http.request raises at once, sync stops the run as `capped`)."""
+    if resp.status != 429:
+        return False
+    try:
+        body = resp.json()
+    except ValueError:
+        return False
+    return isinstance(body, dict) and body.get("code") in CAP_CODES
+
+
+def _ingestion_id(v: Any) -> str | None:
+    try:
+        return str(uuid.UUID(str(v))) if v else None
+    except ValueError:
+        return None
 
 
 def _client(cfg: Config | None, client: Client | None, sleep: Callable[[float], None]) -> Client | None:
@@ -223,9 +267,14 @@ select e.id::text as id, e.status, e.instruction_source, e.rule_id, e.rule_title
        e.created_at, (coalesce(e.meta ->> 'team' = 'true', false) or {_team_sql(_DEVS.format("e"))}) as team
 from edits e order by e.created_at, e.id
 """
+# Mission 004C (F2): ingestion never sets runs.meta.team, so a lesson is also a team item when its run's repo
+# (runs.meta.repo) or the lesson's scope_repo is a team repo: a repo or project of any session flagged team.
 _LESSONS_SQL = """
 select lc.run_id::text as id, lc.decision, lc.reason, lc.considered_at, l.slug, l.title,
-       coalesce(r.meta ->> 'team' = 'true', false) as team
+       (coalesce(r.meta ->> 'team' = 'true', false)
+        or exists (select 1 from sessions s where s.meta ->> 'team' = 'true'
+                   and (s.repo in (r.meta ->> 'repo', l.scope_repo) or s.project in (r.meta ->> 'repo', l.scope_repo))))
+           as team
 from lesson_candidates lc join runs r on r.id = lc.run_id left join lessons l on l.id = lc.lesson_id
 where lc.decision in ('accept', 'reject')
 order by lc.considered_at, lc.run_id
@@ -305,11 +354,12 @@ def build_records(conn: psycopg.Connection) -> list[Record]:
     return out
 
 
-def corpus(conn: psycopg.Connection) -> list[tuple[str, str]]:
+def corpus(conn: psycopg.Connection, environ: Mapping[str, str] | None = None) -> list[tuple[str, str]]:
     """(ref, content) for every record the sink may send: exactly what past.dev receives."""
     out = []
+    deny = egress.load(conn, environ)
     for rec in build_records(conn):
-        content, _ = sanitize_record(rec.fields)
+        content, _ = sanitize_record(rec.fields, deny)
         if content is not None:
             out.append((rec.ref, content))
     return out
@@ -346,10 +396,36 @@ def _evidence(sid: str, metrics: dict[str, Any], summary: str | None = None) -> 
         return None
 
 
+LINK_KEYS = ("sha256", "kind", "status", "ingestion_id", "retries", "unchanged", "failure")
+
+
+def _link(ref: str, content: str, metrics: Mapping[str, Any]) -> EvidenceRef:
+    """One record's rsi_evidence link: its content hash, kind and ingestion state (never the content)."""
+    f = _fields(content)
+    m = {k: metrics[k] for k in LINK_KEYS if metrics.get(k) is not None}
+    m["kind"] = f["kind"]
+    ev = _evidence(ref, m, f"{f['kind']}: {f['rule']}" if "rule" in f else f["kind"])
+    assert ev is not None                      # a sanitized ref always parses
+    return ev
+
+
+def _key(items: list[dict[str, Any]]) -> str:
+    """The batch idempotencyKey: content only (Mission 004C, F5 and G-PD0), so a replay or a re-send after a
+    lost response is the same request, and the 409 rule (same key, other body) can never fire."""
+    return _sha({"items": items})
+
+
+def _with(ev: EvidenceRef, **metrics: Any) -> EvidenceRef:
+    m = {**ev.metrics, **metrics}
+    return EvidenceRef(ev.ref, ev.source, ev.kind, ev.subject_refs, {k: v for k, v in m.items() if v is not None},
+                       ev.summary)
+
+
 def delete_ids(client: Client, ids: Sequence[str], *, chunk: int = DELETE_MAX,
                done: Callable[[list[str]], None] | None = None) -> tuple[list[str], list[str], int]:
     """Delete source ids in calls of <= `chunk` (<= 1000). past.dev deletes all or nothing and answers 404
-    when any id is not live, so a 404 splits the call in halves until the dead ids are found.
+    data-point-not-found when any id is not live, so that 404 splits the call in halves until the dead ids are
+    found. Any other 404 (a wrong path, say) raises: it says nothing about the ids.
     Returns (deleted, already gone, calls). `done` runs after each top-level chunk with its ids."""
     chunk = max(1, min(chunk, DELETE_MAX))
     deleted: list[str] = []
@@ -362,7 +438,7 @@ def delete_ids(client: Client, ids: Sequence[str], *, chunk: int = DELETE_MAX,
         try:
             client.delete(part)
         except http.HttpError as exc:
-            if exc.status != 404:
+            if exc.status != 404 or NOT_LIVE not in str(exc):
                 raise
             if len(part) == 1:
                 gone.extend(part)
@@ -389,12 +465,21 @@ class PastDevSink:
     def __init__(self, cfg: Config | None = None, *, environ: Mapping[str, str] | None = None,
                  client: Client | None = None, batch_max: int = BATCH_MAX, poll_s: float = POLL_S,
                  sleep: Callable[[float], None] = time.sleep, clock: Callable[[], float] = time.monotonic,
-                 now: Callable[[], datetime] = lambda: datetime.now(UTC)):
+                 now: Callable[[], datetime] = lambda: datetime.now(UTC), tables: Sequence[str] | None = None,
+                 since: datetime | None = None):
         self._environ = environ
         self.cfg = cfg if cfg is not None else config(environ)
         self.client = _client(self.cfg, client, sleep)
         self.batch_max = max(1, min(batch_max, BATCH_MAX))
         self.poll_s, self.sleep, self.clock, self.now = poll_s, sleep, clock, now
+        # Mission 004C (F4): `--tables` / `--since` narrow what is sent (a record older than `since` waits for a
+        # run without it). Retractions and checks of running ingestions are never narrowed.
+        unknown = sorted(set(tables or ()) - set(TABLES))
+        if unknown:
+            raise ValueError(f"unknown table(s) for pastdev: {', '.join(unknown)} (known: {', '.join(TABLES)})")
+        self.tables = tuple(t for t in TABLES if not tables or t in tables)
+        self.since = since
+        self.replay_scope = frozenset(self.tables) if tables else None     # sync.run: the cursors a replay resets
         self.refused: list[tuple[str, list[str]]] = []      # (ref, reasons) from the last batches() call
         self.retired: list[str] = []                         # refs deleted at past.dev: never sent again
 
@@ -408,12 +493,12 @@ class PastDevSink:
     def batches(self, conn: psycopg.Connection, watermarks: Mapping[str, str], *, replay: bool) -> Iterator[sync.Batch]:
         records = build_records(conn)
         links = _links(conn)
-        failures = (sync.load(conn, self.name).get("failures") or {})
         now = _ts(self.now())
         self.refused, self.retired = [], []
+        deny = egress.load(conn, self._environ)        # Mission 004C (F3): env terms + team repos, read now
         ready: dict[str, tuple[Record, str]] = {}
         for rec in records:
-            content, reasons = sanitize_record(rec.fields)
+            content, reasons = sanitize_record(rec.fields, deny)
             if content is None:
                 self.refused.append((rec.ref, reasons))
             else:
@@ -424,9 +509,11 @@ class PastDevSink:
             part = gone[i:i + DELETE_MAX]
             evs = [ev for sid in part if (ev := _evidence(sid, {"deleted": True, "deleted_at": now})) is not None]
             yield sync.Batch(RETRACT, [{"id": sid} for sid in part], f"{now}|{part[-1]}", evs)
-        # 2. send: a record whose link is missing or holds another hash; a deleted id is retired for good
+        # 2. send: a record whose link is missing or holds another hash; a deleted id is retired for good.
+        #    Same hash: a running ingestion is checked by its id (3), a dead-lettered one waits for new content,
+        #    a sent one goes again only on --replay (same key: past.dev answers the stored receipt).
+        pending: dict[str, list[EvidenceRef]] = {}
         for table in TABLES:
-            attempts = int((failures.get(table) or {}).get("attempts", 0))
             todo = []
             for ref, (rec, content) in ready.items():
                 if rec.table != table:
@@ -436,33 +523,37 @@ class PastDevSink:
                     self.retired.append(ref)
                     continue
                 sha = _sha(content)
-                if replay or link.get("sha256") != sha:
-                    todo.append((rec, content, sha, link))
+                if link.get("sha256") == sha:
+                    iid = _ingestion_id(link.get("ingestion_id"))
+                    if link.get("status") == QUEUED and iid:
+                        pending.setdefault(iid, []).append(_link(rec.ref, content, link))
+                        continue
+                    if link.get("status") in DEAD or (link.get("status") in SENT and not replay):
+                        continue
+                if table not in self.tables or (self.since is not None and rec.at < self.since):
+                    continue                                    # out of this run's scope (F4)
+                todo.append((rec, content, sha))
             for i in range(0, len(todo), self.batch_max):
                 part = todo[i:i + self.batch_max]
                 items = [{"id": rec.ref, "content": content, "timestamp": _ts(rec.at), "label": rec.fields["kind"],
-                          "identity": IDENTITY} for rec, content, _, _ in part]
-                key = _sha({"items": items, "attempt": attempts, "replay": now if replay else None})
-                evs = []
-                for rec, content, sha, _ in part:
-                    f = _fields(content)
-                    summary = f"{f['kind']}: {f['rule']}" if "rule" in f else f["kind"]
-                    ev = _evidence(rec.ref, {"sha256": sha, "kind": f["kind"], "status": "sent"}, summary)
-                    assert ev is not None                      # a sanitized ref always parses
-                    evs.append(ev)
+                          "identity": IDENTITY} for rec, content, _ in part]
+                evs = [_link(rec.ref, content, {"sha256": sha, "status": QUEUED}) for rec, content, sha in part]
                 last = part[-1][0]
-                yield sync.Batch(table, items, f"{_ts(last.at)}|{last.ref}", evs, key)
+                yield sync.Batch(table, items, f"{_ts(last.at)}|{last.ref}", evs, _key(items))
+        # 3. check: one batch per still-running ingestion; no rows, no content, one free GET (and maybe a retry)
+        for iid, evs in sorted(pending.items()):
+            yield sync.Batch(CHECK, [], f"{now}|{iid}", evs, iid)
 
     def cost(self, batch: sync.Batch) -> int:
-        """Credits this batch would spend (local rule; a retraction spends none)."""
-        return 0 if batch.table == RETRACT else local_credits(batch.rows)
+        """Credits this batch would spend (local rule; a retraction or an ingestion check spends none)."""
+        return 0 if batch.table in (RETRACT, CHECK) else local_credits(batch.rows)
 
     def split(self, batch: sync.Batch) -> list[sync.Batch]:
         """One item per batch with a content-addressed key, so the sync loop can dead-letter only refused items."""
-        if batch.table == RETRACT:
+        if batch.table in (RETRACT, CHECK):
             return [batch]
         return [sync.Batch(batch.table, [item], batch.watermark,
-                           [e for e in batch.evidence if e.ref == f"past:{item.get('id')}"], _sha({"item": item}))
+                           [e for e in batch.evidence if e.ref == f"past:{item.get('id')}"], _key([item]))
                 for item in batch.rows]
 
     def push(self, batch: sync.Batch) -> None:
@@ -473,6 +564,10 @@ class PastDevSink:
         if batch.table == RETRACT:
             delete_ids(self.client, [r["id"] for r in batch.rows])
             return
+        if batch.table == CHECK:                        # a running ingestion: one free GET, never a re-send
+            retries = max((int(ev.metrics.get("retries") or 0) for ev in batch.evidence), default=0)
+            self._settle(batch, batch.key, *self._poll(batch.key, retries, 0.0))
+            return
         res = self.client.ingest_batch(batch.rows, batch.key)
         items = res.get("items")
         if not isinstance(items, list) or len(items) != len(batch.rows):
@@ -481,42 +576,58 @@ class PastDevSink:
         for it in items:
             if isinstance(it, Mapping) and isinstance(it.get("ordinal"), int):
                 by_ord[it["ordinal"]] = it
-        status = "unchanged" if res.get("unchanged") is True else str(res.get("status"))
-        if status == "queued" and self.poll_s > 0:
-            status = self._poll(str(res.get("ingestionId")))
-        evs = []
-        for i, (row, ev) in enumerate(zip(batch.rows, batch.evidence, strict=True)):
+        for i, row in enumerate(batch.rows):
             it = by_ord.get(i)
             if it is None or it.get("sourceId") != row["id"]:
                 raise RuntimeError("ingest: past.dev answered with another source id")
-            st = "unchanged" if it.get("unchanged") is True else status
-            evs.append(EvidenceRef(ev.ref, ev.source, ev.kind, ev.subject_refs, {**ev.metrics, "status": st}, ev.summary))
-        batch.evidence = evs                            # the loop records these links once push returns
+        iid = _ingestion_id(res.get("ingestionId"))
+        if res.get("unchanged") is True or res.get("status") == COMPLETED:
+            status, code, retries = COMPLETED, None, 0
+        elif iid is None:
+            raise RuntimeError("ingest: the receipt has no ingestion id to follow")
+        elif self.poll_s > 0:
+            status, code, retries = self._poll(iid, 0, self.poll_s)
+        else:
+            status, code, retries = QUEUED, None, 0
+        batch.evidence = [_with(ev, unchanged=True if by_ord[i].get("unchanged") is True else None)
+                          for i, ev in enumerate(batch.evidence)]
+        self._settle(batch, iid, status, code, retries)
 
-    def _poll(self, ingestion_id: str) -> str:
-        """completed, or queued when the poll budget ran out (the send is durably accepted). Raises on failed."""
-        deadline = self.clock() + self.poll_s
-        wait = 0.5
-        retried = False
+    def _settle(self, batch: sync.Batch, iid: str | None, status: str, code: str | None, retries: int) -> None:
+        """Write the ingestion state into the batch's links (the loop records them once push returns or raises
+        sync.Refused). A rejected or finally failed ingestion is dead-lettered, never split and re-sent."""
+        batch.evidence = [_with(ev, status=status, ingestion_id=iid, retries=retries or None, failure=code)
+                          for ev in batch.evidence]
+        if status in DEAD:
+            rows = [{"id": ev.subject_refs[0]} for ev in batch.evidence if ev.subject_refs]
+            raise sync.Refused(f"ingestion {status}: {code}", rows=rows, evidence=batch.evidence)
+
+    def _poll(self, ingestion_id: str, retries: int, budget: float) -> tuple[str, str | None, int]:
+        """(status, failure code, free retries used) of one ingestion, polled for up to `budget` seconds:
+        completed; queued (still running, or failed and retried: a later run checks it again); rejected
+        (content-rejected); failed (MAX_FREE_RETRIES used up). At most one free retry per call."""
+        deadline = self.clock() + budget
+        wait, retried, code = 0.5, False, None
         while True:
             st = self.client.ingestion(ingestion_id) if self.client else {}
             s = st.get("status")
-            if s == "completed":
-                return "completed"
+            if s == COMPLETED:
+                return COMPLETED, None, retries
             if s == "failed":
-                code = (st.get("failure") or {}).get("code") if isinstance(st.get("failure"), Mapping) else None
+                failure = st.get("failure")
+                code = failure.get("code") if isinstance(failure, Mapping) else None
                 code = code if code in FAILURE_CODES else "unknown"
                 if code == "content-rejected":
-                    # Mission 004B: past.dev batches are atomic, so this is a record-level refusal. A 422 makes the
-                    # sync loop split the batch and dead-letter only the refused item(s).
-                    raise http.HttpError(422, "ingestion failed: content-rejected")
-                if not retried and self.client:
-                    self.client.retry_ingestion(ingestion_id)      # free; then keep polling
-                    retried = True
-                    continue
-                raise RuntimeError(f"ingestion failed: {code}")
+                    return REJECTED, code, retries
+                if retried:
+                    return QUEUED, code, retries         # failed again after this run's retry: the next run looks
+                if retries >= MAX_FREE_RETRIES:
+                    return FAILED, code, retries
+                if self.client:
+                    self.client.retry_ingestion(ingestion_id)      # free: re-runs it under the same id
+                retries, retried = retries + 1, True
             if self.clock() + wait > deadline:
-                return "queued"
+                return QUEUED, code, retries
             self.sleep(wait)
             wait = min(wait * 2, 4.0)
 

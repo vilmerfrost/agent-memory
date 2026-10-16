@@ -68,6 +68,42 @@ def test_verify_without_clickhouse_fails_closed(app: str, capsys: pytest.Capture
     assert "unavailable" in capsys.readouterr().err
 
 
+def _plan(capsys: pytest.CaptureFixture[str], *args: str) -> dict[str, Any]:
+    capsys.readouterr()
+    assert cli.main(["sync", "plan", "--replay", "--json", *args]) == 0
+    return json.loads(capsys.readouterr().out)
+
+
+def test_tables_and_since_narrow_plan_and_run(app: str, tmp_path: Any, monkeypatch: pytest.MonkeyPatch,
+                                              capsys: pytest.CaptureFixture[str]) -> None:
+    """Mission 004C (F4): --tables and --since on `sync plan` and `sync run`."""
+    monkeypatch.setenv("RSI_SANDBOX_DIR", str(tmp_path))
+    from agent_memory.integrations import http
+    monkeypatch.setattr(http, "request", lambda *a, **k: pytest.fail("plan must not call the provider"))
+    out = _plan(capsys, "--sink", "clickhouse", "--tables", "sessions, runs")
+    assert set(out["tables"]) <= {"sessions", "runs"} and out["tables"]["sessions"]["rows"] >= 1   # cli-int-s1
+    assert out["scope"] == {"tables": ["sessions", "runs"]}
+    out = _plan(capsys, "--sink", "clickhouse", "--tables", "sessions", "--since", "2999-01-01")
+    assert out["rows"] == 0 and out["scope"] == {"tables": ["sessions"], "since": "2999-01-01"}
+    assert "scope" not in _plan(capsys, "--sink", "clickhouse")
+    assert _plan(capsys, "--sink", "pastdev", "--tables", "edits", "--since", "2999-01-01")["rows"] == 0
+    assert _plan(capsys, "--sink", "langfuse", "--tables", "sandbox_runs", "--since", "2026-10-01")["rows"] == 0
+    for sink, bad in (("clickhouse", "sessions,nope"), ("pastdev", "sessions"), ("langfuse", "runs")):
+        for cmd in ("plan", "run"):
+            capsys.readouterr()
+            assert cli.main(["sync", cmd, "--sink", sink, "--tables", bad]) == 2, (sink, cmd)
+            err = capsys.readouterr().err
+            assert "unknown table(s)" in err and "known:" in err, err
+    for flag, value in (("--since", "yesterday"), ("--since", "2026-13-01"), ("--tables", " , ")):
+        with pytest.raises(SystemExit) as exc:
+            cli.main(["sync", "run", "--sink", "clickhouse", flag, value])
+        assert exc.value.code == 2
+    capsys.readouterr()
+    assert cli.main(["sync", "run", "--sink", "clickhouse", "--tables", "runs", "--since", "2026-10-01", "--json"]) == 0
+    rep = json.loads(capsys.readouterr().out)
+    assert rep["status"] == "unavailable" and rep["scope"] == {"tables": ["runs"], "since": "2026-10-01"}
+
+
 @pytest.mark.parametrize("sink", ["clickhouse", "langfuse", "pastdev"])
 def test_plan_is_a_read_only_dry_run(app: str, sink: str, tmp_path: Any, monkeypatch: pytest.MonkeyPatch,
                                      capsys: pytest.CaptureFixture[str]) -> None:
