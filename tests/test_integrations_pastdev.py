@@ -91,8 +91,8 @@ def seed(db: Db, t: Text = plain) -> dict[str, str]:
         for sid, team in (("pd-s1", False), ("pd-team", True)):
             c.execute("insert into sessions (session_id, kind, repo, project_dir, transcript_bytes, env, meta) "
                       "values (%s,'chat',%s,%s,1,'prod',%s)",
-                      (sid, T("sessions.repo", "agent-memory"), T("sessions.project_dir", "-Users-x"),
-                       Jsonb({"team": team, "note": T("sessions.meta", "x")})))
+                      (sid, T("sessions.repo", "pipeline-poc" if team else "agent-memory"),
+                       T("sessions.project_dir", "-Users-x"), Jsonb({"team": team, "note": T("sessions.meta", "x")})))
         devs = []
         for sid in ("pd-s1", "pd-team"):
             devs.append(str(c.execute(
@@ -514,6 +514,37 @@ def test_team_flag_later_retracts_and_a_gone_row_is_retracted(db: Db, pdev: Fake
         assert refs_["proposal"] in s.retired and refs_["decision"] in s.retired
     assert refs_["proposal"] not in pdev.points and refs_["decision"] not in pdev.points
     assert links(db)[f"past:{refs_['proposal']}"]["metrics"]["deleted"] is True
+
+
+def _lesson(db: Db, slug: str, decision: str, *, run_meta: dict[str, Any], scope_repo: str | None) -> str:
+    with psycopg.connect(db.admin, autocommit=True) as c:
+        run = str(c.execute("insert into runs (routine, status, meta) values ('dispatch', 'pass', %s) returning id",
+                            (Jsonb(run_meta),)).fetchone()[0])
+        les = c.execute("insert into lessons (slug, title, rule, scope_repo) values (%s, %s, 'r', %s) returning id",
+                        (slug, f"Lesson {slug}", scope_repo)).fetchone()[0]
+        c.execute("insert into lesson_candidates (run_id, decision, reason, lesson_id) values (%s, %s, 'gate', %s)",
+                  (run, decision, les))
+    return f"amem:run/{run}"
+
+
+def test_a_lesson_from_a_team_repo_is_a_team_item(db: Db, pdev: FakePastDev) -> None:
+    """Mission 004C (F2): ingestion never sets runs.meta.team, so the run's repo and the lesson's scope_repo decide:
+    a repo or project of any session flagged team is a team repo."""
+    refs_ = seed(db)                                              # pd-team: a team session in repo pipeline-poc
+    db.sql("insert into sessions (session_id, kind, project, project_dir, transcript_bytes, env, meta) "
+           "values ('pd-team-2', 'chat', 'acme-portal', '-x', 1, 'prod', '{\"team\": true}')")
+    by_run = _lesson(db, "team-by-run", "accept", run_meta={"repo": "pipeline-poc"}, scope_repo=None)
+    by_scope = _lesson(db, "team-by-scope", "reject", run_meta={}, scope_repo="pipeline-poc")
+    by_project = _lesson(db, "team-by-project", "accept", run_meta={"repo": "acme-portal"}, scope_repo=None)
+    own = _lesson(db, "own-repo", "accept", run_meta={"repo": "agent-memory"}, scope_repo="agent-memory")
+    s = sink(pdev)
+    with psycopg.connect(db.app) as conn:
+        assert sync.run(s, conn, environ={}).status == "ok"
+    sent = pdev.sent_ids()
+    for ref in (by_run, by_scope, by_project):
+        assert ref not in sent and (ref, ["team"]) in s.refused, ref
+    assert own in sent and refs_["lesson"] in sent
+    assert "pipeline-poc" not in "\n".join(r.body.decode() for r in pdev.svc.requests)
 
 
 def test_kill_switch_stops_sink_and_retriever(db: Db, pdev: FakePastDev) -> None:

@@ -223,9 +223,14 @@ select e.id::text as id, e.status, e.instruction_source, e.rule_id, e.rule_title
        e.created_at, (coalesce(e.meta ->> 'team' = 'true', false) or {_team_sql(_DEVS.format("e"))}) as team
 from edits e order by e.created_at, e.id
 """
+# Mission 004C (F2): ingestion never sets runs.meta.team, so a lesson is also a team item when its run's repo
+# (runs.meta.repo) or the lesson's scope_repo is a team repo: a repo or project of any session flagged team.
 _LESSONS_SQL = """
 select lc.run_id::text as id, lc.decision, lc.reason, lc.considered_at, l.slug, l.title,
-       coalesce(r.meta ->> 'team' = 'true', false) as team
+       (coalesce(r.meta ->> 'team' = 'true', false)
+        or exists (select 1 from sessions s where s.meta ->> 'team' = 'true'
+                   and (s.repo in (r.meta ->> 'repo', l.scope_repo) or s.project in (r.meta ->> 'repo', l.scope_repo))))
+           as team
 from lesson_candidates lc join runs r on r.id = lc.run_id left join lessons l on l.id = lc.lesson_id
 where lc.decision in ('accept', 'reject')
 order by lc.considered_at, lc.run_id
