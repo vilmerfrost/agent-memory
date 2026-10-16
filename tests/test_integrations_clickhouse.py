@@ -23,7 +23,7 @@ import pytest
 from psycopg import sql
 from psycopg.types.json import Jsonb
 
-from agent_memory.integrations import clickhouse as CH, evidence as E, sync
+from agent_memory.integrations import clickhouse as CH, egress, evidence as E, sync
 from integrations_mock import MockService, Request
 
 APP_PW = "ch-test-pw-0123456789"
@@ -701,6 +701,40 @@ def test_rule_param_and_repo_scoped(monkeypatch: pytest.MonkeyPatch) -> None:
     with pytest.raises(ValueError, match=CH.PSEUDONYM_ENV):
         CH.rule_param("claude-md:agent-memory:own-rule")
     assert CH.source_value("claude-md:agent-memory") is None and CH.source_value("claude-md:global") == "claude-md:global"
+
+
+# ---------------------------------------------------------------- Mission 004C (F3): the egress deny list
+
+
+def test_denied_and_email_shaped_values_never_leave(seed: Seed, pg_url: str, app: str, fake: FakeClickHouse,
+                                                    monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(egress.DENY_ENV, "Acme-Secret, globex")
+    with psycopg.connect(pg_url) as conn:
+        seed.session(conn, "chs-team", repo="pipeline-poc", project="pipeline-poc", meta=Jsonb({"team": True}))
+        # the same repo on a session ingestion did not flag, an email-shaped label, a denied row key
+        stray = seed.session(conn, "chs-stray", repo="pipeline-poc", project="pipeline-poc", model="vilmer@example.com")
+        seed.session(conn, "chs-acme-secret-1")
+        seed.run(conn, "pipeline-poc-nightly", "pass", 30, 5)
+        seed.run(conn, "globex-sync", "pass", 20, 5)
+        seed.ins(conn, "skill_calls", ts=seed.now, skill="acme-secret-helper", invoked_by="me", agent="claude",
+                 project="x", source_key=seed.mk("skey"), session_id=stray)
+    with psycopg.connect(app) as conn:
+        assert sync.run(CH.ClickHouseSink(client_for(fake.svc.url)), conn, replay=True, environ={}).status == "ok"
+    wire = _wire(fake).lower()
+    for term in ("pipeline-poc", "acme-secret", "globex", "vilmer@example.com"):
+        assert term not in wire, term
+    sessions = fake.by_id("sessions")
+    assert "chs-acme-secret-1" not in sessions                                   # a denied row key: the row is dropped
+    assert (sessions["chs-stray"]["repo"], sessions["chs-stray"]["project"], sessions["chs-stray"]["model"]) == \
+        (None, None, None)
+    assert sessions["chs-team"]["repo"] == "team"
+    assert sessions["chs-1"]["repo"] == CH.pseudonym("agent-memory") and sessions["chs-1"]["model"] == "claude-test-1"
+    assert sorted(r["routine"] or "-" for r in fake.final("runs")) == ["-", "-", *["chtest-daily"] * 4, "chtest-ok"]
+    assert sorted(k["skill"] or "-" for k in fake.final("skill_calls")) == ["-", "dispatch"]
+    t = next(t for t in CH.TABLES if t.name == "runs")
+    deny = egress.env_terms({egress.DENY_ENV: "acme"})
+    assert CH.map_row(t, {"id": "r-acme-1", "routine": "x"}, 1, deny) is None
+    assert CH.map_row(t, {"id": "r1", "routine": "ACME-daily", "source": "a@b.co"}, 1, deny)["routine"] is None
 
 
 def test_config_from_env_never_shows_the_key() -> None:

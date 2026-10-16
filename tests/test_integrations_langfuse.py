@@ -20,7 +20,7 @@ from urllib.parse import unquote
 import psycopg
 import pytest
 
-from agent_memory.integrations import evidence as E, langfuse as L, refs, sync
+from agent_memory.integrations import egress, evidence as E, langfuse as L, refs, sync
 from integrations_mock import MockService, Request
 
 NOW = datetime(2026, 10, 17, 12, 0, tzinfo=UTC)       # the retriever's clock: test runs are dated 2026-10-16
@@ -471,13 +471,16 @@ def test_opt_in_result_is_still_redacted_capped_and_root_only(tmp_path: Path) ->
 
 
 class _NoSupabase:
-    """The two lookups LangfuseSink.batches makes: no session row, no earlier lf:trace link."""
+    """The lookups LangfuseSink.batches makes: no session row, no earlier lf:trace link, no team repo."""
 
     def execute(self, *_: Any) -> Any:
         return self
 
     def fetchone(self) -> None:
         return None
+
+    def fetchall(self) -> list[Any]:
+        return []
 
 
 def _inject(where: str, value: str) -> L.SandboxRun:
@@ -776,6 +779,35 @@ def test_sink_down_moves_nothing(app: str, tmp_path: Path) -> None:
         assert (rep.status, rep.detail) == ("unavailable", "unreachable")
         assert "watermarks" not in sync.load(conn, "langfuse")
         assert sync.run(L.LangfuseSink(down, tmp_path), conn, environ={"AMEM_SYNC_LANGFUSE": "off"}).status == "off"
+
+
+def test_egress_deny_terms_and_team_repos_are_sensitive(app: str, pg_url: str, tmp_path: Path,
+                                                         monkeypatch: pytest.MonkeyPatch) -> None:
+    """Mission 004C (F3): a term on AMEM_EGRESS_DENY, or a team repo the sink reads from Supabase, never leaves."""
+    monkeypatch.setattr(egress, "_team", egress.NONE)                     # restored after the test
+    monkeypatch.setenv(egress.DENY_ENV, "Acme-Secret")
+    assert L.sensitive("acme-secret-model") and L._out_name("ACME-SECRET-tool") == L.REDACTED
+    assert not L.sensitive("claude-haiku-5-5") and not L.sensitive("pipeline-poc-tuned")      # not read yet
+    with pytest.raises(L.Refused, match="case looks sensitive"):
+        L.upload_run(base_run(case="acme-secret-case"), L.LangfuseClient("http://127.0.0.1:1", PK, SK))
+    with psycopg.connect(pg_url, autocommit=True) as conn:
+        conn.execute("insert into sessions (session_id, kind, project_dir, repo, project, transcript_bytes, env, meta) "
+                     "values ('lf-team', 'chat', '/lf-test', 'pipeline-poc', 'pipeline-poc', 1, 'prod', '{\"team\": true}')")
+    claude = claude_result("ok")
+    claude["modelUsage"] = {"pipeline-poc-tuned": claude["modelUsage"]["claude-haiku-5-5"]}
+    claude["permission_denials"] = [{"tool_name": "acme-secret-tool", "tool_input": {}}]
+    write_run(tmp_path, arm="A", stdout=json.dumps(claude), sidecar={"case": "c1"})
+    write_run(tmp_path, arm="B", run_id="B-20261016T101500Z-bbbbbb", stdout=json.dumps(claude_result()),
+              sidecar={"case": "pipeline-poc-case"})
+    with MockService() as svc, psycopg.connect(app) as conn:
+        lf = FakeLangfuse(svc)
+        sink = L.LangfuseSink(client_for(svc), tmp_path)
+        rep = sync.run(sink, conn, environ={})
+        sent = (lf.bodies() + json.dumps([r.query for r in svc.requests])).lower()
+        assert rep.status == "ok" and len(lf.observations) == 3                   # run A went, minus the names
+        assert "pipeline-poc" not in sent and "acme-secret" not in sent
+        assert {o["name"] for o in lf.observations} >= {L.REDACTED}
+        assert [why for _, why in sink.refused] == ["case looks sensitive"]       # run B: its identity names the repo
 
 
 # ---------------------------------------------------------------- Langfuse Cloud (Mission 004B)

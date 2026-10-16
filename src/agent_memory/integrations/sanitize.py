@@ -22,8 +22,8 @@ or refuses it. Every text field goes through, in this order:
    (20+ characters with a digit and a letter). The record's own ref id is kept.
 5. Whitespace collapsed, each field cut to its cap.
 
-The record is refused (`None`) when it is a team item (`team` or `meta.team` true), its kind or ref is
-not one we send, a secret shape survives (checked before and after scrubbing, on the final text too),
+The record is refused (`None`) when it is a team item (`team` or `meta.team` true), it names a term on the
+egress deny list (Mission 004C; raw fields or final text), its kind or ref is not one we send, a secret shape survives (checked before and after scrubbing, on the final text too),
 the result is not stable under a second pass, or the final text exceeds CAP_BYTES. The same record
 always gives the same bytes.
 """
@@ -36,7 +36,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from agent_memory import redact
-from agent_memory.integrations import refs
+from agent_memory.integrations import egress, refs
 
 CAP_BYTES = 1536                                   # ~1.5 KB per record, after trimming
 FIELDS = ("kind", "ref", "rule", "hypothesis", "change_kind", "result", "decision", "reason", "night")
@@ -167,10 +167,15 @@ def _text(value: Any) -> str:
     return value if isinstance(value, str) else str(value)
 
 
-def sanitize_record(record: Mapping[str, Any]) -> tuple[str | None, list[str]]:
-    """(content, reasons): the exact text past.dev may receive, or (None, why it was refused)."""
+def sanitize_record(record: Mapping[str, Any], deny: egress.Deny = egress.NONE) -> tuple[str | None, list[str]]:
+    """(content, reasons): the exact text past.dev may receive, or (None, why it was refused).
+
+    `deny` (Mission 004C, egress.py): a record whose raw text fields or final content name a denied term
+    (AMEM_EGRESS_DENY, a team repo or project) is refused, never scrubbed."""
     if _team(record):
         return None, ["team"]
+    if any(deny.match(record.get(f)) for f in (*TEXT_FIELDS, "ref")):
+        return None, ["deny"]
     kind = record.get("kind")
     if kind not in KIND_ENTITY:
         return None, ["kind"]
@@ -208,6 +213,8 @@ def sanitize_record(record: Mapping[str, Any]) -> tuple[str | None, list[str]]:
     hit = secret_like(content)
     if hit:
         return None, [f"secret:{hit}:content"]
+    if deny.match(content):
+        return None, ["deny"]
     if len(content.encode("utf-8")) > CAP_BYTES:
         return None, ["cap"]
     return content, sorted(reasons)

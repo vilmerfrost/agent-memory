@@ -109,7 +109,7 @@ from urllib.parse import quote, urlencode, urlsplit
 import psycopg
 
 from agent_memory import redact as _redact
-from agent_memory.integrations import http, refs
+from agent_memory.integrations import egress, http, refs
 from agent_memory.integrations.evidence import EvidenceRef, Health, NamedQuery
 from agent_memory.integrations.sync import Batch
 
@@ -178,8 +178,11 @@ def clean_text(text: Any) -> str | None:
 
 def sensitive(text: str) -> bool:
     """True for a name-shaped value that must still not leave: a credential the redactor knows, an email, a
-    long token-like run, or anything path-shaped (`~`, `..`, two or more `/`, or `<root>/...`)."""
+    long token-like run, anything path-shaped (`~`, `..`, two or more `/`, or `<root>/...`), or (Mission 004C)
+    a term on the egress deny list: AMEM_EGRESS_DENY and the team repos the sink read this run."""
     if _redact.redact(text) != text or _EMAIL_RE.search(text) or _TOKENISH_RE.search(text):
+        return True
+    if egress.current().match(text):
         return True
     if "~" in text or ".." in text or text.count("/") > 1:
         return True
@@ -951,6 +954,7 @@ class LangfuseSink:
 
     def batches(self, conn: psycopg.Connection, watermarks: Mapping[str, str], *, replay: bool) -> Iterator[Batch]:
         mark = "" if replay else watermarks.get(TABLE, "")
+        egress.use_team_names(egress.team_names(conn))      # Mission 004C: sensitive() denies team repos too
         for wm, path in self._logs():
             if wm <= mark:
                 continue

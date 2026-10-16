@@ -547,6 +547,26 @@ def test_a_lesson_from_a_team_repo_is_a_team_item(db: Db, pdev: FakePastDev) -> 
     assert "pipeline-poc" not in "\n".join(r.body.decode() for r in pdev.svc.requests)
 
 
+def test_a_record_naming_a_denied_term_is_refused(db: Db, pdev: FakePastDev) -> None:
+    """Mission 004C (F3): AMEM_EGRESS_DENY terms and every team repo in Supabase (pd-team: pipeline-poc)."""
+    refs_ = seed(db)
+    db.sql("update rsi_proposals set summary = 'port the Pipeline-POC deploy gate' where id = %s",
+           (refs_["proposal"].split("/")[1],))
+    edit = str(db.sql("insert into edits (status, instruction_source, rule_id, why) values "
+                      "('kept', 'claude-md:global', 'x', 'asked by the ACME-Secret client') returning id")[0][0])
+    clock = Clock()
+    s = PD.PastDevSink(pdev.cfg(), environ={"AMEM_EGRESS_DENY": "acme-secret"}, sleep=clock.sleep, clock=clock)
+    with psycopg.connect(db.app) as conn:
+        assert sync.run(s, conn, environ={}).status == "ok"
+        corpus = dict(PD.corpus(conn, {"AMEM_EGRESS_DENY": "acme-secret"}))
+    denied = (refs_["proposal"], refs_["decision"], f"amem:edit/{edit}")        # the decision carries the hypothesis
+    for ref in denied:
+        assert (ref, ["deny"]) in s.refused and ref not in pdev.sent_ids() and ref not in corpus, ref
+    assert {refs_["experiment"], refs_["edit"], refs_["lesson"]} <= set(pdev.sent_ids())          # not vacuous
+    bodies = "\n".join(r.body.decode() for r in pdev.svc.requests).lower()
+    assert "pipeline-poc" not in bodies and "acme-secret" not in bodies
+
+
 def test_kill_switch_stops_sink_and_retriever(db: Db, pdev: FakePastDev) -> None:
     seed(db)
     off = {"AMEM_PASTDEV": "off"}

@@ -9,6 +9,9 @@ selected from Supabase: no titles, summaries, what/why/how, prompts, reasons, re
 (model, project, rule id, status ...) must match LABEL_RE (no spaces, at most 128 chars) or it ships as
 null, so free text in a label column cannot leak. A row whose key is not a valid ref id is dropped, so
 `ch:<table>/<id>` always maps 1:1 to `amem:<entity>/<id>` and no rsi_evidence link is written per row.
+Mission 004C: a label, id or pseudonym value that matches the egress deny list (egress.py: AMEM_EGRESS_DENY
+plus every team repo and project in Supabase) or is email-shaped ships as null, and a row whose key does
+is dropped; a deviation's repo-scoped instruction source is masked (see REPO_PREFIXES).
 
 Shape. Database `amem` (AMEM_CLICKHOUSE_DB), one `ReplacingMergeTree(version)` table per entity,
 `ORDER BY id`, `SETTINGS non_replicated_deduplication_window = 1000` (a plain MergeTree keeps no insert
@@ -91,7 +94,7 @@ from psycopg import sql
 from psycopg.rows import dict_row
 
 from agent_memory import config as amem_config
-from agent_memory.integrations import http, refs
+from agent_memory.integrations import egress, http, refs
 from agent_memory.integrations.evidence import EvidenceRef, Health, NamedQuery
 from agent_memory.integrations.sync import Batch
 
@@ -493,20 +496,23 @@ def _is_id(s: str) -> bool:
     return refs.is_ref(f"ch:x/{s}")
 
 
-def _value(kind: str, v: Any) -> Any:
+_TEXT_KINDS = frozenset({"label", "pseudo", "source", "id"})
+
+
+def _value(kind: str, v: Any, deny: egress.Deny = egress.NONE) -> Any:
     if v is None:
         return None
+    if kind in _TEXT_KINDS:             # Mission 004C (F3): a denied or email-shaped value never leaves, as is
+        s = str(v)                      # or as a pseudonym: it ships as null
+        if deny.match(s) or egress.email_like(s):
+            return None
     if kind == "label":
-        s = str(v)
         return s if LABEL_RE.fullmatch(s) else None
     if kind == "pseudo":                # label-shaped only: free text stays null, as for labels
-        s = str(v)
         return pseudonym(s) if LABEL_RE.fullmatch(s) else None
     if kind == "source":                # a label whose repo part becomes a pseudonym (F1)
-        s = str(v)
         return source_value(s) if LABEL_RE.fullmatch(s) else None
     if kind == "id":
-        s = str(v)
         return s if _is_id(s) else None
     if kind == "ts":
         return v.astimezone(UTC).strftime("%Y-%m-%d %H:%M:%S.%f")
@@ -520,9 +526,10 @@ def _value(kind: str, v: Any) -> Any:
     raise ValueError(f"unknown column kind {kind!r}")
 
 
-def map_row(t: Table, raw: Mapping[str, Any], version: int) -> dict[str, Any] | None:
-    """The allowlist mapper: only t.cols, each coerced by kind; None when the key is not a valid id."""
-    out = {c.name: _value(c.kind, raw.get(c.name)) for c in t.cols}
+def map_row(t: Table, raw: Mapping[str, Any], version: int, deny: egress.Deny = egress.NONE) -> dict[str, Any] | None:
+    """The allowlist mapper: only t.cols, each coerced by kind; None when the key is not a valid id, or is
+    denied or email-shaped (egress)."""
+    out = {c.name: _value(c.kind, raw.get(c.name), deny) for c in t.cols}
     if not out.get("id"):
         return None
     out["version"] = version
@@ -585,6 +592,7 @@ class ClickHouseSink:
         self.tables = tuple(tables)
         self.auto_schema = auto_schema and not self.client.cfg.cloud      # Cloud: the owner runs the DDL once
         self._schema_ready = False
+        self.deny = egress.NONE         # the egress deny list, read at the start of every batches() call
 
     def health(self) -> Health:
         if self.client.cfg.problem:
@@ -600,6 +608,7 @@ class ClickHouseSink:
 
     def batches(self, conn: psycopg.Connection, watermarks: Mapping[str, str], *, replay: bool) -> Iterator[Batch]:
         version = next_version()
+        self.deny = egress.load(conn)
         since = None if replay or self.lookback_days <= 0 else self._now() - timedelta(days=self.lookback_days)
         for t in self.tables:
             mark = None if replay else parse_mark(watermarks.get(t.name))
@@ -645,7 +654,7 @@ class ClickHouseSink:
             after = (rows[-1]["_changed"], rows[-1]["_key"])
 
     def _batch(self, t: Table, rows: Sequence[Mapping[str, Any]], version: int, mark: Mark) -> Batch:
-        mapped = [m for m in (map_row(t, r, version) for r in rows) if m is not None]
+        mapped = [m for m in (map_row(t, r, version, self.deny) for r in rows) if m is not None]
         return Batch(t.name, mapped, format_mark(mark), key=token_of(t.name, body_of(mapped)) if mapped else "")
 
     def split(self, batch: Batch) -> list[Batch]:

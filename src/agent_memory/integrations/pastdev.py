@@ -3,7 +3,8 @@
 past.dev is an external SaaS. It receives only the sanitized decision records built here (sanitize.py):
 one per proposal, decision or rejection, experiment, edit and lesson decision, each at most CAP_BYTES. No
 transcripts, file contents, prompts, paths, emails, hosts, secrets, ids other than the record's own
-`amem:` ref, and nothing from a team repo. One past.dev project is dedicated to RSI; its project key
+`amem:` ref, nothing from a team repo, and nothing that names a term on the egress deny list (egress.py:
+AMEM_EGRESS_DENY plus every team repo and project, read at the start of each run). One past.dev project is dedicated to RSI; its project key
 (`past_sk_...`) is read from AMEM_PASTDEV_KEY only (this module never reads an env file). Without a key,
 everything here is `unavailable`. AMEM_PASTDEV=off stops the sink (sync.switched_off) and the retriever.
 
@@ -69,7 +70,7 @@ import psycopg
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
-from agent_memory.integrations import http, refs, sync
+from agent_memory.integrations import egress, http, refs, sync
 from agent_memory.integrations.evidence import EvidenceRef, Health, NamedQuery, run_query, usable
 from agent_memory.integrations.sanitize import KIND_ENTITY, KINDS, SAFE_REF_ID, sanitize_record, scrub_text, secret_like
 
@@ -310,11 +311,12 @@ def build_records(conn: psycopg.Connection) -> list[Record]:
     return out
 
 
-def corpus(conn: psycopg.Connection) -> list[tuple[str, str]]:
+def corpus(conn: psycopg.Connection, environ: Mapping[str, str] | None = None) -> list[tuple[str, str]]:
     """(ref, content) for every record the sink may send: exactly what past.dev receives."""
     out = []
+    deny = egress.load(conn, environ)
     for rec in build_records(conn):
-        content, _ = sanitize_record(rec.fields)
+        content, _ = sanitize_record(rec.fields, deny)
         if content is not None:
             out.append((rec.ref, content))
     return out
@@ -416,9 +418,10 @@ class PastDevSink:
         failures = (sync.load(conn, self.name).get("failures") or {})
         now = _ts(self.now())
         self.refused, self.retired = [], []
+        deny = egress.load(conn, self._environ)        # Mission 004C (F3): env terms + team repos, read now
         ready: dict[str, tuple[Record, str]] = {}
         for rec in records:
-            content, reasons = sanitize_record(rec.fields)
+            content, reasons = sanitize_record(rec.fields, deny)
             if content is None:
                 self.refused.append((rec.ref, reasons))
             else:
