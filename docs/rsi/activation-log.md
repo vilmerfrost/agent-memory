@@ -414,3 +414,7 @@ Option A (Vilmer): terminal-only Apply. The phone gets Reject only. No TOTP secr
   (spend-capped) until Vilmer decides to keep or revoke them.
 - **Docs fixed:** sandbox.md: store long keys through the hex pipe, not the `-w` prompt; Codex needs
   `-s danger-full-access` in the worker; real-key runs are now verified.
+- **Merged after approval:** `git merge --ff-only 8594405` in `~/Projects/agent-memory` (21:42:35): `main`
+  `e569df9` → `8594405`, tests and docs only (0 other files). Live suite with the tripwire: **1453 passed**,
+  0 failed (198 s); no Keychain dialog; the admin item is still the one created at 21:23:09; agent-config
+  unchanged. The two sandbox keys are kept (Vilmer). Phase I not started.
