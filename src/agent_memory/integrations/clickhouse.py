@@ -1,0 +1,705 @@
+"""ClickHouse adapter: local analytics over numbers, labels and ids, never text (Mission 004A; blueprint C).
+
+    sink       ClickHouseSink (sync.Sink, name "clickhouse"): Supabase rows -> one table per entity
+    retriever  ClickHouseRetriever (source "ch"): four fixed, named, parameterized queries
+    verify     per-day row counts per table, Supabase vs ClickHouse, and a parity flag
+
+What may leave. Each table has an explicit allowlist (TABLES). A column that is not listed is never even
+selected from Supabase: no titles, summaries, what/why/how, prompts, reasons, refs, paths or jsonb. A label
+(model, project, rule id, status ...) must match LABEL_RE (no spaces, at most 128 chars) or it ships as
+null, so free text in a label column cannot leak. A row whose key is not a valid ref id is dropped, so
+`ch:<table>/<id>` always maps 1:1 to `amem:<entity>/<id>` and no rsi_evidence link is written per row.
+
+Shape. Database `amem` (AMEM_CLICKHOUSE_DB), one `ReplacingMergeTree(version)` table per entity,
+`ORDER BY id`, `SETTINGS non_replicated_deduplication_window = 1000` (a plain MergeTree keeps no insert
+dedup log without it, so insert_deduplication_token would do nothing). No PARTITION BY: one INSERT is one
+block, so one token covers the whole batch. Reads use FINAL.
+
+Write path. One HTTP POST per batch:
+
+    POST {url}/?query=INSERT INTO amem.<t> FORMAT JSONEachRow&insert_deduplication_token=<sha256(table, body)>
+    X-ClickHouse-User / X-ClickHouse-Key headers; body: one JSON object per line
+
+The same batch sent twice (an HTTP retry after a lost response) is stored once. `version` is the extraction
+time in epoch ms (monotonic in this process), so the newest extraction of a row wins in FINAL.
+
+Cursor (the sync watermark, owned here): `<iso ts>|<id>` per table, over `(changed, id)` in that order,
+where `changed` is the newest timestamp the row carries (sessions: created, ended, last activity, tokens,
+outcome; runs: created, finished; proposals: created, decided, promoted, reverted; else the creation time).
+Some columns change without any timestamp (deviations.objective_result / rule_id on `deviations reref`,
+jev verdicts, skill_calls.session_id on a late match), and a row can commit after a later row's timestamp.
+So every incremental run also re-sends the rows at or behind the watermark whose `changed` is inside a
+lookback window (AMEM_CLICKHOUSE_LOOKBACK_DAYS, default 7, 0 = off). ReplacingMergeTree keeps the newest
+version, so a re-send is harmless. Silent updates older than the window heal with `--replay` (a backfill).
+The append-only tables (rsi_decisions, rsi_eval_results) have no lookback.
+
+Reads. Only the named queries in QUERIES: fixed SQL with ClickHouse query parameters (`{name:Type}` in the
+SQL, values as `param_<name>` URL parameters, each checked first by the core NamedQuery regex). `limit` is
+applied here, never interpolated. Results are EvidenceRef metrics (`ch:q.<query>/<key>`, summary None).
+
+Checked against the official docs on 2026-10-16:
+- HTTP interface: POST for INSERT with the query in the URL and the data in the body; X-ClickHouse-User /
+  X-ClickHouse-Key headers; the `database` URL parameter; any setting as a URL parameter; GET /ping answers
+  "Ok."; wait_end_of_query=1 buffers the whole response, so a query error gets a proper status code.
+  https://clickhouse.com/docs/interfaces/http
+- Query parameters: `{<name>: <datatype>}` placeholders, values as `param_<name>` URL parameters.
+  https://clickhouse.com/docs/sql-reference/syntax (section "Defining and Using Query Parameters")
+- insert_deduplication_token takes priority over the data hash; a non-replicated MergeTree deduplicates
+  nothing unless non_replicated_deduplication_window > 0 (default 0); the window counts inserts.
+  https://clickhouse.com/docs/guides/developer/deduplicating-inserts-on-retries
+- ReplacingMergeTree(ver): per ORDER BY key the highest version survives (a tie keeps the last insert);
+  merges are eventual, so read with FINAL.
+  https://clickhouse.com/docs/engines/table-engines/mergetree-family/replacingmergetree
+- quantileExact(0.5) over 0..9 returns 5 (the mock in the tests uses that rule).
+  https://clickhouse.com/docs/sql-reference/aggregate-functions/reference/quantileexact
+Tested against a local mock only (tests/test_integrations_clickhouse.py): the SQL has not run on a real server.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import math
+import os
+import re
+import threading
+import time
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from dataclasses import dataclass, field
+from datetime import UTC, date, datetime, timedelta
+from typing import Any
+from urllib.parse import quote, urlencode
+
+import psycopg
+from psycopg import sql
+from psycopg.rows import dict_row
+
+from agent_memory import config as amem_config
+from agent_memory.integrations import http, refs
+from agent_memory.integrations.evidence import EvidenceRef, Health, NamedQuery
+from agent_memory.integrations.sync import Batch
+
+DEFAULT_DB = "amem"
+DEDUP_WINDOW = 1000        # inserts remembered per table for insert_deduplication_token
+BATCH_SIZE = 500
+LOOKBACK_DAYS = 7
+FETCH_LIMIT = 1000         # the fixed LIMIT in every named query; the `limit` param cuts further here
+DB_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}")
+LABEL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@+=\[\]-]{0,127}")
+_NOT_REF = re.compile(r"[^A-Za-z0-9._:/@-]")
+
+
+# ---------------------------------------------------------------- config and HTTP client
+
+
+@dataclass(frozen=True)
+class Config:
+    url: str = ""
+    user: str = ""
+    key: str = field(default="", repr=False)
+    db: str = DEFAULT_DB
+    lookback_days: int = LOOKBACK_DAYS
+
+    @property
+    def problem(self) -> str:
+        if not self.url:
+            return "not configured (AMEM_CLICKHOUSE_URL)"
+        if not DB_RE.fullmatch(self.db):
+            return "bad AMEM_CLICKHOUSE_DB"
+        return ""
+
+
+def config(environ: Mapping[str, str] | None = None) -> Config:
+    """AMEM_CLICKHOUSE_URL / _USER / _KEY / _DB / _LOOKBACK_DAYS. No URL: unconfigured (health unavailable)."""
+    if environ is None:
+        amem_config.load_env()
+        environ = os.environ
+
+    def get(name: str) -> str:
+        return (environ.get(name) or "").strip()
+
+    try:
+        lookback = int(get("AMEM_CLICKHOUSE_LOOKBACK_DAYS") or LOOKBACK_DAYS)
+    except ValueError:
+        lookback = LOOKBACK_DAYS
+    return Config(get("AMEM_CLICKHOUSE_URL").rstrip("/"), get("AMEM_CLICKHOUSE_USER"), get("AMEM_CLICKHOUSE_KEY"),
+                  get("AMEM_CLICKHOUSE_DB") or DEFAULT_DB, max(0, min(lookback, 90)))
+
+
+class Client:
+    """The ClickHouse HTTP interface: ping, DDL, idempotent inserts and parameterized selects."""
+
+    def __init__(self, cfg: Config | None = None, *, timeout: float = 10.0, retries: int = 2,
+                 sleep: Callable[[float], None] = time.sleep):
+        self.cfg = cfg if cfg is not None else config()
+        self.timeout, self.retries, self.sleep = timeout, retries, sleep
+
+    def _check(self) -> None:
+        if self.cfg.problem:
+            raise http.HttpError(None, self.cfg.problem)
+
+    def _post(self, params: Mapping[str, str], body: bytes) -> http.Response:
+        self._check()
+        headers = {"Content-Type": "text/plain; charset=utf-8"}
+        if self.cfg.user:
+            headers["X-ClickHouse-User"] = self.cfg.user
+        if self.cfg.key:
+            headers["X-ClickHouse-Key"] = self.cfg.key
+        url = f"{self.cfg.url}/" + (f"?{urlencode(params, quote_via=quote)}" if params else "")
+        return http.request("POST", url, headers=headers, body=body, timeout=self.timeout, retries=self.retries,
+                            sleep=self.sleep)
+
+    def ping(self) -> None:
+        self._check()
+        r = http.request("GET", f"{self.cfg.url}/ping", timeout=min(self.timeout, 3.0), retries=0, sleep=self.sleep)
+        if not r.text().startswith("Ok"):
+            raise http.HttpError(r.status, "unexpected /ping answer")
+
+    def command(self, statement: str) -> None:
+        self._post({}, statement.encode("utf-8"))
+
+    def insert(self, table: str, body: bytes, token: str) -> None:
+        if table not in TABLE_NAMES:
+            raise ValueError(f"not a ClickHouse table: {table!r}")
+        self._post({"query": f"INSERT INTO {self.cfg.db}.{table} FORMAT JSONEachRow",
+                    "insert_deduplication_token": token}, body)
+
+    def select(self, statement: str, params: Mapping[str, str]) -> list[dict[str, Any]]:
+        p = {"database": self.cfg.db, "wait_end_of_query": "1", "output_format_json_quote_64bit_integers": "0"}
+        p.update({f"param_{k}": v for k, v in params.items()})
+        r = self._post(p, statement.encode("utf-8"))
+        return [json.loads(line) for line in r.text().splitlines() if line.strip()]
+
+
+# ---------------------------------------------------------------- tables and allowlists
+
+
+@dataclass(frozen=True)
+class Col:
+    name: str           # the ClickHouse column (and the alias in the Supabase select)
+    kind: str           # id | label | ts | int | float | bool
+    expr: str = ""      # Supabase SQL expression; default: the column of the same name
+
+
+@dataclass(frozen=True)
+class Table:
+    name: str                   # Supabase table = ClickHouse table = cursor key
+    key: str                    # Supabase key column, shipped as `id`
+    day: str                    # the column verify counts per day
+    changed: str                # SQL: when the row last changed (the cursor)
+    cols: tuple[Col, ...]       # the allowlist; nothing else is selected
+    lookback: bool = True       # False for append-only tables
+
+    @property
+    def allowlist(self) -> tuple[str, ...]:
+        return tuple(c.name for c in self.cols)
+
+
+def _cols(spec: str, **exprs: str) -> tuple[Col, ...]:
+    """'kind:a,b kind:c' -> Cols; exprs maps a column to its Supabase expression."""
+    out = []
+    for group in spec.split():
+        kind, names = group.split(":")
+        out += [Col(n, kind, exprs.get(n, "")) for n in names.split(",")]
+    return tuple(out)
+
+
+TABLES: tuple[Table, ...] = (
+    Table("sessions", "session_id", "created_at",
+          "greatest(created_at, ended_at, last_activity_at, tokens_updated_at, outcome_at)",
+          _cols("id:id label:kind,tool,env,category,project,repo,model,effort,outcome id:experiment_id "
+                "ts:created_at,started_at,ended_at,last_activity_at,outcome_at "
+                "int:transcript_bytes,turns,tokens_input,tokens_output,tokens_cache_read,tokens_cache_creation "
+                "float:duration_seconds,active_seconds,api_seconds,tool_seconds int:lines_added,lines_removed",
+                id="session_id")),
+    Table("runs", "id", "created_at", "greatest(created_at, finished_at)",
+          _cols("id:id label:routine,source,status ts:started_at,finished_at,created_at float:duration_s",
+                duration_s="extract(epoch from finished_at - started_at)")),
+    Table("deviations", "id", "created_at", "created_at",
+          _cols("id:id,session_id label:instruction_source,rule_id id:instruction_sha int:turn "
+                "float:followed_grade,result_grade,objective_result label:result_outcome,jev_verdict "
+                "float:jev_confidence label:jev_mode,writer_model ts:created_at")),
+    Table("scores", "id", "created_at", "created_at",
+          _cols("id:id,run_id label:question,kind float:value_num,confidence label:jev_mode ts:created_at")),
+    Table("skill_calls", "id", "created_at", "created_at",
+          _cols("id:id ts:ts label:skill,invoked_by,agent,project bool:backfill id:session_id ts:created_at")),
+    Table("rsi_proposals", "id", "created_at", "greatest(created_at, decided_at, promoted_at, reverted_at)",
+          _cols("id:id,artifact_hash,experiment_id,candidate_id label:status float:confidence "
+                "ts:created_at,expires_at,decided_at,promoted_at,reverted_at")),
+    Table("rsi_decisions", "id", "decided_at", "decided_at",
+          _cols("id:id,proposal_id label:action id:artifact_hash label:source,verified ts:decided_at,expires_at"),
+          lookback=False),
+    Table("rsi_eval_results", "id", "created_at", "created_at",
+          _cols("id:id,artifact_hash,experiment_id,baseline_id label:suite,suite_version,model,effort,verdict "
+                "id:record_sha ts:created_at"),
+          lookback=False),
+)
+TABLE_NAMES = frozenset(t.name for t in TABLES)
+_TABLE = {t.name: t for t in TABLES}
+
+_CH_TYPES = {"id": "Nullable(String)", "label": "LowCardinality(Nullable(String))",
+             "ts": "Nullable(DateTime64(6, 'UTC'))", "int": "Nullable(Int64)", "float": "Nullable(Float64)",
+             "bool": "Nullable(Bool)"}
+
+
+def _ch_type(t: Table, c: Col) -> str:
+    if c.name == "id":
+        return "String"
+    if c.name == t.day:
+        return "DateTime64(6, 'UTC')"
+    return _CH_TYPES[c.kind]
+
+
+def schema_sql(db: str = DEFAULT_DB) -> list[str]:
+    """One statement per item (the HTTP interface runs one statement per request)."""
+    if not DB_RE.fullmatch(db):
+        raise ValueError(f"bad database name: {db!r}")
+    out = [f"CREATE DATABASE IF NOT EXISTS {db}"]
+    for t in TABLES:
+        cols = ",\n    ".join(f"{c.name} {_ch_type(t, c)}" for c in t.cols)
+        out.append(f"CREATE TABLE IF NOT EXISTS {db}.{t.name} (\n    {cols},\n    version UInt64\n)\n"
+                   f"ENGINE = ReplacingMergeTree(version)\nORDER BY id\n"
+                   f"SETTINGS non_replicated_deduplication_window = {DEDUP_WINDOW}")
+    return out
+
+
+def ensure_schema(client: Client) -> int:
+    stmts = schema_sql(client.cfg.db)
+    for s in stmts:
+        client.command(s)
+    return len(stmts)
+
+
+def _is_id(s: str) -> bool:
+    # The ref grammar decides what an id may hold, so ch:<table>/<id> and amem:<entity>/<id> stay valid refs.
+    return refs.is_ref(f"ch:x/{s}")
+
+
+def _value(kind: str, v: Any) -> Any:
+    if v is None:
+        return None
+    if kind == "label":
+        s = str(v)
+        return s if LABEL_RE.fullmatch(s) else None
+    if kind == "id":
+        s = str(v)
+        return s if _is_id(s) else None
+    if kind == "ts":
+        return v.astimezone(UTC).strftime("%Y-%m-%d %H:%M:%S.%f")
+    if kind == "int":
+        return int(v)
+    if kind == "float":
+        f = float(v)
+        return f if math.isfinite(f) else None
+    if kind == "bool":
+        return bool(v)
+    raise ValueError(f"unknown column kind {kind!r}")
+
+
+def map_row(t: Table, raw: Mapping[str, Any], version: int) -> dict[str, Any] | None:
+    """The allowlist mapper: only t.cols, each coerced by kind; None when the key is not a valid id."""
+    out = {c.name: _value(c.kind, raw.get(c.name)) for c in t.cols}
+    if not out.get("id"):
+        return None
+    out["version"] = version
+    return out
+
+
+def body_of(rows: Sequence[Mapping[str, Any]]) -> bytes:
+    return b"".join(json.dumps(r, ensure_ascii=False, separators=(",", ":")).encode("utf-8") + b"\n" for r in rows)
+
+
+def token_of(table: str, body: bytes) -> str:
+    return hashlib.sha256(table.encode("utf-8") + b"\n" + body).hexdigest()
+
+
+_version_lock = threading.Lock()
+_last_version = 0
+
+
+def next_version() -> int:
+    """Extraction version: epoch ms, strictly increasing within this process."""
+    global _last_version
+    with _version_lock:
+        _last_version = max(time.time_ns() // 1_000_000, _last_version + 1)
+        return _last_version
+
+
+Mark = tuple[datetime, str]
+
+
+def format_mark(mark: Mark) -> str:
+    return f"{mark[0].astimezone(UTC).isoformat()}|{mark[1]}"
+
+
+def parse_mark(text: str | None) -> Mark | None:
+    """None for no (or an unreadable) watermark: the table is sent again from the start, which is idempotent."""
+    if not text or "|" not in text:
+        return None
+    ts, _, key = text.partition("|")
+    try:
+        dt = datetime.fromisoformat(ts)
+    except ValueError:
+        return None
+    return (dt if dt.tzinfo else dt.replace(tzinfo=UTC)), key
+
+
+# ---------------------------------------------------------------- the sink
+
+
+class ClickHouseSink:
+    """sync.Sink for ClickHouse. Batches hold allowlisted rows only; batch.evidence stays empty."""
+
+    name = "clickhouse"
+
+    def __init__(self, client: Client | None = None, *, batch_size: int = BATCH_SIZE, lookback_days: int | None = None,
+                 now: Callable[[], datetime] | None = None, tables: Sequence[Table] = TABLES, auto_schema: bool = True):
+        self.client = client if client is not None else Client()
+        self.batch_size = batch_size
+        self.lookback_days = self.client.cfg.lookback_days if lookback_days is None else lookback_days
+        self._now = now or (lambda: datetime.now(UTC))
+        self.tables = tuple(tables)
+        self.auto_schema = auto_schema
+        self._schema_ready = False
+
+    def health(self) -> Health:
+        if self.client.cfg.problem:
+            return Health(False, self.client.cfg.problem)
+        try:
+            self.client.ping()
+            if self.auto_schema and not self._schema_ready:
+                ensure_schema(self.client)          # IF NOT EXISTS: cheap and idempotent
+                self._schema_ready = True
+        except http.HttpError as exc:
+            return Health(False, str(exc)[:200])
+        return Health(True)
+
+    def batches(self, conn: psycopg.Connection, watermarks: Mapping[str, str], *, replay: bool) -> Iterator[Batch]:
+        version = next_version()
+        since = None if replay or self.lookback_days <= 0 else self._now() - timedelta(days=self.lookback_days)
+        for t in self.tables:
+            mark = None if replay else parse_mark(watermarks.get(t.name))
+            last = mark
+            for rows in self._pages(conn, t, after=mark):
+                last = (rows[-1]["_changed"], rows[-1]["_key"])
+                yield self._batch(t, rows, version, last)
+            if since is not None and t.lookback and mark is not None:
+                # rows sent by an earlier run that may have changed without a timestamp (see module doc)
+                for rows in self._pages(conn, t, since=since, upto=mark):
+                    yield self._batch(t, rows, version, last or mark)
+
+    def _pages(self, conn: psycopg.Connection, t: Table, *, after: Mark | None = None, since: datetime | None = None,
+               upto: Mark | None = None) -> Iterator[list[dict[str, Any]]]:
+        changed = sql.SQL(t.changed)
+        key = sql.SQL('{}::text collate "C"').format(sql.Identifier(t.key))
+        cols = sql.SQL(", ").join(
+            sql.SQL("{} as {}").format(sql.SQL(c.expr) if c.expr else sql.Identifier(c.name), sql.Identifier(c.name))
+            for c in t.cols)
+        while True:
+            conds: list[sql.Composable] = []
+            args: list[Any] = []
+            if after is not None:
+                conds.append(sql.SQL("({}, {}) > (%s, %s)").format(changed, key))
+                args += [after[0], after[1]]
+            if since is not None:
+                conds.append(sql.SQL("{} >= %s").format(changed))
+                args.append(since)
+            if upto is not None:
+                conds.append(sql.SQL("({}, {}) <= (%s, %s)").format(changed, key))
+                args += [upto[0], upto[1]]
+            where = sql.SQL(" where ") + sql.SQL(" and ").join(conds) if conds else sql.SQL("")
+            q = sql.SQL("select {cols}, {changed} as _changed, {key} as _key from {table}{where} "
+                        "order by _changed, _key limit %s").format(
+                cols=cols, changed=changed, key=key, table=sql.Identifier(t.name), where=where)
+            with conn.cursor(row_factory=dict_row) as cur:
+                rows = cur.execute(q, [*args, self.batch_size]).fetchall()
+            if not rows:
+                return
+            yield rows
+            if len(rows) < self.batch_size:
+                return
+            after = (rows[-1]["_changed"], rows[-1]["_key"])
+
+    def _batch(self, t: Table, rows: Sequence[Mapping[str, Any]], version: int, mark: Mark) -> Batch:
+        mapped = [m for m in (map_row(t, r, version) for r in rows) if m is not None]
+        return Batch(t.name, mapped, format_mark(mark), key=token_of(t.name, body_of(mapped)) if mapped else "")
+
+    def push(self, batch: Batch) -> None:
+        if not batch.rows:
+            return
+        body = body_of(batch.rows)
+        self.client.insert(batch.table, body, batch.key or token_of(batch.table, body))
+
+
+# ---------------------------------------------------------------- the retriever: four named queries
+
+_RULE_P = r"[A-Za-z0-9][A-Za-z0-9._:/@-]{0,199}"
+_LABEL_P = LABEL_RE.pattern
+_DAYS_P = r"[1-9][0-9]{0,2}"
+_WEEKS_P = r"[1-9][0-9]?"
+_N_P = r"[1-9][0-9]{0,2}"
+GAP_FOLLOWED_MAX = 0.5      # rule_gap flag: followed this badly ...
+GAP_OBJECTIVE_MIN = 0.8     # ... yet the objective outcome was this good
+
+RULE_WEEKLY_RATE_SQL = """\
+SELECT d.week_start AS week_start, d.rule_key AS rule_key, d.n_deviations AS n_deviations,
+       d.sessions_hit AS sessions_hit, w.n_sessions AS sessions_total,
+       if(w.n_sessions = 0, NULL, d.sessions_hit / w.n_sessions) AS rate, d.sample_ids AS sample_ids
+FROM (
+    SELECT toMonday(s.started) AS week_start,
+           concat(v.instruction_source, ':', ifNull(v.rule_id, 'unknown')) AS rule_key,
+           count() AS n_deviations, uniqExact(v.session_id) AS sessions_hit,
+           arraySlice(arraySort(groupArray(v.id)), 1, 3) AS sample_ids
+    FROM (SELECT id, session_id, instruction_source, rule_id FROM deviations FINAL) AS v
+    INNER JOIN (SELECT id, ifNull(started_at, created_at) AS started FROM sessions FINAL
+                WHERE ifNull(env, 'prod') NOT IN ('sandbox', 'eval')) AS s ON v.session_id = s.id
+    WHERE toMonday(s.started) >= toMonday(now('UTC')) - toIntervalWeek({weeks:UInt16})
+      AND ({rule:String} = '' OR concat(v.instruction_source, ':', ifNull(v.rule_id, 'unknown')) = {rule:String})
+    GROUP BY week_start, rule_key
+) AS d
+LEFT JOIN (
+    SELECT toMonday(ifNull(started_at, created_at)) AS wk, count() AS n_sessions FROM sessions FINAL
+    WHERE ifNull(env, 'prod') NOT IN ('sandbox', 'eval')
+    GROUP BY wk
+) AS w ON d.week_start = w.wk
+ORDER BY week_start DESC, n_deviations DESC, rule_key
+LIMIT 1000
+FORMAT JSONEachRow"""
+
+TOKENS_BY_OUTCOME_SQL = """\
+SELECT outcome, category, model, effort, count() AS n_sessions,
+       sum(ifNull(tokens_input, 0) + ifNull(tokens_output, 0) + ifNull(tokens_cache_read, 0)
+           + ifNull(tokens_cache_creation, 0)) AS tokens_total,
+       sum(ifNull(tokens_output, 0)) AS tokens_out,
+       sum(ifNull(active_seconds, 0)) AS active_total_s,
+       quantileExact(0.5)(active_seconds) AS active_p50_s
+FROM sessions FINAL
+WHERE ifNull(env, 'prod') NOT IN ('sandbox', 'eval')
+  AND toDate(ifNull(started_at, created_at)) >= toDate(now('UTC')) - {days:UInt16}
+  AND ({project:String} = '' OR ifNull(project, '') = {project:String})
+GROUP BY outcome, category, model, effort
+ORDER BY tokens_total DESC, n_sessions DESC
+LIMIT 1000
+FORMAT JSONEachRow"""
+
+ROUTINE_STREAKS_SQL = """\
+SELECT routine, n_runs, fails, if(last_pass = 0, toInt64(length(rev)), toInt64(last_pass) - 1) AS fail_streak,
+       rev[1] AS last_status, duration_p50_s, duration_p95_s, last_run_id
+FROM (
+    SELECT routine, count() AS n_runs, countIf(status IN ('fail', 'error')) AS fails,
+           arrayReverse(arrayMap(x -> x.2, arraySort(x -> x.1, groupArray((started_at, status))))) AS rev,
+           indexOf(rev, 'pass') AS last_pass,
+           quantileExact(0.5)(duration_s) AS duration_p50_s, quantileExact(0.95)(duration_s) AS duration_p95_s,
+           argMax(id, started_at) AS last_run_id
+    FROM runs FINAL
+    WHERE status != 'skip' AND toDate(started_at) >= toDate(now('UTC')) - {days:UInt16}
+      AND ({routine:String} = '' OR routine = {routine:String})
+    GROUP BY routine
+)
+ORDER BY fail_streak DESC, fails DESC, routine
+LIMIT 1000
+FORMAT JSONEachRow"""
+
+RULE_GAP_SQL = """\
+SELECT rule_key, n_deviations, n_sessions, followed_avg, result_avg, objective_avg, objective_n,
+       objective_avg - followed_avg AS gap, sample_ids
+FROM (
+    SELECT concat(instruction_source, ':', ifNull(rule_id, 'unknown')) AS rule_key,
+           count() AS n_deviations, uniqExact(session_id) AS n_sessions,
+           avg(followed_grade) AS followed_avg, avg(result_grade) AS result_avg,
+           avg(objective_result) AS objective_avg, count(objective_result) AS objective_n,
+           arraySlice(arraySort(groupArray(id)), 1, 3) AS sample_ids
+    FROM deviations FINAL
+    WHERE toDate(created_at) >= toDate(now('UTC')) - {days:UInt16}
+      AND session_id NOT IN (SELECT id FROM sessions FINAL WHERE env IN ('sandbox', 'eval'))
+      AND ({rule:String} = '' OR concat(instruction_source, ':', ifNull(rule_id, 'unknown')) = {rule:String})
+    GROUP BY rule_key
+)
+WHERE n_deviations >= {min_n:UInt32} AND objective_n > 0
+ORDER BY gap DESC, rule_key
+LIMIT 1000
+FORMAT JSONEachRow"""
+
+
+def _part(v: Any) -> str:
+    return _NOT_REF.sub("_", str(v)).replace("/", "_") if v not in (None, "") else "unknown"
+
+
+@dataclass(frozen=True)
+class Query:
+    spec: NamedQuery
+    sql: str
+    defaults: Mapping[str, str]                 # every param the SQL uses gets a value; `limit` stays here
+    key: Callable[[Mapping[str, Any]], str | None]
+    metrics: tuple[str, ...]                    # output columns copied into EvidenceRef.metrics
+    subject: tuple[str, str] | None = None      # (amem entity, output column holding its id or ids)
+
+
+QUERIES: dict[str, Query] = {
+    "rule_weekly_rate": Query(
+        NamedQuery("rule_weekly_rate", {"rule": _RULE_P, "weeks": _WEEKS_P, "limit": _N_P},
+                   "weekly deviation rate per rule: sessions with a deviation / prod sessions that week"),
+        RULE_WEEKLY_RATE_SQL, {"rule": "", "weeks": "8", "limit": "50"},
+        lambda r: f"{r['rule_key']}@{r['week_start']}" if r.get("rule_key") and r.get("week_start") else None,
+        ("week_start", "rule_key", "n_deviations", "sessions_hit", "sessions_total", "rate"),
+        ("deviation", "sample_ids")),
+    "tokens_by_outcome": Query(
+        NamedQuery("tokens_by_outcome", {"project": _LABEL_P, "days": _DAYS_P, "limit": _N_P},
+                   "tokens and active time per outcome x category x model x effort (prod sessions)"),
+        TOKENS_BY_OUTCOME_SQL, {"project": "", "days": "30", "limit": "50"},
+        lambda r: "/".join(_part(r.get(c)) for c in ("outcome", "category", "model", "effort")),
+        ("outcome", "category", "model", "effort", "n_sessions", "tokens_total", "tokens_out", "active_total_s",
+         "active_p50_s")),
+    "routine_streaks": Query(
+        NamedQuery("routine_streaks", {"routine": _LABEL_P, "days": _DAYS_P, "limit": _N_P},
+                   "per routine: current fail streak (fail/error since the last pass, skips ignored), "
+                   "duration p50/p95"),
+        ROUTINE_STREAKS_SQL, {"routine": "", "days": "30", "limit": "50"},
+        lambda r: r.get("routine") or None,
+        ("routine", "n_runs", "fails", "fail_streak", "last_status", "duration_p50_s", "duration_p95_s"),
+        ("run", "last_run_id")),
+    "rule_gap": Query(
+        NamedQuery("rule_gap", {"rule": _RULE_P, "days": _DAYS_P, "min_n": _N_P, "limit": _N_P},
+                   "per rule: followed grade vs objective outcome (gap = objective - followed), prod sessions"),
+        RULE_GAP_SQL, {"rule": "", "days": "90", "min_n": "3", "limit": "50"},
+        lambda r: r.get("rule_key") or None,
+        ("rule_key", "n_deviations", "n_sessions", "followed_avg", "result_avg", "objective_avg", "objective_n", "gap"),
+        ("deviation", "sample_ids")),
+}
+_NUM = re.compile(r"-?[0-9]+(\.[0-9]+)?([eE][-+]?[0-9]+)?")
+
+
+def _metric(v: Any) -> Any:
+    """Numbers and labels only (64-bit ints may arrive quoted)."""
+    if v is None or isinstance(v, bool):
+        return v
+    if isinstance(v, int):
+        return v
+    if isinstance(v, float):
+        return round(v, 4) if math.isfinite(v) else None
+    if isinstance(v, str):
+        if _NUM.fullmatch(v):
+            return int(v) if re.fullmatch(r"-?[0-9]+", v) else _metric(float(v))
+        return v if LABEL_RE.fullmatch(v) else None
+    return None
+
+
+class ClickHouseRetriever:
+    """evidence.Retriever for ClickHouse: only QUERIES, parameters checked by run_query before any call."""
+
+    source = "ch"
+
+    def __init__(self, client: Client | None = None, *, now: Callable[[], datetime] | None = None):
+        self.client = client if client is not None else Client()
+        self._now = now or (lambda: datetime.now(UTC))
+
+    def health(self) -> Health:
+        if self.client.cfg.problem:
+            return Health(False, self.client.cfg.problem)
+        try:
+            self.client.ping()
+        except http.HttpError as exc:
+            return Health(False, str(exc)[:200])
+        return Health(True)
+
+    def named_queries(self) -> Mapping[str, NamedQuery]:
+        return {n: q.spec for n, q in QUERIES.items()}
+
+    def query(self, name: str, params: Mapping[str, str]) -> list[EvidenceRef]:
+        q = QUERIES[name]
+        p = {**q.defaults, **q.spec.check(params)}       # checked again: query() may be called directly
+        limit = int(p.pop("limit"))
+        observed = self._now().astimezone(UTC).isoformat(timespec="seconds")
+        out: list[EvidenceRef] = []
+        for row in self.client.select(q.sql, p):
+            key = q.key(row)
+            ref = f"ch:q.{name}/{_NOT_REF.sub('_', key)}" if key else ""
+            if not refs.is_ref(ref):
+                continue
+            subjects: list[str] = []
+            if q.subject:
+                entity, col = q.subject
+                ids = row.get(col)
+                for i in ids if isinstance(ids, list) else [ids]:
+                    if isinstance(i, str) and _is_id(i):
+                        subjects.append(refs.amem(entity, i))
+            metrics = {m: _metric(row.get(m)) for m in q.metrics}
+            if name == "rule_gap":
+                f, o = metrics.get("followed_avg"), metrics.get("objective_avg")
+                metrics["flag"] = isinstance(f, float | int) and isinstance(o, float | int) \
+                    and f <= GAP_FOLLOWED_MAX and o >= GAP_OBJECTIVE_MIN
+            out.append(EvidenceRef(ref, "ch", "metric", subjects, metrics, None, observed))
+            if len(out) >= limit:
+                break
+        return out
+
+
+# ---------------------------------------------------------------- verify: per-day parity
+
+VERIFY_SQL = {t.name: (f"SELECT toString(toDate({t.day})) AS d, count() AS n FROM {t.name} FINAL "
+                       f"WHERE toDate({t.day}) >= {{since:Date}} GROUP BY d ORDER BY d FORMAT JSONEachRow")
+              for t in TABLES}
+
+
+@dataclass
+class VerifyReport:
+    since: str
+    days: int
+    status: str = "ok"                                       # ok | unavailable | error
+    counts: dict[str, dict[str, list[int]]] = field(default_factory=dict)   # table -> day -> [supabase, clickhouse]
+    parity: bool = False
+    detail: str = ""
+
+    def mismatches(self) -> list[tuple[str, str, int, int]]:
+        return [(t, d, sb, ch) for t, per_day in self.counts.items() for d, (sb, ch) in sorted(per_day.items())
+                if sb != ch]
+
+    def to_json(self) -> dict[str, Any]:
+        return {"since": self.since, "days": self.days, "status": self.status, "parity": self.parity,
+                "detail": self.detail, "counts": self.counts,
+                "mismatches": [list(m) for m in self.mismatches()]}
+
+    def line(self) -> str:
+        if self.status != "ok":
+            return f"verify clickhouse: {self.status} ({self.detail})"
+        bad = self.mismatches()
+        tail = "" if not bad else " " + ", ".join(f"{t}@{d} sb={sb} ch={ch}" for t, d, sb, ch in bad[:5])
+        return f"verify clickhouse since {self.since}: parity={'yes' if self.parity else 'no'}{tail}"
+
+
+def verify(conn: psycopg.Connection, days: int = 30, *, client: Client | None = None, today: date | None = None,
+           tables: Sequence[Table] = TABLES) -> VerifyReport:
+    """Rows per UTC day and table since `days - 1` days before today, Supabase vs ClickHouse (FINAL).
+
+    Supabase counts every row, so a row the mapper dropped (a key that is not a ref id) shows as a mismatch.
+    """
+    if not 1 <= days <= 366:
+        raise ValueError("days is 1..366")
+    client = client if client is not None else Client()
+    since = (today or datetime.now(UTC).date()) - timedelta(days=days - 1)
+    rep = VerifyReport(since.isoformat(), days)
+    if client.cfg.problem:
+        rep.status, rep.detail = "unavailable", client.cfg.problem
+        return rep
+    try:
+        client.ping()
+    except http.HttpError as exc:
+        rep.status, rep.detail = "unavailable", str(exc)[:200]
+        return rep
+    for t in tables:
+        per_day: dict[str, list[int]] = {}
+        q = sql.SQL("select to_char(({day} at time zone 'UTC')::date, 'YYYY-MM-DD'), count(*) from {table} "
+                    "where {day} >= (%s::date)::timestamp at time zone 'UTC' group by 1").format(
+            day=sql.Identifier(t.day), table=sql.Identifier(t.name))
+        for d, n in conn.execute(q, (since,)).fetchall():
+            per_day.setdefault(d, [0, 0])[0] = int(n)
+        try:
+            ch_rows = client.select(VERIFY_SQL[t.name], {"since": since.isoformat()})
+        except http.HttpError as exc:
+            rep.status, rep.detail = "error", f"{t.name}: {str(exc)[:200]}"
+            return rep
+        for r in ch_rows:
+            per_day.setdefault(str(r["d"]), [0, 0])[1] = int(r["n"])
+        rep.counts[t.name] = per_day
+    rep.parity = not rep.mismatches()
+    return rep
