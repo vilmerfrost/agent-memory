@@ -1,0 +1,9 @@
+# rsi egress allowlist. Exact host names. Port 443 only. One per line.
+# The image bakes this file in, so a change needs `rsi_sandbox.py build` (new digest).
+# Why each entry is here, and what is blocked on purpose: docs/sandbox.md, "Egress allowlist".
+
+# Claude Code: the Messages API. Auth with a dedicated sandbox API key.
+api.anthropic.com
+
+# Codex CLI with an API key (CODEX_API_KEY / OPENAI_API_KEY): the Responses API.
+api.openai.com
