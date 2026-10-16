@@ -23,9 +23,9 @@ or refuses it. Every text field goes through, in this order:
 5. Whitespace collapsed, each field cut to its cap.
 
 The record is refused (`None`) when it is a team item (`team` or `meta.team` true), it names a term on the
-egress deny list (Mission 004C; raw fields or final text), its kind or ref is not one we send, a secret shape survives (checked before and after scrubbing, on the final text too),
-the result is not stable under a second pass, or the final text exceeds CAP_BYTES. The same record
-always gives the same bytes.
+egress deny list (Mission 004C; raw fields or final text), its kind or ref is not one we send, a secret
+shape survives (checked before and after scrubbing, on the final text too), the result is not stable under
+a second pass, or the final text exceeds CAP_BYTES. The same record always gives the same bytes.
 """
 
 from __future__ import annotations
