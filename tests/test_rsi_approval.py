@@ -571,3 +571,36 @@ def test_cross_repo_stage_approve_promote_undo(rdb: str, sandbox: Path, tmp_path
     assert claude_md.read_text() == original                                       # undo restored the exact bytes
     ledger = (ac / "improve" / "ledger.jsonl").read_text()
     assert '"event": "promoted"' in ledger and '"event": "reverted"' in ledger and h in ledger
+
+
+# --------------------------------------------------------------------------- rollback
+
+
+def test_rollback_sql_reverses_the_migration_and_it_reapplies(pg_url: str) -> None:
+    """docs/rsi/rollback_rsi_core.sql on a scratch database: RSI objects gone, the rest intact, migrate again works."""
+    with psycopg.connect(pg_url, autocommit=True) as conn:
+        conn.execute("drop database if exists rsi_rollback")
+        conn.execute("create database rsi_rollback")
+    url = pg_url.rsplit("/", 1)[0] + "/rsi_rollback"
+    try:
+        assert subprocess.run([AMEM, "db", "migrate"], env=base_env(AMEM_DB_URL=url), capture_output=True).returncode == 0
+        sql = (Path(__file__).resolve().parents[1] / "docs" / "rsi" / "rollback_rsi_core.sql").read_text()
+        with psycopg.connect(url) as conn:
+            conn.execute("insert into edits (instruction_source, rule_id, status) values ('t', 'r', 'staged')")
+        with psycopg.connect(url) as conn:
+            with pytest.raises(psycopg.errors.RaiseException, match="staged"):
+                conn.execute(sql)
+        with psycopg.connect(url) as conn:
+            conn.execute("update edits set status = 'refused'")
+            conn.execute(sql)
+        with psycopg.connect(url) as conn:
+            assert conn.execute("select count(*) from pg_tables where tablename like 'rsi\\_%%'").fetchone() == (0,)
+            cols = {r[0] for r in conn.execute("select column_name from information_schema.columns where table_name = 'sessions'")}
+            assert "env" not in cols and "experiment_id" not in cols and "session_id" in cols
+            assert conn.execute("select count(*) from edits").fetchone() == (1,)
+        assert subprocess.run([AMEM, "db", "migrate"], env=base_env(AMEM_DB_URL=url), capture_output=True).returncode == 0
+        with psycopg.connect(url) as conn:
+            assert conn.execute("select count(*) from pg_tables where tablename like 'rsi\\_%%'").fetchone()[0] == 10
+    finally:
+        with psycopg.connect(pg_url, autocommit=True) as conn:
+            conn.execute("drop database if exists rsi_rollback with (force)")

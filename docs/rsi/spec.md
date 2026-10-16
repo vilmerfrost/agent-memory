@@ -67,6 +67,10 @@ Manifest:
 A record binds to exactly one artifact. Promotion requires one passing record per required suite,
 where `artifact_hash` and `baseline_id` equal the manifest's. Passing verdicts: `pass`, `improves`.
 
+Writers: `improve stage` writes `static`. `rsi_sandbox.py record-eval` writes sandbox suites. It refuses
+unless the candidate arm was built by `prepare-arm --artifact <hash>`, holds the artifact's exact bytes
+after sanitizing, and the control arm is the same baseline without the artifact.
+
 Required suites come from `criteria.json` `promotion.required_suites` (default `["static", "sandbox-replay"]`).
 `sandbox-replay` needs model credentials in the sandbox. Until it exists, nothing is promotable
 (fail-closed).

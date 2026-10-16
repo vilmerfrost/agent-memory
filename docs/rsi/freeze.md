@@ -104,8 +104,8 @@ git -C ~/agent-config commit -m "unfreeze" -- improve/criteria.json launchd/com.
 # re-enable ab-lessons-monthly in the app
 ```
 
-## Optional hardening (prepared in code, not installed)
+## Optional hardening (not built)
 
-`rsi-prod-fence`: deny file-tool writes to production paths in **unattended** sessions (scheduled
-tasks, `-p` runs). This is a hook change in `~/.claude/settings.json`, so it needs separate approval.
-See activation.md.
+`rsi-prod-fence` is an idea, not code: a hook that denies file-tool writes to production paths in
+**unattended** sessions (scheduled tasks, `-p` runs). It is a Mission 004 candidate. Installing it
+changes `~/.claude/settings.json`, so it needs separate approval. See activation.md, "Not covered".
