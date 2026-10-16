@@ -130,6 +130,7 @@ Each part has its own doc:
 | Jev scoring + human labels | `score`, `label`, `escalations`, `calibrate`, `drift` | [docs/scoring.md](docs/scoring.md) |
 | Lessons memory (frozen) | `lessons import/export/for/score/distill`, `lesson propose`, `gate friction` | [docs/lessons.md](docs/lessons.md) |
 | A/B proof | `ab report` | [docs/ab.md](docs/ab.md) |
+| Transcript archive (encrypted, local, 180 days) | `archive init`, `archive run [--dry-run]`, `archive verify`, `archive restore`, `archive prune`, `archive status`, `archive key-export`, `archive key-import` | [docs/archive.md](docs/archive.md) |
 
 The v2 loop: `sessions ingest` indexes transcripts → `deviations scan` finds deviations, writes
 what/why/how and two raw grades, Jev gives a verdict → `deviations report --json` hands the

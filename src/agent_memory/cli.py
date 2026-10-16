@@ -13,6 +13,7 @@ from psycopg.conninfo import conninfo_to_dict
 
 from agent_memory import cli_cloud, config, jev, routines_log, store
 from agent_memory import cli_ab
+from agent_memory import cli_archive
 from agent_memory import cli_daily
 from agent_memory import cli_deviations
 from agent_memory import cli_edits
@@ -192,6 +193,7 @@ def build_parser() -> argparse.ArgumentParser:
     cli_handoffs.register(sub)
     cli_evals.register(sub)
     cli_rsi.register(sub)
+    cli_archive.register(sub)
 
     # Handled in main() before parsing: every argument goes to amem_digest as is.
     sub.add_parser("digest-self", add_help=False,
