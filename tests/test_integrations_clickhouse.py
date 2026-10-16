@@ -737,6 +737,38 @@ def test_denied_and_email_shaped_values_never_leave(seed: Seed, pg_url: str, app
     assert CH.map_row(t, {"id": "r1", "routine": "ACME-daily", "source": "a@b.co"}, 1, deny)["routine"] is None
 
 
+# ---------------------------------------------------------------- Mission 004C (F4): --tables and --since
+
+
+def test_sink_narrowed_to_tables_and_since(seed: Seed, pg_url: str, app: str, fake: FakeClickHouse) -> None:
+    old = seed.ids["runs"][0]
+    with psycopg.connect(pg_url) as conn:
+        conn.execute("update runs set created_at = now() - interval '10 days', started_at = now() - interval '10 days', "
+                     "finished_at = now() - interval '10 days' where id = %s", (old,))
+    since = datetime.now(UTC) - timedelta(days=5)
+    sink = CH.ClickHouseSink(client_for(fake.svc.url), tables=CH.tables_named(["skill_calls", "runs"]), since=since)
+    assert [t.name for t in sink.tables] == ["runs", "skill_calls"]
+    with psycopg.connect(app) as conn:
+        rep = sync.run(sink, conn, replay=True, environ={})
+        assert rep.status == "ok" and set(sync.load(conn, "clickhouse")["watermarks"]) == {"runs", "skill_calls"}
+    assert {r.q("query").split()[2] for r in fake.inserts()} == {"amem.runs", "amem.skill_calls"}
+    runs = fake.by_id("runs")
+    assert old not in runs and len(runs) == len(seed.ids["runs"]) - 1 and len(fake.by_id("skill_calls")) == 1
+    with psycopg.connect(app) as conn:
+        assert sync.run(CH.ClickHouseSink(client_for(fake.svc.url)), conn, environ={}).status == "ok"
+        assert old not in fake.by_id("runs")                                # behind the cursor, as documented
+        marks = sync.load(conn, "clickhouse")["watermarks"]
+        assert set(marks) == set(TABLES)
+        # a narrowed replay without --since sends the old row, and keeps the other tables' cursors
+        sync.run(CH.ClickHouseSink(client_for(fake.svc.url), tables=CH.tables_named(["runs"])), conn, replay=True,
+                 environ={})
+        after = sync.load(conn, "clickhouse")["watermarks"]
+    assert old in fake.by_id("runs") and set(after) == set(TABLES)
+    assert {t: m for t, m in after.items() if t != "runs"} == {t: m for t, m in marks.items() if t != "runs"}
+    with pytest.raises(ValueError, match="unknown table.*nope"):
+        CH.tables_named(["runs", "nope"])
+
+
 def test_config_from_env_never_shows_the_key() -> None:
     cfg = CH.config({"AMEM_CLICKHOUSE_URL": "http://localhost:8123/", "AMEM_CLICKHOUSE_USER": "u",
                      "AMEM_CLICKHOUSE_KEY": CH_KEY, "AMEM_CLICKHOUSE_LOOKBACK_DAYS": "3"})

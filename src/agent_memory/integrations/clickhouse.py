@@ -372,6 +372,16 @@ TABLES: tuple[Table, ...] = (
 TABLE_NAMES = frozenset(t.name for t in TABLES)
 _TABLE = {t.name: t for t in TABLES}
 
+
+def tables_named(names: Sequence[str]) -> tuple[Table, ...]:
+    """The tables a sync is narrowed to (`--tables`), in TABLES order. Raises ValueError on an unknown name."""
+    unknown = sorted(set(names) - TABLE_NAMES)
+    if unknown:
+        known = ", ".join(t.name for t in TABLES)
+        raise ValueError(f"unknown table(s) for clickhouse: {', '.join(unknown)} (known: {known})")
+    return tuple(t for t in TABLES if t.name in set(names))
+
+
 _CH_TYPES = {"id": "Nullable(String)", "label": "LowCardinality(Nullable(String))",
              "pseudo": "LowCardinality(Nullable(String))", "source": "LowCardinality(Nullable(String))",
              "ts": "Nullable(DateTime64(6, 'UTC'))", "int": "Nullable(Int64)", "float": "Nullable(Float64)",
@@ -584,15 +594,24 @@ class ClickHouseSink:
     name = "clickhouse"
 
     def __init__(self, client: Client | None = None, *, batch_size: int = BATCH_SIZE, lookback_days: int | None = None,
-                 now: Callable[[], datetime] | None = None, tables: Sequence[Table] = TABLES, auto_schema: bool = True):
+                 now: Callable[[], datetime] | None = None, tables: Sequence[Table] = TABLES, auto_schema: bool = True,
+                 since: datetime | None = None):
         self.client = client if client is not None else Client()
         self.batch_size = batch_size
         self.lookback_days = self.client.cfg.lookback_days if lookback_days is None else lookback_days
         self._now = now or (lambda: datetime.now(UTC))
         self.tables = tuple(tables)
+        # Mission 004C (F4, `--since`): only rows that changed at or after this time. Older rows are skipped and
+        # fall behind the cursor; a later --replay without --since sends them.
+        self.since = since
         self.auto_schema = auto_schema and not self.client.cfg.cloud      # Cloud: the owner runs the DDL once
         self._schema_ready = False
         self.deny = egress.NONE         # the egress deny list, read at the start of every batches() call
+
+    @property
+    def replay_scope(self) -> frozenset[str] | None:
+        """The cursors a --replay starts over (sync.run): only these tables when narrowed with --tables."""
+        return None if set(self.tables) == set(TABLES) else frozenset(t.name for t in self.tables)
 
     def health(self) -> Health:
         if self.client.cfg.problem:
@@ -610,10 +629,12 @@ class ClickHouseSink:
         version = next_version()
         self.deny = egress.load(conn)
         since = None if replay or self.lookback_days <= 0 else self._now() - timedelta(days=self.lookback_days)
+        if since is not None and self.since is not None:
+            since = max(since, self.since)
         for t in self.tables:
             mark = None if replay else parse_mark(watermarks.get(t.name))
             last = mark
-            for rows in self._pages(conn, t, after=mark):
+            for rows in self._pages(conn, t, after=mark, since=self.since):
                 last = (rows[-1]["_changed"], rows[-1]["_key"])
                 yield self._batch(t, rows, version, last)
             if since is not None and t.lookback and mark is not None:

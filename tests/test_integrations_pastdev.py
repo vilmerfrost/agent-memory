@@ -667,6 +667,20 @@ def test_a_record_naming_a_denied_term_is_refused(db: Db, pdev: FakePastDev) -> 
     assert "pipeline-poc" not in bodies and "acme-secret" not in bodies
 
 
+def test_tables_and_since_narrow_what_is_sent(db: Db, pdev: FakePastDev) -> None:
+    """Mission 004C (F4): --tables / --since narrow the sends; the rest waits for an unnarrowed run."""
+    refs_ = seed(db)
+    with psycopg.connect(db.app) as conn:
+        assert sync.run(sink(pdev, since=datetime.now(UTC) + timedelta(days=1)), conn, environ={}).rows == 0
+        assert pdev.ingest_requests() == []
+        rep = sync.run(sink(pdev, tables=["edits", "rsi_experiments"]), conn, environ={})
+        assert sorted(pdev.sent_ids()) == sorted([refs_["edit"], refs_["experiment"]]) and rep.rows == 2
+        rep = sync.run(sink(pdev), conn, environ={})                          # unnarrowed: the rest goes now
+    assert sorted(pdev.sent_ids()) == sorted(refs_[k] for k in SENT)
+    with pytest.raises(ValueError, match="unknown table.*sessions"):
+        sink(pdev, tables=["edits", "sessions"])
+
+
 def test_kill_switch_stops_sink_and_retriever(db: Db, pdev: FakePastDev) -> None:
     seed(db)
     off = {"AMEM_PASTDEV": "off"}

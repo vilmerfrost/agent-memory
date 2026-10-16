@@ -218,7 +218,13 @@ def run(sink: Sink, conn: psycopg.Connection, *, budget_s: float = 60.0, replay:
         rep.status, rep.detail = "off", "kill switch"
         return rep
     meta = load(conn, sink.name)
-    watermarks: dict[str, str] = {} if replay else dict(meta.get("watermarks") or {})
+    stored: dict[str, str] = dict(meta.get("watermarks") or {})
+    watermarks: dict[str, str] = dict(stored)
+    if replay:
+        # A replay starts its tables over from no cursor. A sink narrowed to some tables (Mission 004C, `--tables`)
+        # names them in `replay_scope`, and every other table keeps its cursor; None: every table starts over.
+        scope = getattr(sink, "replay_scope", None)
+        watermarks = {} if scope is None else {t: m for t, m in stored.items() if t not in scope}
     failures: dict[str, dict[str, Any]] = dict(meta.get("failures") or {})
     dead_letters: list[dict[str, Any]] = list(meta.get("dead_letters") or [])
     usage: dict[str, Any] = dict(meta.get("usage") or {})
@@ -238,7 +244,7 @@ def run(sink: Sink, conn: psycopg.Connection, *, budget_s: float = 60.0, replay:
         return rep
     blocked = {t for t, f in failures.items() if not _due(f, now)}
     rep.skipped_tables = sorted(blocked)
-    for batch in sink.batches(conn, watermarks, replay=replay):
+    for batch in sink.batches(conn, {} if replay else stored, replay=replay):
         if batch.table in blocked:
             continue
         if clock() - start > budget_s:

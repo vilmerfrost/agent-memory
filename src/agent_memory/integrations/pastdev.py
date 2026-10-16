@@ -465,12 +465,21 @@ class PastDevSink:
     def __init__(self, cfg: Config | None = None, *, environ: Mapping[str, str] | None = None,
                  client: Client | None = None, batch_max: int = BATCH_MAX, poll_s: float = POLL_S,
                  sleep: Callable[[float], None] = time.sleep, clock: Callable[[], float] = time.monotonic,
-                 now: Callable[[], datetime] = lambda: datetime.now(UTC)):
+                 now: Callable[[], datetime] = lambda: datetime.now(UTC), tables: Sequence[str] | None = None,
+                 since: datetime | None = None):
         self._environ = environ
         self.cfg = cfg if cfg is not None else config(environ)
         self.client = _client(self.cfg, client, sleep)
         self.batch_max = max(1, min(batch_max, BATCH_MAX))
         self.poll_s, self.sleep, self.clock, self.now = poll_s, sleep, clock, now
+        # Mission 004C (F4): `--tables` / `--since` narrow what is sent (a record older than `since` waits for a
+        # run without it). Retractions and checks of running ingestions are never narrowed.
+        unknown = sorted(set(tables or ()) - set(TABLES))
+        if unknown:
+            raise ValueError(f"unknown table(s) for pastdev: {', '.join(unknown)} (known: {', '.join(TABLES)})")
+        self.tables = tuple(t for t in TABLES if not tables or t in tables)
+        self.since = since
+        self.replay_scope = frozenset(self.tables) if tables else None     # sync.run: the cursors a replay resets
         self.refused: list[tuple[str, list[str]]] = []      # (ref, reasons) from the last batches() call
         self.retired: list[str] = []                         # refs deleted at past.dev: never sent again
 
@@ -521,6 +530,8 @@ class PastDevSink:
                         continue
                     if link.get("status") in DEAD or (link.get("status") in SENT and not replay):
                         continue
+                if table not in self.tables or (self.since is not None and rec.at < self.since):
+                    continue                                    # out of this run's scope (F4)
                 todo.append((rec, content, sha))
             for i in range(0, len(todo), self.batch_max):
                 part = todo[i:i + self.batch_max]

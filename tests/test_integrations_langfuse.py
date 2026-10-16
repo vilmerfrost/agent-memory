@@ -810,6 +810,19 @@ def test_egress_deny_terms_and_team_repos_are_sensitive(app: str, pg_url: str, t
         assert [why for _, why in sink.refused] == ["case looks sensitive"]       # run B: its identity names the repo
 
 
+def test_since_skips_runs_that_started_before_it(app: str, tmp_path: Path) -> None:
+    """Mission 004C (F4): `--since`. The _tree runs started on 2026-10-16."""
+    _tree(tmp_path)
+    with MockService() as svc, psycopg.connect(app) as conn:
+        lf = FakeLangfuse(svc)
+        sink = L.LangfuseSink(client_for(svc), tmp_path, since=datetime(2026, 10, 17, tzinfo=UTC))
+        rep = sync.run(sink, conn, environ={})
+        assert rep.status == "ok" and rep.rows == 0 and lf.observations == [] and len(sink.skipped) == 2
+        sink = L.LangfuseSink(client_for(svc), tmp_path, since=datetime(2026, 10, 16, tzinfo=UTC))
+        rep = sync.run(sink, conn, replay=True, environ={})
+        assert rep.rows == 2 and sink.skipped == [] and len(lf.observations) == 10
+
+
 # ---------------------------------------------------------------- Langfuse Cloud (Mission 004B)
 
 
