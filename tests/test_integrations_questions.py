@@ -103,7 +103,7 @@ def _seed(conn: psycopg.Connection, ids: Ids) -> None:
 def _clean(conn: psycopg.Connection, ids: Ids) -> None:
     conn.execute("set session_replication_role = replica")
     conn.execute("delete from rsi_evidence where external_ref like any(array['lf:trace/abab%%', 'ch:q.%%q-quote%%', "
-                 "'lf:dataset_run/exp-20261016-q1%%', 'past:amem:proposal/%%'])")
+                 "'lf:dataset_run/exp-20261016-q1%%', 'past:amem:proposal/%%', 'answer:%%'])")
     conn.execute("delete from rsi_decisions where id = any(%s::uuid[])", ([ids.d_apply, ids.d_reject],))
     conn.execute("delete from rsi_eval_results where id = any(%s::uuid[])", ([ids.e_fail, ids.e_pass],))
     conn.execute("delete from rsi_proposals where id = any(%s::uuid[])", ([ids.p1, ids.p2],))
@@ -285,12 +285,16 @@ def test_record_stores_only_linked_external_findings(world: tuple[str, Ids]) -> 
     with psycopg.connect(app) as conn:
         first = Q.record_findings(conn, ans)
         again = Q.record_findings(conn, ans)
-        assert len(first) == 1 and first == again                                  # idempotent
-        rows = conn.execute("select system, external_ref, metrics, valid_until is not null from rsi_evidence "
-                            "where id = any(%s::uuid[])", (first,)).fetchall()
-    ((system, ext, metrics, expires),) = rows
+        assert len(first) == 2 and first == again                                  # idempotent
+        rows = conn.execute("select id::text, system, kind, external_ref, metrics, valid_until is not null "
+                            "from rsi_evidence where id = any(%s::uuid[])", (first,)).fetchall()
+    by_id = {r[0]: r[1:] for r in rows}
+    system, _, ext, metrics, expires = by_id[first[0]]                             # the one linked external finding
     assert (system, ext) == ("clickhouse", "ch:q.rule_gap/claude-md:global:q-quote-globs")
     assert metrics["question"] == "recurring_failures" and expires
+    system, kind, ext, metrics, expires = by_id[first[1]]                         # Mission 004C: plus the answer row
+    assert (system, kind) == ("supabase", "answer") and ext.startswith("answer:recurring_failures/") and expires
+    assert metrics["providers"] == {"supabase": "ok", "clickhouse": "ok"} and metrics["findings"] == len(ans.findings)
 
 
 @pytest.mark.parametrize("name, params, err", [
@@ -309,7 +313,7 @@ def test_cli_ask_with_unconfigured_adapters(world: tuple[str, Ids], capsys: pyte
         monkeypatch.delenv(k, raising=False)
     monkeypatch.setattr(CH.amem_config, "load_env", lambda: None)
     assert cli.main(["evidence", "questions"]) == 0
-    assert len(capsys.readouterr().out.strip().splitlines()) == 6
+    assert len(capsys.readouterr().out.strip().splitlines()) == 7              # Mission 004C: + repeat_failures
     assert cli.main(["evidence", "ask", "why_rejected", "--param", f"experiment={EXP}", "--json"]) == 0
     out = json.loads(capsys.readouterr().out)
     assert {s["source"]: s["status"] for s in out["steps"]} == {"sb": "ok", "lf": "unavailable", "pd": "unavailable"}

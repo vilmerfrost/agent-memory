@@ -1,11 +1,13 @@
-"""The investigator's six questions over the evidence facade (Mission 004B, brief section 9).
+"""The investigator's questions over the evidence facade (Mission 004B, brief section 9; 004C added
+`repeat_failures`).
 
     amem evidence ask <question> [--param k=v ...] [--record] [--json]
     amem evidence questions
 
 A question is a fixed plan of named queries (no free-form query path, as everywhere in the facade):
-Supabase first, then ClickHouse, Langfuse and past.dev. A second phase may follow up on what the first
-found (the failing traces an experiment's links name; the rule a promoted proposal changed). Each step
+Supabase first, then ClickHouse, Langfuse and past.dev. Later phases (at most MAX_PHASES in all) may follow
+up on what the earlier ones found (the failing traces an experiment's links name; the rule a promoted
+proposal changed; the experiments that already tested a change to a repeatedly failed rule). Each step
 keeps its own retrieval status, so a source that is down or unconfigured shows as `unavailable` and
 never blocks the answer.
 
@@ -17,14 +19,21 @@ confidence or rank where the source has one) and a status:
     stale          an external finding with a subject that no longer resolves (not usable)
     unlinked       an external aggregate with no amem: subject (context only)
 
-`--record` stores linked external findings in rsi_evidence (idempotent on (system, external_ref), valid
-for RECORD_VALID_DAYS). That is the only write: a provider's answer becomes evidence for a human or the
-investigator to weigh, never a change to proposals, decisions, instructions or schedules.
+`--record` writes rsi_evidence rows only (idempotent on (system, external_ref), valid for RECORD_VALID_DAYS):
+- each linked external finding that a provider answered live in this ask (a link that a Supabase step read
+  back from rsi_evidence is not a new observation, so it is never re-written);
+- one `answer` row (system supabase): the structured finding, i.e. the question, its params, the status per
+  provider, the steps, the counts per finding status and the Supabase refs the answer rests on.
+That is the only write: an answer becomes evidence for a human or the investigator to weigh, never a change
+to proposals, decisions, instructions or schedules.
 """
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
+from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -38,10 +47,15 @@ from agent_memory.integrations.pastdev import QUERY_RE
 
 SERVICE = {"sb": "supabase", "ch": "clickhouse", "lf": "langfuse", "pd": "pastdev", "ncm": "ncm"}
 RECORD_VALID_DAYS = 30
+MAX_PHASES = 4
 MAX_TRACE_FOLLOWUPS = 3
+MAX_EXPERIMENTS = 2             # repeat_failures: earlier experiments followed up per ask
+ANSWER_KIND = "answer"
+MAX_ANSWER_REFS = 50
 _BASIS = {"pattern": "aggregate", "aggregate": "aggregate", "metric": "aggregate", "attempt": "record",
           "decision": "record", "experiment": "record", "change": "record", "row": "record", "eval": "eval",
-          "trace": "trace", "score": "score", "decision-memory": "semantic-recall", "research-run": "measurement"}
+          "trace": "trace", "score": "score", "decision-memory": "semantic-recall", "research-run": "measurement",
+          ANSWER_KIND: "answer"}
 _N_KEYS = ("n", "n_sessions", "n_deviations", "traces", "n_runs", "sessions")
 
 
@@ -143,6 +157,16 @@ def _why_rejected(p: Mapping[str, str], done: Sequence[tuple[Step, QueryResult]]
     return steps
 
 
+def _trace_followups(done: Sequence[tuple[Step, QueryResult]]) -> list[Step]:
+    """lf.trace for the failing runs among the stored lf:trace links (each trace once, at most 3)."""
+    bad: list[str] = []
+    for ev in _found(done, "evidence_for"):
+        if ev.ref.startswith("lf:trace/") and _failed(ev.metrics) and ev.ref not in bad:
+            bad.append(ev.ref)
+    return [Step("lf", "trace", {"trace_id": refs.parse(ref).id}, "a failing run's trace, read live")
+            for ref in bad[:MAX_TRACE_FOLLOWUPS]]
+
+
 def _failed_traces(p: Mapping[str, str], done: Sequence[tuple[Step, QueryResult]], phase: int) -> list[Step]:
     exp = p["experiment"]
     if phase == 0:
@@ -150,9 +174,7 @@ def _failed_traces(p: Mapping[str, str], done: Sequence[tuple[Step, QueryResult]
                 Step("sb", "evidence_for", {"ref": refs.amem("experiment", exp), "limit": "50"},
                      "the trace links stored in Supabase"),
                 Step("lf", "experiment_scores", {"experiment_id": exp}, "score aggregates per arm")]
-    bad = [ev for ev in _found(done, "evidence_for") if ev.ref.startswith("lf:trace/") and _failed(ev.metrics)]
-    return [Step("lf", "trace", {"trace_id": refs.parse(ev.ref).id}, "a failing run's trace, read live")
-            for ev in bad[:MAX_TRACE_FOLLOWUPS]]
+    return _trace_followups(done) if phase == 1 else []
 
 
 def _after(p: Mapping[str, str], done: Sequence[tuple[Step, QueryResult]], phase: int) -> list[Step]:
@@ -162,11 +184,74 @@ def _after(p: Mapping[str, str], done: Sequence[tuple[Step, QueryResult]], phase
                      "the timeline and the rule's deviations before vs after"),
                 Step("sb", "evidence_for", {"ref": refs.amem("proposal", prop), "limit": "20"},
                      "evidence already linked to the proposal")]
+    if phase > 1:
+        return []
     hist = _found(done, "promotion_history")
     rule = hist[0].metrics.get("rule_key") if hist else None
     if isinstance(rule, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/@-]{0,199}", rule):
         return [Step("ch", "rule_weekly_rate", {"rule": rule, "weeks": "8"}, "the rule's weekly rate, from ClickHouse")]
     return []
+
+
+def _top_rule(done: Sequence[tuple[Step, QueryResult]]) -> str | None:
+    """The rule most sessions keep failing: Supabase's patterns first (sessions, then deviations), else
+    ClickHouse's rule_gap rows. Only a rule key the follow-up queries accept."""
+    def ok(rule: Any) -> bool:
+        return isinstance(rule, str) and re.fullmatch(sb_queries.RULE_P, rule) is not None
+
+    def num(v: Any) -> int:
+        return v if isinstance(v, int) and not isinstance(v, bool) else 0
+
+    for query, sessions, n in (("recurring_deviations", "sessions", "n"), ("rule_gap", "n_sessions", "n_deviations")):
+        rows = [ev.metrics for ev in _found(done, query) if ok(ev.metrics.get("rule_key"))]
+        if rows:
+            best = min(rows, key=lambda m: (-num(m.get(sessions)), -num(m.get(n)), m["rule_key"]))
+            return str(best["rule_key"])
+    return None
+
+
+def _experiments_tried(done: Sequence[tuple[Step, QueryResult]]) -> list[str]:
+    """Experiments named by the attempts (and by recalled decisions), in the order found."""
+    out: list[str] = []
+    for ev in _found(done, "attempts_for") + _found(done, "recall"):
+        for s in ev.subject_refs:
+            r = refs.parse(s)
+            if r.kind == "experiment" and refs.EXPERIMENT_RE.fullmatch(r.id) and r.id not in out:
+                out.append(r.id)
+    return out[:MAX_EXPERIMENTS]
+
+
+def _repeat(p: Mapping[str, str], done: Sequence[tuple[Step, QueryResult]], phase: int) -> list[Step]:
+    """Mission 004C: why sessions keep failing the same rule, and whether a similar change was tested.
+    0: the patterns (Supabase, with Claude vs Codex sessions) and the followed-vs-outcome gap (ClickHouse);
+    1: for the top rule (or `rule`): earlier attempts, similar decisions (past.dev), the weekly rate;
+    2: per experiment those attempts name: eval verdicts, stored trace links, Langfuse score aggregates;
+    3: the failing runs' traces, read live."""
+    d, n = p.get("days", "30"), p.get("min_n", "3")
+    if phase == 0:
+        gap = {"days": d, "min_n": n, **({"rule": p["rule"]} if p.get("rule") else {})}
+        return [Step("sb", "recurring_deviations", {"days": d, "min_n": n},
+                     "rules several sessions keep failing, with Claude vs Codex sessions"),
+                Step("ch", "rule_gap", gap, "per rule: followed grade vs objective outcome")]
+    if phase == 1:
+        rule = p.get("rule") or _top_rule(done)
+        if not rule:
+            return []
+        steps = [Step("sb", "attempts_for", {"rule": rule}, "proposals and improve edits that already targeted the rule"),
+                 Step("ch", "rule_weekly_rate", {"rule": rule, "weeks": "8"}, "the rule's weekly rate, from ClickHouse")]
+        words = _words(rule)
+        if words:
+            steps.append(Step("pd", "recall", {"query": words, "limit": "10"}, "decision memory: similar past decisions"))
+        return steps
+    if phase == 2:
+        steps = []
+        for exp in _experiments_tried(done):
+            steps += [Step("sb", "evals_for", {"experiment": exp}, "the eval verdicts of an earlier test"),
+                      Step("sb", "evidence_for", {"ref": refs.amem("experiment", exp), "limit": "50"},
+                           "the sandbox trace links stored in Supabase"),
+                      Step("lf", "experiment_scores", {"experiment_id": exp}, "score aggregates per arm")]
+        return steps
+    return _trace_followups(done) if phase == 3 else []
 
 
 QUESTIONS: dict[str, Question] = {q.name: q for q in (
@@ -184,6 +269,8 @@ QUESTIONS: dict[str, Question] = {q.name: q for q in (
              {"experiment": sb_queries.EXP_P}, _failed_traces, required=("experiment",)),
     Question("after_approval", "What changed after an approved improvement?",
              {"proposal": sb_queries.UUID_P, "window_days": sb_queries.DAYS_P}, _after, required=("proposal",)),
+    Question("repeat_failures", "Why do sessions keep failing the same instruction, and was a similar change tested?",
+             {"days": sb_queries.DAYS_P, "min_n": sb_queries.N_P, "rule": sb_queries.RULE_P}, _repeat),
 )}
 
 
@@ -196,8 +283,16 @@ class Answer:
     findings: list[dict[str, Any]] = field(default_factory=list)
     asked_at: str = ""
 
+    def providers(self) -> dict[str, str]:
+        """One status per service over its steps: the shared status, or `partial` when its steps differ."""
+        seen: dict[str, set[str]] = {}
+        for st, res in self.steps:
+            seen.setdefault(SERVICE.get(st.source, st.source), set()).add(res.status)
+        return {svc: next(iter(s)) if len(s) == 1 else "partial" for svc, s in seen.items()}
+
     def to_json(self) -> dict[str, Any]:
         return {"question": self.question, "text": self.text, "params": self.params, "asked_at": self.asked_at,
+                "providers": self.providers(),
                 "steps": [{"source": st.source, "service": SERVICE.get(st.source, st.source), "query": st.query,
                            "params": dict(st.params), "why": st.why, "status": res.status, "detail": res.detail,
                            "found": len(res.refs)} for st, res in self.steps],
@@ -234,7 +329,7 @@ def ask(name: str, params: Mapping[str, str], retrievers: Mapping[str, Retriever
     q = QUESTIONS[name]
     p = q.check(params)
     ans = Answer(q.name, q.text, p, asked_at=(now or (lambda: datetime.now(UTC)))().isoformat(timespec="seconds"))
-    for phase in (0, 1):
+    for phase in range(MAX_PHASES):
         for st in q.plan(p, ans.steps, phase):
             r = retrievers.get(st.source)
             res = run_query(r, st.query, st.params) if r is not None else QueryResult(st.source, "unavailable",
@@ -245,14 +340,57 @@ def ask(name: str, params: Mapping[str, str], retrievers: Mapping[str, Retriever
     return ans
 
 
+def answer_row(ans: Answer) -> dict[str, Any]:
+    """The structured finding as rsi_evidence fields: the Supabase refs the answer rests on (authoritative and
+    linked findings), the status per provider, the steps, and the first finding of each step that answered.
+    Numbers, labels and refs only. The external_ref is a digest of (question, params, findings, day), so the
+    same ask on the same day updates one row. An earlier answer that the ask read back (sb.evidence_for) is
+    shown as a finding but left out of the digest, the subjects and `top`, so answers never cite answers."""
+    own = [f for f in ans.findings if f["type"] != ANSWER_KIND]
+    subjects: list[str] = []
+    for f in own:
+        if f["status"] in ("authoritative", "linked"):
+            subjects += [r for r in f["supabase_refs"] if r not in subjects and refs.is_ref(r)
+                         and refs.parse(r).scheme == "amem"]
+    top: list[dict[str, Any]] = []
+    for f in own:
+        if not any(t["step"] == f["step"] for t in top):
+            top.append({"step": f["step"], "ref": f["ref"], "type": f["type"], "status": f["status"],
+                        "measure": f["measure"]})
+    providers = ans.providers()
+    metrics = {"question": ans.question, "params": dict(ans.params), "asked_at": ans.asked_at, "providers": providers,
+               "steps": [{"step": f"{st.source}.{st.query}", "status": res.status, "found": len(res.refs)}
+                         for st, res in ans.steps],
+               "findings": len(ans.findings), "by_status": dict(Counter(f["status"] for f in ans.findings)),
+               "subjects_total": len(subjects), "top": top}
+    digest = hashlib.sha256(json.dumps({"q": ans.question, "p": dict(ans.params), "day": ans.asked_at[:10],
+                                        "refs": sorted(f["ref"] for f in own)},
+                                       sort_keys=True).encode("utf-8")).hexdigest()[:24]
+    summary = (f"{ans.text} ({ans.question}): {len(ans.findings)} finding(s); "
+               + ", ".join(f"{svc}={st}" for svc, st in providers.items()))
+    return {"system": "supabase", "kind": ANSWER_KIND, "subject_refs": subjects[:MAX_ANSWER_REFS],
+            "summary": summary, "metrics": metrics, "external_ref": f"answer:{ans.question}/{digest}"}
+
+
 def record_findings(conn: psycopg.Connection, ans: Answer, *, valid_days: int = RECORD_VALID_DAYS) -> list[str]:
-    """Store linked external findings as rsi_evidence rows (the only write; idempotent). Returns their ids."""
+    """Store the live linked external findings and one answer row in rsi_evidence (the only write;
+    idempotent). Returns their ids, the answer row's last.
+
+    Not written (Mission 004C fixes):
+    - a finding from a Supabase step (`sb.evidence_for` reads back stored lf:/ch: links): re-recording it would
+      overwrite the link's metrics and move its observed_at without any provider having been asked;
+    - a past.dev recall: its ref `past:<amem ref>` is the past.dev sink's own link key, so recording it would
+      replace the sink's sha256 and make the next sync re-send the record. A recall only points back at a
+      Supabase row; the answer row keeps it (its `top` and subjects)."""
+    from agent_memory import rsi_approval   # lazy: rsi_approval imports a lot
+
     ids = []
     for f in ans.findings:
-        if f["source"] == "sb" or f["status"] != "linked":
+        if f["source"] in ("sb", "pd") or f["step"].startswith("sb.") or f["status"] != "linked":
             continue
         ev = EvidenceRef(f["ref"], f["source"], f["type"], list(f["supabase_refs"]),
                          {**f["metrics"], "question": ans.question}, f["summary"], f["timestamp"])
         ids.append(record(conn, ev, valid_days=valid_days))
+    ids.append(rsi_approval.add_evidence(conn, **answer_row(ans), valid_days=valid_days))
     conn.commit()
     return ids
