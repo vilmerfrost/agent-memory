@@ -126,7 +126,7 @@ def test_record_writes_fixture_that_fixture_mode_reads(live: type[FakeClient], q
     (call,) = live.calls
     assert call["state"] == STATE
     assert list(call["questions"]) == ["verdict", "severity", "flag"]
-    assert call["model"] == "jev-latest"   # pinned: TYPESAFE_DEFAULT_MODEL cannot swap it
+    assert call["model"] == "jev-1.14.0"   # pinned: TYPESAFE_DEFAULT_MODEL cannot swap it
 
     body = json.loads(path.read_text())
     assert body["answers"] == RESPONSE["answers"]
@@ -195,4 +195,4 @@ def test_jev_ask_pins_the_latest_model_even_with_an_env_default(monkeypatch: pyt
     monkeypatch.setattr(typesafe_sdk, "TypeSafeClient", Capture)
     with pytest.raises(Stop):
         jev.ask("state: x", [jev.noul("flag", "Is it flagged?")])
-    assert seen == ["jev-latest"]
+    assert seen == ["jev-1.14.0"]

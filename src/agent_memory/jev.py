@@ -33,9 +33,11 @@ from pydantic import TypeAdapter
 
 from agent_memory import config
 
-# Every live call names the model. The SDK's own default is also "jev-latest", but the
+# Every live call names the model. The SDK's own default is "jev-latest", but the
 # TYPESAFE_DEFAULT_MODEL env var can replace it silently; an explicit argument wins over both.
-MODEL = "jev-latest"
+# A versioned ID, not an alias: aliases move without a code change (docs.typesafe.ai/models,
+# 2026-10-16: jev-latest -> jev-1.13.0, jev-preview -> jev-1.14.0).
+MODEL = "jev-1.14.0"
 
 Kind = Literal["choice", "score", "noul"]
 Mode = Literal["fixture", "live"]
