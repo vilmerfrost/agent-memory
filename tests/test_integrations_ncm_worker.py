@@ -73,6 +73,13 @@ def test_anything_off_pin_or_broken_is_failed_with_no_metrics(change: dict[str, 
     assert run.status == "failed" and run.reason is not None and run.reason.startswith(reason) and run.metrics == {}
 
 
+def test_a_given_failure_wins_over_everything_else() -> None:
+    run = ncm.parse_results(build(failure="the Modal call raised RemoteError:\n  container  lost"))
+    assert run.status == "failed" and run.metrics == {}                       # the stdout row is ignored
+    assert run.reason == "the Modal call raised RemoteError: container lost"   # one line
+    assert len(build(failure="x" * 900)["reason"]) == 300
+
+
 def test_parsers_and_cost() -> None:
     assert W.parse_sudoku(merge_output(2000, 2000, 100.0, 100.0)) == {"solved_rate": 1.0, "cell_rate": 1.0, "valid_rate": 1.0}
     assert W.parse_sudoku("solved %   solved  cell %  valid %\n  50.00  1/2  101.00  100.00") is None

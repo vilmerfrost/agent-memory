@@ -117,10 +117,27 @@ def evaluate(run_id: str, experiment_id: str | None) -> dict:
     return res
 
 
+def _call_failed(run_id: str, experiment_id: str | None, exc: Exception, started: datetime,
+                 seconds: float) -> dict:
+    """results.json for a Modal call that raised (a crash, a timeout, a lost container): `failed`, no metrics."""
+    first = (str(exc).strip().splitlines() or [""])[0]
+    return W.build_results(run_id=run_id, experiment_id=experiment_id, stdout="", exit_code=None, repo_commit=None,
+                           sha256sum_text="", seconds=seconds, gpu=GPU, region=REGION,
+                           started_at=started.isoformat(timespec="seconds"),
+                           finished_at=datetime.now(UTC).isoformat(timespec="seconds"),
+                           failure=f"the Modal call raised {type(exc).__name__}" + (f": {first}" if first else ""),
+                           extra_limitations=["written by the local entrypoint: no container output; the wall "
+                                              "time includes queueing and startup"])
+
+
 @app.local_entrypoint()
 def main(experiment_id: str = "") -> None:
-    run_id = f"ncm-{datetime.now(UTC):%Y%m%d}-sudoku-easy"
-    res = evaluate.remote(run_id, experiment_id or None)
+    started, t0 = datetime.now(UTC), time.monotonic()
+    run_id = f"ncm-{started:%Y%m%d}-sudoku-easy"
+    try:
+        res = evaluate.remote(run_id, experiment_id or None)
+    except Exception as exc:          # still one results.json, so the run is recorded as failed, never lost
+        res = _call_failed(run_id, experiment_id or None, exc, started, time.monotonic() - t0)
     dest = pathlib.Path("ncm-results") / run_id
     dest.mkdir(parents=True, exist_ok=True)
     (dest / "results.json").write_text(json.dumps(res, indent=2, sort_keys=True))

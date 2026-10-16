@@ -14,8 +14,9 @@ from typing import Any
 
 import pytest
 
-from agent_memory.integrations import ncm_worker as W
+from agent_memory.integrations import ncm, ncm_worker as W
 
+EXP = "exp-20261020-ncm"
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "deploy" / "ncm" / "modal_sudoku.py"
 WORKER = ROOT / "src" / "agent_memory" / "integrations" / "ncm_worker.py"
@@ -139,3 +140,24 @@ def test_the_gpu_function_is_capped(monkeypatch: pytest.MonkeyPatch) -> None:
                                "retries", "block_network")} == {
         "gpu": "L4", "region": "eu", "timeout": 600, "startup_timeout": 120, "scaledown_window": 2,
         "max_containers": 1, "retries": 0, "block_network": True}
+
+
+# ---------------------------------------------------------------- F3: the local entrypoint always leaves a result
+
+
+def test_a_raising_modal_call_still_writes_a_failed_results_file(monkeypatch: pytest.MonkeyPatch,
+                                                                  tmp_path: Path) -> None:
+    mod = load_script(monkeypatch)
+    monkeypatch.chdir(tmp_path)
+
+    def remote(*a: Any) -> dict[str, Any]:
+        raise TimeoutError("Function timed out after 600 seconds\ntraceback lines")
+
+    monkeypatch.setattr(mod.evaluate, "remote", remote)
+    mod.main(experiment_id=EXP)
+    (path,) = (tmp_path / "ncm-results").glob("*/results.json")
+    run = ncm.load_results(path)                                              # passes the contract
+    assert run.status == "failed" and run.metrics == {} and run.experiment_id == EXP
+    assert run.reason == "the Modal call raised TimeoutError: Function timed out after 600 seconds"
+    assert run.provider == "modal" and run.cost["usd"] >= 0 and run.hardware["gpu"] == "L4"
+    assert any("local entrypoint" in x for x in run.limitations)

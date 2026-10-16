@@ -110,12 +110,13 @@ def build_results(*, run_id: str, experiment_id: str | None, stdout: str, exit_c
                   repo_commit: str | None, sha256sum_text: str, seconds: float, gpu: str = "L4",
                   gpu_name: str | None = None, region: str = "eu", started_at: str | None = None,
                   finished_at: str | None = None, out: str | None = None,
-                  extra_limitations: Sequence[str] = ()) -> dict[str, Any]:
+                  extra_limitations: Sequence[str] = (), failure: str | None = None) -> dict[str, Any]:
     """One results.json object. `ok` only when the commit and every pinned hash match, the command exited 0
-    and the metrics row parsed; otherwise `failed` with a short reason and no metrics."""
+    and the metrics row parsed; otherwise `failed` with a short reason and no metrics. A given `failure` (the
+    caller saw the run break, e.g. the Modal call raised) is the reason, as one line of at most 300 chars."""
     hashes = parse_sha256sum(sha256sum_text)
     metrics = parse_sudoku(stdout)
-    reason = _pin_problem(repo_commit, hashes)
+    reason = " ".join(failure.split())[:300] if failure and failure.strip() else _pin_problem(repo_commit, hashes)
     if reason is None and exit_code != 0:
         reason = f"evaluate.py exited {exit_code}" if exit_code is not None else "evaluate.py timed out"
     if reason is None and metrics is None:
