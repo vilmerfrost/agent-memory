@@ -1,7 +1,7 @@
 # RSI V1: least-privilege promotion (Mission 003.5, Phase E)
 
-Status: **Plan A built and tested on branch `rsi/m0035-e`. Not active.** Unattended Apply stays disabled until
-the activation steps below run and verify.
+Status: **E1 applied to the hosted database and E2 merged into local `main` (2026-10-16). E3 not run yet.**
+Unattended promotion stays disabled while R2 is open (see "Decision" below).
 
 ## The problem (verified 2026-10-16)
 
@@ -86,6 +86,48 @@ A fifth path is not forgery but a bypass:
 | E3 | **You** run `amem admin split-credentials` in your terminal | credentials-status exit 0; the next ingest and the 09:20 amem-daily run exit 0 as `amem_app` | **you** run `amem admin restore-credentials` |
 | — | Phase G: deploy `amem-decide`, `amem rsi totp-enroll`, host the page (or choose terminal-only), then `supabase logout` (A4) | a disposable proposal: no code → refused, code → recorded, replay → refused | delete the function; restore the grant via the rollback |
 | — | A5: you restrict the connector | a connector `insert` fails | revert the connector setting |
+
+## Safeguards and security boundaries
+
+Two different things protect production. Do not confuse them.
+
+- A **safeguard** stops accidents: a bug, a wrong command, or an agent that leaves its task but still
+  follows its instructions. Code that runs as `vilmerfrost` can turn a safeguard off or go around it.
+- A **security boundary** holds against a compromised agent that runs as `vilmerfrost`. It needs
+  something that agent does not have: your password or code, a secret that is not on the Mac, or a
+  different macOS user.
+
+| Control | Kind | Why |
+|---------|------|-----|
+| Freeze (cap 0, no `AMEM_EDITS_LIVE`, task disabled) | Safeguard | The agent can edit `criteria.json` and the plist (T5). |
+| Stage → approve → promote engine, WAL, artifact hashes, `verify_decision` | Safeguard | It controls the normal path only. The agent can write the target files directly, or change the worker's code (T5). |
+| Sandbox tests and evals | Safeguard (quality) | They catch bad changes, not hostile ones. |
+| Hooks (`secret-read-block`, `parent-guard`, a future `rsi-prod-fence`) | Safeguard | They are config files the agent can edit. They match text, so a different wording gets past them. |
+| `_human_only()` in `amem admin` and `totp-enroll` | Safeguard | It checks environment variables and a TTY. An agent can clear the variables and fake a TTY. |
+| Phone Reject token, ntfy topic | Safeguard | Both are on the Mac (T4, R3). A Reject can only stop a change. |
+| Decide page CSP, token in the URL fragment | Safeguard | They reduce leaks. A compromised page host defeats them (R4). |
+| `amem_app` + Keychain-gated admin DSN (A1, A2) | **Boundary for the decision record**, after E3, A4 and A5 | The credential on disk cannot insert, change or delete a decision, or change the schema. It holds only while the Supabase CLI is logged out (T2), the connector is read-only (T3), and you never Allow a dialog you did not start (R1). |
+| TOTP for phone Apply and Undo (A3) | **Boundary for phone decisions**, after Phase G, A4 and A5 | The secret is only in the function secrets and your authenticator app. Without A4 and A5, an agent can redeploy the function or reset the secret. |
+| A separate macOS user that owns the production files (Plan B) | **Boundary for the change itself** | Not built. It is the only control that stops an agent from skipping the approval (R2). |
+
+**What this means.** Plan A makes an approval impossible to *forge* in the database. It does not make the
+approval *mandatory*. A compromised agent does not need a forged decision: it can write
+`~/.claude/CLAUDE.md`, a skill or a plist directly (T5). It can also change the `amem` code that you later
+run and Allow in the Keychain dialog. Only Plan B closes this.
+
+**Check at E3.** Note whether the Keychain dialog asks for your login password or shows only buttons. A
+password prompt is a human-presence gate. If it shows only buttons, it is not verified whether a process
+with Accessibility permission (for example a computer-use tool) can click them. Until that is known, treat
+A2 as a boundary only for code that has no Accessibility permission.
+
+## Decision: no unattended promotion while R2 is open (2026-10-16, Vilmer)
+
+- No launchd job or scheduled task runs `amem rsi decide-poll`.
+- A promotion runs only when you start `amem rsi decide-poll` in your own terminal. A phone Apply (after
+  Phase G) records the decision. The change lands at your next attended run.
+- The loop stays the same: Observe → Stage → Sandbox test → Human approval → Promote → Monitor → Undo.
+  Only the trigger for Promote is attended.
+- Revisit only after Plan B, or another control that closes R2, is built and verified.
 
 ## What Plan A does not close
 

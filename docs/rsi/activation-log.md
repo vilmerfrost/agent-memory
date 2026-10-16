@@ -212,3 +212,33 @@ Branch `rsi/m0035-e`, commit `c079c04`. Suite 1451 passed; edge function 12/12. 
   It still runs as `postgres`; `amem_app` takes over only at E3.
 - **Undo** (never automatic): [rollback_least_privilege.sql](rollback_least_privilege.sql) restores the
   Phase C state. It is tested.
+
+## E2: Phase E code merged (2026-10-16 20:05:38 CEST), approved in chat (local only, no push)
+
+- **Merged:** `git merge --ff-only 9c4cb71` in `~/Projects/agent-memory`. `main` moved from `06322c2` to
+  `9c4cb71` (`rsi/m0035-e`). No dependency, plist or routine-script change, so no `uv sync`.
+  The only untracked item is the existing `docs/ideas/` (Oct 14–15, not touched).
+- **Live suite:** 1450 passed, 1 skipped (209 s). The skip is the opt-in cross-repo test. Run alone with
+  `RSI_TEST_IMPROVE_REPO=~/agent-config` (`f87355e`): 1 passed, and `~/agent-config` stayed clean. Total 1451.
+- **`amem admin credentials-status`:** "connects as postgres; admin Keychain item: absent;
+  AMEM_SUPABASE_KEY: none". Exit 1, as expected before E3.
+- **`amem rsi freeze-status`:** `FROZEN`.
+- **New commands present:** `amem admin split-credentials | restore-credentials | credentials-status`,
+  `amem rsi totp-enroll`, `amem rsi decide-page`.
+- **Ingestion after E2:** the 20:19 run exited 0: `amem-ingest` (0 new, 350 present, 0 unparsed),
+  `amem-sessions` (261 files, 2 updated, eval=144) and `amem-undo-poll` (0 requests). No FAIL lines since
+  20:05. The file count has fallen all day (276 at 17:31) because transcripts leave the disk; E2 changed no
+  session-ingest code.
+- **Undo** (never automatic): `git reset --hard 06322c2` in `~/Projects/agent-memory`.
+
+## E3 preflight (2026-10-16, read-only, no production change)
+
+- **Hosted database, as `amem_app`:** no `nextval` defaults and no sequences in `public`; no materialized
+  views; TEMP allowed; insert on every non-RSI table; an `amem_app` policy on every non-RSI table with RLS.
+  No select on `rsi_decision_tokens` (four columns only), `rsi_totp_used` or `rsi_totp_failures`, as designed.
+- **Two functions without EXECUTE:** `cloud_digests_keep_routine` and `cloud_digests_claim_chat`. Both are
+  trigger functions, revoked from PUBLIC on purpose. Postgres does not check EXECUTE when a trigger fires.
+  New test `test_amem_app_fires_the_cloud_digest_triggers` proves it: `sessions_ingest` marks digests
+  ingested as `amem_app`, and both triggers run.
+- **Routine code:** no superuser statements (`session_replication_role`, `vacuum`, `set role`, DDL).
+  agent-config, the hooks and Codex never use `AMEM_DB_URL` directly; they call `amem`.

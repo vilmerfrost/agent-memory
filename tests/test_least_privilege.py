@@ -140,6 +140,30 @@ def test_amem_app_runs_the_ingestion_paths(db: dict[str, str]) -> None:
         conn.execute("delete from sessions where session_id = 'lp-1'")
 
 
+def test_amem_app_fires_the_cloud_digest_triggers(db: dict[str, str]) -> None:
+    """amem_app has no EXECUTE on the two cloud_digests trigger functions (revoked from PUBLIC on purpose).
+    Triggers still fire: sessions_ingest marks digests ingested as amem_app after the split (E3 preflight)."""
+    key = "cloud:lp-trigger-test"
+    with psycopg.connect(db["owner"]) as conn:
+        conn.execute("delete from cloud_digests where source_key = %s", (key,))
+        assert not conn.execute("select has_function_privilege('amem_app', 'public.cloud_digests_keep_routine()', "
+                                "'execute')").fetchone()[0]
+    try:
+        with psycopg.connect(db["app"]) as conn:
+            conn.execute("insert into cloud_digests (source_key, kind, session_id, digest) values (%s, 'chat', 's', 'c')",
+                         (key,))
+            conn.execute("insert into cloud_digests (source_key, kind, routine, session_id) values (%s, 'routine', 'r1', 's')",
+                         (key,))                                     # claim_chat deletes the chat row first
+            conn.execute("update cloud_digests set kind = 'chat', routine = null, ingested_at = now() "
+                         "where source_key = %s", (key,))           # keep_routine keeps it a routine row
+            kind, routine, ingested = conn.execute("select kind, routine, ingested_at from cloud_digests "
+                                                   "where source_key = %s", (key,)).fetchone()
+        assert (kind, routine) == ("routine", "r1") and ingested is not None
+    finally:
+        with psycopg.connect(db["owner"]) as conn:
+            conn.execute("delete from cloud_digests where source_key = %s", (key,))
+
+
 def test_every_table_is_reachable_by_amem_app_or_deliberately_not(db: dict[str, str]) -> None:
     """Guards later migrations: a new routine table without an amem_app grant and policy fails here."""
     secret = {"rsi_totp_used", "rsi_totp_failures"}

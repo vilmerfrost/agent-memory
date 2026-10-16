@@ -75,7 +75,8 @@ In `~/agent-config/improve/criteria.json`:
 ### 10. Re-enable the writers in stage mode
 - [ ] amem-daily plist: `AMEM_EDITS_LIVE=1` **and** `AMEM_EDITS_MODE=stage`. `bootout` and
   `bootstrap` the job.
-- [ ] New launchd job for `amem rsi decide-poll` (for example every 5 minutes).
+- [ ] ~~New launchd job for `amem rsi decide-poll`~~ **Not while R2 is open** (decision 2026-10-16,
+  [least-privilege.md](least-privilege.md)). You run `amem rsi decide-poll` in your own terminal.
 - [ ] New launchd job for `amem rsi push` after the nightly run (the morning brief).
 - [ ] Re-enable `ab-lessons-monthly` only if you want it. Under stage mode it cannot write.
 
