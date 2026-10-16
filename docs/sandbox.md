@@ -193,7 +193,7 @@ A provider supplies named credentials. Names are limited to `ANTHROPIC_API_KEY`,
 |---|---|
 | `none` | Default. No credential. |
 | `env-file:<path>` | Tests only. `NAME=value` lines. Refuses `.env*` names and files under forbidden paths. |
-| `keychain:<service>/<account>` | Production. Runs `/usr/bin/security find-generic-password -s <service> -a <account> -w`. `--credential-name` picks the env name (default `ANTHROPIC_API_KEY`). |
+| `keychain:<service>/<account>` | Production. Runs `/usr/bin/security find-generic-password -s <service> -a <account> -w`. `--credential-name` picks the env name (default `ANTHROPIC_API_KEY`). Only `rsi-sandbox/anthropic` and `rsi-sandbox/openai` are allowed (`KEYCHAIN_ITEMS`), so a wrong spec can never pull a personal login into a worker. A safeguard against mistakes: a hostile process as the same user can call `security` itself. |
 
 The value goes only into the env of the `docker run` process. The argv has `-e NAME` with no
 value, so it never shows in `ps`, logs or `RunResult.argv`. The Docker daemon does see the value

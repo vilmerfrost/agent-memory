@@ -63,6 +63,9 @@ ENV_ALLOWLIST = ("HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY", "HOME", "CLAUDE_CONFIG
                  "CODEX_HOME", "EXPERIMENT_ID", "RSI_ARM")
 # Named credentials a provider may supply. No OAuth token: production uses a dedicated API key.
 CREDENTIAL_NAMES = ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "CODEX_API_KEY")
+# The only Keychain items the runner reads: the dedicated, spend-capped sandbox keys. A mistyped spec can
+# then never pull a personal login (for example Claude Code's own Keychain item) into a worker.
+KEYCHAIN_ITEMS = (("rsi-sandbox", "anthropic"), ("rsi-sandbox", "openai"))
 
 ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 ARM_RE = re.compile(r"^[A-Z]$")
@@ -174,6 +177,9 @@ def load_credentials(spec: str, name: str | None = None, runner=subprocess.run) 
         service, sep, account = spec[len("keychain:"):].partition("/")
         if not sep or not service or not account:
             raise CredentialError("keychain spec is keychain:<service>/<account>")
+        if (service, account) not in KEYCHAIN_ITEMS:
+            raise CredentialError("keychain item not allowed: use " +
+                                  " or ".join(f"keychain:{s}/{a}" for s, a in KEYCHAIN_ITEMS))
         cred_name = name or "ANTHROPIC_API_KEY"
         if cred_name not in CREDENTIAL_NAMES:
             raise CredentialError(f"credential name not allowed: {cred_name}")

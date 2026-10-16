@@ -245,6 +245,26 @@ def test_credentials_keychain_builds_security_call_without_calling_keychain():
         rs.load_credentials("vault:x")
 
 
+def test_credentials_keychain_reads_only_the_sandbox_items():
+    """A wrong spec must never read a personal Keychain item: refused before `security` runs."""
+    calls = []
+
+    class P:
+        returncode, stdout = 0, f"{DUMMY}\n"
+
+    def fake_runner(argv, **kw):
+        calls.append(argv)
+        return P()
+    for spec in ("keychain:Claude Code-credentials/vilmerfrost", "keychain:amem-admin-db/postgres",
+                 "keychain:amem-archive/k1", "keychain:Supabase CLI/supabase", "keychain:rsi-sandbox/x",
+                 "keychain:RSI-SANDBOX/anthropic"):
+        with pytest.raises(rs.CredentialError, match="not allowed"):
+            rs.load_credentials(spec, runner=fake_runner)
+    assert calls == []
+    assert rs.load_credentials("keychain:rsi-sandbox/openai", name="CODEX_API_KEY", runner=fake_runner) == \
+        {"CODEX_API_KEY": DUMMY}
+
+
 # ---------------------------------------------------------------- docker argv
 
 def test_run_argv_flags_and_env_allowlist(sb):
