@@ -6,7 +6,8 @@ A CLI and an importable library. Stdlib only. Design and threat model: docs/sand
     rsi_sandbox.py init
     rsi_sandbox.py build
     rsi_sandbox.py net-up | net-down | net-status
-    rsi_sandbox.py prepare-arm --experiment E --baseline B --arm A [--hook-experiment] [--force]
+    rsi_sandbox.py prepare-arm --experiment E --baseline B --arm A [--artifact H] [--hook-experiment] [--force]
+    rsi_sandbox.py record-eval --artifact H --experiment E --arm B --suite S --verdict V [--results FILE] ...
     rsi_sandbox.py run --experiment E --arm A [--timeout S] [--credentials SPEC] -- CMD ...
     rsi_sandbox.py cleanup [--max-age-hours N]
     rsi_sandbox.py recover
@@ -66,6 +67,14 @@ CREDENTIAL_NAMES = ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "CODEX_API_KEY")
 ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 ARM_RE = re.compile(r"^[A-Z]$")
 RO_TARGET_RE = re.compile(r"^/(mnt|baseline)(/[A-Za-z0-9_.-]+)*$")
+
+# RSI V1 formats (docs/rsi/spec.md). Same canonical JSON as agent-config lib/rsi_artifact.py.
+ARTIFACT_FORMAT = "rsi-artifact/1"
+BASELINE_FORMAT = "rsi-baseline/1"
+EVAL_FORMAT = "rsi-eval/1"
+VERDICTS = ("pass", "improves", "no-effect", "worse", "fail", "inconclusive")
+HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
+SUITE_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,40}$")
 
 DEFAULT_TIMEOUT_S = 1200
 MAX_TIMEOUT_S = 4 * 3600
@@ -199,6 +208,105 @@ def _env_file_credentials(path_s: str) -> dict[str, str]:
     return creds
 
 
+# ------------------------------------------------------------------ RSI baselines and artifacts
+
+def canonical(obj) -> bytes:
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+
+def _sha(b: bytes) -> str:
+    return hashlib.sha256(b).hexdigest()
+
+
+def _home_rel(key: str) -> str:
+    """'~/.claude/CLAUDE.md' -> '.claude/CLAUDE.md'. Anything else (absolute, '..', empty parts) is refused."""
+    if not isinstance(key, str) or not key.startswith("~/"):
+        raise SandboxError(f"path must start with ~/: {key!r}")
+    rel = key[2:]
+    parts = rel.split("/")
+    if not rel or any(p in ("", ".", "..") for p in parts) or "\x00" in rel:
+        raise SandboxError(f"unsafe path: {key!r}")
+    return rel
+
+
+def read_baseline(bdir: Path) -> tuple[dict | None, Path]:
+    """(manifest, dir to copy). An rsi-baseline/1 dir is verified (id, every copy, no extra files) and its
+    files/ subtree is the home. A dir without manifest.json is a raw home snapshot: (None, bdir)."""
+    mf = bdir / "manifest.json"
+    if not mf.exists():
+        return None, bdir
+    try:
+        m = json.loads(mf.read_text())
+    except (OSError, ValueError):
+        raise SandboxError(f"baseline {bdir.name}: unreadable manifest") from None
+    if not isinstance(m, dict) or m.get("format") != BASELINE_FORMAT or not isinstance(m.get("files"), list):
+        raise SandboxError(f"baseline {bdir.name}: not {BASELINE_FORMAT}")
+    body = {k: v for k, v in m.items() if k != "baseline_id"}
+    if m.get("baseline_id") != bdir.name or bdir.name != "bl-" + _sha(canonical(body))[:12]:
+        raise SandboxError(f"baseline {bdir.name}: id does not match its manifest")
+    root = bdir / "files"
+    listed = set()
+    for f in m["files"]:
+        rel = _home_rel(f.get("path"))
+        copy = root / rel
+        if copy.is_symlink() or not copy.is_file() or _sha(copy.read_bytes()) != f.get("sha256"):
+            raise SandboxError(f"baseline {bdir.name}: copy of {f.get('path')} is missing or changed")
+        listed.add(rel)
+    found = {p.relative_to(root).as_posix() for p in root.rglob("*") if not p.is_dir()} if root.is_dir() else set()
+    if found != listed:
+        raise SandboxError(f"baseline {bdir.name}: unlisted files {sorted(found - listed)[:5]}")
+    return m, root
+
+
+def load_artifact(adir: Path) -> tuple[dict, str, dict[str, bytes]]:
+    """(manifest, hash, {path: after bytes}). The dir name, the canonical manifest and every after file
+    must verify; otherwise SandboxError."""
+    try:
+        raw = (adir / "manifest.json").read_bytes()
+        m = json.loads(raw)
+    except (OSError, ValueError):
+        raise SandboxError(f"artifact {adir.name}: unreadable manifest") from None
+    if not isinstance(m, dict) or m.get("format") != ARTIFACT_FORMAT or not isinstance(m.get("files"), list):
+        raise SandboxError(f"artifact {adir.name}: not {ARTIFACT_FORMAT}")
+    if raw.rstrip(b"\n") != canonical(m):
+        raise SandboxError(f"artifact {adir.name}: manifest is not canonical JSON")
+    h = _sha(canonical(m))
+    if adir.name != h:
+        raise SandboxError("artifact dir name does not equal its manifest hash")
+    after = {}
+    for f in m["files"]:
+        _home_rel(f.get("path"))
+        sha = str(f.get("after_sha256", ""))
+        if not HEX64_RE.match(sha):
+            raise SandboxError(f"artifact {h[:12]}: bad after_sha256 for {f.get('path')}")
+        try:
+            b = (adir / "files" / sha).read_bytes()
+        except OSError:
+            raise SandboxError(f"artifact {h[:12]}: after bytes missing for {f.get('path')}") from None
+        if _sha(b) != sha:
+            raise SandboxError(f"artifact {h[:12]}: after bytes of {f.get('path')} changed since staging")
+        after[f["path"]] = b
+    return m, h, after
+
+
+def _file_mode(mode) -> int:
+    try:
+        return int(str(mode), 8) & 0o777
+    except (TypeError, ValueError):
+        return 0o644
+
+
+def _atomic_write(path: Path, data: bytes, mode: int = 0o600) -> None:
+    tmp = path.with_name(f".{path.name}.{secrets.token_hex(4)}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+    try:
+        os.write(fd, data)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.replace(tmp, path)
+
+
 # ------------------------------------------------------------------ docker helpers
 
 def _docker_cli_env(extra: dict[str, str] | None = None) -> dict[str, str]:
@@ -278,6 +386,7 @@ class Sandbox:
             if _within(self.root, bad) or _within(bad, self.root):
                 raise SandboxError(f"sandbox root overlaps a forbidden host path: {self.root}")
         self.baselines = self.root / "baselines"
+        self.artifacts = self.root / "artifacts"
         self.experiments = self.root / "experiments"
         self.rundir = self.root / "run"
 
@@ -560,10 +669,29 @@ class Sandbox:
     # ---- prepare-arm
 
     def prepare_arm(self, experiment: str, baseline: str, arm: str, *, hook_experiment: bool = False,
-                    force: bool = False) -> dict:
+                    force: bool = False, artifact: str | None = None) -> dict:
+        """home-<arm> = the sanitized baseline, or with `artifact` the baseline plus that artifact's after
+        bytes (the candidate arm). The report records whether the home holds the artifact's exact bytes."""
         src = self.baseline_dir(baseline)
         if not src.is_dir() or src.is_symlink():
             raise SandboxError(f"baseline not found: {src}")
+        bman, broot = read_baseline(src)
+        overlay: dict[str, bytes] = {}
+        art_m = None
+        if artifact is not None:
+            if not HEX64_RE.match(artifact):
+                raise SandboxError("artifact must be a 64-hex hash")
+            if bman is None:
+                raise SandboxError(f"--artifact needs an {BASELINE_FORMAT} baseline")
+            art_m, _, overlay = load_artifact(self.artifacts / artifact)
+            if art_m.get("baseline_id") != baseline:
+                raise SandboxError(f"artifact was staged against {art_m.get('baseline_id')}, not {baseline}")
+            if art_m.get("experiment_id") != experiment:
+                raise SandboxError(f"artifact belongs to experiment {art_m.get('experiment_id')}, not {experiment}")
+            base_sha = {f["path"]: f["sha256"] for f in bman["files"]}
+            for f in art_m["files"]:
+                if f.get("before_sha256") != base_sha.get(f["path"]):
+                    raise SandboxError(f"stale artifact: {f['path']} differs from the baseline it claims")
         dest = self.arm_home(experiment, arm)
         exp_dir = self.experiment_dir(experiment)
         if dest.exists():
@@ -576,11 +704,35 @@ class Sandbox:
                   "hook_experiment": hook_experiment,
                   "created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                   "removed": [], "set": []}
+        report["baseline_format"] = BASELINE_FORMAT if bman else "raw-home"
+        report["artifact_hash"] = artifact
+        stage = None
         try:
-            _copy_sanitized(src, dest, report, hook_experiment)
+            copy_from = broot
+            if bman is not None:
+                # A writable stage: baseline copies are read-only (0444), modes come from the manifests.
+                stage = exp_dir / f".stage-{arm}-{secrets.token_hex(4)}"
+                shutil.copytree(broot, stage, symlinks=True, copy_function=shutil.copyfile)
+                for d in (stage, *(q for q in stage.rglob("*") if q.is_dir() and not q.is_symlink())):
+                    os.chmod(d, 0o700)
+                modes = {f["path"]: f.get("mode") for f in bman["files"]}
+                for key, b in overlay.items():
+                    out = stage / _home_rel(key)
+                    out.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                    out.write_bytes(b)
+                modes.update({f["path"]: f.get("mode") for f in (art_m or {}).get("files", [])})
+                for key, mode in modes.items():
+                    q = stage / _home_rel(key)
+                    if q.is_file() and not q.is_symlink():
+                        os.chmod(q, (_file_mode(mode) & 0o755) | 0o600)
+                copy_from = stage
+            _copy_sanitized(copy_from, dest, report, hook_experiment)
         except BaseException:
             shutil.rmtree(dest, ignore_errors=True)    # fail closed: no half-sanitized home
             raise
+        finally:
+            if stage is not None:
+                shutil.rmtree(stage, ignore_errors=True)
         for d in (".claude", ".codex"):            # CLAUDE_CONFIG_DIR / CODEX_HOME must exist
             (dest / d).mkdir(mode=0o700, exist_ok=True)
         if not hook_experiment:
@@ -590,11 +742,62 @@ class Sandbox:
             data["disableAllHooks"] = True
             settings.write_text(json.dumps(data, indent=2) + "\n")
             report["set"].append({"path": ".claude/settings.json", "key": "disableAllHooks", "value": True})
+        if art_m is not None:
+            rows = []
+            for f in art_m["files"]:
+                p = dest / _home_rel(f["path"])
+                got = _sha(p.read_bytes()) if p.is_file() and not p.is_symlink() else None
+                rows.append({"path": f["path"], "after_sha256": f["after_sha256"], "home_sha256": got})
+            report["overlay"] = rows
+            report["exact"] = all(r["after_sha256"] == r["home_sha256"] for r in rows)
         rep_path = exp_dir / "sanitize-report.json"
         allrep = json.loads(rep_path.read_text()) if rep_path.exists() else {}
         allrep[arm] = report
         rep_path.write_text(json.dumps(allrep, indent=2) + "\n")
         return report
+
+    # ---- evaluation records
+
+    def record_eval(self, *, artifact: str, experiment: str, arm: str, suite: str, verdict: str,
+                    results: dict | None = None, suite_version: str = "1", model: str = "none", effort: str = "none",
+                    started_at: str | None = None, finished_at: str | None = None, control_arm: str | None = "A",
+                    replace: bool = False) -> Path:
+        """Write artifacts/<H>/evals/<suite>.json (rsi-eval/1). Refused unless home-<arm> was prepared from
+        exactly this artifact (exact bytes) and the control arm from the same baseline without an artifact."""
+        if not HEX64_RE.match(artifact or ""):
+            raise SandboxError("artifact must be a 64-hex hash")
+        if not SUITE_RE.match(suite or "") or verdict not in VERDICTS:
+            raise SandboxError(f"bad suite or verdict (verdicts: {', '.join(VERDICTS)})")
+        adir = self.artifacts / artifact
+        m, h, _ = load_artifact(adir)
+        if m.get("experiment_id") != experiment:
+            raise SandboxError(f"artifact belongs to experiment {m.get('experiment_id')}, not {experiment}")
+        try:
+            rep = json.loads((self.experiment_dir(experiment) / "sanitize-report.json").read_text())
+        except (OSError, ValueError):
+            raise SandboxError("no sanitize report for this experiment; run prepare-arm first") from None
+        cand = rep.get(_check_arm(arm)) or {}
+        if cand.get("artifact_hash") != h or cand.get("baseline") != m.get("baseline_id"):
+            raise SandboxError(f"home-{arm} was not prepared from this artifact and its baseline")
+        if not cand.get("exact"):
+            raise SandboxError(f"home-{arm} does not hold the artifact's exact bytes (the sanitizer changed "
+                               f"them); this artifact cannot be evaluated as staged")
+        if control_arm is not None:
+            ctl = rep.get(_check_arm(control_arm)) or {}
+            if ctl.get("baseline") != m.get("baseline_id") or ctl.get("artifact_hash") is not None:
+                raise SandboxError(f"control home-{control_arm} is not the plain baseline {m.get('baseline_id')}")
+        now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        rec = {"format": EVAL_FORMAT, "artifact_hash": h, "experiment_id": experiment, "baseline_id": m["baseline_id"],
+               "suite": suite, "suite_version": str(suite_version), "model": model, "effort": effort,
+               "verdict": verdict, "started_at": started_at or now, "finished_at": finished_at or now,
+               "runner": "rsi_sandbox", "results": {**(results or {}), "candidate_arm": arm,
+                                                    "control_arm": control_arm}}
+        out = adir / "evals" / f"{suite}.json"
+        if out.exists() and not replace:
+            raise SandboxError(f"{out.name} exists; pass --replace to overwrite it")
+        out.parent.mkdir(exist_ok=True)
+        _atomic_write(out, canonical(rec) + b"\n", 0o644)
+        return out
 
     # ---- cleanup and recovery
 
@@ -882,6 +1085,19 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--arm", required=True)
     p.add_argument("--hook-experiment", action="store_true", help="keep hooks (arm tests a hook)")
     p.add_argument("--force", action="store_true", help="replace an existing home-<arm>")
+    p.add_argument("--artifact", default=None, help="overlay this staged artifact (the candidate arm)")
+    e = sub.add_parser("record-eval", help="write an rsi-eval/1 record bound to the tested artifact")
+    e.add_argument("--artifact", required=True)
+    e.add_argument("--experiment", required=True)
+    e.add_argument("--arm", default="B", help="the candidate arm prepared with --artifact")
+    e.add_argument("--control-arm", default="A")
+    e.add_argument("--suite", required=True)
+    e.add_argument("--suite-version", default="1")
+    e.add_argument("--model", default="none")
+    e.add_argument("--effort", default="none")
+    e.add_argument("--verdict", required=True, choices=VERDICTS)
+    e.add_argument("--results", default=None, help="JSON file with the suite's results")
+    e.add_argument("--replace", action="store_true")
     r = sub.add_parser("run", help="run one command in a fresh worker container")
     r.add_argument("--experiment", required=True)
     r.add_argument("--arm", required=True)
@@ -914,7 +1130,13 @@ def main(argv: list[str] | None = None) -> int:
             out = sb.net_status()
         elif args.cmd == "prepare-arm":
             out = sb.prepare_arm(args.experiment, args.baseline, args.arm,
-                                 hook_experiment=args.hook_experiment, force=args.force)
+                                 hook_experiment=args.hook_experiment, force=args.force, artifact=args.artifact)
+        elif args.cmd == "record-eval":
+            results = json.loads(Path(args.results).read_text()) if args.results else {}
+            out = {"eval": str(sb.record_eval(
+                artifact=args.artifact, experiment=args.experiment, arm=args.arm, suite=args.suite,
+                verdict=args.verdict, results=results, suite_version=args.suite_version, model=args.model,
+                effort=args.effort, control_arm=args.control_arm or None, replace=args.replace))}
         elif args.cmd == "run":
             cmd = args.command[1:] if args.command[:1] == ["--"] else args.command
             ro = []

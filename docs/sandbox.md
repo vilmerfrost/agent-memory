@@ -148,6 +148,19 @@ With the baked flags, Claude Code 2.1.295 contacts only `api.anthropic.com`.
 `prepare-arm` copies `baselines/<B>/` into `experiments/<E>/home-<arm>/` and cleans it.
 It never writes to the baseline. It never opens a `.env*` file.
 
+**RSI formats** (docs/rsi/spec.md, docs/rsi/targets.md):
+- An `rsi-baseline/1` dir (one with `manifest.json`) is verified first: the id matches the manifest,
+  every copy matches its sha256, and no unlisted file exists. The home is built from its `files/`,
+  with file modes from the manifest. A dir without a manifest is a raw home snapshot, as before.
+- `--artifact <hash>` builds the **candidate arm**. The artifact must verify (canonical manifest, dir
+  name = hash, every after file). It must be staged against this baseline and this experiment, and
+  each `before_sha256` must equal the baseline copy. The after bytes are added before sanitizing.
+  The report records `overlay` (artifact sha vs. home sha per file) and `exact`.
+- `record-eval` writes `artifacts/<hash>/evals/<suite>.json` (`rsi-eval/1`, runner `rsi_sandbox`).
+  It refuses unless the candidate arm is `exact` and was built from this artifact, and the control arm
+  is the same baseline without an artifact. A change the sanitizer alters (for example a
+  `settings.json` with hooks, without `--hook-experiment`) therefore cannot get a sandbox evaluation.
+
 - **Not copied:** symlinks (they could point at host files), special files, `.env*`,
   `.claude/.credentials.json`, `.codex/auth.json`, `.codex/history.jsonl`, every `.mcp.json`,
   `.claude/plugins/` (plugins and marketplaces), `.claude/hooks/`, and session state
