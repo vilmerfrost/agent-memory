@@ -7,6 +7,7 @@ container's commands (`nvidia-smi`, `sha256sum`, `evaluate.py`, ...) are faked t
 from __future__ import annotations
 
 import importlib.util
+import re
 import subprocess
 import sys
 import types
@@ -277,3 +278,19 @@ def test_the_local_results_folder_is_ignored_by_git() -> None:
     probe = subprocess.run(["git", "-C", str(ROOT), "check-ignore", "-q", "ncm-results/ncm-20261020-100000-x/results.json"],
                            capture_output=True, text=True, timeout=30)
     assert probe.returncode == 0, "main() writes ./ncm-results/<run_id>/ inside the repo: keep it in .gitignore"
+
+
+# ---------------------------------------------------------------- F9: the docs agree with the script
+
+
+def test_the_ncm_docs_agree_on_caps_and_commands() -> None:
+    track = (ROOT / "docs" / "integrations" / "ncm-track.md").read_text()
+    activation = (ROOT / "docs" / "integrations" / "cloud-activation.md").read_text()
+    for text in (track, activation, SCRIPT.read_text()):
+        assert not re.search(r"modal volume rm amem-ncm-results\s*[`|\n]", text)   # rm needs a path (and -r)
+        assert "stops workloads at the budget" not in text                      # the budget is the outer cap
+    assert "artifacts/<task>" not in track and "--checkpoint-dir artifacts/sudoku/easy" in track
+    assert "$10" not in track and "at most $0.25" in track and "budget: $5" in track
+    assert "Workspace budget of $5" in activation and "at most $0.25 per run" in activation
+    for text in (track, activation):
+        assert "modal volume rm amem-ncm-results /<run_id> -r" in text and "modal volume delete amem-ncm-results" in text

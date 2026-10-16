@@ -86,11 +86,11 @@ is `unavailable` and leaves the cursor; 0 of 8 planted markers in 19.6 KB read b
 
 | Step | Who | What | Accept | Undo |
 |---|---|---|---|---|
-| G-NCM1 | owner | A Modal account (Starter, card on file). Set a **Workspace budget of $5** on Usage & Billing. | the budget is shown | close the account |
+| G-NCM1 | owner | A Modal account (Starter, card on file). Set a **Workspace budget of $5** on Usage & Billing (Modal's docs call it the hard outer cap; it bounds the workspace, not one run), plus a spend limit. | the budget and the limit are shown | close the account |
 | G-NCM2 | owner | In a separate venv (not the amem one): `pip install modal==1.6.2`, then `modal setup` | `modal profile current` works | revoke the token in the Modal dashboard |
 | G-NCM3 | owner approves, agent runs | Register the experiment: one `rsi_experiments` row (`kind='research'`, id `exp-YYYYMMDD-ncm`) | the row exists | it stays as a record (append-style registry) |
-| G-NCM4 | owner approves | One run: `modal run deploy/ncm/modal_sudoku.py --experiment-id exp-YYYYMMDD-ncm` | every C4 criterion; spend at most $0.25 | `modal volume rm amem-ncm-results` |
-| G-NCM5 | agent | `amem evidence record-ncm ncm-results/<run>/results.json`. With ClickHouse approved, a later sync carries it to `research_runs`. | one `ncm:run` row; `evidence query --source ch research_runs` shows it after a sync | `AMEM_SYNC_CLICKHOUSE=off` |
+| G-NCM4 | owner approves | One run: `modal run deploy/ncm/modal_sudoku.py --experiment-id exp-YYYYMMDD-ncm` | every C4 criterion; spend at most $0.25 per run (worst case ~$0.22: `docs/integrations/ncm-track.md`, N2 caps) | one run: `modal volume rm amem-ncm-results /<run_id> -r`; all: `modal volume delete amem-ncm-results` |
+| G-NCM5 | agent | `amem evidence record-ncm ncm-results/<run_id>/results.json` (`run_id` = `ncm-YYYYMMDD-HHMMSS-sudoku-easy`). With ClickHouse approved, a later sync carries it to `research_runs`. | one `ncm:run` row; `evidence query --source ch research_runs` shows it after a sync | `AMEM_SYNC_CLICKHOUSE=off` |
 
 NCM never runs from the nightly routine. Nothing in amem-daily imports `ncm_worker` or the Modal script.
 

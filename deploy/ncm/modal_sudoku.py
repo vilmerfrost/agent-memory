@@ -2,7 +2,9 @@
 
 Before the first run (docs/integrations/cloud-activation.md, NCM steps):
 1. A Modal account on the Starter plan ($30/month of included credit; a card on file is required).
-2. A Workspace budget set in the Modal console (Usage & Billing). Modal stops workloads at the budget.
+2. A Workspace budget of $5 and a spend limit in the Modal console (Usage & Billing). Modal's docs call the
+   workspace budget the hard outer cap: it bounds the workspace, not one run. One run is bounded by the
+   function's own caps below (worst case ~$0.22, at most $0.25).
 3. `pip install modal==1.6.2` in a separate venv (not the amem venv), then `modal setup` by the owner.
 
 Run (after approval), from the repo root:
@@ -16,9 +18,12 @@ $0.184 plus ~$0.037 for at most 2 cores and 8 GiB; arithmetic in docs/integratio
 block_network=True: it needs nothing from the internet and can send nothing anywhere. It receives no amem data,
 credentials or session content: only public files.
 
-What it writes: results.json (the Mission 004A contract, built by integrations/ncm_worker.py) and the raw
-evaluation log in the Modal Volume `amem-ncm-results`, and a local copy under ./ncm-results/<run_id>/.
+What it writes: results.json (the Mission 004A contract, built by integrations/ncm_worker.py), the raw
+evaluation log and pip-freeze.txt in the Modal Volume `amem-ncm-results` under /<run_id>/, and a local copy of
+results.json under ./ncm-results/<run_id>/ (git-ignored). run_id is ncm-YYYYMMDD-HHMMSS-sudoku-easy (UTC).
+If the Modal call itself raises, main() still writes a `failed` results.json locally.
 Record it afterwards with `amem evidence record-ncm ./ncm-results/<run_id>/results.json`.
+Undo: `modal volume rm amem-ncm-results /<run_id> -r` (one run) or `modal volume delete amem-ncm-results`.
 
 Checked against the modal 1.6.2 source (2026-10-16): Image.debian_slim(python_version=), .apt_install,
 .pip_install, .run_commands, .add_local_file(local, remote, copy=False) (must be the last layer),
