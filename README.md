@@ -131,6 +131,8 @@ Each part has its own doc:
 | Lessons memory (frozen) | `lessons import/export/for/score/distill`, `lesson propose`, `gate friction` | [docs/lessons.md](docs/lessons.md) |
 | A/B proof | `ab report` | [docs/ab.md](docs/ab.md) |
 | Transcript archive (encrypted, local, 180 days) | `archive init`, `archive run [--dry-run]`, `archive verify`, `archive restore`, `archive prune`, `archive status`, `archive key-export`, `archive key-import` | [docs/archive.md](docs/archive.md) |
+| RSI V1 approval-first (stage, proposals, decisions, promotion worker, undo) | `rsi targets`, `rsi baseline create/check`, `rsi tracking-plan`, `rsi freeze-status`, `rsi propose`, `rsi push`, `rsi decide`, `rsi decide-poll`, `rsi verify-decision`, `rsi show`, `rsi checkpoint` | [docs/rsi/approval.md](docs/rsi/approval.md) |
+| RSI sandbox (isolated Docker workers) | `python3 sandbox/rsi_sandbox.py init/build/net-up/prepare-arm/run/record-eval/cleanup` | [docs/sandbox.md](docs/sandbox.md) |
 
 The v2 loop: `sessions ingest` indexes transcripts → `deviations scan` finds deviations, writes
 what/why/how and two raw grades, Jev gives a verdict → `deviations report --json` hands the
