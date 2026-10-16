@@ -645,6 +645,64 @@ def test_retriever_and_sink_unavailable_when_unconfigured_or_down(app: str) -> N
         assert sync.run(CH.ClickHouseSink(down), conn, environ={"AMEM_SYNC_CLICKHOUSE": "off"}).status == "off"
 
 
+# ---------------------------------------------------------------- Mission 004C (F1): repo-scoped deviation sources
+
+
+def _wire(fake: FakeClickHouse) -> str:
+    return "\n".join(f"{r.method} {r.path} {json.dumps(r.query)} {json.dumps(r.headers)} "
+                     f"{r.body.decode('utf-8', 'replace')}" for r in fake.svc.requests)
+
+
+def test_team_repo_rules_never_leave_and_own_repo_sources_are_pseudonyms(seed: Seed, pg_url: str, app: str,
+                                                                         fake: FakeClickHouse) -> None:
+    with psycopg.connect(pg_url) as conn:
+        team = seed.session(conn, "chs-team", repo="pipeline-poc", project="pipeline-poc",
+                            meta=Jsonb({"team": True, "note": seed.mk("tmeta")}))
+        t1 = seed.deviation(conn, team, "claude-md:pipeline-poc", "pipeline-poc-deploy-gate", 0.2, 0.9)
+        t2 = seed.deviation(conn, team, "agents-md:pipeline-poc", "pipeline-poc-review", 0.2, 0.9)
+        tg = seed.deviation(conn, team, "claude-md:global", "explaining/core-rule", 0.2, 0.9)   # the owner's own rule
+        own = [seed.deviation(conn, "chs-1", "claude-md:agent-memory", "own-rule", f, 0.9) for f in (0.1, 0.2, 0.3)]
+    with psycopg.connect(app) as conn:
+        assert sync.run(CH.ClickHouseSink(client_for(fake.svc.url)), conn, replay=True, environ={}).status == "ok"
+    wire = _wire(fake)
+    assert "pipeline-poc" not in wire and "agent-memory" not in wire
+    devs = fake.by_id("deviations")
+    assert (devs[t1]["instruction_source"], devs[t1]["rule_id"]) == ("claude-md:team", None)
+    assert (devs[t2]["instruction_source"], devs[t2]["rule_id"]) == ("agents-md:team", None)
+    assert (devs[tg]["instruction_source"], devs[tg]["rule_id"]) == ("claude-md:global", "explaining/core-rule")
+    pseudo = CH.pseudonym("agent-memory")
+    assert pseudo and all((devs[d]["instruction_source"], devs[d]["rule_id"]) == (f"claude-md:{pseudo}", "own-rule")
+                          for d in own)
+    # the named queries still take the Mac's names: the rule param is translated before it leaves
+    r = CH.ClickHouseRetriever(client_for(fake.svc.url))
+    (gap,) = E.gather("rule_gap", {"rule": "claude-md:agent-memory:own-rule", "min_n": "3"}, [r])
+    assert fake.svc.requests[-1].q("param_rule") == f"claude-md:{pseudo}:own-rule"
+    assert gap.status == "ok" and [e.ref for e in gap.refs] == [f"ch:q.rule_gap/claude-md:{pseudo}:own-rule"]
+    (rate,) = E.gather("rule_weekly_rate", {"rule": "claude-md:agent-memory:own-rule"}, [r])
+    assert fake.svc.requests[-1].q("param_rule") == f"claude-md:{pseudo}:own-rule"
+    assert rate.status == "ok" and sum(e.metrics["n_deviations"] for e in rate.refs) == 3
+    (again,) = E.gather("rule_gap", {"rule": f"claude-md:{pseudo}:own-rule", "min_n": "3"}, [r])   # an answer's key
+    assert [e.ref for e in again.refs] == [e.ref for e in gap.refs]
+    (glob,) = E.gather("rule_gap", {"rule": "claude-md:global:explaining/core-rule"}, [r])
+    assert fake.svc.requests[-1].q("param_rule") == "claude-md:global:explaining/core-rule" and glob.refs
+    assert "pipeline-poc" not in _wire(fake) and "agent-memory" not in _wire(fake)
+
+
+def test_rule_param_and_repo_scoped(monkeypatch: pytest.MonkeyPatch) -> None:
+    from agent_memory import deviations
+
+    for s in ("claude-md:global", "agents-md:global", "claude-md:x", "agents-md:pipeline-poc", "skill:dispatch",
+              "parent-md", "claude-md", "routine:daily", "agent:worker"):
+        assert CH.repo_scoped(s) == deviations.repo_scoped(s), s
+    assert CH.rule_param("skill:dispatch:spawn") == "skill:dispatch:spawn"
+    assert CH.rule_param("claude-md:team:unknown") == "claude-md:team:unknown"
+    assert CH.rule_param("agents-md:x") == f"agents-md:{CH.pseudonym('x')}"
+    monkeypatch.delenv(CH.PSEUDONYM_ENV)
+    with pytest.raises(ValueError, match=CH.PSEUDONYM_ENV):
+        CH.rule_param("claude-md:agent-memory:own-rule")
+    assert CH.source_value("claude-md:agent-memory") is None and CH.source_value("claude-md:global") == "claude-md:global"
+
+
 def test_config_from_env_never_shows_the_key() -> None:
     cfg = CH.config({"AMEM_CLICKHOUSE_URL": "http://localhost:8123/", "AMEM_CLICKHOUSE_USER": "u",
                      "AMEM_CLICKHOUSE_KEY": CH_KEY, "AMEM_CLICKHOUSE_LOOKBACK_DAYS": "3"})

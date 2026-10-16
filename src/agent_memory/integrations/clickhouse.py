@@ -263,6 +263,56 @@ def pseudonym(value: str, environ: Mapping[str, str] | None = None) -> str | Non
     return "p_" + hmac.new(key.encode("utf-8"), value.encode("utf-8"), hashlib.sha256).hexdigest()[:16]
 
 
+# Mission 004C (F1): a deviation's instruction source names a repo when it is a repo's own file
+# (`claude-md:<repo>`, `agents-md:<repo>`; deviations.repo_scoped), and its rule_id is a slug of a heading in
+# that file. A team row sends `<prefix>:team` and no rule_id; any other repo-scoped source sends
+# `<prefix>:<pseudonym of the repo>` (no key: null). Global, skill, agent and routine sources stay as they are.
+REPO_PREFIXES = ("claude-md", "agents-md")
+_GLOBAL_SOURCES = frozenset(f"{p}:global" for p in REPO_PREFIXES)
+_PSEUDO_RE = re.compile(r"p_[0-9a-f]{16}")
+
+
+def repo_scoped(source: str) -> bool:
+    """deviations.repo_scoped (that module imports the whole ingest stack, so the rule is repeated here)."""
+    return source.startswith(tuple(f"{p}:" for p in REPO_PREFIXES)) and source not in _GLOBAL_SOURCES
+
+
+_DEV_REPO_SCOPED = ("((starts_with(instruction_source, 'claude-md:') or starts_with(instruction_source, 'agents-md:')) "
+                    "and instruction_source not in ('claude-md:global', 'agents-md:global'))")
+_DEV_TEAM = ("(meta ->> 'team' = 'true' or exists (select 1 from sessions s where s.session_id = deviations.session_id "
+             "and s.meta ->> 'team' = 'true'))")
+_DEV_SOURCE = (f"case when {_DEV_REPO_SCOPED} and {_DEV_TEAM} then split_part(instruction_source, ':', 1) || ':team' "
+               "else instruction_source end")
+_DEV_RULE = f"case when {_DEV_REPO_SCOPED} and {_DEV_TEAM} then null else rule_id end"
+
+
+def source_value(source: str, environ: Mapping[str, str] | None = None) -> str | None:
+    """An instruction source as ClickHouse holds it: a repo-scoped source's repo becomes its pseudonym."""
+    if not repo_scoped(source):
+        return source
+    prefix, repo = source.split(":", 1)
+    if repo == "team" or _PSEUDO_RE.fullmatch(repo):
+        return source
+    p = pseudonym(repo, environ)
+    return f"{prefix}:{p}" if p else None
+
+
+def rule_param(rule: str, environ: Mapping[str, str] | None = None) -> str:
+    """A rule key (`<source>:<rule_id>`) as ClickHouse holds it, so `rule` filters keep working on the Mac's
+    names: `claude-md:agent-memory:x` -> `claude-md:p_...:x`. A key that already holds a pseudonym (from an
+    earlier answer), `team` or `global` is sent as it is. Raises ValueError without a pseudonym key."""
+    prefix, sep, rest = rule.partition(":")
+    if not sep or prefix not in REPO_PREFIXES:
+        return rule
+    repo, sep2, tail = rest.partition(":")
+    if repo in ("global", "team") or _PSEUDO_RE.fullmatch(repo):
+        return rule
+    p = pseudonym(repo, environ)
+    if p is None:
+        raise ValueError(f"{PSEUDONYM_ENV} is not set: cannot filter by a repo's rule")
+    return f"{prefix}:{p}{sep2}{tail}"
+
+
 _NCM_FLOATS = {m: m for m in ("solved_rate", "cell_rate", "valid_rate", "rouge1", "rouge2", "gen_ppl",
                                 "sacrebleu_cased", "sacrebleu_lower", "chrf", "length_ratio", "unigram_entropy")}
 _NCM_FLOATS.update({"rouge_l": "rougeL", "cost_usd": "cost_usd", "gpu_minutes": "cost_gpu_minutes",
@@ -285,9 +335,10 @@ TABLES: tuple[Table, ...] = (
           _cols("id:id label:routine,source,status ts:started_at,finished_at,created_at float:duration_s",
                 duration_s="extract(epoch from finished_at - started_at)")),
     Table("deviations", "id", "created_at", "created_at",
-          _cols("id:id,session_id label:instruction_source,rule_id id:instruction_sha int:turn "
+          _cols("id:id,session_id source:instruction_source label:rule_id id:instruction_sha int:turn "
                 "float:followed_grade,result_grade,objective_result label:result_outcome,jev_verdict "
-                "float:jev_confidence label:jev_mode,writer_model ts:created_at")),
+                "float:jev_confidence label:jev_mode,writer_model ts:created_at",
+                instruction_source=_DEV_SOURCE, rule_id=_DEV_RULE)),
     Table("scores", "id", "created_at", "created_at",
           _cols("id:id,run_id label:question,kind float:value_num,confidence label:jev_mode ts:created_at")),
     Table("skill_calls", "id", "created_at", "created_at",
@@ -319,7 +370,7 @@ TABLE_NAMES = frozenset(t.name for t in TABLES)
 _TABLE = {t.name: t for t in TABLES}
 
 _CH_TYPES = {"id": "Nullable(String)", "label": "LowCardinality(Nullable(String))",
-             "pseudo": "LowCardinality(Nullable(String))",
+             "pseudo": "LowCardinality(Nullable(String))", "source": "LowCardinality(Nullable(String))",
              "ts": "Nullable(DateTime64(6, 'UTC'))", "int": "Nullable(Int64)", "float": "Nullable(Float64)",
              "bool": "Nullable(Bool)"}
 
@@ -451,6 +502,9 @@ def _value(kind: str, v: Any) -> Any:
     if kind == "pseudo":                # label-shaped only: free text stays null, as for labels
         s = str(v)
         return pseudonym(s) if LABEL_RE.fullmatch(s) else None
+    if kind == "source":                # a label whose repo part becomes a pseudonym (F1)
+        s = str(v)
+        return source_value(s) if LABEL_RE.fullmatch(s) else None
     if kind == "id":
         s = str(v)
         return s if _is_id(s) else None
@@ -830,6 +884,8 @@ class ClickHouseRetriever:
             if pseudo is None:
                 raise ValueError(f"{PSEUDONYM_ENV} is not set: cannot filter by project")
             p["project"] = pseudo
+        if p.get("rule"):               # the same for a repo-scoped rule key (F1)
+            p["rule"] = rule_param(p["rule"])
         limit = int(p.pop("limit"))
         observed = self._now().astimezone(UTC).isoformat(timespec="seconds")
         out: list[EvidenceRef] = []
