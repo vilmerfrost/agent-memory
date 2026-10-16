@@ -78,7 +78,9 @@ past.dev is the only **external** service. Records come from `rsi_proposals`, `r
 Behaviour to confirm at PD0 (the adapter's choices):
 - A record that later becomes a team item, or is deleted in Supabase, is removed from past.dev on the next sync.
 - `delete_all()` works even with `AMEM_PASTDEV=off`, so the kill switch never blocks a deletion.
-- A batch past.dev refuses for its content blocks that table until it is marked dead (6 attempts); `sync status` shows it.
+- An ingestion past.dev fails as `content-rejected` is dead-lettered at once, and its records are not re-sent until
+  they change; another failed ingestion gets the free retry by its id (at most 3 in all), then is dead-lettered.
+  A record counts as sent only when its ingestion completed (Mission 004C). `sync status` shows the dead letters.
 - Lesson records use the ref `amem:run/<id>` (there is no lesson entity).
 - Not detected by the sanitizer: machine names without a dot, and bare user names.
 
