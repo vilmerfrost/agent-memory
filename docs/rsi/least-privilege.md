@@ -1,6 +1,8 @@
 # RSI V1: least-privilege promotion (Mission 003.5, Phase E)
 
-Status: **E1 applied to the hosted database, E2 merged into local `main`, E3 run by Vilmer (2026-10-16). A4 and A5 wait for Phase G.**
+Status (2026-10-16): **E1, E2 and E3 done. Phase G option A done: `amem-decide` deployed (Reject only, no TOTP),
+A4 done (CLI logged out). A5 not done, by Vilmer's decision: T3 stays open, so the decision-record boundary is
+not complete.**
 Unattended promotion stays disabled while R2 is open (see "Decision" below).
 
 ## The problem (verified 2026-10-16)
@@ -106,8 +108,9 @@ Two different things protect production. Do not confuse them.
 | `_human_only()` in `amem admin` and `totp-enroll` | Safeguard | It checks environment variables and a TTY. An agent can clear the variables and fake a TTY. |
 | Phone Reject token, ntfy topic | Safeguard | Both are on the Mac (T4, R3). A Reject can only stop a change. |
 | Decide page CSP, token in the URL fragment | Safeguard | They reduce leaks. A compromised page host defeats them (R4). |
-| `amem_app` + Keychain-gated admin DSN (A1, A2) | **Boundary for the decision record**, after E3, A4 and A5 | The credential on disk cannot insert, change or delete a decision, or change the schema. It holds only while the Supabase CLI is logged out (T2), the connector is read-only (T3), and you never Allow a dialog you did not start (R1). |
-| TOTP for phone Apply and Undo (A3) | **Boundary for phone decisions**, after Phase G, A4 and A5 | The secret is only in the function secrets and your authenticator app. Without A4 and A5, an agent can redeploy the function or reset the secret. |
+| `amem_app` + Keychain-gated admin DSN (A1, A2) | **Boundary for the decision record**, after E3, A4 and A5. **Incomplete: A5 not done (T3 open by decision, 2026-10-16)** | The credential on disk cannot insert, change or delete a decision, or change the schema. It holds only while the Supabase CLI is logged out (T2), the connector is read-only (T3), and you never Allow a dialog you did not start (R1). |
+| TOTP for phone Apply and Undo (A3) | **Boundary for phone decisions**, after Phase G, A4 and A5. **Not enabled (option A)**: phone Apply and Undo are refused | The secret is only in the function secrets and your authenticator app. Without A4 and A5, an agent can redeploy the function or reset the secret. |
+| claude.ai connector tool setting "Ask always" | **Not a boundary for Claude Code** | Tested 2026-10-16: a `select` from a Claude Code session ran at once, with no prompt, as `postgres`. |
 | A separate macOS user that owns the production files (Plan B) | **Boundary for the change itself** | Not built. It is the only control that stops an agent from skipping the approval (R2). |
 
 **What this means.** Plan A makes an approval impossible to *forge* in the database. It does not make the
@@ -134,11 +137,22 @@ buttons, treat A2 as a safeguard again and say so.
 
 - **R1:** in an attended session you may click "Allow" on the Keychain dialog when an agent asks.
   Allow only for a command you started yourself. **Never click "Always Allow"**: that trusts the
-  `security` tool for every later read.
+  `security` tool for every later read. This happened once (G6, 2026-10-16). The fix is
+  `restore-credentials`, then `split-credentials` (Deny), which re-creates the item with no trusted apps.
 - **R2 (T5):** production files stay writable by any process that runs as `vilmerfrost`. Closing this
   needs Plan B (a separate macOS identity that owns the config files).
 - **R3:** anyone who knows the ntfy topic sees proposal summaries and can tap Reject. A Reject can only
   stop a change.
 - **R4:** if the decide page's host account is compromised, a changed page could capture a code for a
   different proposal within its 30 seconds. Check the artifact hash on the page against the morning
-  brief.
+  brief. (Not in use: option A has no page.)
+- **T3, open by decision (Vilmer, 2026-10-16):** the claude.ai Supabase connector keeps full access and runs
+  SQL as `postgres` from any Claude session, including Claude Code sessions. A session that is tricked can
+  insert a decision through it. The routines do not use it. Close it with the read-only connector URL (A5)
+  or by disconnecting the connector.
+- **R5:** a browser that is signed in to the Supabase dashboard can run SQL as `postgres` (the SQL editor).
+  Browser tools ask before they use a new site: never allow supabase.com for an agent.
+- **R6 (decision, Vilmer, 2026-10-16): the `postgres` password was not rotated.** It is the same password
+  that sat in `.env.local` until E3, readable by any process that ran as `vilmerfrost`, and an agent test
+  process read it once at G6. Anything that kept a copy can still use it. Rotating it (dashboard → Database →
+  Reset database password, then split again) closes this.

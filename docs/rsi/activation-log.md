@@ -322,3 +322,48 @@ Branch `rsi/m0035-e`, commit `c079c04`. Suite 1451 passed; edge function 12/12. 
 - **Undo** (never automatic): `launchctl bootout gui/$(id -u)/com.vilmerfrost.amem-archive`, delete the
   installed plist, `git revert 08d6348` in `~/agent-config` (revert, not reset: routines may commit to main).
   The archive data stays (Phase F undo is separate).
+
+## Phase G: amem-decide, option A (2026-10-16 20:53–21:05 CEST), approved in chat
+
+Option A (Vilmer): terminal-only Apply. The phone gets Reject only. No TOTP secret, no hosted decide page
+(so R4 does not apply). Apply is `amem rsi decide <id> apply` in Vilmer's terminal (Keychain password).
+
+- **Preflight:** function secrets were the platform's own only (no `RSI_TOTP_SECRET`, no `RSI_DECIDE_ORIGIN`).
+  Deployed functions: only the legacy `amem-undo`.
+- **G1, deploy** (20:53:50): `supabase functions deploy amem-decide --no-verify-jwt --project-ref
+  uyolylfqjxoplpqmplpq` from `main` `9c4cb71`. Exit 0, 6.8 kB. Version 1, ACTIVE, `verify_jwt` false.
+- **G2, source check:** the deployed function, downloaded into a temp folder, is byte-identical to the repo
+  (`index.ts`, `handler.ts`, `totp.ts`). The test file is not deployed.
+- **G3, live test** (as `amem_app`; one labelled test proposal `ee814446-946b-490a-9437-987b90c85625`,
+  "Phase G e2e test (disposable, no files)", artifact `368b1484b373…` with no files). All 5 cases passed:
+  - Apply without a code → 503 "Phone approval is not set up — decide in the terminal";
+  - Apply with a code → 503 (no secret, so no code is checked and nothing is counted);
+  - Reject with a wrong token → 403 "Not allowed";
+  - Reject with the right token → 200 "Rejected — nothing will change";
+  - Reject again → 200 "Already recorded".
+
+  Database: one `reject` / `phone` decision; the proposal is `rejected`; both tokens are used (one decision
+  consumes the apply and reject tokens, by design). **These rows stay**: the audit trail is append-only.
+  The test also shows R3 in practice: code running as `vilmerfrost` can arm a Reject token and reject a proposal.
+- **G4 (A4), `supabase logout`** (20:55:29): token deleted. The "Supabase CLI" Keychain item and the token file
+  are gone; `supabase projects list` fails with `AccessTokenRequiredError`. No shell startup file and no launch
+  environment sets `SUPABASE_ACCESS_TOKEN`. A later deploy or function rollback needs Vilmer's `supabase login`.
+- **G6, live gate test, first attempt (20:55:49): FAILED.** The agent's own shell ran
+  `security find-generic-password -s amem-admin-db -w`. The read returned the value after about 9 s: Vilmer
+  clicked **Always Allow** by mistake. The test process never printed or stored the value. Stopped there.
+  - **Fix (Vilmer, ~20:58):** `amem admin restore-credentials`, then `amem admin split-credentials` (Deny on the
+    probe). This re-created the item with no trusted apps and set a new random `amem_app` password.
+  - **Decision (Vilmer): no rotation of the `postgres` password.** It is the same password that sat in
+    `.env.local` until E3, and the agent's test process read it once at 20:55. Recorded as R6.
+  - **After the fix:** `credentials-status` exit 0 (`amem_app`, item present); the forged-decision probe again
+    11/11 refused, 0 rows left.
+- **G6, second attempt (20:59:50): passed.** The same read: Vilmer clicked Deny; `security` exit 128, no value.
+- **Routine cycle after the fix:** the 21:05 run exited 0 as `amem_app` with its new password: `amem-ingest`
+  (0 new, 351 present), `amem-sessions` (260 files, 1 updated, 1 summary) and `amem-undo-poll` (0 requests).
+  No FAIL lines since 20:56.
+- **G5 (A5), the Supabase connector: not done, by decision.** Vilmer set the claude.ai connector's tools to
+  "Ask always". A test `select` from this Claude Code session ran at once with **no prompt**, as `postgres`.
+  So that setting does not reach Claude Code sessions, and it is not a boundary here. **Decision (Vilmer):
+  keep the connector with full access for now.** T3 stays open (see least-privilege.md).
+- **Undo** (never automatic): delete `amem-decide` (dashboard, or the CLI after `supabase login`); `supabase login`
+  undoes A4. The G3 test rows cannot be removed (append-only by design).
