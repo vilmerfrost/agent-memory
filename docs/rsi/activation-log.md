@@ -174,3 +174,41 @@ Both ran right after the 18:47:59 ingest run. Nothing was pushed: `origin/main` 
 **Undo:**
 - D1: `git -C ~/agent-config revert -m 1 f87355e`, or a reset to `319fe0a` (nothing is pushed).
 - D2: `git -C ~/Projects/agent-memory reset --hard 32ea623 && uv sync`.
+
+## Phase E: Plan A built (2026-10-16), approved in chat as the design
+
+Branch `rsi/m0035-e`, commit `c079c04`. Suite 1451 passed; edge function 12/12. See
+[least-privilege.md](least-privilege.md).
+
+## E1: Phase E migrations (2026-10-16 19:51:41 CEST), approved in chat
+
+- **Applied**, from a folder holding only these two files (taken from `c079c04`, hashes checked first):
+  - `20261023010000_amem_app_role.sql`, sha256 `af72e5d561f6d43220d759ecd6db102d53c95fac0178bdba6ba739d2bb01ea61`;
+  - `20261023020000_rsi_totp.sql`, sha256 `2ba9a6612bb449cb48765e4547359d6ad0f2fc4703a5958425977dbca24f93fd`.
+
+  The command was the main checkout's `amem db migrate --dir`. Exit 0, about 1 s. `schema_migrations`
+  now holds 25 files.
+- **[verify_least_privilege.sql](verify_least_privilege.sql)** (sha256 `c6cde45a…`) ran with no error.
+  The `rsi_*` and TOTP tables hold 0 rows afterwards (the ROLLBACK worked).
+- **`amem_app`:**
+  - login, **no password yet** (it cannot connect until E3);
+  - not superuser, no create-role, no RLS bypass;
+  - select on 25 of 28 tables (not the two TOTP tables; only four columns of `rsi_decision_tokens`);
+  - insert on 23 tables (not `rsi_decisions`, the tokens, the TOTP tables or `schema_migrations`).
+- **API roles:**
+  - `anon` / `authenticated` reach 0 of 28 tables;
+  - `service_role` reaches the same 16 tables as before;
+  - `service_role` runs only `amem_rsi_record_phone_decision` and `amem_rsi_phone_bad_code`. The
+    token-only function is gone from it.
+  - Policies: 49.
+- **Security advisors:** INFO only. `rsi_totp_used` and `rsi_totp_failures` have RLS and no policy
+  (owner-only, as intended). The 8 older INFO notes are gone, because those tables now have
+  `amem_app` policies.
+- **Denied:** the `parent-guard` hook blocked a read-only `launchctl print` started from a worktree.
+  It was not worked around: the ingest-idle check used `ps`, and the ingest watch ran from the normal
+  working folder.
+- **Ingestion after E1:** the 20:04 run exited 0: `amem-ingest` (0 new, 350 present, 0 unparsed),
+  `amem-sessions` (266 files, 4 updated, eval=144) and `amem-undo-poll` (0 requests). No FAIL lines since 19:51.
+  It still runs as `postgres`; `amem_app` takes over only at E3.
+- **Undo** (never automatic): [rollback_least_privilege.sql](rollback_least_privilege.sql) restores the
+  Phase C state. It is tested.
