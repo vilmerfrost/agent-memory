@@ -821,8 +821,19 @@ class SandboxReplayer:
         if pairs > cap:          # refused before any container: a bigger replay than the night allows
             raise ExperimentFailed(f"replay of {len(cases)} case(s) x {rc.reps} rep(s) = {pairs} A/B pairs is over "
                                    f"the cap of {cap}")
-        r = rsi_replay.run_replay(artifact_hash, cases, rc, root=RA.sandbox_dir(), experiment_id=experiment_id,
-                                  budget=budget, baseline_id=baseline_id)
+        # A live agent or judge needs rsi-internal + the egress proxy. `replay.ensure_network` (unattended nights)
+        # brings them up for this replay and takes them down again if they were not up before.
+        live = rc.agent != "stub" or rc.judge in ("codex", "claude")
+        ensure = bool(self.cfg.get("ensure_network")) and live
+        box = sandbox_module().Sandbox(RA.sandbox_dir()) if ensure else None
+        was_up = bool((box.net_status() or {}).get("proxy_running")) if box is not None else True
+        try:
+            r = rsi_replay.run_replay(artifact_hash, cases, rc, root=RA.sandbox_dir(), experiment_id=experiment_id,
+                                      budget=budget, baseline_id=baseline_id, ensure_network=ensure)
+        finally:
+            if box is not None and not was_up:
+                with contextlib.suppress(Exception):
+                    box.net_down()
         v = _dget(r, "verdict")
         return ReplayOutcome(verdict=str(_dget(v, "verdict", v)), reasons=[str(x) for x in (_dget(v, "reasons") or [])],
                              arms=dict(_dget(r, "arms") or {}), artifact_hash=_dget(r, "artifact_hash"),

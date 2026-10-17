@@ -72,7 +72,8 @@
     "max_budget_usd": 0.05,
     "judge_model": "gpt-6-luna",
     "judge_credentials": "keychain:rsi-sandbox/openai",
-    "judge_credential_name": "CODEX_API_KEY"
+    "judge_credential_name": "CODEX_API_KEY",
+    "ensure_network": true
   },
   "staging": {
     "timeout_s": 300

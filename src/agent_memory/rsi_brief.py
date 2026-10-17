@@ -410,7 +410,9 @@ def judgment_text(judge: Any, jev: Any) -> str:
     if isinstance(judge, dict) and judge.get("mode"):
         n, wb, wa = judge.get("judged"), judge.get("wins_b"), judge.get("wins_a")
         rate = judge.get("b_winrate")
+        ties = judge.get("ties")
         parts.append(f"judge {text(judge['mode'], 20)}: candidate won {_fmt(wb)}/{_fmt(n)}, baseline {_fmt(wa)}"
+                     + (f", ties {_fmt(ties)}" if _count(ties) and ties else "")
                      + (f", B win rate {rate:.2f}" if _num(rate) else ""))
     else:
         parts.append("judge: not recorded")

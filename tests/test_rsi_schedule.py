@@ -222,6 +222,62 @@ def test_a_replay_over_the_pair_cap_is_refused_before_any_container() -> None:
                    budget=Budget(cfg.budget))
 
 
+def test_live_replay_brings_the_network_up_and_down_only_when_asked(monkeypatch: pytest.MonkeyPatch) -> None:
+    from agent_memory import rsi_replay
+    from agent_memory.rsi_budget import Budget
+    events: list[Any] = []
+
+    class Box:
+        def __init__(self, root: Path) -> None:
+            pass
+
+        def net_status(self) -> dict[str, Any]:
+            events.append("status")
+            return {"proxy_running": False}
+
+        def net_down(self) -> dict[str, Any]:
+            events.append("down")
+            return {}
+
+    monkeypatch.setattr(N, "sandbox_module", lambda: SimpleNamespace(Sandbox=Box))
+
+    def fake_run(h: str, cases: Any, rc: Any, **kw: Any) -> Any:
+        events.append(("run", kw["ensure_network"], rc.judge, len(cases)))
+        return SimpleNamespace(verdict=SimpleNamespace(verdict="NO_EFFECT", reasons=["checks-equal"]), arms={},
+                               artifact_hash=h, baseline_id="bl-1", eval_path=None, budget_stop=None, runs=[],
+                               judge=None, jev=None)
+    monkeypatch.setattr(rsi_replay, "run_replay", fake_run)
+    cfg = first_cfg()
+    assert cfg.replay["ensure_network"] is True
+    out = N.SandboxReplayer(cfg.stages, cfg.replay).replay(artifact_hash="a" * 64, experiment_id="exp-20261018-ab",
+                                                          baseline_id="bl-1", budget=Budget(cfg.budget))
+    assert out.verdict == "NO_EFFECT" and events == ["status", ("run", True, "codex", 3), "down"]
+    events.clear()
+    stub = N.load_config()                                   # stub agent and judge: no network, nothing touched
+    N.SandboxReplayer(stub.stages, {**stub.replay, "ensure_network": True}).replay(
+        artifact_hash="a" * 64, experiment_id="exp-20261018-ab", baseline_id="bl-1", budget=Budget(stub.budget))
+    assert events == [("run", False, "stub", 3)]
+
+
+def test_mock_rehearsal_config_keeps_the_limits_and_drops_every_paid_stage(tmp_path: Path) -> None:
+    from agent_memory import rsi_rehearsal as R
+    mock = N.load_config(R.mock_config(FIRST, tmp_path / "mock.json"))
+    first = first_cfg()
+    assert S.paid_stages(mock) == [] and mock.budget.max_usd == 0.0 and S.paid_plan(mock)["calls"] == []
+    for k in ("max_experiments", "max_hypotheses", "max_ab_pairs", "max_sandbox_runs", "wall_clock_s", "model_retries"):
+        assert getattr(mock.budget, k) == getattr(first.budget, k), k
+    assert mock.replay["credentials"] == mock.replay["judge_credentials"] == "none" and mock.replay["reps"] == 1
+    assert S.prerequisites(S.schedule_section(mock.path)) == S.DEFAULT_PREREQS
+    now = datetime(2026, 10, 18, 22, 40, tzinfo=CEST)
+    log = write_log(tmp_path, R.routines_lines(NIGHT, now, daily=False))
+    assert S.check_prerequisites(log, NIGHT, now, S.DEFAULT_PREREQS) == ["prerequisite amem-daily: no run in routines.log"]
+    log.write_text(R.routines_lines(NIGHT, now, daily=True))
+    assert S.check_prerequisites(log, NIGHT, now, S.DEFAULT_PREREQS) == []
+    for bad in (R.D.REAL_HOME / "sandbox-dev" / "x", R.D.REAL_HOME / "sandbox" / "x"):
+        with pytest.raises((R.RehearsalError, R.D.DemoError)):
+            R.check_workdir(bad)
+
+
 def test_paid_plan_lists_every_paid_call_and_fits_the_cap() -> None:
     plan = S.paid_plan(first_cfg())
     got = {(r["stage"], r["model"]): r["count"] for r in plan["calls"]}
