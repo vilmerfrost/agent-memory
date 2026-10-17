@@ -1,0 +1,29 @@
+{
+  "format": "rsi-prices/1",
+  "version": "2026-10-17",
+  "_note": "Prices the RSI budget (src/agent_memory/rsi_budget.py) books for a paid model call that reports no USD cost itself (Codex CLI, the Jev wrapper). ASSUMPTIONS, not verified against any provider's own price page: a human checks and changes them. A cost the provider reports (Claude Code's total_cost_usd) always wins over this table. A paid model the table does not name gets `default` (deliberately high), and a paid call with neither a cost nor token counts gets `unknown_usage_usd`: the budget never books a paid call at $0. Token prices are USD per million tokens. The investigator only reads this file (rsi_night.SELF_FILES).",
+  "models": {
+    "gpt-6-luna": {
+      "basis": "tokens",
+      "input_per_mtok": 0.10,
+      "cached_input_per_mtok": 0.01,
+      "cache_write_per_mtok": 0.125,
+      "output_per_mtok": 0.50,
+      "unknown_usage_usd": 0.05,
+      "source": "third-party listings (eesel.ai GPT-6 Luna pricing guide, anotherwrapper.com LLM pricing), read 2026-10-17; not verified against the provider's price page",
+      "_usage": "Codex `exec --json` turn.completed: input_tokens includes cached_input_tokens and cache_write_input_tokens; output_tokens includes reasoning_output_tokens (G2: reasoning 388 of output 427), so reasoning is not priced twice. Codex bills this model with the API key it gets, so the API price is the right basis."
+    },
+    "jev-1.14.0": {
+      "basis": "call",
+      "per_call_usd": 0.01,
+      "source": "flat conservative price per call (the G2 plan's estimate). Third-party listings (OpenRouter, Infrabase, read 2026-10-17) show $0.042 per million input tokens and $0 output, so a replay or triage call (a few thousand tokens) costs far less than $0.001; not verified against TypeSafe's price page. The jev wrapper does not expose usage, so the call is booked flat."
+    }
+  },
+  "default": {
+    "basis": "tokens",
+    "input_per_mtok": 15.0,
+    "output_per_mtok": 75.0,
+    "unknown_usage_usd": 1.0,
+    "source": "fail-closed fallback for a paid model this table does not name: priced well above any model the RSI stages use, so an unpriced model stops a budget early instead of running free"
+  }
+}

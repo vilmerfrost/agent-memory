@@ -54,6 +54,7 @@ from types import ModuleType
 from typing import Any
 
 from agent_memory import config, jev as J, questions as Q, rsi_artifact as RA
+from agent_memory import rsi_budget as BU
 from agent_memory import rsi_verdict as V
 
 SUITE = "sandbox-replay"
@@ -230,7 +231,10 @@ class RunRecord:
     tool_calls: list[dict] = field(default_factory=list)
     tokens_in: int = 0
     tokens_out: int = 0
-    cost_usd: float = 0.0
+    cost_usd: float = 0.0                # what the budget books (rsi_budget.PriceTable.book)
+    cost_basis: str = ""                 # reported | table | default | unknown-usage | cli-cap | free | none
+    tokens_cached: int = 0
+    tokens_cache_write: int = 0
     check_passed: bool | None = None
     error: str | None = None
     timed_out: bool = False
@@ -443,10 +447,16 @@ def run_jev(state: str, mode: str, budget: Any = None) -> V.JevResult:
                                    error="jev live needs TYPESAFE_API_KEY and AMEM_JEV_LIVE=1")
             if budget is not None and hasattr(budget, "take_call"):
                 budget.take_call(J.MODEL, stage="replay-jev")
-            t0 = time.monotonic()
-            answers = J.ask(state, qs)
-            if budget is not None and hasattr(budget, "record_call"):
-                budget.record_call(J.MODEL, stage="replay-jev", duration_s=round(time.monotonic() - t0, 2))
+            t0, ok = time.monotonic(), False
+            try:
+                answers = J.ask(state, qs)
+                ok = True
+            finally:            # booked even when the call failed: it may have been billed (fail-closed)
+                if budget is not None and hasattr(budget, "record_call"):
+                    # The wrapper reports no usage or cost: usd 0 makes the budget book the price table's flat
+                    # per-call Jev price (config/rsi-prices.json), never $0.
+                    budget.record_call(J.MODEL, stage="replay-jev", duration_s=round(time.monotonic() - t0, 2),
+                                       ok=ok, error=None if ok else "jev call failed")
         else:
             J._validate(state, qs)            # fixture mode by construction: never J.ask (it may be live)
             answers = J._ask_fixture(state, qs)
@@ -487,11 +497,29 @@ def parse_agent(stdout: str, agent: str, model: str | None) -> dict[str, Any]:
         calls = [{"name": t.name, "input": t.status} for t in out.tools]
     tokens_in = sum(g.usage.get("total", 0) - g.usage.get("output", 0) for g in out.generations)
     tokens_out = sum(g.usage.get("output", 0) for g in out.generations)
+    # Parts of tokens_in that are priced differently: cache reads (Codex input_cached_tokens, Claude
+    # cache_read_input_tokens) and cache writes (Codex cache_write_input_tokens, Claude cache_creation_input_tokens).
+    cached = sum(g.usage.get("input_cached_tokens", 0) + g.usage.get("cache_read_input_tokens", 0)
+                 for g in out.generations)
+    cache_write = sum(g.extra.get("cache_write_input_tokens", 0) + g.usage.get("cache_creation_input_tokens", 0)
+                      for g in out.generations)
     cost = sum(g.cost_usd or 0.0 for g in out.generations)
     seen = bool(out.generations) or out.result is not None or out.num_turns is not None
     return {"tool_calls": calls, "tokens_in": int(tokens_in), "tokens_out": int(tokens_out),
+            "tokens_cached": int(cached), "tokens_cache_write": int(cache_write),
             "cost_usd": round(float(cost), 6), "final": (out.result or "")[-4000:], "is_error": out.is_error,
             "parsed": seen, "instructions": list(stub.get("instructions") or []), "rules": list(stub.get("rules") or [])}
+
+
+def price(budget: Any, model: str | None, parsed: Mapping[str, Any]) -> tuple[float, str]:
+    """(USD, basis) for one parsed agent or judge output: the cost the CLI reported, else the price table
+    (config/rsi-prices.json; never $0 for a paid model). The budget's own table when it has one, so the replay's
+    evidence and the budget book the same number."""
+    kw = {k: int(parsed.get(k) or 0) for k in ("tokens_in", "tokens_out", "tokens_cached", "tokens_cache_write")}
+    book = getattr(budget, "book", None)
+    if callable(book):
+        return book(model, usd=float(parsed.get("cost_usd") or 0.0), **kw)
+    return BU.load_prices().book(model, reported_usd=float(parsed.get("cost_usd") or 0.0), **kw)
 
 
 # ---------------------------------------------------------------- the runner
@@ -541,6 +569,7 @@ class _Replay:
         self.budget_stop: str | None = None
         self.prepared = False                     # an arm was built for this replay
         self.home_digests: dict[str, str] = {}
+        self.judge_costs: dict[tuple[str, int], tuple[float, str]] = {}   # live judge: (usd, basis) per pair
         self.settle_s = float(getattr(sb, "settle_s", SETTLE_S))
         self.manifest: dict | None = None
         self.baseline_id: str | None = None
@@ -716,7 +745,13 @@ class _Replay:
         parsed = parse_agent(res.stdout, cfg.agent, cfg.model)
         rec.exit_code, rec.timed_out, rec.duration_s = res.exit_code, res.timed_out, res.duration_s
         rec.tool_calls, rec.final = parsed["tool_calls"], parsed["final"]
-        rec.tokens_in, rec.tokens_out, rec.cost_usd = parsed["tokens_in"], parsed["tokens_out"], parsed["cost_usd"]
+        rec.tokens_in, rec.tokens_out = parsed["tokens_in"], parsed["tokens_out"]
+        rec.tokens_cached, rec.tokens_cache_write = parsed["tokens_cached"], parsed["tokens_cache_write"]
+        rec.cost_usd, rec.cost_basis = price(self.budget, self.billed_model(rec), parsed)
+        if rec.cost_basis == "unknown-usage" and cfg.agent == "claude" and cfg.max_budget_usd > 0:
+            # No cost and no tokens (killed, unreadable): Claude Code enforced --max-budget-usd, so that cap is
+            # the most this run can have cost.
+            rec.cost_usd, rec.cost_basis = round(float(cfg.max_budget_usd), 6), "cli-cap"
         rec.instructions, rec.rules = parsed["instructions"], parsed["rules"]
         if res.timed_out:
             rec.error = "timeout"
@@ -726,8 +761,13 @@ class _Replay:
             rec.error = "agent reported an error" if parsed["is_error"] else "agent output unreadable"
         if rec.error is None and cfg.agent == "stub":
             rec.error = self.content_mismatch(arm, rec.instructions)
-        self.charge(rec.run_id, rec.duration_s, rec, model=rec.model)
+        self.charge(rec.run_id, rec.duration_s, rec, model=self.billed_model(rec))
         return rec
+
+    def billed_model(self, rec: RunRecord) -> str:
+        """The model a run is priced and booked as. A live agent without --model runs its CLI's default model:
+        booked under the agent's name, a paid model the price table does not name (its high default)."""
+        return rec.model or self.cfg.agent
 
     def content_mismatch(self, arm: str, seen: Sequence[Mapping[str, Any]]) -> str | None:
         """The stub reports the sha256 of every instruction file it read: arm A must see each changed file's
@@ -775,12 +815,17 @@ class _Replay:
             rec.error = "check timeout"
 
     def charge(self, run_id: str, duration_s: float, rec: RunRecord | None, model: str | None = None) -> None:
+        """Book one container run. An agent run carries its priced cost (rec.cost_usd, rec.cost_basis); a check
+        run has no model and costs nothing."""
         if self.budget is None or not hasattr(self.budget, "record_run"):
             return
-        self.budget.record_run(run_id, duration_s=float(duration_s or 0.0),
-                               tokens_in=rec.tokens_in if rec else 0, tokens_out=rec.tokens_out if rec else 0,
-                               usd=rec.cost_usd if rec else 0.0, model=model,
-                               exit_code=rec.exit_code if rec else None, error=rec.error if rec else None)
+        if rec is None:
+            self.budget.record_run(run_id, duration_s=float(duration_s or 0.0), model=model)
+            return
+        self.budget.record_run(run_id, duration_s=float(duration_s or 0.0), tokens_in=rec.tokens_in,
+                               tokens_out=rec.tokens_out, tokens_cached=rec.tokens_cached,
+                               tokens_cache_write=rec.tokens_cache_write, usd=rec.cost_usd, model=model,
+                               price_basis=rec.cost_basis or None, exit_code=rec.exit_code, error=rec.error)
 
     # ---- the pairs
 
@@ -896,14 +941,17 @@ class _Replay:
                              limits={"memory": "1g", "cpus": "1", "pids": 256},
                              credentials=self.cfg.judge_credentials, credential_name=self.cfg.judge_credential_name)
         parsed = parse_agent(res.stdout, self.cfg.judge, model)
+        # One judge call, one cost, booked once: on the model call. Codex reports tokens but no USD, so the budget
+        # prices it from the price table (config/rsi-prices.json). The container run is recorded without a cost.
+        self.judge_costs[(case, rep)] = price(self.budget, model, parsed)
         if self.budget is not None and hasattr(self.budget, "record_call"):
             self.budget.record_call(model, stage="replay-judge", tokens_in=parsed["tokens_in"],
-                                    tokens_out=parsed["tokens_out"], usd=parsed["cost_usd"],
-                                    duration_s=res.duration_s, ok=res.exit_code == 0)
+                                    tokens_out=parsed["tokens_out"], tokens_cached=parsed["tokens_cached"],
+                                    tokens_cache_write=parsed["tokens_cache_write"], usd=parsed["cost_usd"],
+                                    duration_s=res.duration_s, ok=res.exit_code == 0 and not res.timed_out)
         if self.budget is not None and hasattr(self.budget, "record_run"):
-            self.budget.record_run(rid, duration_s=res.duration_s, tokens_in=parsed["tokens_in"],
-                                   tokens_out=parsed["tokens_out"], usd=parsed["cost_usd"], model=model,
-                                   exit_code=res.exit_code)
+            self.budget.record_run(rid, duration_s=res.duration_s, model=model, exit_code=res.exit_code,
+                                   cost_on_call=True)
         if res.timed_out or res.exit_code != 0:
             raise RuntimeError(f"judge run exit {res.exit_code}{' (timeout)' if res.timed_out else ''}")
         return parse_judge_answer(parsed["final"])
@@ -948,7 +996,10 @@ def run_replay(artifact_hash: str, cases: Sequence[ReplayCase], cfg: ReplayConfi
     root: the RSI sandbox root (a temp dir in tests; never implied). baseline_id: the baseline the caller
     expects (for example tonight's); a different manifest baseline is a stale baseline. budget (optional):
     take_sandbox_run / record_run / remaining_s / take_call / record_call (rsi_budget.Budget); a
-    BudgetExhausted stops the replay cleanly with INCONCLUSIVE and result.budget_stop set. sandbox: an
+    BudgetExhausted stops the replay cleanly with INCONCLUSIVE and result.budget_stop set. Costs: an agent run
+    is booked on its run, a live judge call on its model call (its container run carries no cost), a live Jev
+    call on its model call at the price table's flat price; a cost no CLI reports comes from the price table
+    (config/rsi-prices.json), never $0 for a paid model (result.totals has the split). sandbox: an
     rsi_sandbox.Sandbox (or a test double) for `root`; default Sandbox(root).
     """
     cfg.validate()
@@ -1018,9 +1069,17 @@ def run_replay(artifact_hash: str, cases: Sequence[ReplayCase], cfg: ReplayConfi
                                                "result": jev_res.summary() if jev_res else None})
     verdict = V.decide(machine, judge, jev_res, policy)
     finished = _now()
+    # What the replay's model calls cost, as the budget books them (one cost per call): agent runs (cost_usd),
+    # live judge calls, the live Jev call (a flat table price: its wrapper reports nothing).
+    judge_usd = round(sum(u for u, _ in r.judge_costs.values()), 6)
+    jev_called = cfg.jev == "live" and jev_res is not None and jev_res.status in ("ok", "error")
+    jev_usd, jev_basis = price(budget, J.MODEL, {}) if jev_called else (0.0, "")
+    agent_usd = round(sum(x.cost_usd for x in r.runs), 6)
+    bases = {x.cost_basis for x in r.runs} | {b for _, b in r.judge_costs.values()} | {jev_basis}
     totals = {"runs": len(r.runs), "check_runs": sum(x.check_run_id is not None for x in r.runs),
               "tokens_in": sum(x.tokens_in for x in r.runs), "tokens_out": sum(x.tokens_out for x in r.runs),
-              "cost_usd": round(sum(x.cost_usd for x in r.runs), 6),
+              "cost_usd": agent_usd, "judge_cost_usd": judge_usd, "jev_cost_usd": round(jev_usd, 6),
+              "model_cost_usd": round(agent_usd + judge_usd + jev_usd, 6), "cost_bases": sorted(bases - {""}),
               "duration_s": round(sum(x.duration_s + x.check_duration_s for x in r.runs), 2)}
     result = ReplayResult(verdict=verdict, arms=r.arms(), runs=r.runs, judge=judge, jev=jev_res,
                           evidence_dir=r.evidence, eval_path=None, artifact_hash=artifact_hash,
@@ -1230,12 +1289,13 @@ def main(argv: Sequence[str] | None = None, out: Callable[[str], None] = print) 
             except (rs.SandboxError, OSError) as exc:
                 art = {"ok": False, "error": str(exc)}
             plan = {"dry_run": True, "root": str(sb.root), "artifact": art, "cases": [c.id for c in cases],
-                    "config": cfg.describe(), "docker": rs.docker_available(), **_plan(cases, cfg, args.experiment)}
+                    "config": cfg.describe(), "docker": rs.docker_available(), "prices": BU.load_prices().describe(),
+                    **_plan(cases, cfg, args.experiment)}
             out(json.dumps(plan, indent=None if args.json else 2, sort_keys=True))
             return 0
         res = run_replay(args.artifact, cases, cfg, root=root, experiment_id=args.experiment,
                          baseline_id=args.baseline_id, ensure_network=args.net_up)
-    except (ReplayError, V.PolicyError, Q.QuestionConfigError) as exc:
+    except (ReplayError, V.PolicyError, Q.QuestionConfigError, BU.PriceConfigError) as exc:
         print(f"rsi replay: {exc}", file=sys.stderr)
         return 2
     if args.json:

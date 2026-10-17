@@ -43,6 +43,27 @@ another one in the manifest is a stale baseline. The budget is `rsi_budget.Budge
 every container, `record_run` after, `remaining_s` caps timeouts, `take_call`/`record_call` around live
 judge and Jev calls); a `BudgetExhausted` stops the replay cleanly (`budget_stop`, INCONCLUSIVE).
 
+## Costs and the USD cap
+
+The budget's `max_usd` cap sees every model call of a replay, each booked once:
+
+| Call | Booked on | Price |
+|---|---|---|
+| agent run (Claude Code) | its container run | the CLI's `total_cost_usd`; no cost and no tokens (killed, unreadable) → its `--max-budget-usd` (`cli-cap`) |
+| agent run (Codex) | its container run | tokens × the price table |
+| live judge (Codex) | its model call (`record_call`) | tokens × the price table; the judge's container run is recorded with `cost_on_call=True` and no cost |
+| live Jev | its model call | the table's flat per-call price (the wrapper reports no usage); a failed call is booked too |
+
+The price table is `config/rsi-prices.json` (`rsi-prices/1`, versioned, its version and sha256 in `costs()`
+and the dry-run plan). Its prices are **assumptions** from third-party listings, not verified against the
+providers' price pages; a human checks and changes them. Rules (`rsi_budget.PriceTable.book`): a cost the
+provider reports wins; else the table (Codex: input, cached input, cache writes and output priced apart;
+reasoning tokens are part of `output_tokens`); a paid model the table does not name gets the table's high
+`default`; a paid call with neither a cost nor tokens books `unknown_usage_usd`. A paid call is never booked at
+$0. The pre-call estimate of a paid model without a configured `cost_estimate_usd` comes from the table too.
+`result.totals` splits the booked cost: `cost_usd` (agents), `judge_cost_usd`, `jev_cost_usd`, `model_cost_usd`,
+`cost_bases`.
+
 ## Cases (`bench/rsi-replay/`)
 
 | Case | Task | Check (hidden from the agent) |
@@ -111,9 +132,11 @@ experiment replaces its evidence and its run dirs.
   0/8 after 1 s and 2 s). So each replay stages its inputs under a new path, and waits `SETTLE_S` (2 s) after it
   prepared or replaced anything a container mounts.
 
-## Live replay (unverified in Mission 005)
+## Live replay
 
-Live agents and judges exist behind flags and were not run (no paid calls without approval). After approval:
+Live agents and judges run behind flags, only with approval. Gates G1 and G2 (2026-10-17, dev root
+`~/sandbox-dev/sandbox`) ran them: live Claude Haiku agents, the Codex blind judge and live Jev worked. The
+generic commands:
 
 ```
 export RSI_SANDBOX_DIR=$HOME/sandbox-dev           # a dev root, not ~/sandbox
@@ -132,5 +155,72 @@ agent (Phase H measured $0.0005 for a 2-turn task; these tasks take about 3 to 6
 25k input tokens per call), roughly $0.05 to $0.30. Hard cap on the agent side: `--max-budget-usd 0.25` × 6 =
 $1.50; the Codex judge has no per-run flag, so its cap is the spend-capped sandbox key.
 
-Not verified: the live agent and judge command lines inside the worker, Codex `-s read-only` for the judge,
-tool-call parsing of live Claude stream-json and Codex events, Jev live answers for a replay state.
+G2 measured: 6 Haiku agent runs $0.0080 (CLI-reported), 3 Codex judge calls 38.8k input / 764 output tokens
+(about $0.005 at the table's prices; G2 itself booked $0 for them, fixed since), 1 Jev call.
+
+## Gate G2b: re-run after the G2 fixes (commands written, not run)
+
+G2 found two problems, both fixed: (1) the USD cap saw only Claude's cost (Codex and Jev were booked $0, and the
+judge's cost went on both its call and its run) → the price table and booking above; (2) live Haiku put the
+closing line in its chat reply, not in REPORT.md, in both arms (A 0/3, B 0/3) → the `closing-line` candidate now
+says the line is the last line inside the report file, and the `report-todos` prompt says REPORT.md is the report
+(the hidden check is unchanged). The new candidate bytes give a new artifact, so G2b stages it again. Same
+approval rules as G2 (paid calls, a $0.50 hard cap); same safety steps (isolation suite on the dev root,
+production and hosted fingerprints before and after, `net-down`, delete the Jev key file afterwards).
+
+1. Code: the rsi/m005 worktree with this fix merged (`cd ~/worktrees/agent-memory/m005`, `git log --oneline -1`).
+2. Stage the new artifact on the dev root (no model, no Docker):
+
+   ```
+   uv run python -m agent_memory.rsi_replay stage-synthetic --root ~/sandbox-dev/sandbox \
+       --experiment exp-20261017-g2b --candidate closing-line
+   # expect {"baseline_id": "bl-63a9878bbf11",
+   #         "artifact_hash": "bc4fe3b2c742fe0a84a849626befd7b81088391dca0716f580a67de4cf99a13a"}
+   ```
+
+   Same baseline as G1/G2 (the home is unchanged). Another experiment id gives another hash: use what it prints.
+3. Runner: copy `~/sandbox-dev/g2_run.py` to `~/sandbox-dev/g2b_run.py` and change:
+   - `ARTIFACT = "bc4fe3b2c742fe0a84a849626befd7b81088391dca0716f580a67de4cf99a13a"`,
+     `EXPERIMENT = "exp-20261017-g2b"`; `CASES` and `CONFIG` unchanged (Haiku, reps 3, Codex `gpt-6-luna`
+     judge, Jev live, `max_budget_usd=0.05`).
+   - `BUDGET`: values unchanged (`max_usd` 0.50, `model_calls` gpt-6-luna 3 / jev-1.14.0 1,
+     `default_model_calls` 0, `model_retries` 0, the same `cost_estimate_usd`). Only the `max_usd` comment is
+     wrong now: each cost is booked once (Claude reported, Codex from tokens, Jev flat $0.01).
+   - `simulate()`: book the judge and Jev like the replay does, so the simulation proves the new booking:
+     `b.record_call("gpt-6-luna", stage="replay-judge", tokens_in=13000, tokens_out=500, tokens_cache_write=13000)`
+     and `b.record_run(f"J{rep}", duration_s=10, model="gpt-6-luna", exit_code=0, cost_on_call=True)` in the judge
+     loop; `b.record_call("jev-1.14.0", stage="replay-jev")` for Jev (no `usd=`). Check that the judge calls
+     have `price_basis` "table" and usd > 0, Jev (0.01, "call"), the J runs usd 0 ("on-call"); add a Codex token
+     overrun (`record_call("gpt-6-luna", ..., tokens_in=5_000_000, tokens_out=100_000)`, about $0.55) that
+     `check()` must stop.
+   - `run()`: write `replays/g2b-result.json` (keep G2's `g2-result.json`), add `"costs": b.costs()` to the
+     budget block, and name the archive dir `<E>.archive-<time>` (a new experiment has nothing to archive).
+   The worker that made this fix ran such a copy's `simulate` on the fixed code: planned sequence allowed (15 runs,
+   3 judge + 1 Jev calls), booked $0.315625 pessimistic (agents at their $0.05 cap, Codex $0.005625 from tokens,
+   Jev $0.01, judge runs $0); the 4th judge call, 16th run, 2nd Jev call and any other paid model refused; a
+   Claude or a Codex overrun past $0.50 stopped.
+4. Simulate (no model, no Docker): `uv run python ~/sandbox-dev/g2b_run.py simulate` → exit 0, no "unexpected".
+5. Dry run (writes nothing; shows the plan and the price table version `2026-10-17`):
+
+   ```
+   env RSI_SANDBOX_DIR=$HOME/sandbox-dev/sandbox uv run python -m agent_memory.rsi_replay run \
+       --root ~/sandbox-dev/sandbox --artifact bc4fe3b2c742fe0a84a849626befd7b81088391dca0716f580a67de4cf99a13a \
+       --experiment exp-20261017-g2b --cases report-todos --reps 3 \
+       --agent claude --model claude-haiku-5-5 --credentials keychain:rsi-sandbox/anthropic --max-budget-usd 0.05 \
+       --judge codex --judge-model gpt-6-luna --judge-credentials keychain:rsi-sandbox/openai \
+       --judge-credential-name CODEX_API_KEY --jev live --dry-run
+   ```
+
+6. Live run, only with Vilmer's G2b approval (paid: 6 agent runs, 3 Codex judge calls, 1 Jev call; Jev needs
+   `TYPESAFE_API_KEY` from the secret popup and `AMEM_JEV_LIVE=1` for this process):
+
+   ```
+   env RSI_SANDBOX_DIR=$HOME/sandbox-dev/sandbox python3 sandbox/rsi_sandbox.py net-up
+   env AMEM_JEV_LIVE=1 uv run python ~/sandbox-dev/g2b_run.py run
+   env RSI_SANDBOX_DIR=$HOME/sandbox-dev/sandbox python3 sandbox/rsi_sandbox.py net-down
+   ```
+
+   Read `replays/g2b-result.json`: `budget.costs.total_usd` now includes the judge and Jev
+   (`result.totals.judge_cost_usd`, `jev_cost_usd`, `cost_bases`). Expect about $0.02-0.03 booked.
+   IMPROVES needs B passing more often than A in the machine check plus the judge and Jev agreeing; with 3 pairs
+   a live model can still give INCONCLUSIVE.

@@ -70,10 +70,13 @@ def test_retries_are_bounded_and_each_is_a_counted_call() -> None:
     def flaky() -> tuple[str, Usage]:
         n["calls"] += 1
         raise TimeoutError("slow")
-    b = Budget(cfg(model_retries=1, model_calls={"opus": 10}))
+    # max_usd 10: a failed paid call that reported nothing is booked fail-closed (opus is not in the price table:
+    # the table default's unknown_usage_usd), so the 3.0 default cap would stop the third attempt here.
+    b = Budget(cfg(model_retries=1, model_calls={"opus": 10}, max_usd=10.0))
     with pytest.raises(TimeoutError):
         b.call("opus", "s", flaky, retry_on=(TimeoutError,))
     assert n["calls"] == 2 and [c["attempt"] for c in b.calls] == [1, 2] and not any(c["ok"] for c in b.calls)
+    assert all(c["usd"] > 0 and c["price_basis"] == "unknown-usage" for c in b.calls)
     n["calls"] = 0
     with pytest.raises(TimeoutError):                           # retries=5 cannot exceed the config's 1
         b.call("opus", "s", flaky, retry_on=(TimeoutError,), retries=5)
