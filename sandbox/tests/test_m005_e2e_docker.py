@@ -9,7 +9,7 @@ agent-config's real `improve stage`, the real Docker sandbox replay with the stu
 credentials), the deterministic verdict and the approval proposer. Never ~/sandbox, the real ~/.claude, a hosted
 database, an env file or a paid call.
 
-    success          IMPROVES -> staged proposal -> `amem rsi brief` with Apply / Reject / Details
+    success          IMPROVES -> staged proposal -> `amem rsi brief` with Reject / Details (Apply withheld: stand-ins)
     no-effect        NO_EFFECT -> not promotable, candidate tested, agent-config eval_problems refuses it
     regression       WORSE -> candidate rejected, nothing staged
     provider outage  ClickHouse / past.dev raise, Langfuse down: the night goes on (partial); and the literal
@@ -175,16 +175,19 @@ def test_success_improves_is_staged_and_briefed(world: D.World, fp_before: dict[
     assert m005_proposals(world) == [(e["proposal_id"], "staged")]
     assert decisions_for(world, [e["proposal_id"]]) == 0                         # staged, never decided
     md = Path(res["brief"]["path"]).read_text()
-    for needle in (f"amem rsi decide {e['proposal_id']} apply --hash {e['artifact_hash']}",
-                   f"amem rsi decide {e['proposal_id']} reject --hash {e['artifact_hash']}",
-                   f"amem rsi show {e['proposal_id']}", "Skills used: none"):
+    for needle in (f"amem rsi decide {e['proposal_id']} reject --hash {e['artifact_hash']}",
+                   f"amem rsi show {e['proposal_id']}", "Skills used: none",
+                   "Apply:** not offered: not independently evaluated (judge stub, Jev fixture/ok)"):
         assert needle in md, needle
+    # Mission 005.5: a stub judge and fixture Jev are stand-ins, so the brief never offers Apply for them
+    assert f"amem rsi decide {e['proposal_id']} apply --hash" not in md
     n = docker_argv_isolated(world, e["experiment_id"])
     assert n == 12 and res["costs"]["sandbox_runs"] == 12 and res["costs"]["total_usd"] == 0.0
     assert res["checks"]["production_unchanged"], res["checks"]["production_diff"]
     clean(world, {"experiments": [e]})
     evidence(f"success: {e['verdict']} ({'; '.join(e['verdict_reasons'])}); proposal {e['proposal_id']} staged; "
-             f"artifact {e['artifact_hash'][:12]}; {n} docker runs --network none; brief has Apply/Reject/Details; "
+             f"artifact {e['artifact_hash'][:12]}; {n} docker runs --network none; brief has Reject/Details, Apply "
+             f"withheld (stand-in evaluation); "
              f"production fingerprint {res['checks']['production_sha256']['after'][:12]} unchanged; {res['seconds']} s")
 
 

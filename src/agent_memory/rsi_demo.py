@@ -632,7 +632,8 @@ def render(results: Sequence[Mapping[str, Any]]) -> str:
                 f" 8. staging    {e.get('status')}" + (f", proposal {e.get('proposal_id')}" if e.get("proposal_id") else "")
                 + f"; agent-config eval_problems {r.get('eval_problems')}",
                 f" 9. brief      {r['brief']['path']}: {(r['brief']['pending'] or {}).get('total', 0)} pending "
-                f"decision(s)" + "".join(f"\n               Apply:   {i['actions']['apply']}\n               Reject:  "
+                f"decision(s)" + "".join(f"\n               Apply:   {i['actions']['apply'] or 'not offered: ' + '; '.join(i.get('apply_blocked') or [])}"
+                                         f"\n               Reject:  "
                                          f"{i['actions']['reject']}\n               Details: {i['actions']['details']}"
                                          for i in (r['brief']['pending'] or {}).get('items', [])),
                 f"10. checks     production unchanged {r['checks'].get('production_unchanged')}; synthetic production "
