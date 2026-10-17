@@ -250,6 +250,28 @@ def test_environ_restores_the_callers_env(monkeypatch: pytest.MonkeyPatch) -> No
     assert os.environ["W_E2E_MARK"] == "1"
 
 
+def test_render_shows_the_ten_steps_and_the_decision_commands() -> None:
+    acts = {"apply": "amem rsi decide P apply --hash H", "reject": "amem rsi decide P reject --hash H",
+            "details": "amem rsi show P"}
+    r = {"scenario": "success", "expect": "IMPROVES", "why": "w", "night": "2026-10-18", "status": "ok", "ok": True,
+         "problems": [], "seconds": 6.0, "checkpoint": {"advanced": True}, "costs": {"total_usd": 0.0},
+         "seed": {"base": {"anchor": "2026-09-18"}, "rsi_demo": {"status": "seeded", "dataset": "d", "rule": "r",
+                                                                 "counts": {"sessions": 7, "deviations": 8}}},
+         "candidates": [{"key": "k", "rank": 0.7, "selected": True, "reason": "selected"}],
+         "evidence": {"findings": [{}], "health": {"supabase": "ok"}},
+         "experiment": {"hypothesis": {"what": "x"}, "target": "~/.claude/CLAUDE.md", "artifact_hash": "H",
+                        "baseline_id": "bl-1", "arms": {"A": {"check_pass_rate": 0.6, "runs": 3},
+                                                         "B": {"check_pass_rate": 1.0, "runs": 3}},
+                        "verdict": "IMPROVES", "verdict_reasons": ["improved"], "status": "staged", "proposal_id": "P"},
+         "eval_problems": [], "brief": {"path": "/tmp/b.md", "pending": {"total": 1, "items": [{"actions": acts}]}},
+         "checks": {"production_unchanged": True, "synthetic_production_unchanged": True,
+                    "scratch_agent_config_unchanged": True, "keychain_tripwire_hits": 0, "containers_left": [],
+                    "improve_calls": ["stage"], "db_host": "127.0.0.1"}}
+    out = D.render([r])
+    assert all(f"{n:>2}. " in out for n in range(1, 11)) and out.count("SYNTHETIC DATA") == 1
+    assert all(a in out for a in acts.values()) and "-> OK" in out
+
+
 @pytest.mark.parametrize("mode", ["healthy", "outage", "injection"])
 def test_provider_stand_ins_use_the_real_query_specs(mode: str) -> None:
     from agent_memory.integrations import evidence as E
