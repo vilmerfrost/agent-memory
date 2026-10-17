@@ -1,6 +1,6 @@
 {
   "_note": "Hand-written fixture for the sandbox-replay mixed WORSE scenario (questions/rsi-replay.toml, bench/rsi-replay scenario 'mixed-worse': all three cases, reps 1, stub agent). Not a live response.",
-  "_state": "suite: sandbox-replay/1\nagent: stub\nmodel: default\nreps: 1\ncases:\n- docs-typo: pairs=1 A_pass=1 B_pass=0\n- fix-add: pairs=1 A_pass=1 B_pass=0\n- report-todos: pairs=1 A_pass=0 B_pass=0\njudge: mode=stub judged=3 A_wins=2 B_wins=0 ties=1 unfired_B=0 errors=0\nruns: expected=6 done=6 errors=0",
+  "_replay_state":"suite: sandbox-replay/1\nagent: stub\nmodel: default\nreps: 1\ncases:\n- docs-typo: pairs=1 A_pass=1 B_pass=0\n- fix-add: pairs=1 A_pass=1 B_pass=0\n- report-todos: pairs=1 A_pass=0 B_pass=0\njudge: mode=stub judged=3 A_wins=2 B_wins=0 ties=1 unfired_B=0 errors=0\nruns: expected=6 done=6 errors=0",
   "model": "jev-1.14.0",
   "usage": {"input_tokens": 0, "output_tokens": 0},
   "answers": {

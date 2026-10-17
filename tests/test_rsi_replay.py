@@ -98,6 +98,21 @@ def test_triggered_win_rule():
     assert R.tally(pairs, "stub", {}, always_on=True).wins_b == 2
 
 
+def test_replay_jev_fixtures_match_their_states():
+    """Every shipped replay fixture answers exactly the state it documents (its file name is that state's key).
+    The key is `_replay_state`, not `_state`: tests/test_tasks_state.py reads `_state` as a routine state."""
+    from agent_memory import config, jev
+    qs = R.Q.load_file(R.QUESTIONS_FILE, "rsi-replay").jev_questions()
+    found = 0
+    for p in sorted(config.jev_fixtures_dir().glob("*.json")):
+        body = json.loads(p.read_text())
+        if "_replay_state" in body:
+            found += 1
+            assert jev.fixture_key(body["_replay_state"], qs) == p.stem and "_state" not in body
+            assert set(body["answers"]) == {"effect", "harness_problem", "evidence_strength"}
+    assert found == 5
+
+
 def test_jev_state_is_numbers_only_and_fixture_mode_never_goes_live(monkeypatch):
     m = V.ArmPair(cases=(V.CaseStats("report-todos", 3, 0, 3),), runs_expected=6, runs_done=6)
     j = V.JudgeResult(mode="stub", judged=3, wins_b=3)
