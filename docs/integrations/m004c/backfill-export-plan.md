@@ -11,7 +11,7 @@ production promotion without a separate approval.
 | Item | Before | Now |
 |---|---|---|
 | Ownership host | Ingestion stored the remote owner, not the host. `gitlab.example.com/vilmerfrost/x` was `own`. | Ingestion stores `meta.remote_host`. `own` needs host `github.com` AND an owner account. Any other host, an ssh alias, or no host is `private`. |
-| Rows ingested before this change | Owner only, so `own`. | No host, so `private`, until `amem sessions hosts --apply` re-derives the host (section 1.3) or a re-ingest reads it. |
+| Rows ingested before this change | Owner only, so `own`. | No host, so `private`, until `amem sessions hosts --apply` re-derives the host (section 1.2) or a re-ingest reads it. |
 | Review of the exact outgoing records | `sync plan` gave counts only. | `amem sync plan --contents` lists every outgoing record: the exact payload, its sha256, class, credit and size estimate. Refused records are listed with reasons and without content. |
 | Sending only a reviewed set | Not possible: a run sends everything pending. | `amem sync run --sink pastdev --only reviewed.json` sends only those refs. It refuses the whole run (sends nothing) when any current payload sha256 differs from the reviewed one. |
 | Rollback of one set | `pastdev.delete_all` only (every linked id). | `amem sync delete --sink pastdev --only reviewed.json` deletes only that set's data points. |
@@ -140,7 +140,7 @@ A record is never masked; it is **refused** (never sent; listed in `refused_reco
 
 | Reason | When |
 |---|---|
-| `team` | proposals: own/experiment/candidate/edit `meta.team`, or any cited deviation or session is team. Decisions: their proposal's class (a decision without a proposal is team). Experiments: `meta.team` or `hypothesis.team`. Edits: `meta.team` or a team deviation. Lessons: `runs.meta.team`, or the run's repo or the lesson's `scope_repo` is a repo or project of a team session. |
+| `team` | proposals: `team` true in the proposal's `meta`, its experiment's `meta`, its candidate's `metrics` or its latest edit's `meta`, or any cited deviation or session is team. Decisions: their proposal's class (a decision without a proposal is team). Experiments: `meta.team` or `hypothesis.team`. Edits: `meta.team` or a team deviation. Lessons: `runs.meta.team`, or the run's repo or the lesson's `scope_repo` is a repo or project of a team session. |
 | `private` | proposals, decisions, edits: any cited deviation or session is not own (no host, another host, another owner, or not found). Lessons: the run's repo or `scope_repo` is not a repo or project of an own session. Experiments are tied to no repo: never private (the reviewer reads them). |
 | `deny` | a raw field or the final text names an `AMEM_EGRESS_DENY` term or a team or private repo/project name (names an own session also has are not terms). |
 | `secret:*`, `unstable:*`, `cap`, `kind`, `ref` | see 2.3. |
