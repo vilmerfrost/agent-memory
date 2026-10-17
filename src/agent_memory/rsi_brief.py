@@ -68,7 +68,9 @@ FILE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 MAX_PATTERNS, MAX_CANDIDATES, MAX_REFS, MAX_METRICS, MAX_EXCERPT, MAX_NOTES = 8, 12, 10, 14, 12, 6
 PUSH_ITEMS = 5
 
-_CTRL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f  ‪-‮⁦-⁩]")
+# C0/C1 controls, line/paragraph separators and bidi overrides (written with chr() to keep the source ASCII)
+_CTRL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f" + chr(0x2028) + chr(0x2029) + chr(0x202A) + "-"
+                   + chr(0x202E) + chr(0x2066) + "-" + chr(0x2069) + "]")
 _WS = re.compile(r"\s+")
 _HOME_PATH = re.compile(r"(?:/Users|/home|/root|/private/var|/var/folders)/[^\s'\"`),;]*")
 _TILDE_PATH = re.compile(r"(?<![\w/])~[A-Za-z0-9_.-]*/[^\s'\"`),;]*")
