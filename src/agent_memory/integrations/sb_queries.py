@@ -15,12 +15,20 @@ every result's ref is an `amem:` ref. They join the two named queries of evidenc
     promotion_history     one proposal's timeline, and its rule's deviations in equal windows before and after
                           the promotion (or the decision when it was never promoted)
 
+Mission 005 (evidence packs, rsi_evidence_pack.py), one rule at a time:
+    rule_pattern          one rule's deviations in prod sessions in the last `days` (n, sessions per tool, grades)
+    jev_for               the Jev evaluations of a rule: its deviations' verdicts and confidence, its candidates'
+                          Jev calls, and for a routine rule (`routine:<name>:<rule>`) the routine runs' Jev scores
+    experiments_for       experiments that tested a change to a rule (or a candidate key): status, verdict and
+                          eval verdict counts
+
 A rule key is `<instruction_source>:<rule_id>`, as in ClickHouse (`claude-md:global:zsh-quote-globs`): rule
 ids are slugs, so the last ':' splits it.
 """
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable, Mapping
 from datetime import datetime
 from typing import Any
@@ -37,6 +45,8 @@ UUID_P = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
 HASH_P = r"[0-9a-f]{64}"
 DAYS_P = r"[1-9][0-9]{0,2}"
 N_P = r"[1-9][0-9]{0,2}"
+KEY_P = r"[A-Za-z0-9][A-Za-z0-9._:/@-]{0,199}"     # a candidate dedupe key (Mission 005)
+LABEL_P = r"[A-Za-z0-9][A-Za-z0-9._:@+=-]{0,79}"   # a label read back from a jsonb or text column (Mission 005)
 TEXT_MAX = 160
 PROD = "coalesce(s.env, 'prod') not in ('sandbox', 'eval')"
 
@@ -54,6 +64,14 @@ SPECS: dict[str, NamedQuery] = {
                                 "eval verdict counts per suite x model x effort"),
     "promotion_history": NamedQuery("promotion_history", {"proposal": UUID_P, "window_days": DAYS_P},
                                     "a proposal's timeline and its rule's deviations before vs after", ("proposal",)),
+    # Mission 005: one rule's evidence for an evidence pack
+    "rule_pattern": NamedQuery("rule_pattern", {"rule": RULE_P, "days": DAYS_P},
+                               "one rule's deviations in prod sessions: n, sessions per tool, grades", ("rule",)),
+    "jev_for": NamedQuery("jev_for", {"rule": RULE_P, "days": DAYS_P, "limit": N_P},
+                          "Jev evaluations of a rule: deviation verdicts, candidate calls, routine run scores",
+                          ("rule",)),
+    "experiments_for": NamedQuery("experiments_for", {"rule": RULE_P, "key": KEY_P, "limit": N_P},
+                                  "experiments that tested a change to a rule or candidate: verdict, eval counts"),
 }
 
 
@@ -258,7 +276,141 @@ def promotion_history(conn: psycopg.Connection, p: Mapping[str, str]) -> list[Ev
                         _iso(promoted or decided or created))]
 
 
+# ---------------------------------------------------------------- Mission 005: one rule, for an evidence pack
+
+
+def _label(v: Any) -> str | None:
+    """A label read back from a text or jsonb column: kept only when it is label-shaped (no spaces, no text)."""
+    return v if isinstance(v, str) and re.fullmatch(LABEL_P, v) else None
+
+
+def rule_pattern(conn: psycopg.Connection, p: Mapping[str, str]) -> list[EvidenceRef]:
+    """One aggregate over the rule's deviations in prod sessions (the index on (instruction_source, rule_id)).
+    A rule id `unknown` matches the deviations without one, as recurring_deviations names them."""
+    source, rule_id = _split_rule(p["rule"])
+    days = int(p.get("days", "30"))
+    row = conn.execute(
+        f"""select count(*), count(distinct d.session_id),
+                   count(distinct d.session_id) filter (where s.tool = 'claude'),
+                   count(distinct d.session_id) filter (where s.tool = 'codex'),
+                   avg(d.followed_grade), avg(d.result_grade), avg(d.objective_result), count(d.objective_result),
+                   min(d.created_at), max(d.created_at),
+                   (array_agg(d.id::text order by d.created_at desc, d.id))[1:5]
+            from deviations d left join sessions s on s.session_id = d.session_id
+            where d.instruction_source = %s and coalesce(d.rule_id, 'unknown') = %s
+              and d.created_at >= now() - make_interval(days => %s) and {PROD}""",
+        (source, rule_id, days)).fetchone()
+    if not row or not row[0]:
+        return []
+    n, sessions, claude, codex, followed, result, objective, objective_n, first_at, last_at, samples = row
+    subjects = [refs.amem("deviation", i) for i in samples]
+    return [EvidenceRef(subjects[0], "sb", "pattern", subjects,
+                        _clean({"rule_key": p["rule"], "n": n, "sessions": sessions, "claude_sessions": claude,
+                                "codex_sessions": codex, "followed_avg": followed, "result_avg": result,
+                                "objective_avg": objective, "objective_n": objective_n, "first_at": first_at,
+                                "window_days": days}),
+                        None, _iso(last_at))]
+
+
+def jev_for(conn: psycopg.Connection, p: Mapping[str, str]) -> list[EvidenceRef]:
+    """Jev's calls on a rule: one aggregate over its deviations' jev columns (prod sessions, last `days`), each
+    candidate's Jev verdict for the rule, and for a routine rule the routine runs' Jev scores per question."""
+    source, rule_id = _split_rule(p["rule"])
+    days, limit = int(p.get("days", "30")), int(p.get("limit", "5"))
+    out: list[EvidenceRef] = []
+    row = conn.execute(
+        f"""select count(*), count(d.jev_verdict),
+                   count(*) filter (where d.jev_verdict = 'edit_instruction'),
+                   count(*) filter (where d.jev_verdict = 'enforce'), count(*) filter (where d.jev_verdict = 'leave'),
+                   avg(d.jev_confidence), count(*) filter (where d.jev_mode = 'live'),
+                   count(*) filter (where d.jev_mode = 'fixture'), max(d.created_at),
+                   (array_agg(d.id::text order by d.created_at desc, d.id) filter (where d.jev_verdict is not null))[1:5]
+            from deviations d left join sessions s on s.session_id = d.session_id
+            where d.instruction_source = %s and coalesce(d.rule_id, 'unknown') = %s
+              and d.created_at >= now() - make_interval(days => %s) and {PROD}""",
+        (source, rule_id, days)).fetchone()
+    if row and row[1]:
+        n, judged, edit, enforce, leave, conf, live, fixture, last_at, samples = row
+        counts = {"edit_instruction": edit, "enforce": enforce, "leave": leave}
+        top = max(counts, key=lambda k: (counts[k], k)) if any(counts.values()) else None
+        subjects = [refs.amem("deviation", i) for i in samples]
+        out.append(EvidenceRef(subjects[0], "sb", "jev", subjects,
+                               _clean({"rule_key": p["rule"], "basis": "deviations", "n": n, "judged": judged,
+                                       "unjudged": n - judged, **counts, "top_verdict": top, "confidence_avg": conf,
+                                       "live": live, "fixture": fixture, "window_days": days}),
+                               None, _iso(last_at)))
+    rows = conn.execute(
+        """select id::text, status, rank, jev ->> 'verdict',
+                  case when jsonb_typeof(jev -> 'confidence') = 'number' then (jev ->> 'confidence')::float8 end,
+                  seen_count, last_seen_at
+           from rsi_candidates where rule_key = %s and jev is not null
+           order by last_seen_at desc, id limit %s""", (p["rule"], limit)).fetchall()
+    for cid, status, rank, verdict, conf, seen, last in rows:
+        ref = refs.amem("candidate", cid)
+        out.append(EvidenceRef(ref, "sb", "jev", [ref],
+                               _clean({"rule_key": p["rule"], "basis": "candidate", "candidate_status": status,
+                                       "rank": rank, "jev_verdict": _label(verdict), "jev_confidence": conf,
+                                       "seen_count": seen}),
+                               None, _iso(last)))
+    if source.startswith("routine:"):
+        rows = conn.execute(
+            """select sc.question, count(*), avg(sc.value_num), avg(sc.confidence),
+                      count(*) filter (where sc.jev_mode = 'live'), max(sc.created_at),
+                      (array_agg(sc.id::text order by sc.created_at desc, sc.id))[1:5]
+               from scores sc join runs r on r.id = sc.run_id
+               where r.routine = %s and sc.created_at >= now() - make_interval(days => %s)
+               group by sc.question order by count(*) desc, sc.question limit %s""",
+            (source.split(":", 1)[1], days, limit)).fetchall()
+        for question, n, value, conf, live, last, samples in rows:
+            subjects = [refs.amem("score", i) for i in samples]
+            out.append(EvidenceRef(subjects[0], "sb", "jev", subjects,
+                                   _clean({"rule_key": p["rule"], "basis": "routine-scores",
+                                           "question": _label(question), "n": n, "value_avg": value,
+                                           "confidence_avg": conf, "live": live, "window_days": days}),
+                                   None, _iso(last)))
+    return out
+
+
+def experiments_for(conn: psycopg.Connection, p: Mapping[str, str]) -> list[EvidenceRef]:
+    """Experiments that tested a change to the rule: named by the experiment itself (hypothesis.rule,
+    meta.rule_key, meta.candidate_key) or by a proposal of one of the rule's candidates. Newest first."""
+    rule, key = p.get("rule"), p.get("key")
+    if not (rule or key):
+        raise ValueError("experiments_for: give rule or key")
+    rows = conn.execute(
+        """with ex as (
+               select e.id from rsi_experiments e
+               where (%(rule)s::text is not null and (e.hypothesis ->> 'rule' = %(rule)s or e.meta ->> 'rule_key' = %(rule)s))
+                  or (%(key)s::text is not null and e.meta ->> 'candidate_key' = %(key)s)
+               union
+               select p.experiment_id from rsi_proposals p join rsi_candidates c on c.id = p.candidate_id
+               where p.experiment_id is not null
+                 and ((%(rule)s::text is not null and c.rule_key = %(rule)s)
+                      or (%(key)s::text is not null and c.dedupe_key = %(key)s)))
+           select e.id, e.status, e.verdict, e.kind, e.baseline_id, e.created_at, e.finished_at,
+                  count(r.id), count(r.id) filter (where r.verdict in ('pass', 'improves')),
+                  count(r.id) filter (where r.verdict in ('fail', 'worse')),
+                  count(r.id) filter (where r.verdict = 'no-effect'),
+                  count(r.id) filter (where r.verdict = 'inconclusive')
+           from rsi_experiments e join ex on ex.id = e.id
+           left join rsi_eval_results r on r.experiment_id = e.id
+           group by e.id order by coalesce(e.finished_at, e.created_at) desc, e.id limit %(limit)s""",
+        {"rule": rule, "key": key, "limit": int(p.get("limit", "5"))}).fetchall()
+    out = []
+    for eid, status, verdict, kind, baseline, created, finished, evals, good, bad, none_, inconclusive in rows:
+        ref = refs.amem("experiment", eid)
+        out.append(EvidenceRef(ref, "sb", "experiment", [ref],
+                               _clean({"rule_key": rule, "status": status, "verdict": _label(verdict),
+                                       "kind": _label(kind), "baseline_id": _label(baseline), "evals": evals,
+                                       "evals_good": good, "evals_bad": bad, "evals_no_effect": none_,
+                                       "evals_inconclusive": inconclusive, "created_at": created,
+                                       "finished_at": finished}),
+                               None, _iso(finished or created)))
+    return out
+
+
 RUN: dict[str, Callable[[psycopg.Connection, Mapping[str, str]], list[EvidenceRef]]] = {
     "recurring_deviations": recurring_deviations, "attempts_for": attempts_for, "decisions_for": decisions_for,
     "evals_for": evals_for, "eval_by_model": eval_by_model, "promotion_history": promotion_history,
+    "rule_pattern": rule_pattern, "jev_for": jev_for, "experiments_for": experiments_for,
 }
