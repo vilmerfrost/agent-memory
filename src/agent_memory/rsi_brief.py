@@ -752,7 +752,7 @@ def render_markdown(b: dict[str, Any]) -> str:
         out.append(f"- {f['experiment_id'] or '(not started)'}" + (f" ({f['candidate_key']})" if f["candidate_key"] else "")
                    + f": {f['verdict'] or 'no verdict'}, {f['status'].replace('_', ' ')}. {f['why_not_staged'][:1].upper()}"
                    + f"{f['why_not_staged'][1:]}."
-                   + (f" Reasons: {reasons}." if reasons else "") + (f" Hypothesis: {f['what']}" if f["what"] else ""))
+                   + (f" Reasons: {reasons}." if reasons else "") + (f" Hypothesis: {_sentence(f['what'])}" if f["what"] else ""))
     if not b["failed"]:
         out.append("- None.")
 
