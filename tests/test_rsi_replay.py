@@ -308,6 +308,78 @@ def test_a_check_that_writes_into_its_home_is_not_trusted(tmp_path, monkeypatch)
         not (rs.Sandbox(root).arm_home(EXP, "K") / ".planted").exists()
 
 
+def test_parse_agent_reads_claude_stream_json_and_codex_events():
+    claude = "\n".join(json.dumps(e) for e in [
+        {"type": "system", "subtype": "init"},
+        {"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Edit",
+                                                       "input": {"file_path": "calc.py"}}]}},
+        {"type": "result", "subtype": "success", "is_error": False, "num_turns": 3, "result": "fixed",
+         "total_cost_usd": 0.0123, "modelUsage": {"claude-haiku-5-5": {"inputTokens": 900, "outputTokens": 120,
+                                                                       "cacheReadInputTokens": 100,
+                                                                       "costUSD": 0.0123}}}])
+    p = R.parse_agent(claude, "claude", "claude-haiku-5-5")
+    assert p["tool_calls"] == [{"name": "Edit", "input": '{"file_path": "calc.py"}'}]
+    assert (p["tokens_in"], p["tokens_out"], p["cost_usd"], p["final"], p["is_error"]) == (1000, 120, 0.0123, "fixed",
+                                                                                         False)
+    codex = "\n".join(json.dumps(e) for e in [
+        {"type": "turn.started"},
+        {"type": "item.completed", "item": {"id": "i1", "type": "command_execution", "status": "completed"}},
+        {"type": "item.completed", "item": {"id": "i2", "type": "agent_message", "text": "done"}},
+        {"type": "turn.completed", "usage": {"input_tokens": 2000, "cached_input_tokens": 500, "output_tokens": 80}}])
+    p = R.parse_agent(codex, "codex", "gpt-6-luna")
+    assert p["tool_calls"] == [{"name": "command_execution", "input": "completed"}] and p["final"] == "done"
+    assert (p["tokens_in"], p["tokens_out"]) == (2000, 80)
+    assert R.parse_agent("not json at all", "claude", None)["parsed"] is False
+
+
+def test_live_agent_and_judge_plumbing_without_any_call(tmp_path, monkeypatch):
+    """The live paths' command lines, credentials by name only, network and judge mapping. No CLI runs: the
+    host double answers each agent and judge container with canned output (the CLIs stay unverified)."""
+    root, _, h = setup_root(tmp_path, monkeypatch, "closing-line")
+    creds = tmp_path / "dummy-creds.txt"
+    creds.write_text("ANTHROPIC_API_KEY=sk-ant-api03-DUMMY-NOT-A-KEY\nCODEX_API_KEY=sk-proj-DUMMY-NOT-A-KEY\n")
+    claude_out = json.dumps({"type": "result", "subtype": "success", "is_error": False, "num_turns": 2,
+                             "result": "ok", "modelUsage": {"claude-haiku-5-5": {"inputTokens": 10, "outputTokens": 5,
+                                                                                 "costUSD": 0.001}}})
+    judge_out = "\n".join(json.dumps(e) for e in [
+        {"type": "item.completed", "item": {"id": "m", "type": "agent_message", "text": '{"winner": "2", "reason": "r"}'}},
+        {"type": "turn.completed", "usage": {"input_tokens": 100, "output_tokens": 10}}])
+
+    def fault(rid, arm):
+        if arm in "AB":
+            return {"exit_code": 0, "stdout": claude_out}
+        if arm == "J":
+            return {"exit_code": 0, "stdout": judge_out}
+        return None
+    sb = HostSandbox(root, fault=fault)
+    monkeypatch.setattr(sb, "net_status", lambda: {"internal": {"internal": True}, "proxy_running": True})
+    budget = FakeBudget()
+    cfg = R.ReplayConfig(agent="claude", model="claude-haiku-5-5", effort="low", reps=3, judge="codex",
+                         credentials=f"env-file:{creds}", judge_credentials=f"env-file:{creds}",
+                         judge_credential_name="CODEX_API_KEY")
+    res = R.run_replay(h, R.load_cases(["report-todos"]), cfg, root=root, experiment_id=EXP, sandbox=sb, budget=budget)
+    agent = [c for c in sb.calls if c["arm"] in "AB"]
+    assert all(c["network"] == rs.NET_INTERNAL and c["credentials"] == ["ANTHROPIC_API_KEY", "CODEX_API_KEY"]
+               for c in agent)
+    cmd = agent[0]["command"]
+    assert cmd[:3] == ["python3", "-I", "/mnt/agent/live_entry.py"] and "claude" in cmd
+    for flag, value in (("--model", "claude-haiku-5-5"), ("--effort", "low"), ("--max-budget-usd", "0.25"),
+                        ("--permission-mode", "dontAsk"), ("-p", "{PROMPT}")):
+        assert cmd[cmd.index(flag) + 1] == value
+    assert all(c["network"] == "none" and c["credentials"] == [] for c in sb.calls if c["arm"] == "K")
+    judge = [c for c in sb.calls if c["arm"] == "J"]
+    assert len(judge) == 3 and "codex" in judge[0]["command"] and "gpt-6-luna" in judge[0]["command"]
+    logs = sb.experiment_dir(EXP) / "logs"
+    for c in agent + judge:
+        argv = json.loads((logs / f"{c['run_id']}.json").read_text())["argv"]
+        assert "ANTHROPIC_API_KEY" in argv and not any("DUMMY" in a for a in argv)
+    # "2" means the second attempt shown: B when the order was AB, A when it was BA.
+    for p in res.judge.pairs:
+        assert p["winner"] == ("B" if p["order"] == "AB" else "A")
+    assert {s for _, s in budget.calls} == {"replay-judge"} and len(budget.calls) == 3
+    assert res.arms["A"]["cost_usd"] == pytest.approx(0.003) and res.totals["tokens_out"] == 30
+
+
 def test_stub_agent_never_gets_credentials():
     with pytest.raises(R.ReplayError, match="never gets credentials"):
         R.ReplayConfig(credentials="keychain:rsi-sandbox/anthropic").validate()

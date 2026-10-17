@@ -351,6 +351,10 @@ python3 -m pytest sandbox/tests -s -rA -p no:cacheprovider     # EVIDENCE lines 
 python3 sandbox/rsi_sandbox.py net-down                        # optional
 ```
 
+To keep the run out of `~/sandbox`, set `RSI_SANDBOX_DIR` to a temp dir whose last part is `sandbox`
+(for example `$(mktemp -d)/sandbox`): `test_fs_mount_table_only_allowed_mounts` checks the mount source ends in
+`/sandbox/experiments/<id>/home-A`.
+
 The suite creates and removes its own `t-iso-*` experiment and `t-base-*` baseline, plus short-lived
 test containers labelled `rsi.sandbox=1` (one on `--network host` as the VM-listener control).
 Without Docker or `lock.json`, the Docker tests skip and the unit tests still run.
