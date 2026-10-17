@@ -22,7 +22,8 @@ team = false only for a personal owner, AMEM_OWNER_ACCOUNTS can narrow what coun
 Rows stored before ingestion kept the host (Mission 004C) have team = false and an owner but no remote_host, so
 they are private. A later ingest of the same transcript adds the host (the sessions upsert merges meta), and
 `amem sessions hosts` (session_hosts.py) re-derives it from the repo's local git config (dry run unless
---apply; never the network).
+--apply; never the network). Until then their repo and project names are withheld names below (deny terms)
+unless an own session has the same name.
 
 Rows tied to a session take its class: a deviation (team also when its own meta says so), a skill call (no
 matched session: private, F7). A row tied to repo names (a lesson's run repo and scope repo) is team when a team

@@ -59,7 +59,13 @@ Trade-off:
 - Default private is safe but makes every pre-change session private. Until hosts are restored, past.dev refuses
   every proposal, decision and edit that cites those sessions' deviations, and ClickHouse masks their
   project/repo as `private`. Records tied to no session (experiments, lessons without a repo, edits without
-  deviations) are not affected.
+  deviations) are not affected by the class, but see the next point.
+- The deny list grows too: every repo and project name of a private session is a deny term unless an own
+  session has the same name. While no session has a host, own repo names such as `agent-memory` are deny terms,
+  so past.dev also refuses records that name them (reason `deny`) and ClickHouse nulls labels that contain them.
+  After the merge, the scheduled `amem sessions ingest` (7-day window) adds hosts to recent sessions of repos
+  that still exist, which brings the active own names back; `amem sessions hosts --apply` does the same for the
+  rest. Read `refused_records` in the preview with this in mind.
 - Re-derivation uses the remote the repo has **today**, not at session time. A repo whose remote moved to
   github.com from another host (same owner) counts as own for older work too. The owner check limits this to the
   same account. A moved or deleted repo stays private (the safe direction).
