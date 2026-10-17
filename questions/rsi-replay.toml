@@ -1,0 +1,43 @@
+# Jev's typed read of one sandbox replay (Mission 005, src/agent_memory/rsi_replay.py).
+# Not a routine: `amem score` and `amem daily` skip this file (questions.NOT_ROUTINES).
+#
+# Jev's state holds only numbers and labels the runner measured: case ids, complete A/B pairs, check
+# passes per arm, run errors and timeouts, and the blind judge's tally. Never agent output, never a diff,
+# never instruction text. Arm A is the unchanged baseline, arm B the baseline plus the candidate change.
+# Jev is one input of three: rsi_verdict.decide (deterministic code) makes the verdict, and IMPROVES needs
+# Jev's effect = improves (policy config/rsi-verdict-policy.json).
+
+threshold = 0.6
+pass_question = "effect"
+pass_options = ["improves"]
+
+[[questions]]
+name = "effect"
+kind = "choice"
+prompt = """A candidate configuration change (arm B) was replayed against the unchanged baseline (arm A) on
+the same tasks, with the same agent, model and limits. A_pass and B_pass count the runs whose objective
+check passed, per case, out of `pairs` complete A/B pairs. The judge compared each pair blind (it never
+knew which attempt was A or B). Decide the change's effect on the work."""
+[questions.options]
+improves = "B passes more checks than A on at least one case, no case gets worse, and the judge does not prefer A."
+no_effect = "The two arms do the same: equal check results and no clear judge preference."
+worse = "B passes fewer checks than A on at least one case, or the judge clearly prefers A."
+unclear = "The numbers are too few, contradictory or broken to say."
+
+[[questions]]
+name = "harness_problem"
+kind = "noul"
+prompt = "Do these numbers look like a broken replay (errors, timeouts, missing runs, every run failing in both arms) rather than a real effect of the change?"
+[questions.criteria]
+true = "The replay harness or the environment, not the change, likely explains the numbers."
+false = "The numbers look like a working replay."
+
+[[questions]]
+name = "evidence_strength"
+kind = "score"
+prompt = "How strong is the evidence for the effect you picked?"
+levels = [
+    "Weak: one or two pairs, or the layers disagree.",
+    "Moderate: a few pairs, consistent but small.",
+    "Strong: every pair agrees and the judge agrees with the checks.",
+]

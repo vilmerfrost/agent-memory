@@ -2,6 +2,7 @@
 """rsi sandbox: run agent config experiments in isolated Docker workers.
 
 A CLI and an importable library. Stdlib only. Design and threat model: docs/sandbox.md.
+The root is $RSI_SANDBOX_DIR when set, else ~/sandbox (the CLI and `Sandbox()` both honor it).
 
     rsi_sandbox.py init
     rsi_sandbox.py build
@@ -45,6 +46,7 @@ LOCK_FILE = IMAGES_DIR / "lock.json"
 # The real home from the password database, not $HOME, so a changed HOME cannot move the guard.
 REAL_HOME = Path(pwd.getpwuid(os.getuid()).pw_dir)
 DEFAULT_ROOT = REAL_HOME / "sandbox"
+ROOT_ENV = "RSI_SANDBOX_DIR"          # overrides DEFAULT_ROOT (tests and demos use a temp dir)
 DEFAULT_ARCHIVE_DIR = REAL_HOME / "Library" / "Application Support" / "amem-archive"
 LAYOUT = ("baselines", "experiments", "artifacts", "stack", "db", "briefs", "run")
 
@@ -54,6 +56,8 @@ NET_EGRESS = "rsi-egress"
 PROXY_NAME = "rsi-egress-proxy"
 PROXY_PORT = 3128
 PROXY_URL = f"http://{PROXY_NAME}:{PROXY_PORT}"
+# A worker joins rsi-internal (egress only through the proxy) or no network at all (a stub agent, a check).
+RUN_NETWORKS = (NET_INTERNAL, "none")
 WORKER_UID = 10001
 PROXY_UID = 10002
 LABEL = "rsi.sandbox"
@@ -385,9 +389,14 @@ class RunResult:
 
 # ------------------------------------------------------------------ the sandbox
 
+def default_root() -> Path:
+    """$RSI_SANDBOX_DIR when set, else ~/sandbox (the production staging root)."""
+    return Path(os.environ.get(ROOT_ENV) or DEFAULT_ROOT).expanduser()
+
+
 class Sandbox:
     def __init__(self, root: Path | str | None = None):
-        self.root = Path(os.path.abspath(Path(root or DEFAULT_ROOT).expanduser()))
+        self.root = Path(os.path.abspath(Path(root or default_root()).expanduser()))
         for bad in forbidden_paths():
             if _within(self.root, bad) or _within(bad, self.root):
                 raise SandboxError(f"sandbox root overlaps a forbidden host path: {self.root}")
@@ -544,9 +553,10 @@ class Sandbox:
     def build_run_argv(self, *, experiment: str, arm: str, run_id: str, command: list[str],
                        image: str | None, timeout_s: int, memory: str, cpus: str, pids: int,
                        credential_names: list[str], ro_mounts: list[tuple[str, str]] = (),
-                       ) -> tuple[list[str], str, int]:
+                       network: str = NET_INTERNAL) -> tuple[list[str], str, int]:
         """The docker argv for one worker run. Pure apart from the mount guard's stat calls.
 
+        network: rsi-internal (default; egress only through the proxy) or none (no interface but loopback).
         Returns (argv, container_name, deadline_epoch).
         """
         _check_id(experiment, "experiment id")
@@ -554,6 +564,10 @@ class Sandbox:
         _check_id(run_id, "run id")
         if not command:
             raise SandboxError("empty command")
+        if network not in RUN_NETWORKS:
+            raise SandboxError(f"network must be one of {', '.join(RUN_NETWORKS)}")
+        if network == "none" and credential_names:
+            raise CredentialError("a run without network gets no credentials")
         if not (1 <= int(timeout_s) <= MAX_TIMEOUT_S):
             raise SandboxError(f"timeout must be 1..{MAX_TIMEOUT_S}s")
         if not re.match(r"^\d+(\.\d+)?[kmg]?$", str(memory)) or not re.match(r"^\d+(\.\d+)?$", str(cpus)):
@@ -588,7 +602,7 @@ class Sandbox:
                 "--label", f"{LABEL}=1", "--label", "rsi.role=worker",
                 "--label", f"rsi.experiment={experiment}", "--label", f"rsi.arm={arm}",
                 "--label", f"rsi.run={run_id}", "--label", f"rsi.deadline={deadline}",
-                "--network", NET_INTERNAL, "--hostname", "rsi-worker",
+                "--network", network, "--hostname", "rsi-worker",
                 "--read-only", "--tmpfs", "/tmp:rw,nosuid,nodev,size=512m",
                 "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
                 "--pids-limit", str(int(pids)), "--memory", str(memory), "--memory-swap", str(memory),
@@ -607,8 +621,10 @@ class Sandbox:
     def run(self, experiment: str, arm: str, command: list[str], *, timeout_s: int = DEFAULT_TIMEOUT_S,
             memory: str = "2g", cpus: str = "2", pids: int = 512, credentials: str = "none",
             credential_name: str | None = None, ro_mounts: list[tuple[str, str]] = (),
-            run_id: str | None = None, max_output: int = 1 << 20) -> RunResult:
-        """Run one command in a fresh worker container for one experiment arm."""
+            run_id: str | None = None, max_output: int = 1 << 20, network: str = NET_INTERNAL) -> RunResult:
+        """Run one command in a fresh worker container for one experiment arm.
+
+        network="none" (a stub agent or a check) needs no rsi-internal network and takes no credentials."""
         _check_id(experiment, "experiment id")
         _check_arm(arm)
         run_id = run_id or f"{arm}-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}-{secrets.token_hex(3)}"
@@ -626,8 +642,9 @@ class Sandbox:
             argv, name, deadline = self.build_run_argv(
                 experiment=experiment, arm=arm, run_id=run_id, command=list(command),
                 image=None, timeout_s=timeout_s, memory=memory, cpus=cpus, pids=pids,
-                credential_names=sorted(creds), ro_mounts=list(ro_mounts))
-            self._require_internal_network()
+                credential_names=sorted(creds), ro_mounts=list(ro_mounts), network=network)
+            if network == NET_INTERNAL:
+                self._require_internal_network()
         except BaseException:
             run_dir.rmdir()              # refused before start: leave no empty run dir
             raise
@@ -1080,7 +1097,7 @@ def _parse_docker_time(s: str) -> float | None:
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="rsi_sandbox.py", description=__doc__.split("\n\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
-    sub.add_parser("init", help="create the ~/sandbox layout (mode 700)")
+    sub.add_parser("init", help=f"create the sandbox layout (mode 700) in ${ROOT_ENV} or ~/sandbox")
     sub.add_parser("build", help="build both images and write images/lock.json")
     sub.add_parser("net-up", help="create the networks and start the egress proxy")
     sub.add_parser("net-down", help="stop the proxy and remove the networks")
@@ -1116,6 +1133,8 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--credential-name", default=None, help="env name for a keychain credential")
     r.add_argument("--ro-mount", action="append", default=[], metavar="SRC:TARGET",
                    help="read-only mount from the experiment or a baseline, target under /mnt or /baseline")
+    r.add_argument("--network", default=NET_INTERNAL, choices=RUN_NETWORKS,
+                   help="rsi-internal (egress through the proxy) or none (no network, no credentials)")
     r.add_argument("command", nargs=argparse.REMAINDER)
     c = sub.add_parser("cleanup", help="remove overdue or old worker containers and temp files")
     c.add_argument("--max-age-hours", type=float, default=6.0)
@@ -1153,7 +1172,7 @@ def main(argv: list[str] | None = None) -> int:
                 ro.append((src, target))
             res = sb.run(args.experiment, args.arm, cmd, timeout_s=args.timeout, memory=args.memory,
                          cpus=args.cpus, pids=args.pids, credentials=args.credentials,
-                         credential_name=args.credential_name, ro_mounts=ro)
+                         credential_name=args.credential_name, ro_mounts=ro, network=args.network)
             print(json.dumps(res.to_json(), indent=2))
             return 124 if res.timed_out else (res.exit_code or 0)
         elif args.cmd == "cleanup":
