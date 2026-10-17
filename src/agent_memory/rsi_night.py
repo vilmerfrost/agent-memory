@@ -460,6 +460,23 @@ class ReplayOutcome:
     eval_path: str | None = None
     budget_stop: str | None = None
     runs: int = 0
+    judge: dict[str, Any] | None = None      # rsi_verdict.JudgeResult.summary(): mode, judged, wins, b_winrate
+    jev: dict[str, Any] | None = None        # rsi_verdict.JevResult.summary(): mode, status, effect, confidence
+
+
+JUDGE_KEYS = ("mode", "judged", "wins_a", "wins_b", "ties", "unfired_b", "errors", "b_winrate")
+JEV_KEYS = ("mode", "status", "effect", "confidence", "harness_problem", "evidence_strength", "error")
+
+
+def _summary(obj: Any, keys: Sequence[str]) -> dict[str, Any] | None:
+    """A judge or Jev summary reduced to its scalar fields (the report carries numbers and enums only)."""
+    if obj is None:
+        return None
+    if not isinstance(obj, Mapping):
+        obj = obj.summary() if callable(getattr(obj, "summary", None)) else {}
+    out = {k: obj.get(k) for k in keys if k in obj}
+    return {k: (str(v)[:200] if isinstance(v, str) else v) for k, v in out.items()
+            if v is None or isinstance(v, (bool, int, float, str))} or None
 
 
 class Replayer(Protocol):
@@ -616,10 +633,16 @@ def model_cli_env(environ: Mapping[str, str] | None = None) -> dict[str, str]:
     return out
 
 
+# Unattended `claude -p` (Mission 005.5): no host hook may run or stall it, and nothing may wait for a permission
+# answer. The no-tools flags of distill.writer_argv stay; these are added on top.
+UNATTENDED_CLAUDE_FLAGS = ("--settings", '{"disableAllHooks": true}', "--permission-prompts", "none")
+
+
 class ClaudeCliHypothesizer:
     """S5 live (unverified in Mission 005): headless `claude -p` with the edit writer's configured model
     (edits_writer.writer_model, AMEM_EDITS_MODEL, default opus) and distill's no-tools flags (`--tools ""`: it
-    cannot read or run anything). Its environment is `model_cli_env()`: no store or provider credential."""
+    cannot read or run anything), plus UNATTENDED_CLAUDE_FLAGS (host hooks off, permission prompts denied). Its
+    environment is `model_cli_env()` (no store or provider credential) with AMEM_HOOK_OFF=1."""
 
     def __init__(self, cfg: Mapping[str, Any]) -> None:
         self.cfg = dict(cfg)
@@ -628,7 +651,7 @@ class ClaudeCliHypothesizer:
               target_text: str, budget: Budget) -> str:
         from agent_memory import distill, edits_writer
         model = str(self.cfg.get("model") or edits_writer.writer_model())
-        argv = distill.writer_argv(edits_writer.CLAUDE_ENV, model=model)
+        argv = [*distill.writer_argv(edits_writer.CLAUDE_ENV, model=model), *UNATTENDED_CLAUDE_FLAGS]
         cand = {k: candidate.get(k) for k in ("dedupe_key", "source", "kind", "target", "rule_key", "seen_count")}
         cand["metrics"] = {k: v for k, v in (candidate.get("metrics") or {}).items() if isinstance(v, (int, float))}
         prompt = HYPOTHESIS_PROMPT.format(cap=cap, targets=", ".join(targets),
@@ -640,7 +663,7 @@ class ClaudeCliHypothesizer:
 
         def run() -> tuple[str, Usage]:
             out = distill.run_cli(argv, prompt, timeout=max(1.0, min(timeout, budget.remaining_s())),
-                                  env=model_cli_env())
+                                  env={**model_cli_env(), "AMEM_HOOK_OFF": "1"})
             return distill.parse_envelope(out), _envelope_usage(out)
         return budget.call(model, "hypothesize", run, retry_on=(distill.WriterError,))
 
@@ -773,15 +796,31 @@ class SandboxReplayer:
             return "unavailable"
         return "ok" if ok else "unavailable"
 
-    def replay(self, *, artifact_hash: str, experiment_id: str, baseline_id: str, budget: Budget) -> ReplayOutcome:
+    def replay_config(self) -> Any:
+        """The rsi_replay.ReplayConfig this night's config asks for (stages + the `replay` section). Live judge and
+        agent credentials are references (keychain:<service>/<account>), never values."""
         from agent_memory import rsi_replay
-        cases = rsi_replay.load_cases(self.cfg.get("cases"))
         fields = {"agent": self.stages.get("replay_agent", "stub"), "judge": self.stages.get("judge", "stub"),
                   "jev": self.stages.get("replay_jev", "fixture"), "reps": int(self.cfg.get("reps") or 1),
                   "model": self.cfg.get("model"), "effort": self.cfg.get("effort"),
-                  "credentials": self.cfg.get("credentials") or "none"}
+                  "credentials": self.cfg.get("credentials") or "none",
+                  "credential_name": self.cfg.get("credential_name"), "judge_model": self.cfg.get("judge_model"),
+                  "judge_credentials": self.cfg.get("judge_credentials") or "none",
+                  "judge_credential_name": self.cfg.get("judge_credential_name")}
+        if self.cfg.get("max_budget_usd") is not None:
+            fields["max_budget_usd"] = float(self.cfg["max_budget_usd"])
         known = getattr(rsi_replay.ReplayConfig, "__dataclass_fields__", fields)
-        rc = rsi_replay.ReplayConfig(**{k: v for k, v in fields.items() if k in known})
+        return rsi_replay.ReplayConfig(**{k: v for k, v in fields.items() if k in known})
+
+    def replay(self, *, artifact_hash: str, experiment_id: str, baseline_id: str, budget: Budget) -> ReplayOutcome:
+        from agent_memory import rsi_replay
+        cases = rsi_replay.load_cases(self.cfg.get("cases"))
+        rc = self.replay_config()
+        pairs = len(cases) * int(rc.reps)
+        cap = int(getattr(budget.cfg, "max_ab_pairs", pairs))
+        if pairs > cap:          # refused before any container: a bigger replay than the night allows
+            raise ExperimentFailed(f"replay of {len(cases)} case(s) x {rc.reps} rep(s) = {pairs} A/B pairs is over "
+                                   f"the cap of {cap}")
         r = rsi_replay.run_replay(artifact_hash, cases, rc, root=RA.sandbox_dir(), experiment_id=experiment_id,
                                   budget=budget, baseline_id=baseline_id)
         v = _dget(r, "verdict")
@@ -789,7 +828,8 @@ class SandboxReplayer:
                              arms=dict(_dget(r, "arms") or {}), artifact_hash=_dget(r, "artifact_hash"),
                              baseline_id=_dget(r, "baseline_id"),
                              eval_path=str(_dget(r, "eval_path")) if _dget(r, "eval_path") else None,
-                             budget_stop=_dget(r, "budget_stop"), runs=len(_dget(r, "runs") or []))
+                             budget_stop=_dget(r, "budget_stop"), runs=len(_dget(r, "runs") or []),
+                             judge=_summary(_dget(r, "judge"), JUDGE_KEYS), jev=_summary(_dget(r, "jev"), JEV_KEYS))
 
 
 class ApprovalProposer:
@@ -1462,7 +1502,7 @@ class Night:
         return {"experiment_id": exp_id, "candidate_key": c["dedupe_key"], "hypothesis": {"what": h.what, "why": h.why},
                 "target": h.target, "artifact_hash": None, "baseline_id": None, "verdict": None, "verdict_reasons": [],
                 "arms": {"A": {}, "B": {}}, "risk": h.risk, "confidence": h.confidence, "cost_usd": 0.0,
-                "status": status, "proposal_id": None, "evidence_refs": refs[:20]}
+                "status": status, "proposal_id": None, "evidence_refs": refs[:20], "judge": None, "jev": None}
 
     def _experiment(self, c: dict[str, Any], h: Hypothesis, refs: list[str], later: list[Hypothesis]) -> None:
         assert self.conn is not None
@@ -1505,10 +1545,13 @@ class Night:
                                              budget=self.budget)
             verdict = rr.verdict if rr.verdict in VERDICTS else "INCONCLUSIVE"
             entry.update(verdict=verdict, verdict_reasons=rr.reasons[:20],
-                         arms={"A": dict(rr.arms.get("A") or {}), "B": dict(rr.arms.get("B") or {})})
+                         arms={"A": dict(rr.arms.get("A") or {}), "B": dict(rr.arms.get("B") or {})},
+                         judge=_summary(getattr(rr, "judge", None), JUDGE_KEYS),
+                         jev=_summary(getattr(rr, "jev", None), JEV_KEYS))
             row = {"status": "evaluated", "verdict": verdict,
                    "meta": {"verdict_reasons": rr.reasons[:20], "arms": entry["arms"], "eval_path": rr.eval_path,
-                            "replay_runs": rr.runs, "budget_stop": rr.budget_stop}}
+                            "replay_runs": rr.runs, "budget_stop": rr.budget_stop, "judge": entry["judge"],
+                            "jev": entry["jev"]}}
             if rr.budget_stop:
                 entry["status"] = "skipped_budget"
                 cand_status, cand_reason = "deferred", f"replay stopped by the budget ({rr.budget_stop})"
@@ -1761,6 +1804,9 @@ def validate_report(obj: Any) -> list[str]:
         if isinstance(pid, str) and not _UUID.fullmatch(pid):
             errs.append(f"{w}.proposal_id is not a lowercase uuid")
         need(e, "evidence_refs", list, w)
+        for k in ("judge", "jev"):                    # optional (Mission 005.5): the replay's judge and Jev summaries
+            if e.get(k) is not None and not isinstance(e[k], dict):
+                errs.append(f"{w}.{k} must be an object or null")
         if e.get("status") == "staged" and not (e.get("proposal_id") and e.get("verdict") == "IMPROVES"
                                                 and e.get("artifact_hash") and e.get("experiment_id")):
             errs.append(f"{w}: staged without an IMPROVES verdict, an experiment id, an artifact hash and a proposal")

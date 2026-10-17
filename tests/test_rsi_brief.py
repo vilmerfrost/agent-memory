@@ -31,8 +31,15 @@ TOP_KEYS = {"format", "night", "status", "generated_at", "report", "started_at",
             "summary", "notes", "sessions", "patterns", "candidates", "experiments", "passed", "failed", "costs", "health",
             "pending_decisions", "sections"}
 BLOCK_KEYS = {"experiment_id", "candidate_key", "proposal_id", "title", "what", "target", "change", "why", "evidence_refs",
-              "baseline_vs_candidate", "risk", "confidence", "artifact_hash", "proposal_status", "expires_at", "cost_usd",
-              "actions", "warnings"}
+              "baseline_vs_candidate", "evaluation", "risk", "confidence", "artifact_hash", "proposal_status", "expires_at",
+              "cost_usd", "actions", "apply_blocked", "warnings"}
+# What a sandbox-replay record holds after an independent evaluation (G2b: Codex judge, live Jev)
+LIVE_RESULTS = {"agent": "claude", "judge": {"mode": "codex", "judged": 3, "wins_a": 1, "wins_b": 2, "ties": 0,
+                                             "unfired_b": 0, "errors": 0, "b_winrate": 0.6667},
+                "jev": {"mode": "live", "status": "ok", "effect": "improves", "confidence": 0.76,
+                        "harness_problem": 0.06, "evidence_strength": 0.64, "error": None}}
+STUB_RESULTS = {"agent": "stub", "judge": {**LIVE_RESULTS["judge"], "mode": "stub"},
+                "jev": {**LIVE_RESULTS["jev"], "mode": "fixture"}}
 
 
 @pytest.fixture(autouse=True)
@@ -79,8 +86,9 @@ def rdb(pg_url: str, monkeypatch: pytest.MonkeyPatch) -> str:
 
 
 def make_artifact(root: Path, files: list[tuple[str, bytes, bytes]], *, exp: str, baseline: str = "bl-000000000001",
-                  evals: dict[str, str] | None = None) -> tuple[str, Path]:
-    """The same bytes improve stage writes (agent-config lib/rsi_artifact.py), plus eval records."""
+                  evals: dict[str, str] | None = None, results: dict[str, Any] | None = None) -> tuple[str, Path]:
+    """The same bytes improve stage writes (agent-config lib/rsi_artifact.py), plus eval records. The
+    sandbox-replay record's results: `results` (default LIVE_RESULTS, an independent evaluation)."""
     entries = sorted(({"path": k, "kind": "instruction", "rule_id": "claude-md-global--closing-line", "mode": "0644",
                        "before_sha256": RA.sha256_bytes(b), "after_sha256": RA.sha256_bytes(a)} for k, b, a in files),
                      key=lambda f: f["path"])
@@ -98,16 +106,16 @@ def make_artifact(root: Path, files: list[tuple[str, bytes, bytes]], *, exp: str
         rec = {"format": RA.EVAL_FORMAT, "artifact_hash": h, "experiment_id": exp, "baseline_id": baseline, "suite": suite,
                "suite_version": "1", "model": "stub", "effort": "none", "verdict": verdict,
                "started_at": "2026-10-18T01:10:00+00:00", "finished_at": "2026-10-18T01:20:00+00:00", "runner": "test",
-               "results": {}}
+               "results": (LIVE_RESULTS if results is None else results) if suite == "sandbox-replay" else {}}
         (d / "evals" / f"{suite}.json").write_bytes(RA.canonical(rec) + b"\n")
     return h, d
 
 
 def stage(url: str, root: Path, exp: str, *, night: str = NIGHT, before: bytes = BEFORE, after: bytes = AFTER,
           title: str = "Closing line as a required section", evals: dict[str, str] | None = None,
-          ttl: timedelta = AP.TOKEN_TTL, **kw: Any) -> tuple[str, str]:
+          ttl: timedelta = AP.TOKEN_TTL, results: dict[str, Any] | None = None, **kw: Any) -> tuple[str, str]:
     """An experiment row, a staged artifact and its proposal (rsi_approval.create_proposal). (hash, proposal id)."""
-    h, d = make_artifact(root, [("~/.claude/CLAUDE.md", before, after)], exp=exp, evals=evals)
+    h, d = make_artifact(root, [("~/.claude/CLAUDE.md", before, after)], exp=exp, evals=evals, results=results)
     with psycopg.connect(url) as conn:
         conn.execute("insert into rsi_experiments (id, night, kind, status, verdict) values (%s, %s, 'edit_instruction', "
                      "'evaluated', 'IMPROVES')", (exp, night))
@@ -191,7 +199,7 @@ def test_full_brief_has_every_section_and_a_complete_proposal_block(rdb: str, sa
     md = BR.render_markdown(b)
     sections_once(md)
     assert md.startswith(f"# RSI morning brief: night {NIGHT}\n")
-    assert "1 improvement passed, 2 failed or inconclusive, 1 decision waiting for you. Total cost $0.42." in md
+    assert "1 improvement ready to apply, 2 failed or inconclusive, 1 decision waiting for you. Total cost $0.42." in md
     assert "Checkpoint advanced: 2026-10-17T03:00:00+00:00 -> 2026-10-18T03:00:00+00:00." in md
     assert "- 42 new or changed sessions since 2026-10-17T03:00:00+00:00." in md
     assert "- 7 deviations, 2 eval failures, 1 routine failure." in md
@@ -256,11 +264,14 @@ def test_json_output_schema_and_cli(rdb: str, sandbox: Path) -> None:
     for k in ("patterns", "experiments"):
         assert set(out[k]) == {"total", "items"}
     assert set(out["candidates"]) == {"total", "selected", "backlog", "items"}
-    assert set(out["costs"]) == {"by_model", "sandbox_runs", "providers", "total_usd", "budget_exhausted"}
+    assert set(out["costs"]) == {"by_model", "sandbox_runs", "providers", "total_usd", "budget_exhausted", "by_basis",
+                                 "reported_usd", "estimated_usd"}
     assert set(out["health"]) == {"services", "degraded", "database", "warnings"}
-    assert set(out["pending_decisions"]) == {"total", "items", "no_longer_pending"}
+    assert set(out["pending_decisions"]) == {"total", "items", "no_longer_pending", "with_apply"}
     assert set(out["pending_decisions"]["items"][0]) == {"proposal_id", "title", "night", "this_night", "status", "created_at",
-                                                         "expires_at", "artifact_hash", "risk", "confidence", "files", "actions"}
+                                                         "expires_at", "artifact_hash", "risk", "confidence", "files", "actions",
+                                                         "evidence_refs", "judgments", "apply_blocked"}
+    assert out["pending_decisions"]["with_apply"] == 1 and out["pending_decisions"]["items"][0]["apply_blocked"] == []
     (blk,) = out["passed"]
     assert set(blk) == BLOCK_KEYS and set(blk["actions"]) == {"apply", "reject", "details"}
     assert set(blk["change"]) == {"dir", "verified", "error", "matches_db", "files"}
@@ -283,7 +294,7 @@ VARIANTS: dict[str, tuple[dict[str, Any], list[str]]] = {
                "costs": {"by_model": {}, "sandbox_runs": 0, "providers": {}, "total_usd": 0.0}},
               ["The night finished.", "- No new sessions since 2026-10-17T03:00:00+00:00.", "- None found.",
                "0 considered, 0 selected", "- None ran.", "- None this night.", "- No model calls.",
-               "- Nothing waits for you.", "0 improvements passed, 0 failed or inconclusive, 0 decisions waiting"]),
+               "- Nothing waits for you.", "0 improvements ready to apply, 0 failed or inconclusive, 0 decisions waiting"]),
     "all_failed": ({"experiments": [experiment("exp-20261018-01", "not_promotable", "NO_EFFECT", h="a" * 64),
                                     experiment("exp-20261018-02", "not_promotable", "WORSE", h="b" * 64),
                                     experiment("exp-20261018-03", "not_promotable", "INCONCLUSIVE", h="c" * 64,
@@ -378,7 +389,10 @@ def test_database_outage_still_renders_from_the_report(sandbox: Path) -> None:
     assert blk["change"]["verified"] and blk["change"]["matches_db"] is None
     assert blk["baseline_vs_candidate"]["evals_from"] == "artifact" and blk["warnings"] == []
     (item,) = b["pending_decisions"]["items"]
-    assert item["actions"]["apply"] == f"amem rsi decide {pid} apply --hash {h}"
+    # Mission 005.5: without the database the proposal cannot be confirmed, so no Apply (Reject and Details stay)
+    assert item["actions"]["apply"] is None and blk["actions"]["apply"] is None
+    assert item["actions"]["reject"] == f"amem rsi decide {pid} reject --hash {h}" and item["artifact_hash"] == h
+    assert any("could not be confirmed in the database" in x for x in item["apply_blocked"])
     md = BR.render_markdown(b)
     sections_once(md)
     assert "- Database rows for this brief: unavailable (OperationalError)." in md
@@ -401,7 +415,12 @@ def test_artifact_problems_are_flagged_in_the_block(rdb: str, sandbox: Path) -> 
     assert not tampered["change"]["verified"] and "does not verify" in tampered["warnings"][0]
     assert any("points at another artifact" in w for w in other["warnings"])
     assert any("not registered in the database" in w for w in other["warnings"])
-    assert other["actions"]["apply"] == f"amem rsi decide {p1} apply --hash {h2}"        # bound to the tested bytes
+    assert other["actions"]["reject"] == f"amem rsi decide {p1} reject --hash {h2}"      # bound to the tested bytes
+    for blk in (tampered, other, no_replay):                                               # Mission 005.5: no Apply
+        assert blk["actions"]["apply"] is None and blk["apply_blocked"], blk["title"]
+    assert "the artifact does not verify" in tampered["apply_blocked"]
+    assert "the proposal points at another artifact" in other["apply_blocked"]
+    assert "no sandbox-replay record is bound to this hash" in no_replay["apply_blocked"]
     assert no_replay["warnings"] == ["required evaluation(s) missing or not passing: sandbox-replay; promotion refuses it"]
     md = BR.render_markdown(b)
     assert f"`{h1}` (DOES NOT VERIFY;" in md and md.count("- **Warning:**") >= 4
@@ -598,6 +617,92 @@ def test_opted_in_push_text_has_no_sensitive_data(rdb: str, sandbox: Path, sent:
     assert f"- CLAUDE.md ({h[:12]}): amem rsi show {pid}" in payload["message"]
     assert f"amem rsi show {old}" in payload["message"]
     assert "Degraded: clickhouse error, 1 other." in payload["message"]
+
+
+# --------------------------------------------------------------------------- Mission 005.5: the Apply rule
+
+
+def test_apply_only_for_fully_evaluated_improvements(rdb: str, sandbox: Path) -> None:
+    """Apply is shown only for IMPROVES with a verified artifact, passing required evaluations, a bound sandbox-replay
+    `improves` record from an independent judge and live Jev, and a pending proposal for exactly that hash.
+    INCONCLUSIVE / NO_EFFECT / WORSE / stand-in evaluations / an unverified hash: never."""
+    h_ok, p_ok = stage(rdb, sandbox, "exp-20261018-01", after=b"ok\n", title="Fully evaluated")
+    h_stub, p_stub = stage(rdb, sandbox, "exp-20261018-02", after=b"stub\n", title="Stand-in evaluation",
+                           results=STUB_RESULTS)
+    earlier = {}
+    for i, v in enumerate(("inconclusive", "no-effect", "worse"), 1):      # earlier nights: the bound record says so
+        earlier[v] = stage(rdb, sandbox, f"exp-20261017-0{i}", night="2026-10-17", after=f"{v}\n".encode(),
+                           title=f"Earlier {v}", evals={"static": "pass", "sandbox-replay": v})
+    h_nv, p_nv = stage(rdb, sandbox, "exp-20261016-01", night="2026-10-16", after=b"nv\n", title="Experiment said NO_EFFECT")
+    h_bad, p_bad = stage(rdb, sandbox, "exp-20261016-02", night="2026-10-16", after=b"bad\n", title="Tampered bytes")
+    with psycopg.connect(rdb) as conn:
+        conn.execute("update rsi_experiments set verdict = 'NO_EFFECT' where id = 'exp-20261016-01'")
+    (sandbox / "artifacts" / h_bad / "files" / RA.sha256_bytes(b"bad\n")).write_bytes(b"sneaked\n")
+    write_report(sandbox, night_report(
+        experiments=[experiment("exp-20261018-01", "staged", "IMPROVES", h=h_ok, pid=p_ok, judge=LIVE_RESULTS["judge"],
+                                jev=LIVE_RESULTS["jev"]),
+                     experiment("exp-20261018-02", "staged", "IMPROVES", h=h_stub, pid=p_stub),
+                     experiment("exp-20261018-03", "not_promotable", "INCONCLUSIVE", h="c" * 64),
+                     experiment("exp-20261018-04", "not_promotable", "NO_EFFECT", h="d" * 64),
+                     experiment("exp-20261018-05", "not_promotable", "WORSE", h="e" * 64)],
+        pending_decisions=[p_ok, p_stub]))
+    b = BR.make_brief(root=sandbox, db_url=rdb)
+    ok, stub = b["passed"]
+    assert ok["actions"]["apply"] == f"amem rsi decide {p_ok} apply --hash {h_ok}" and ok["apply_blocked"] == []
+    assert ok["evaluation"]["independent"] and ok["evaluation"]["judge"]["mode"] == "codex"
+    assert stub["actions"]["apply"] is None and not stub["evaluation"]["independent"]
+    assert any("not independently evaluated (judge stub, Jev fixture/ok)" in x for x in stub["apply_blocked"])
+    items = {i["title"]: i for i in b["pending_decisions"]["items"]}
+    assert set(items) == {"Fully evaluated", "Stand-in evaluation", "Earlier inconclusive", "Earlier no-effect",
+                          "Earlier worse", "Experiment said NO_EFFECT", "Tampered bytes"}
+    assert [t for t, i in items.items() if i["actions"]["apply"]] == ["Fully evaluated"]
+    assert b["pending_decisions"]["with_apply"] == 1
+    for v in ("inconclusive", "no-effect", "worse"):
+        blk = items[f"Earlier {v}"]["apply_blocked"]
+        assert f"the bound sandbox-replay record says {v}, not improves" in blk, blk
+        assert any("required evaluation(s) missing or not passing: sandbox-replay" in x for x in blk)
+        assert items[f"Earlier {v}"]["actions"]["reject"].endswith(f"--hash {earlier[v][0]}")   # Reject stays, bound
+    assert "verdict NO_EFFECT is not IMPROVES" in items["Experiment said NO_EFFECT"]["apply_blocked"]
+    assert "the artifact does not verify" in items["Tampered bytes"]["apply_blocked"]
+    for i in items.values():                     # every proposal names its exact hash and its evidence
+        assert RA.HEX64.fullmatch(i["artifact_hash"]) and i["evidence_refs"]
+    md = BR.render_markdown(b)
+    sections_once(md)
+    assert md.count(" apply --hash ") == 2                     # the ready proposal: its block and its pending item
+    assert f"amem rsi decide {p_ok} apply --hash {h_ok}" in md
+    for h in (h_stub, h_nv, h_bad, *(x[0] for x in earlier.values()), "c" * 64, "d" * 64, "e" * 64):
+        assert f"apply --hash {h}" not in md
+    assert "1 improvement ready to apply (1 more staged but not ready)" in md
+    assert "- **Status:** staged, NOT ready to apply" in md and "- Apply: not offered: " in md
+    assert "judge codex: candidate won 2/3, baseline 1, B win rate 0.67; Jev live: improves (0.76)" in md
+    assert "Apply offered for 1 of 7 proposals" in md
+    _, body = BR.notification(b)
+    assert "Ready to apply 1, staged not ready 1, failed or inconclusive 3." in body and "(no Apply)" in body
+
+
+def test_costs_show_their_basis(sandbox: Path) -> None:
+    """Provider-reported vs local estimates, per model and in total (the G2b split)."""
+    from agent_memory.rsi_budget import Budget, BudgetConfig
+    bud = Budget(BudgetConfig.from_dict({"max_usd": 1.0, "model_calls": {"gpt-6-luna": 3, "jev-1.14.0": 1}}))
+    bud.record_run("a1", model="claude-haiku-5-5", usd=0.0081, exit_code=0)                 # CLI-reported
+    bud.record_call("gpt-6-luna", stage="replay-judge", tokens_in=12981, tokens_out=562, tokens_cache_write=12978)
+    bud.record_run("j1", model="gpt-6-luna", exit_code=0, cost_on_call=True)
+    bud.record_call("jev-1.14.0", stage="replay-jev")                                        # flat table price
+    costs = bud.costs()
+    assert costs["model_bases"] == {"claude-haiku-5-5": {"reported": 0.0081}, "gpt-6-luna": {"table": 0.001904},
+                                    "jev-1.14.0": {"call": 0.01}}
+    assert costs["reported_usd"] == 0.0081 and costs["estimated_usd"] == 0.011904
+    assert costs["by_basis"]["on-call"] == {"kind": "free", "records": 1, "usd": 0.0}
+    write_report(sandbox, night_report(costs=json.loads(json.dumps(costs))))
+    b = BR.make_brief(root=sandbox, db_url=CLOSED_DB)
+    md = BR.render_markdown(b)
+    assert "| claude-haiku-5-5 | 0 | 0 | 0 | $0.01 | reported $0.0081 |" in md
+    assert "| gpt-6-luna | 1 | 12981 | 562 | $0.00 | table $0.0019 |" in md
+    assert "- Provider-reported: $0.0081" in md and "Local estimates: $0.0119" in md
+    assert "No cost here is verified provider billing." in md
+    old = night_report()                                       # a report without bases says so
+    write_report(sandbox, old)
+    assert "- Cost basis: not recorded in this report" in BR.render_markdown(BR.make_brief(root=sandbox, db_url=CLOSED_DB))
 
 
 def test_scrub_removes_paths_emails_and_secrets() -> None:
