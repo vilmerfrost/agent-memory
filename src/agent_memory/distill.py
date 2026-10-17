@@ -25,6 +25,7 @@ import os
 import re
 import subprocess
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import Any
@@ -214,13 +215,15 @@ def call_writer(prompt: str, *, timeout: float = DEFAULT_TIMEOUT) -> str:
     return run_cli(writer_argv(), prompt, timeout=timeout)
 
 
-def run_cli(argv: list[str], prompt: str, *, timeout: float = DEFAULT_TIMEOUT) -> str:
+def run_cli(argv: list[str], prompt: str, *, timeout: float = DEFAULT_TIMEOUT,
+            env: Mapping[str, str] | None = None) -> str:
     """Run a headless CLI argv with the prompt on stdin; return stdout. Raises WriterError.
 
     The child gets `AMEM_HOOK_OFF=1`: the user's session hook (deploy/hooks/amem-session-hook.sh)
-    would otherwise record every model call as its own empty `sessions` row.
+    would otherwise record every model call as its own empty `sessions` row. `env`: the child's
+    environment (default: this process's).
     """
-    env = {**os.environ, "AMEM_HOOK_OFF": "1"}
+    env = {**(os.environ if env is None else env), "AMEM_HOOK_OFF": "1"}
     try:
         proc = subprocess.run(argv, input=prompt, capture_output=True, text=True, timeout=timeout, env=env)
     except subprocess.TimeoutExpired:

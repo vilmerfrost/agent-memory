@@ -1029,6 +1029,12 @@ def run_replay(artifact_hash: str, cases: Sequence[ReplayCase], cfg: ReplayConfi
     result = _record(r, result, cfg, policy)
     _write_evidence(r, result, cfg, policy)
     if interrupted is not None:
+        reap = getattr(sb, "reap_experiment", None)      # an interrupted `docker run` can leave a Created container
+        if callable(reap):
+            try:
+                r.log("reaped", containers=reap(experiment_id))
+            except Exception as exc:  # noqa: BLE001 - best effort; the night reaps again after an abort
+                r.log("reap-failed", error=f"{type(exc).__name__}: {str(exc)[:200]}")
         raise interrupted
     return result
 
