@@ -1,0 +1,30 @@
+{
+  "format": "rsi-evidence-providers/1",
+  "note": "What the nightly investigator (amem rsi night) and amem rsi evidence-probe may READ from each provider. Owner-approved; the investigator never writes this file. Missing or unreadable: every external provider is unavailable (fail closed). See docs/rsi/evidence-providers.md.",
+  "providers": {
+    "supabase": {
+      "read": true,
+      "queries": ["*"],
+      "data": "the authoritative store: sessions, deviations, scores, rsi_* rows; read-only connections",
+      "approval": "authoritative store (Mission 005 plan 2.3)"
+    },
+    "clickhouse": {
+      "read": true,
+      "queries": ["rule_gap", "rule_weekly_rate", "routine_streaks"],
+      "data": "egress-filtered numbers, labels and pseudonyms written by the approved sink; today only the C1 synthetic rows (their amem: subjects do not resolve in production, so they show as stale)",
+      "approval": "Mission 005.5 brief section 5 (read-only retrieval); service G-CH1..G-CH3 (m004c-report sections 1 and 8); historical backfill not approved"
+    },
+    "langfuse": {
+      "read": true,
+      "queries": ["trace", "experiment_scores"],
+      "data": "sandbox experiment traces and scores only (ids, numbers, labels)",
+      "approval": "Mission 005.5 brief section 5 (read-only retrieval); C2 accepted (m004c-report section 3)"
+    },
+    "pastdev": {
+      "read": false,
+      "queries": ["recall"],
+      "data": "the reviewed own decision records only (backfill-export-plan section 5.7: 2 records)",
+      "approval": "not approved for investigator recall: the backfill approval (backfill-export-plan 5.8) excludes recall from routines, and each recall spends 0.1 credit"
+    }
+  }
+}

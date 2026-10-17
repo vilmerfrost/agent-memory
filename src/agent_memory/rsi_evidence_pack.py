@@ -257,15 +257,11 @@ def _when(v: str | datetime | None) -> datetime | None:
 
 
 def _read_only(connect: Callable[[], psycopg.Connection]) -> Callable[[], psycopg.Connection]:
-    """A connection factory whose connections refuse writes (default_transaction_read_only)."""
-    def ro() -> psycopg.Connection:
-        conn = connect()
-        try:
-            conn.read_only = True
-        except psycopg.Error:             # a connection already in a transaction keeps its mode
-            pass
-        return conn
-    return ro
+    """A connection factory whose connections refuse writes: every statement runs in a READ ONLY transaction
+    (autocommit off, read_only on); a connection that cannot be made so is refused (rsi_evidence_providers)."""
+    from agent_memory.rsi_evidence_providers import read_only_connect
+
+    return read_only_connect(connect)
 
 
 # ---------------------------------------------------------------- the candidate and the plan
@@ -367,6 +363,25 @@ def _phase2(done: Sequence[tuple[_Step, QueryResult]], lim: PackLimits) -> list[
                 and r.id not in traces:
             traces.append(r.id)
     return [_Step("lf", "trace", {"trace_id": t}, "langfuse") for t in traces[: lim.max_traces]]
+
+
+def run_steps(c: _Cand, runner: _Runner, lim: PackLimits) -> list[tuple[_Step, QueryResult]]:
+    """Stage S4's queries for one candidate: phase 0, then what it found (experiments, then failing traces)."""
+    done = runner.phase(_phase0(c, lim))
+    done += runner.phase(_phase1(done, lim))
+    done += runner.phase(_phase2(done, lim))
+    return done
+
+
+def _delta_steps(since: datetime, until: datetime, experiments: Sequence[str]) -> list[_Step]:
+    """Stage S1's provider queries for the window (since, until]: ClickHouse rule gaps and routine streaks over the
+    window's days, Langfuse score aggregates for at most two of the window's experiments."""
+    window = max(1, min(999, math.ceil((until - since).total_seconds() / 86400)))
+    steps = [_Step("ch", "rule_gap", {"days": str(window), "min_n": "3", "limit": "20"}, "clickhouse"),
+             _Step("ch", "routine_streaks", {"days": str(window), "limit": "20"}, "clickhouse")]
+    steps += [_Step("lf", "experiment_scores", {"experiment_id": x}, "langfuse")
+              for x in experiments if refs.EXPERIMENT_RE.fullmatch(x)][:2]
+    return steps
 
 
 # ---------------------------------------------------------------- running steps under a time budget
@@ -539,29 +554,16 @@ class _Raw:
 
 
 def default_retrievers(environ: Mapping[str, str] | None = None,
-                       connect: Callable[[], psycopg.Connection] | None = None) -> dict[str, Retriever | None]:
-    """Supabase plus the three optional providers as configured in `environ` (None: the process env, as the
-    CLI loads it). A provider whose adapter cannot even be built is None (its steps answer unavailable)."""
-    from agent_memory import store
+                       connect: Callable[[], psycopg.Connection] | None = None, *,
+                       subject_rule: str | None = None) -> dict[str, Retriever | None]:
+    """The real providers (Mission 005.5): Supabase plus ClickHouse, Langfuse and past.dev as configured in
+    `environ` (None: the process env, as the CLI loads it), each read-only and gated by configuration, kill
+    switches, the owner-approved policy (config/rsi-evidence-providers.json) and the egress rules
+    (rsi_evidence_providers). A provider that may not be asked answers `unavailable` with the reason.
+    `subject_rule`: the candidate's rule, which past.dev recall words come from."""
+    from agent_memory import rsi_evidence_providers as EP
 
-    conn_f = connect or store.connect
-    out: dict[str, Retriever | None] = {"sb": SupabaseRetriever(conn_f)}
-    try:
-        from agent_memory.integrations import clickhouse
-        out["ch"] = clickhouse.ClickHouseRetriever(clickhouse.Client(clickhouse.config(environ)))
-    except Exception:  # noqa: BLE001 - an adapter that cannot be built is unavailable
-        out["ch"] = None
-    try:
-        from agent_memory.integrations import langfuse
-        out["lf"] = langfuse.LangfuseRetriever(langfuse.LangfuseClient.from_env(environ))
-    except Exception:  # noqa: BLE001
-        out["lf"] = None
-    try:
-        from agent_memory.integrations import pastdev
-        out["pd"] = pastdev.PastDevRetriever(_read_only(conn_f), environ=environ)   # re-reads recalled refs
-    except Exception:  # noqa: BLE001
-        out["pd"] = None
-    return out
+    return EP.build(environ, connect=connect, subject_rule=subject_rule).retrievers
 
 
 def _combine(statuses: Sequence[str]) -> str:
@@ -570,6 +572,10 @@ def _combine(statuses: Sequence[str]) -> str:
         return "skipped"
     if len(s) == 1:
         return next(iter(s))
+    if s == {"ok", "unavailable"}:
+        # some steps stopped by policy or egress (Mission 005.5, evidence.Unavailable), the rest answered: the
+        # provider works. Its unavailable steps stay visible as findings; health never turns that into error.
+        return "ok"
     return "partial" if "ok" in s else ("error" if "error" in s else "unavailable")
 
 
@@ -660,8 +666,8 @@ def build_pack(candidate: Mapping[str, Any], *, retrievers: Mapping[str, Retriev
     """The bounded evidence pack for one candidate. Never raises for a provider: an unconfigured, down, slow or
     broken one shows in `health` and as an unavailable/error finding. Writes nothing (read-only connections)."""
     c = _candidate(candidate)
-    rs: dict[str, Retriever | None] = dict(retrievers) if retrievers is not None else default_retrievers(environ,
-                                                                                                         connect)
+    rs: dict[str, Retriever | None] = (dict(retrievers) if retrievers is not None
+                                       else default_retrievers(environ, connect, subject_rule=c.rule))
     sb = rs.get("sb")
     conn_f = connect or (sb.connect if isinstance(sb, SupabaseRetriever) else None)
     ro = _read_only(conn_f) if conn_f is not None else None
@@ -669,9 +675,7 @@ def build_pack(candidate: Mapping[str, Any], *, retrievers: Mapping[str, Retriev
         rs["sb"] = SupabaseRetriever(ro)
     runner = _Runner({k: rs.get(k) for k in RETRIEVERS}, limits.timeout_s, clock)
 
-    done = runner.phase(_phase0(c, limits))
-    done += runner.phase(_phase1(done, limits))
-    done += runner.phase(_phase2(done, limits))
+    done = run_steps(c, runner, limits)
 
     # retrievers no step asked: their health, within the same budget (Supabase: when no supabase-source step ran)
     asked = {st.retr for st, _ in done if st.retr != "sb" or st.source == "supabase"}
@@ -1088,11 +1092,7 @@ def delta_since(checkpoint_ts: str | datetime | None, *, conn: psycopg.Connectio
 
     live: list[_Raw] = []
     if retrievers:
-        window = max(1, min(999, math.ceil((until - since).total_seconds() / 86400)))
-        steps = [_Step("ch", "rule_gap", {"days": str(window), "min_n": "3", "limit": "20"}, "clickhouse"),
-                 _Step("ch", "routine_streaks", {"days": str(window), "limit": "20"}, "clickhouse")]
-        steps += [_Step("lf", "experiment_scores", {"experiment_id": x["id"]}, "langfuse")
-                  for x in d.experiments if refs.EXPERIMENT_RE.fullmatch(x["id"])][:2]
+        steps = _delta_steps(since, until, [x["id"] for x in d.experiments])
         runner = _Runner({k: retrievers.get(k) for k in ("ch", "lf", "pd")}, limits.timeout_s, clock)
         done = runner.phase(steps)
         stat: dict[str, list[str]] = defaultdict(list)
