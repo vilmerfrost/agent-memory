@@ -517,7 +517,9 @@ def test_plan_counts_without_pushing_and_cannot_write(app: str) -> None:
     s = _Priced(n=5)
     with psycopg.connect(app) as conn:
         out = sync.plan(s, conn, environ={"AMEM_SYNC_PASTDEV_MAX_ROWS_PER_DAY": "2"})
-        assert s.pushed == [] and conn.read_only is False
+        # Mission 004C: plan restores the connection's own setting (None here), never False: False would start every
+        # later transaction as READ WRITE and override a session's default_transaction_read_only = on
+        assert s.pushed == [] and conn.read_only is None
         assert out["tables"]["t"]["rows"] == 5 and out["tables"]["t"]["batches"] == 1 and out["cost"] == 10
         assert (out["rows"], out["requests"], out["days_at_limit"]) == (5, 1, 3)
 
@@ -527,7 +529,7 @@ def test_plan_counts_without_pushing_and_cannot_write(app: str) -> None:
                 yield from ()
         with pytest.raises(psycopg.errors.ReadOnlySqlTransaction):
             sync.plan(_Writer(), conn)
-        assert conn.read_only is False
+        assert conn.read_only is None
 
 
 def test_pastdev_local_credits_follow_the_pricing_rule() -> None:
