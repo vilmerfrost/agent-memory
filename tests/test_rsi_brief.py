@@ -434,7 +434,8 @@ def test_brief_is_read_only(rdb: str, sandbox: Path) -> None:
 
     before = (tree(), rows())
     BR.render_markdown(BR.make_brief(root=sandbox, db_url=rdb))
-    assert run_amem("rsi", "brief", "--root", str(sandbox), env=base_env(AMEM_DB_URL=rdb)).returncode == 0
+    env = base_env(AMEM_DB_URL=rdb, AMEM_AGENT_CONFIG_DIR=str(sandbox.parent / "no-agent-config"))
+    assert run_amem("rsi", "brief", "--root", str(sandbox), env=env).returncode == 0
     assert (tree(), rows()) == before
 
 
