@@ -23,7 +23,9 @@ It runs the scheduled path end to end, the way launchd would, in the Mission 005
                  database never configured; no container, lock or Keychain read left behind
 
 `--paid-plan` prints `rsi_schedule.paid_plan` for the live first-night config: the exact paid calls, the G2b-based
-estimate and the worst case. A live (paid) rehearsal needs Vilmer's approval and is not run here.
+estimate and the worst case. `--live --approve-max-usd <max_usd>` is the paid rehearsal (activation gate 2): the
+same world and checks with the config's live stages (live Jev with the caller's TYPESAFE_API_KEY, the sandbox's
+Keychain items, the host `claude -p` hypothesizer). It refuses without the approval flag. Unverified until run.
 """
 
 from __future__ import annotations
@@ -112,11 +114,26 @@ def checkpoint_rows(db_url: str) -> list[dict[str, Any]]:
         return [dict(r) for r in cur.fetchall()]
 
 
+LIVE_ENV_PASS = ("TYPESAFE_API_KEY",)        # the only caller env a live rehearsal passes in (Jev's key)
+
+
+def live_config(first: Path, out: Path) -> Path:
+    """The first-night config as is (paid stages): the paid rehearsal runs exactly what the first night would."""
+    d = json.loads(first.read_bytes())
+    d["_note"] = (f"PAID rehearsal config: {first.name} unchanged (sha256 "
+                  f"{hashlib.sha256(first.read_bytes()).hexdigest()[:12]}), on the synthetic world.")
+    out.write_text(json.dumps(d, indent=1) + "\n")
+    return out
+
+
 def run_rehearsal(work: Path, *, first: Path = FIRST_CONFIG, db_url: str | None = None, keep: bool = False,
-                  agent_config: Path | None = None) -> dict[str, Any]:
+                  agent_config: Path | None = None, live: bool = False) -> dict[str, Any]:
+    """live=False: the $0 mock. live=True: the first-night config's paid stages on the same synthetic world (only
+    with Vilmer's approval; main() requires --approve-max-usd). Unverified until the paid rehearsal runs."""
     from agent_memory import rsi_approval as AP, rsi_artifact as RA, rsi_night as N, rsi_schedule as S
     work = Path(work).expanduser().resolve()
     check_workdir(work)
+    passed = {k: os.environ[k] for k in LIVE_ENV_PASS if live and os.environ.get(k)}
     fp_before = D.production_fingerprint()
     nights_before = D.listing(D.REAL_HOME / "sandbox" / "nights")
     real_lines_before = real_job_lines()
@@ -133,10 +150,12 @@ def run_rehearsal(work: Path, *, first: Path = FIRST_CONFIG, db_url: str | None 
             admin = db_url
         world = D.build_world(work / "world", agent_config=agent_config)
         world.db_url = D.fresh_database(admin)
-        cfgp = mock_config(first, work / "rsi-night.rehearsal.json")
+        cfgp = (live_config if live else mock_config)(first, work / "rsi-night.rehearsal.json")
         log = work / "routines.log"
         reports = work / "reports"
         env = D.demo_env(world, hypotheses=D.BENCH / "hypotheses" / "success")
+        if live:     # live Jev, and the sandbox items' presence check on the real Keychain (attributes only)
+            env.update(passed, AMEM_JEV_LIVE="1", AMEM_RSI_SECURITY="/usr/bin/security")
         now = datetime.now().astimezone()
         night = AP.night_key(now)
         with D.environ(env):
@@ -186,7 +205,8 @@ def run_rehearsal(work: Path, *, first: Path = FIRST_CONFIG, db_url: str | None 
         "real_sandbox_nights": {"before": nights_before, "after": D.listing(D.REAL_HOME / "sandbox" / "nights")},
         "real_routines_log_job_lines": {"before": real_lines_before, "after": real_job_lines()}}
     out["seconds"] = round(time.monotonic() - t0, 1)
-    out["problems"] = problems_of(out)
+    out["live"] = live
+    out["problems"] = problems_of(out, live=live)
     out["ok"] = out["problems"] == []
     return out
 
@@ -195,25 +215,29 @@ def checks_db_host(out: Mapping[str, Any]) -> str:
     return str((out.get("checks") or {}).get("db_host"))
 
 
-def problems_of(r: Mapping[str, Any]) -> list[str]:
+def problems_of(r: Mapping[str, Any], *, live: bool = False) -> list[str]:
+    """What makes the rehearsal fail. The mock must stage IMPROVES with $0 and no Apply (stand-ins); a live
+    rehearsal may end with any verdict, but every safety check below applies to both."""
     p: list[str] = []
     if (r.get("gate") or {}).get("status") != "SKIP":
         p.append(f"the gate did not skip without amem-daily: {r.get('gate')}")
     nj = r.get("night_job") or {}
-    if nj.get("status") != "PASS" or (nj.get("fields") or {}).get("status") != "ok":
+    if not live and (nj.get("status") != "PASS" or (nj.get("fields") or {}).get("status") != "ok"):
+        p.append(f"night job {nj.get('status')} {nj.get('items')}")
+    if live and nj.get("status") not in ("PASS", "FAIL"):
         p.append(f"night job {nj.get('status')} {nj.get('items')}")
     exp = r.get("experiment") or {}
-    if exp.get("verdict") != "IMPROVES" or exp.get("status") != "staged" or not exp.get("proposal_id"):
+    if not live and (exp.get("verdict") != "IMPROVES" or exp.get("status") != "staged" or not exp.get("proposal_id")):
         p.append(f"experiment {exp.get('status')} {exp.get('verdict')} {exp.get('verdict_reasons')}")
-    if r.get("eval_problems") not in ([], None):
+    if exp.get("status") == "staged" and r.get("eval_problems") not in ([], None):
         p.append(f"agent-config eval_problems: {r.get('eval_problems')}")
     bj = r.get("brief_job") or {}
     if bj.get("status") != "PASS":
         p.append(f"brief job {bj.get('status')} {bj.get('items')}")
     md = r.get("brief_markdown") or ""
-    if " apply --hash " in md:
+    if not live and " apply --hash " in md:
         p.append("the brief offered Apply for a stand-in evaluation")
-    if "- Apply: not offered: " not in md:
+    if not live and "- Apply: not offered: " not in md:
         p.append("the brief does not say why Apply is not offered")
     fp = r.get("fingerprint") or {}
     if fp.get("before") != fp.get("after") or fp.get("diff"):
@@ -223,9 +247,9 @@ def problems_of(r: Mapping[str, Any]) -> list[str]:
         v = pc.get(k) or {}
         if v.get("before") != v.get("after"):
             p.append(f"{k} changed: {v}")
-    if (r.get("report") or {}).get("costs", {}).get("total_usd") not in (0, 0.0):
+    if not live and (r.get("report") or {}).get("costs", {}).get("total_usd") not in (0, 0.0):
         p.append("the mock night booked a cost")
-    if not (r.get("rehearsal_checkpoint") or [{}])[0].get("status") == "done":
+    if not live and not (r.get("rehearsal_checkpoint") or [{}])[0].get("status") == "done":
         p.append(f"the night's own checkpoint did not advance in the throwaway database: {r.get('rehearsal_checkpoint')}")
     c = r.get("checks") or {}
     for k in ("synthetic_production_unchanged", "scratch_agent_config_unchanged"):
@@ -249,11 +273,17 @@ def render(r: Mapping[str, Any]) -> str:
     nj, bj, rep = r["night_job"], r["brief_job"], r["report"]
     sd = (r.get("seed") or {}).get("rsi_demo") or {}
     pc = r["production_checkpoint"]
-    out = [bar, BANNER, bar, "",
+    banner = BANNER if not r.get("live") else ("PAID REHEARSAL (Mission 005.5): synthetic data, the first-night "
+                                              "config's live stages. Production is not touched.")
+    out = [bar, banner, bar, "",
            f"night {r['night']}, work dir {r['work']}, {r['seconds']} s",
            f" 0. world      seeded {sd.get('dataset')}: {(sd.get('counts') or {}).get('sessions')} sessions, "
            f"{(sd.get('counts') or {}).get('deviations')} deviations; db host {r['checks'].get('db_host')}",
-           f" 1. config     {r['config']} (first-night limits, stand-in stages, max_usd 0)",
+           f" 1. config     {r['config']} " + ("(the first-night config, live stages)" if r.get("live") else
+                                                "(first-night limits, stand-in stages, max_usd 0)"),
+           f"               costs: total ${float((rep.get('costs') or {}).get('total_usd') or 0):.4f}, provider-reported "
+           f"${float((rep.get('costs') or {}).get('reported_usd') or 0):.4f}, estimated "
+           f"${float((rep.get('costs') or {}).get('estimated_usd') or 0):.4f}",
            f" 2. gate       without amem-daily: {r['gate']['status']} ({'; '.join(r['gate']['items'])})",
            f"               with amem-daily PASS: {nj['status']}",
            f" 3. night      status {rep.get('status')}; candidates "
@@ -290,16 +320,26 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--db-url", default=None, help="a local Postgres (default: a throwaway container)")
     ap.add_argument("--keep", action="store_true", help="keep the throwaway Postgres container")
     ap.add_argument("--paid-plan", action="store_true", help="print the live night's paid calls and estimate; run nothing")
+    ap.add_argument("--live", action="store_true",
+                    help="PAID: run the config's live stages on the synthetic world (needs --approve-max-usd)")
+    ap.add_argument("--approve-max-usd", type=float, default=None,
+                    help="the approved hard cap; must equal the config's budget.max_usd")
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args(argv)
-    if args.paid_plan:
-        from agent_memory import rsi_night as N, rsi_schedule as S
+    from agent_memory import rsi_night as N, rsi_schedule as S
+    if args.paid_plan or args.live:
         plan = S.paid_plan(N.load_config(args.config))
-        print(json.dumps(plan, indent=1, sort_keys=True, default=str) if args.json else S.render_plan(plan))
-        return 0
+        print(json.dumps(plan, indent=1, sort_keys=True, default=str) if args.json else S.render_plan(plan), flush=True)
+        if args.paid_plan:
+            return 0
+        if args.approve_max_usd is None or abs(args.approve_max_usd - plan["max_usd"]) > 1e-9:
+            print(f"m0055 rehearsal: --live makes paid calls; it needs Vilmer's approval of this plan and "
+                  f"--approve-max-usd {plan['max_usd']:g} (the config's max_usd). Nothing ran.", file=sys.stderr)
+            return 2
     work = (args.workdir or Path(tempfile.mkdtemp(prefix="amem-m0055-rehearsal-"))).expanduser().resolve()
     try:
-        res = run_rehearsal(work, first=args.config.expanduser().resolve(), db_url=args.db_url, keep=args.keep)
+        res = run_rehearsal(work, first=args.config.expanduser().resolve(), db_url=args.db_url, keep=args.keep,
+                            live=args.live)
     except (RehearsalError, D.DemoError) as exc:
         print(f"m0055 rehearsal: {exc}", file=sys.stderr)
         return 2

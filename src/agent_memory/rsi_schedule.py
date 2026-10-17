@@ -52,7 +52,8 @@ HARD_GRACE_S = 600          # the watchdog's SIGTERM comes this long after the n
 KILL_GRACE_S = 120          # then a hard exit if the night still has not finished
 EXIT_HARD_TIMEOUT = 124
 MAX_ITEMS = 8
-SECURITY_ENV = "AMEM_ADMIN_SECURITY"        # credentials.SECURITY_ENV: the `security` executable (tests: a tripwire)
+RSI_SECURITY_ENV = "AMEM_RSI_SECURITY"     # the `security` used for the sandbox items' presence check, if set
+SECURITY_ENV = "AMEM_ADMIN_SECURITY"        # else credentials.SECURITY_ENV (tests and demos: a tripwire)
 DEFAULT_REPORTS_DIR = Path.home() / ".claude" / "parent" / "reports"
 PAID_STAGE_MODES = {"triage": ("live",), "hypothesizer": ("claude-cli",), "implementer": ("claude", "codex"),
                     "replay_agent": ("claude", "codex"), "judge": ("codex", "claude"), "replay_jev": ("live",)}
@@ -199,7 +200,8 @@ def keychain_present(ref: str, *, runner: Callable[..., Any] | None = None) -> s
     service, sep, account = ref[len("keychain:"):].partition("/")
     if not sep or not service or not account:
         return "keychain reference is not keychain:<service>/<account>"
-    exe = os.environ.get(SECURITY_ENV, "").strip() or "/usr/bin/security"
+    exe = (os.environ.get(RSI_SECURITY_ENV, "").strip() or os.environ.get(SECURITY_ENV, "").strip()
+           or "/usr/bin/security")
     run = runner or subprocess.run
     try:
         proc = run([exe, "find-generic-password", "-s", service, "-a", account], capture_output=True, timeout=10,

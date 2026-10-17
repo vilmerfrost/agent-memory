@@ -278,6 +278,19 @@ def test_mock_rehearsal_config_keeps_the_limits_and_drops_every_paid_stage(tmp_p
             R.check_workdir(bad)
 
 
+def test_paid_rehearsal_refuses_without_the_approved_cap(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+                                                         capsys: pytest.CaptureFixture[str]) -> None:
+    from agent_memory import rsi_rehearsal as R
+    ran: list[Any] = []
+    monkeypatch.setattr(R, "run_rehearsal", lambda *a, **k: ran.append((a, k)))
+    for argv in (["--live"], ["--live", "--approve-max-usd", "5"], ["--live", "--approve-max-usd", "0.5"]):
+        assert R.main([*argv, "--workdir", str(tmp_path / "w")]) == 2
+        err = capsys.readouterr().err
+        assert "needs Vilmer's approval" in err and "--approve-max-usd 1" in err and "Nothing ran." in err
+    assert ran == [] and not (tmp_path / "w").exists()
+    assert R.main(["--paid-plan"]) == 0 and "worst case $0.9100" in capsys.readouterr().out and ran == []
+
+
 def test_paid_plan_lists_every_paid_call_and_fits_the_cap() -> None:
     plan = S.paid_plan(first_cfg())
     got = {(r["stage"], r["model"]): r["count"] for r in plan["calls"]}
