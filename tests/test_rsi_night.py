@@ -512,8 +512,11 @@ def test_jev_fixture_triage_ranks_with_the_typed_answers(env: SimpleNamespace) -
     for key, (rid, _ref, n, grade) in ((KEY_A, RULE_A), (KEY_B, RULE_B)):         # the committed fixtures match
         c = {"source": "deviations", "kind": "edit_instruction", "target": "~/.claude/CLAUDE.md",
              "rule_key": f"claude-md:global:{rid}", "seen_count": 1, "metrics": {"sessions": n, "followed_grade_mean": grade}}
-        k = jev.fixture_key(N.triage_state(c, [], True), qset.jev_questions())
+        state = N.triage_state(c, [], True)
+        k = jev.fixture_key(state, qset.jev_questions())
         assert (config.JEV_FIXTURES_DIR / f"{k}.json").is_file(), (key, k)
+        fx = json.loads((config.JEV_FIXTURES_DIR / f"{k}.json").read_text())
+        assert fx["_triage_state"] == state and "_state" not in fx   # `_state` is reserved for routine states
     rep = run(env)
     assert rep["health"]["jev"] == "fixture"
     a, b = candidate(env.url, KEY_A), candidate(env.url, KEY_B)
