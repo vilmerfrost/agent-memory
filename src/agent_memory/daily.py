@@ -17,8 +17,10 @@ Steps, in order. A failed step is recorded and the next step still runs:
    An id is marked pushed only after ntfy answered 200.
 3b. deviations (daily): `sessions ingest` + `deviations scan --limit 40` (docs/deviations.md) when
    the last scan in the state file is >= 20 hours old (AMEM_DEVIATIONS_EVERY_HOURS). Off unless AMEM_DEVIATIONS_LIVE=1 (then not
-   a failure, and the log line has no deviation fields). Any session error fails the step. A lost
-   database before the scan loop is retried once, after `wait_for_db`.
+   a failure, and the log line has no deviation fields). Any session error fails the step. A
+   malformed writer item next to valid ones is a counted warning (`deviation_skipped=N`, one
+   stderr line per item), not a failure. A lost database before the scan loop is retried once,
+   after `wait_for_db`.
 3c. edits: `edits run` (docs/edits.md) after the deviations step. Off unless AMEM_EDITS_LIVE=1
    (then not a failure, and the log line has no edit fields). Kept edits are pushed with an
    Undo button (not with --no-push). Any candidate error fails the step; the others still run.
@@ -440,6 +442,9 @@ def step_deviations(result: DailyResult, *, state_file: Path, now: datetime) -> 
             return
     result.deviations = report
     _err(report.summary())
+    for o in report.outcomes:  # a counted warning (deviation_skipped=N), not a failure: see docs/daily.md
+        for reason in o.skipped_reasons:
+            _err(f"deviations: invalid item skipped: session {o.session_id}: {reason}")
     if report.errors:
         first = next(o for o in report.outcomes if o.status == "error")
         n = report.errors
@@ -517,7 +522,7 @@ def log_lines(ts: str, result: DailyResult, secs: int) -> list[str]:
         v = s.verdicts()
         head += (f"deviations={s.found} deviation_sessions={len(s.outcomes)} "
                  f"deviations_edit={v['edit_instruction']} deviations_enforce={v['enforce']} "
-                 f"deviations_leave={v['leave']} deviation_errors={s.errors} ")
+                 f"deviations_leave={v['leave']} deviation_errors={s.errors} deviation_skipped={s.skipped} ")
     if result.edits is not None:  # only when the step ran
         e = result.edits
         head += (f"edits={e.edits} edits_kept={e.kept} edits_reverted={e.reverted} "

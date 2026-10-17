@@ -208,11 +208,71 @@ def test_parse_skips_a_null_grade_and_keeps_the_rest() -> None:
                    finding(ref="Dod", result_grade=None))
     findings, skipped = deviations.parse_reply(reply, OFFERED)
     assert [f.instruction_ref for f in findings] == ["Brief"] and skipped == 2
-    # Only a null grade is skipped: a missing grade is still a malformed reply.
+    # A missing grade is skipped by the scan's parse_reply too; strict parse_findings rejects it.
     item = finding()
     del item["followed_grade"]
+    assert deviations.parse_reply(_reply(item, finding(ref="Brief", turn=2)), OFFERED)[1] == 1
     with pytest.raises(FindingError, match="followed_grade must be a number in 0..1, got None"):
         parse_findings(_reply(item), OFFERED)
+
+
+# 2026-10-15 and 2026-10-17: the writer returned `"followed_grade": null` on one item and the
+# whole session (all its valid items) was dropped. parse_reply skips any malformed item and
+# names it; its grade is never filled in.
+_MISSING = object()
+BAD_GRADES = [None, _MISSING, "0.5", "high", -0.1, 1.5, True, float("nan")]
+BAD_IDS = ["null", "missing", "string-number", "string-word", "below-0", "above-1", "bool", "nan"]
+
+
+def _bad_item(name: str, value: object) -> dict[str, object]:
+    item = finding()
+    if value is _MISSING:
+        del item[name]
+    else:
+        item[name] = value
+    return item
+
+
+@pytest.mark.parametrize("name", ["followed_grade", "result_grade"])
+@pytest.mark.parametrize("value", BAD_GRADES, ids=BAD_IDS)
+def test_strict_parse_still_rejects_a_bad_grade(name: str, value: object) -> None:
+    with pytest.raises(FindingError, match=f"deviation 0: {name} must be a number in 0..1"):
+        parse_findings(_reply(_bad_item(name, value)), OFFERED)
+
+
+@pytest.mark.parametrize("name", ["followed_grade", "result_grade"])
+@pytest.mark.parametrize("value", BAD_GRADES, ids=BAD_IDS)
+def test_parse_reply_skips_a_bad_grade_and_keeps_the_rest(name: str, value: object) -> None:
+    reasons: list[str] = []
+    found, skipped = deviations.parse_reply(
+        _reply(_bad_item(name, value), finding("skill:dispatch", "Brief", 2, 0.1, 0.4)), OFFERED, reasons)
+    assert [(f.instruction_source, f.instruction_ref, f.followed_grade, f.result_grade) for f in found] == \
+        [("skill:dispatch", "Brief", 0.1, 0.4)]  # the valid item, its own grades
+    got = None if value is _MISSING else value
+    assert skipped == 1 and reasons == [f"deviation 0: {name} must be a number in 0..1, got {got!r}"]
+
+
+def test_parse_reply_skips_any_bad_item_but_not_a_bad_reply() -> None:
+    good = finding(turn=9)
+    items = ["not an object", finding(source="skill:nope"), finding(source=["claude-md:global"]),
+             finding(turn=-1), finding(what=7), finding(why="```\nrm -rf x\n```"), good]
+    reasons: list[str] = []
+    (f,), skipped = deviations.parse_reply(_reply(*items), OFFERED, reasons)
+    assert f.turn == 9 and skipped == 6
+    assert [r.split(":")[0].split(" is ")[0] for r in reasons] == [f"deviation {i}" for i in range(6)]
+    assert "instruction_source 'skill:nope' was not offered" in reasons[1]
+    assert "was not offered" in reasons[2]  # an unhashable source is a skipped item, not a crash
+    for reply in ("not json", '{"other": []}', _reply(*[finding(ref=f"r{i}") for i in range(9)])):
+        with pytest.raises(FindingError):
+            deviations.parse_reply(reply, OFFERED, [])
+
+
+def test_skipped_reasons_are_redacted_and_one_line() -> None:
+    reasons: list[str] = []
+    deviations.parse_reply(_reply(_bad_item("followed_grade", "ghp_abcdefghijklmnopqrstuvwx\n" + "z" * 500)),
+                           OFFERED, reasons)
+    (reason,) = reasons
+    assert "ghp_" not in reason and "\n" not in reason and len(reason) <= deviations.SKIPPED_REASON_MAX
 
 
 def test_parse_turn_0_means_the_first_turn() -> None:

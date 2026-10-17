@@ -29,7 +29,7 @@ from test_scoring_support import ScoringDb, sdb  # noqa: F401
 NOW = datetime(2026, 10, 15, 9, 20, 0, tzinfo=timezone(timedelta(hours=2)))
 Writer = Callable[..., FakeWriter]
 FIELDS = re.compile(r" deviations=\d+ deviation_sessions=\d+ deviations_edit=\d+ deviations_enforce=\d+ "
-                    r"deviations_leave=\d+ deviation_errors=\d+ ")
+                    r"deviations_leave=\d+ deviation_errors=\d+ deviation_skipped=\d+ ")
 
 
 @pytest.fixture
@@ -94,6 +94,51 @@ def test_session_errors_fail_the_step_only(live: ScoringDb, daily_io: DailyIO, s
     head, fail = daily_io.log_lines()
     assert " deviation_errors=1 " in head and fail.endswith("amem-daily-fail " + r.failures[0])
     assert daily.DEVIATIONS_KEY in _state(daily_io)  # the scan finished; the failed session is retried later
+
+
+def test_skipped_item_is_a_counted_warning_not_a_fail(live: ScoringDb, daily_io: DailyIO,  # noqa: F811
+                                                      setup_home: Home, writer: Writer,  # noqa: F811
+                                                      fake_jev: FakeJev,  # noqa: F811
+                                                      capsys: pytest.CaptureFixture[str]) -> None:
+    # 2026-10-17 09:20: one item with `"followed_grade": null` made the routine FAIL and dropped
+    # the session's valid items. Now the valid items are stored, each bad one is counted and named
+    # (a null and an out-of-range grade alike).
+    ids = make_all_kinds(setup_home)
+    writer(default=envelope({"deviations": [finding(followed=None), finding(turn=2), finding(turn=3, result_=1.5)]}))
+    r = daily.run_daily(push=False, now=NOW)
+    assert r.verdict == "PASS", r.failures
+    assert r.deviations is not None and (r.deviations.found, r.deviations.errors, r.deviations.skipped) == (5, 0, 10)
+    (line,) = daily_io.log_lines()
+    assert FIELDS.search(line) and " deviation_errors=0 deviation_skipped=10 " in line
+    err = capsys.readouterr().err
+    assert (f"deviations: invalid item skipped: session {ids['worker']}: "
+            "deviation 0: followed_grade must be a number in 0..1, got None") in err
+    assert (f"deviations: invalid item skipped: session {ids['worker']}: "
+            "deviation 2: result_grade must be a number in 0..1, got 1.5") in err
+    assert err.count("deviations: invalid item skipped: ") == 10
+    assert "errors=0 skipped=10" in err  # the scan summary line
+
+
+def test_deviation_errors_do_not_stop_the_edits_step(live: ScoringDb, daily_io: DailyIO,  # noqa: F811
+                                                     setup_home: Home, writer: Writer,  # noqa: F811
+                                                     fake_jev: FakeJev,  # noqa: F811
+                                                     monkeypatch: pytest.MonkeyPatch) -> None:
+    # Scope of a deviations failure: that session only; the step fails, later steps still run.
+    from agent_memory import edits
+
+    ids = make_all_kinds(setup_home)
+    monkeypatch.setenv(edits.LIVE_ENV, "1")
+    runs: list[object] = []
+    monkeypatch.setattr(edits, "run", lambda **kw: runs.append(kw) or edits.Report())
+    writer(envelope({"deviations": [finding(followed=None)]}), default=envelope({"deviations": [finding()]}))
+    r = daily.run_daily(push=False, now=NOW)
+    assert r.failures == [f"deviations: 1 error; first: session {ids['chat']}: writer output: "
+                          "deviation 0: followed_grade must be a number in 0..1, got None"]
+    assert r.deviations is not None and (r.deviations.found, r.deviations.errors) == (4, 1)
+    assert len(runs) == 1 and r.edits is not None
+    head, _fail = daily_io.log_lines()
+    assert " deviation_errors=1 deviation_skipped=0 edits=0 " in head
+    assert daily.DEVIATIONS_KEY in _state(daily_io)
 
 
 def test_crash_before_the_scan_is_a_failed_step(live: ScoringDb, daily_io: DailyIO, setup_home: Home,  # noqa: F811

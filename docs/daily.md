@@ -84,7 +84,9 @@ overrides it. House format (`%Y-%m-%dT%H:%M:%S%z`):
   distill step ran, `distilled=N lessons_new=A lessons_merged=M lessons_rejected=R distill_errors=E`
   follows `tasks=N` (docs/lessons.md). When the deviations step ran,
   `deviations=D deviation_sessions=N deviations_edit=E deviations_enforce=F deviations_leave=L
-  deviation_errors=X` follows (docs/deviations.md). When the edits step ran, `edits=N edits_kept=K
+  deviation_errors=X deviation_skipped=S` follows (docs/deviations.md). `deviation_skipped` counts
+  writer items skipped as malformed (e.g. a null grade) in sessions whose valid items were stored:
+  a warning, not a failed step (each is named on stderr). When the edits step ran, `edits=N edits_kept=K
   edits_reverted=R edits_suggested=S edit_errors=E` follows (docs/edits.md). One `amem-daily-fail <reason>` line per failed step.
 - `amem ingest routines-log` reads these back as routine `amem-daily`
   (`meta.scored`, `meta.escalations`, `meta.new`, `meta.push`, `meta.tasks`, `meta.duration_s`,

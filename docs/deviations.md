@@ -224,9 +224,17 @@ Per session:
    `{"deviations": [...]}`, at most 8.
 3. **Validation**: the reply must be JSON with a `deviations` list. Every item needs an offered
    `instruction_source`, a ref, a turn (positive integer or null), `what`/`why`/`how` strings
-   and both grades in 0..1. Anything else rejects the whole reply (session error). Text fields
+   and both grades as numbers in 0..1. A reply that is not JSON, has no list or has more than
+   8 items is rejected whole (session error). A malformed item (e.g. `"followed_grade": null`,
+   a missing or out-of-range grade, a bad turn, a source that was not offered) is skipped, and
+   the session's valid items are kept: the scan counts it (`skipped=N` on the session line and
+   in the summary) and stores `sessions.meta.scan_skipped` (the count) and
+   `scan_skipped_reasons` (redacted, one line each, e.g. `deviation 0: followed_grade must be a
+   number in 0..1, got None`). A grade is never filled in. A reply whose items are all
+   malformed is a session error (retried). The prompt says grades are never null and a
+   deviation that cannot be graded is left out. Text fields
    are cleaned: quoted spans become `[quote]`, backtick code `[code]`, paths `[path]`, file
-   names `[file]`, secrets `[redacted]`; a code block is a rejection. Max 300 characters each
+   names `[file]`, secrets `[redacted]`; a code block makes that item malformed. Max 300 characters each
    (ref 80). Duplicates (same source, ref and turn) are merged.
 4. **Resolve**: each ref is snapped to its source's catalog (see Rule catalog), which sets
    `rule_id`, `rule_title`, `instruction_sha` and `meta.ref_match` / `meta.ref_score`. Two
@@ -243,13 +251,14 @@ Per session:
    (still the writer's ref, so keys of older rows stay valid), then `sessions.scanned_at` is
    set, in one transaction.
 
-Errors: a writer error, an invalid reply or a Jev error fails that session only. It is
+Errors: a writer error, an invalid reply (or one with no valid item) or a Jev error fails that session only. It is
 recorded in `sessions.meta.scan_error` (and `scan_errors` counts up), nothing is stored for
 it, and the scan goes on. The session is retried on the next scan. A missing Jev fixture
 (fixture mode) is not an error: the deviation is stored with `jev_verdict = null` and
-`jev_mode = fixture-missing`. A deviation with a null grade (the writer could not grade it)
-is not an error either: only that deviation is skipped, the session's other findings are
-stored, and the count shows as `skipped=N` in the scan line and `sessions.meta.scan_skipped`.
+`jev_mode = fixture-missing`. A malformed deviation next to valid ones (e.g. a null grade:
+the writer could not grade it) is not an error either: only that deviation is skipped, the
+session's other findings are stored, and it shows as `skipped=N` in the scan line and
+`sessions.meta.scan_skipped` / `scan_skipped_reasons` (see Validation).
 
 ## Incident scans
 
@@ -386,7 +395,9 @@ Rows without a rule id yet show `[no rule id]`; run `amem deviations reref`.
 step. The daily state file holds `deviations_last_scan`; the step runs when it is missing or
 at least 20 hours old (`AMEM_DEVIATIONS_EVERY_HOURS`). Off (not a failure) unless `AMEM_DEVIATIONS_LIVE=1`. When it ran, the
 log line gets `deviations=D deviation_sessions=N deviations_edit=E deviations_enforce=F
-deviations_leave=L deviation_errors=X`. Any session error fails the step. The timestamp moves
+deviations_leave=L deviation_errors=X deviation_skipped=S`. Any session error fails the step.
+Skipped writer items (`deviation_skipped`) are a counted warning, not a failure: each one gets
+a `deviations: invalid item skipped: session <id>: <reason>` line on stderr. The timestamp moves
 when the scan finished, so failed sessions wait for next week; a crash before the scan leaves
 it, so the step retries the next day. See [daily.md](daily.md).
 

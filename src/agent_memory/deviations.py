@@ -15,7 +15,10 @@ Per session (`scan`):
    AGENTS.md and the skills). `.env*` files are never read.
 3. writer: headless `claude -p` (distill.writer_argv flags) gets the numbered rule list per
    source (rule_catalog.py) and returns JSON deviations naming a rule id. `parse_findings`
-   validates them and strips quotes, paths, code and secrets; `resolve` snaps each ref to
+   validates them and strips quotes, paths, code and secrets; in the scan (`parse_reply`) a
+   malformed item (e.g. a null grade) is skipped and counted (`Outcome.skipped`,
+   `sessions.meta.scan_skipped` / `scan_skipped_reasons`), the valid ones are kept; a reply with
+   no valid item is a session error. `resolve` snaps each ref to
    a rule id (or `unmatched`) and adds the source's sha.
 4. Jev: one `questions/deviation.toml` ask per deviation. The state holds the instruction
    source, the rule id and title, the two raw grades, the objective result (from the
@@ -93,6 +96,7 @@ INSTRUCTIONS_MAX = 70_000   # all sources together
 FIELD_MAX = 300             # what / why / how
 REF_MAX = 80
 MAX_FINDINGS = 8
+SKIPPED_REASON_MAX = 300    # why one writer item was skipped (logged and in sessions.meta.scan_skipped_reasons)
 
 
 def live() -> bool:
@@ -737,20 +741,51 @@ def _grade(obj: dict[str, Any], name: str) -> float:
     return round(float(value), 3)
 
 
-def _ungraded(item: dict[str, Any]) -> bool:
-    """The writer gave a null grade: it could not grade this deviation. The deviation is
-    skipped, not an error, so one ungradeable item does not lose the session's other findings."""
-    return any(name in item and item[name] is None for name in ("followed_grade", "result_grade"))
+def _item(i: int, item: Any, offered: set[str]) -> Finding:
+    """One deviation of the reply. Raises FindingError naming the item (`deviation <i>...`)."""
+    if not isinstance(item, dict):
+        raise FindingError(f"deviation {i} is not an object")
+    source = item.get("instruction_source")
+    if not isinstance(source, str) or source not in offered:
+        raise FindingError(f"deviation {i}: instruction_source {source!r} was not offered")
+    turn = item.get("turn")
+    if turn == 0 and not isinstance(turn, bool):
+        turn = 1   # the digest numbers from 1; 0 can only mean the activity before the first prompt
+    if turn is not None and (isinstance(turn, bool) or not isinstance(turn, int) or turn < 1):
+        raise FindingError(f"deviation {i}: turn must be a positive integer or null, got {turn!r}")
+    try:
+        return Finding(source, _ref(item), turn,
+                       _field(item, "what", FIELD_MAX), _field(item, "why", FIELD_MAX),
+                       _field(item, "how", FIELD_MAX),
+                       _grade(item, "followed_grade"), _grade(item, "result_grade"))
+    except FindingError as exc:
+        raise FindingError(f"deviation {i}: {exc}") from None
 
 
 def parse_findings(text: str, offered: set[str]) -> list[Finding]:
-    """The findings of `parse_reply`, without the skipped count."""
-    return parse_reply(text, offered)[0]
+    """Strict: raises FindingError for a malformed reply and for any malformed item (a null grade
+    too). The scan uses `parse_reply`."""
+    return _parse(text, offered, None)
 
 
-def parse_reply(text: str, offered: set[str]) -> tuple[list[Finding], int]:
-    """Validate the model's JSON: the findings and the number of skipped (null-grade)
-    deviations. Raises FindingError for anything malformed."""
+def parse_reply(text: str, offered: set[str], reasons: list[str] | None = None) -> tuple[list[Finding], int]:
+    """The scan's parse: the findings and the number of skipped deviations.
+
+    A malformed item (a null, missing or out-of-range grade, a bad turn, a source that was not
+    offered, a bad text field) is skipped and the valid items are kept; why it was skipped
+    (`deviation <i>: ...`, redacted, one line) is appended to `reasons`. A grade is never filled
+    in. Raises FindingError for a malformed reply (not JSON, no 'deviations' list, more than
+    MAX_FINDINGS items)."""
+    got: list[str] = []
+    findings = _parse(text, offered, got)
+    if reasons is not None:
+        reasons.extend(got)
+    return findings, len(got)
+
+
+def _parse(text: str, offered: set[str], skipped: list[str] | None) -> list[Finding]:
+    """Validate the model's JSON. A malformed item raises, or with a `skipped` list is skipped
+    and its reason appended."""
     text = text.strip()
     fenced = _FENCE_RE.match(text)
     if fenced:
@@ -768,34 +803,20 @@ def parse_reply(text: str, offered: set[str]) -> tuple[list[Finding], int]:
     if len(items) > MAX_FINDINGS:
         raise FindingError(f"{len(items)} deviations, max {MAX_FINDINGS}")
     out: list[Finding] = []
-    skipped = 0
     seen: set[tuple[str, str, int | None]] = set()
     for i, item in enumerate(items):
-        if not isinstance(item, dict):
-            raise FindingError(f"deviation {i} is not an object")
-        if _ungraded(item):
-            skipped += 1
-            continue
-        source = item.get("instruction_source")
-        if source not in offered:
-            raise FindingError(f"deviation {i}: instruction_source {source!r} was not offered")
-        turn = item.get("turn")
-        if turn == 0 and not isinstance(turn, bool):
-            turn = 1   # the digest numbers from 1; 0 can only mean the activity before the first prompt
-        if turn is not None and (isinstance(turn, bool) or not isinstance(turn, int) or turn < 1):
-            raise FindingError(f"deviation {i}: turn must be a positive integer or null, got {turn!r}")
         try:
-            f = Finding(source, _ref(item), turn,
-                        _field(item, "what", FIELD_MAX), _field(item, "why", FIELD_MAX),
-                        _field(item, "how", FIELD_MAX),
-                        _grade(item, "followed_grade"), _grade(item, "result_grade"))
+            f = _item(i, item, offered)
         except FindingError as exc:
-            raise FindingError(f"deviation {i}: {exc}") from None
+            if skipped is None:
+                raise
+            skipped.append(_one_line(redact(str(exc)), SKIPPED_REASON_MAX))
+            continue
         if f.key() in seen:
             continue
         seen.add(f.key())
         out.append(f)
-    return out, skipped
+    return out
 
 
 def resolve(findings: list[Finding], instructions: list[LoadedSource]) -> list[Finding]:
@@ -925,12 +946,17 @@ class Outcome:
     instructions: list[str] = field(default_factory=list)
     missing: list[str] = field(default_factory=list)  # sources named at ingest with no file now
     judged: list[Judged] = field(default_factory=list)
-    skipped: int = 0             # deviations the writer could not grade (null grade), not stored
+    # ok sessions: why each malformed writer item (e.g. a null grade) was skipped; not stored as a deviation
+    skipped_reasons: list[str] = field(default_factory=list)
     tool: str = "claude"
     team: bool = False           # a team repo's session: the edit step never edits its repo files
     title: str | None = None     # the session's name, shown when known
     session_outcome: str | None = None   # sessions.outcome at scan time (stored as result_outcome)
     objective: float | None = None       # objective_result of that outcome
+
+    @property
+    def skipped(self) -> int:
+        return len(self.skipped_reasons)
 
     @classmethod
     def of(cls, row: SessionRow, status: str, reason: str = "") -> Outcome:
@@ -974,6 +1000,7 @@ class ScanReport:
 
     @property
     def skipped(self) -> int:
+        """Writer items skipped as malformed in sessions that were otherwise scanned (a warning)."""
         return sum(o.skipped for o in self.outcomes)
 
     def verdicts(self) -> Counter[str]:
@@ -1099,10 +1126,13 @@ def _store(o: Outcome, db_url: str | None) -> None:
                 Jsonb(j.answers), f"claude-cli:{distill.WRITER_MODEL}",
                 f.rule_id, f.rule_title, f.instruction_sha, Jsonb(f.meta()), o.session_outcome, o.objective,
             ))
+        meta: dict[str, Any] = {"scan_found": len(o.judged), "scan_instructions": o.instructions}
+        if o.skipped:  # skipped writer items stay visible on the session
+            meta.update(scan_skipped=o.skipped, scan_skipped_reasons=o.skipped_reasons)
         conn.execute(
-            "update sessions set scanned_at = now(), meta = (meta - 'scan_error') || %s where session_id = %s",
-            (Jsonb({"scan_found": len(o.judged), "scan_instructions": o.instructions,
-                    **({"scan_skipped": o.skipped} if o.skipped else {})}), o.session_id))
+            "update sessions set scanned_at = now(), "
+            "meta = (meta - 'scan_error' - 'scan_skipped' - 'scan_skipped_reasons') || %s where session_id = %s",
+            (Jsonb(meta), o.session_id))
 
 
 def _record_error(o: Outcome, db_url: str | None) -> None:
@@ -1154,10 +1184,16 @@ def _scan_one(row: SessionRow, *, dry_run: bool, timeout: float, qset: questions
     except distill.WriterError as exc:
         out.status, out.reason = "error", f"writer: {exc}"
         return out
+    reasons: list[str] = []
     try:
-        findings, out.skipped = parse_reply(distill.parse_envelope(envelope), {s.name for s in instructions})
+        findings, skipped = parse_reply(distill.parse_envelope(envelope), {s.name for s in instructions}, reasons)
     except (distill.DraftError, FindingError) as exc:
         out.status, out.reason = "error", _one_line(f"writer output: {exc}", 300)
+        return out
+    if skipped and not findings:
+        # Not one usable item: a writer failure (retried), never stored as "found nothing".
+        more = f" (+{skipped - 1} more skipped)" if skipped > 1 else ""
+        out.status, out.reason = "error", _one_line(f"writer output: {reasons[0]}{more}", 300)
         return out
     findings = resolve(findings, instructions)
     assert qset is not None and recurrence is not None
@@ -1172,6 +1208,7 @@ def _scan_one(row: SessionRow, *, dry_run: bool, timeout: float, qset: questions
     for f in findings:
         recurrence.add(f, row.session_id)
     out.judged = judged
+    out.skipped_reasons = reasons
     return out
 
 

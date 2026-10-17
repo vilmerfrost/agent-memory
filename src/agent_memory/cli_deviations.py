@@ -226,6 +226,8 @@ def cmd_scan(args: argparse.Namespace) -> int:
         return _err("deviations scan", exc)
     for o in report.outcomes:
         print(o.line())
+        for reason in o.skipped_reasons:  # skipped writer items: a warning, the exit code stays 0
+            print(f"  invalid item skipped: {reason}")
     print(report.summary())
     return 1 if report.errors else 0
 

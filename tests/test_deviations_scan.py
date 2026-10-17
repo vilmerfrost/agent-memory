@@ -159,6 +159,57 @@ def test_a_null_grade_is_skipped_not_a_session_error(setup_home: Home, db: str, 
                   "where session_id = %s", ids["chat"]) == [(True, "1", False)]
 
 
+def test_any_malformed_item_skips_only_that_item(setup_home: Home, db: str, writer: Writer,  # noqa: F811
+                                                 fake_jev: FakeJev) -> None:  # noqa: F811
+    # 2026-10-17 (session b1b2011c.../agent-a079...): item 0 had `"followed_grade": null` and
+    # the session's valid items were dropped with it. Now only the bad items are skipped:
+    # a null, a missing or an out-of-range grade alike, each named.
+    ids = _ingest(setup_home, db)
+    missing = finding(turn=4)
+    del missing["result_grade"]
+    w = writer(default=envelope({"deviations": [finding(followed=None), finding(turn=2),
+                                                 finding(turn=3, result_="high"), missing,
+                                                 finding(turn=5, followed=1.5)]}))
+    report = deviations.scan(session_id=ids["chat"], now=NOW)
+    (o,) = report.outcomes
+    assert (o.status, report.errors, report.found, report.skipped) == ("ok", 0, 1, 4)
+    assert o.skipped_reasons == ["deviation 0: followed_grade must be a number in 0..1, got None",
+                                 "deviation 2: result_grade must be a number in 0..1, got 'high'",
+                                 "deviation 3: result_grade must be a number in 0..1, got None",
+                                 "deviation 4: followed_grade must be a number in 0..1, got 1.5"]
+    assert o.line().endswith("found=1 edit=1 enforce=0 leave=0 unjudged=0 skipped=4")
+    assert report.summary() == "deviations: sessions=1 found=1 edit=1 enforce=0 leave=0 errors=0 skipped=4"
+    # The valid item is stored with its own grades; nothing is invented for the bad ones.
+    assert _q(db, "select turn, followed_grade, result_grade from deviations") == \
+        [(2, pytest.approx(0.3), pytest.approx(0.8))]
+    (row,) = _q(db, "select scanned_at is not null, meta -> 'scan_skipped', meta -> 'scan_skipped_reasons', "
+                    "meta ? 'scan_error', meta ? 'scan_errors' from sessions where session_id = %s", ids["chat"])
+    assert row == (True, 4, o.skipped_reasons, False, False)
+    # Scanned: not picked again (no second writer call, no duplicate rows under new refs).
+    assert ids["chat"] not in {r.session_id for r in deviations.pick_sessions(since=NOW.replace(day=1), limit=50)}
+    assert len(w.prompts) == 1
+
+
+def test_reply_with_only_malformed_items_is_a_session_error(setup_home: Home, db: str, writer: Writer,  # noqa: F811
+                                                            fake_jev: FakeJev) -> None:  # noqa: F811
+    # Nothing usable: a writer failure, retried on the next scan (never stored as "found nothing").
+    ids = _ingest(setup_home, db)
+    writer(envelope({"deviations": [finding(followed=None)]}),
+           envelope({"deviations": [finding(followed=None), finding(turn=2, result_=2)]}),
+           default=envelope({"deviations": [finding()]}))
+    one = deviations.scan(session_id=ids["chat"], now=NOW)
+    two = deviations.scan(session_id=ids["parent"], now=NOW)
+    assert one.outcomes[0].reason == "writer output: deviation 0: followed_grade must be a number in 0..1, got None"
+    assert two.outcomes[0].reason == ("writer output: deviation 0: followed_grade must be a number in 0..1, "
+                                      "got None (+1 more skipped)")
+    assert (one.errors, two.errors, one.skipped, two.skipped) == (1, 1, 0, 0)
+    assert _q(db, "select count(*) from deviations") == [(0,)]
+    assert _q(db, "select scanned_at, meta ->> 'scan_errors' from sessions where session_id = %s", ids["chat"]) == \
+        [(None, "1")]
+    again = deviations.scan(session_id=ids["chat"], now=NOW)  # retried: the next reply is good
+    assert (again.errors, again.found) == (0, 1)
+
+
 def test_jev_error_fails_only_that_session(setup_home: Home, db: str, writer: Writer,  # noqa: F811
                                            fake_jev: FakeJev) -> None:  # noqa: F811
     ids = _ingest(setup_home, db)
@@ -288,6 +339,24 @@ def test_cli_scan_live_with_a_missing_writer_records_errors(setup_home: Home, db
     assert res.returncode == 1
     assert "error chat-1 kind=chat: writer: cannot run" in res.stdout
     assert res.stdout.splitlines()[-1].endswith("errors=1")
+
+
+def test_cli_scan_names_skipped_items_and_exits_0(setup_home: Home, db: str, tmp_path: Path) -> None:  # noqa: F811
+    ids = _ingest(setup_home, db)
+    reply = tmp_path / "reply.json"
+    reply.write_text(envelope({"deviations": [finding(followed=None), finding(turn=2)]}))
+    exe = tmp_path / "fake-claude"
+    exe.write_text(f'#!/bin/sh\ncat >/dev/null\ncat "{reply}"\n')
+    exe.chmod(0o755)
+    env = base_env(AMEM_DB_URL=db, AMEM_PROJECTS_DIR=str(setup_home.projects),
+                   AMEM_CLAUDE_HOME=str(setup_home.claude), AMEM_AGENT_CONFIG_DIR=str(setup_home.agent_config),
+                   AMEM_DEVIATIONS_LIVE="1", AMEM_DEVIATIONS_CLAUDE=str(exe),
+                   AMEM_JEV_FIXTURES_DIR=str(tmp_path / "no-fixtures"))
+    res = run_amem("deviations", "scan", "--session", ids["chat"], "--days", "3650", env=env)
+    assert res.returncode == 0, res.stdout + res.stderr
+    lines = res.stdout.splitlines()
+    assert "  invalid item skipped: deviation 0: followed_grade must be a number in 0..1, got None" in lines
+    assert lines[-1] == "deviations: sessions=1 found=1 edit=0 enforce=0 leave=0 errors=0 skipped=1"
 
 
 def test_report_groups_and_json_candidates(setup_home: Home, db: str, writer: Writer,  # noqa: F811
