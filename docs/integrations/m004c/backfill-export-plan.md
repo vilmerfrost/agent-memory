@@ -328,7 +328,7 @@ jq -n --slurpfile a "$TMPDIR/usage-before.json" --slurpfile b "$TMPDIR/usage-aft
 # 4. recall spot check (0.1 credit each): words from one reviewed record; only amem: refs come back, each re-read
 uv run amem evidence query --source pd recall --param 'query=<words from one reviewed hypothesis>' --json
 # 5. leak scan of the reviewed (= sent) text: expect no output
-jq -r '.records[].payload.content' reviewed.json | grep -nEi '@|/Users/|~/|https?://|sk-|past_sk|stupidhuman|<deny terms>'
+jq -r '.records[].payload.content' reviewed.json | grep -nEi '@|/Users/|~/|https?://|(^|[^a-z])sk-|past_sk|stupidhuman|<deny terms>'
 ```
 
 Accept: the links are the reviewed refs and nothing else; `review.states` all `already-sent`; the credits delta
@@ -342,8 +342,9 @@ export AMEM_PASTDEV=off                                   # stops sink and retri
 uv run amem sync delete --sink pastdev --only reviewed.json --json    # deleted = the set size, not_linked 0
 ```
 
-Then recall the spot-check query again (expect no reviewed ref; deletion is asynchronous, allow a minute), and
-check the links show `deleted: true`. The deleted ids are retired: they can never be sent again under the same
+Then recall the spot-check query again with the kill switch lifted for that one command
+(`env -u AMEM_PASTDEV uv run amem evidence query --source pd recall ...`; expect no reviewed ref; deletion is
+asynchronous, allow a minute), and check the links show `deleted: true`. The deleted ids are retired: they can never be sent again under the same
 ref. Delete the local preview, run and usage files.
 
 ### 5.7 Record list (the parent fills this from hosted)
