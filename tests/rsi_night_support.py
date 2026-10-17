@@ -185,9 +185,11 @@ class FakeReplayer:
     record_run after; BudgetExhausted caught and reported as budget_stop), writes the bound eval record."""
 
     def __init__(self, verdicts: str | list[str] = "IMPROVES", *, runs: int = 4,
-                 on_replay: Callable[[Budget], None] | None = None, health: str = "ok") -> None:
+                 on_replay: Callable[[Budget], None] | None = None, health: str = "ok",
+                 judge: dict[str, Any] | None = None, jev: dict[str, Any] | None = None) -> None:
         self.verdicts = [verdicts] if isinstance(verdicts, str) else list(verdicts)
         self.runs, self.on_replay, self.health = runs, on_replay, health
+        self.judge, self.jev = judge, jev            # the replay's judge / Jev summaries (rsi_verdict *.summary())
         self.calls: list[dict[str, Any]] = []
 
     def preflight(self) -> str:
@@ -212,7 +214,8 @@ class FakeReplayer:
                                    baseline_id, str(p), budget_stop=exc.kind, runs=done)
         p = write_eval(adir, "sandbox-replay", EVAL_VERDICT[verdict])
         arms = {"A": {"pass_rate": 0.5, "n": 3}, "B": {"pass_rate": 0.9 if verdict == "IMPROVES" else 0.5, "n": 3}}
-        return N.ReplayOutcome(verdict, [f"fake replay: {verdict}"], arms, artifact_hash, baseline_id, str(p), runs=done)
+        return N.ReplayOutcome(verdict, [f"fake replay: {verdict}"], arms, artifact_hash, baseline_id, str(p), runs=done,
+                               judge=self.judge, jev=self.jev)
 
 
 class FakeSandboxOps(N.SandboxOps):

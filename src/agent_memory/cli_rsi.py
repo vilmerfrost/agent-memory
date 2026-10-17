@@ -270,6 +270,8 @@ def register(sub: argparse._SubParsersAction) -> None:
 
     from agent_memory import rsi_night                 # `amem rsi night` (Mission 005, rsi_night.register)
     rsi_night.register(s)
+    from agent_memory import rsi_schedule              # `amem rsi night-job` / `brief-job` (Mission 005.5)
+    rsi_schedule.register(s)
 
     p = s.add_parser("targets",help="production files the loop may target (sha256, git state); read-only")
     p.add_argument("--no-schedules", action="store_true")
