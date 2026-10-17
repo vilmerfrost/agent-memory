@@ -1,11 +1,29 @@
 # Merge plan: `rsi/m004c` into `main` (Mission 004C, G-0)
 
-Prepared 2026-10-17 by the `m004c-mergecheck` worker on branch `worktree-m004c-mergecheck`. Nothing here was
-merged into `main`; no ref other than the worker branch moved. **The ownership fix is still landing on
-`rsi/m004c`. Re-run `scripts/merge_check.sh` on the final tip and re-read sections 2, 6 and 7 before
-merging** (see section 11).
+Prepared 2026-10-17 by the `m004c-mergecheck` worker; re-verified by the parent on the final tip after the
+ownership fix landed (section 0, "Final tip"). Nothing here was merged into `main`. **Merge only the reviewed
+SHA, and only after the owner's separate approval.**
 
 ## 0. Verdict
+
+### Final tip (re-verified 2026-10-17 by the parent)
+
+| Check | Result |
+|---|---|
+| Tip reviewed | `4ef7d8f` (suite run on `7096b70`; `7096b70..4ef7d8f` adds only `scripts/` and `docs/`) |
+| Trial merge into `main` 5e6a24f (`git merge --no-ff`) | clean, 0 conflicts; merged tree `bc58bda` (7096b70: `ceeaf43`); 64 files, +19,396 / -10 |
+| Full suite on the merged tree (7096b70) | **1992 passed, 1 skipped, 0 failed** (361.5 s) |
+| Supabase migrations / dependencies | none / unchanged |
+| Existing files changed | `.gitignore`, `cli.py` (+4: register `sync`/`synth`), `cli_deviations.py` (adds `amem sessions hosts`; changed on both sides, merges cleanly), `sessions_ingest.py` (see below) |
+| Import probe | no socket at import; `amem --help`, `amem daily --help` ok |
+
+**One production change, additive:** `amem-ingest` (every 15 min) runs `amem sessions ingest`, which after the
+merge stores `meta.remote_host` next to `meta.remote_owner` for sessions it ingests. The `team` decision is
+unchanged (same owner regex group, same personal-owner rule), so the edit step's team guard behaves as before.
+Nothing reads `remote_host` except `integrations/egress.py` (manual `amem sync` only). `amem sessions hosts
+--apply` (re-derive hosts for old rows) is a hosted data write and is NOT part of the merge.
+
+### First trial (tip `09413ba`, worker)
 
 | Check | Result at tip `09413ba` |
 |---|---|
