@@ -214,3 +214,60 @@ Per the owner's stop rule, **C3 was not started.** Nothing was sent to past.dev:
 with no content. Owner question 1 is answered: a project already existed (Pay as you go allows one).
 Needed before C3: in Settings > Projects, set this project's monthly credit cap to 250 and ingestion cap to
 100 (and rename it to `amem-rsi` if the console allows), then re-run G-PD2: `/usage` must show both caps.
+
+## 10. past.dev C3 and the Phase I investigation, 2026-10-17 evening
+
+### past.dev G-PD2 (re-check) and G-PD3 (C3): PASS
+
+The owner set the project caps. `/usage` before C3: `creditCap` 250, `ingestionCap` 100, 0 used. The project slug
+stays `default-project` (Pay as you go allows one project; it is empty apart from this run and only amem uses
+it). C3 ran with `scripts/c3_pastdev.py` (5a331ad) on a throwaway pgvector Postgres seeded with
+`amem synth seed`. Only `AMEM_PASTDEV_KEY` was in the environment (no env file loaded), so no hosted database
+URL or other cloud key could reach the run. Report: `m004c/c3-report-2026-10-17.json`. PASS in 141 s:
+
+| Step | s | Result |
+|---|---|---|
+| preflight | 0.5 | DB local and seeded = gold; caps 250 / 100 enforced; no prior ingestion |
+| plan (1) | 1.2 | 8 to send, 4 refused (team 2, private 2); free estimate 10 credits = local rule |
+| sync_run (2) | 81.8 | 8 batches, 8 rows, 0 failed; receipts 202 x8; 8/8 completed within 180 s; links hold the ingestionId; sourceId = `amem:` ref byte for byte |
+| recall (3) | 6.2 | 3/3 synthetic queries return only gold refs, all re-read locally; expected ref in top 5: 3/3 |
+| duplicates (4) | 28.7 | second run sends nothing; `--replay` 8 stored receipts, 0 credits; one changed record cost 1.0 = its estimate |
+| failure_path | 1.1 | bad host: `unavailable`, cursor unchanged; 429 `project-cap-reached`: `capped` after 1 request, no retry |
+| deletion (5) | 6.7 | `delete_all` 202 in 1 call; gone from recall after 1 round; 8 ids retired; a later run sends nothing |
+| metrics (6) | 1.1 | 11.6 credits used = local estimate 11.6; ingest p50/p95 0.53/0.63 s; recall p50/p95 0.69/0.93 s |
+| leak_scan (7) | 14.2 | 0 strict markers, `sk-ant-`, `@example.com` or team/private refs in 26 request bodies, 25 stored payloads and 6 recall answers; 44 decision_text markers seen (sent by design) |
+
+`/usage` after: 11.6 credits, 9 ingestions, 6 recalls; cap left 239 credits / 91 data points; account balance
+149,988.4 of 150,000. No live data points remain (all 8 deleted and retired).
+Limits: the `/requests` check read the first page only (6 of 9 ingest payloads found); every outgoing body was
+scanned before sending, which covers all 9. The synthetic ids are retired, so a second C3 needs a fresh project.
+
+### Phase I: the deviation-writer failure (investigation complete, fix not merged)
+
+- **Scope:** the error dropped all deviations of the one affected session, not the routine. `parse_findings`
+  raised on the first bad item; `_scan_one` turned that into a session error (valid items lost, retried up to
+  3 times). Other sessions and the edits step still ran (`test_deviation_errors_do_not_stop_the_edits_step`).
+- **The FAIL on 10-15 and 10-17** came only from this error (the only `-fail` line). The missing `edits=` fields
+  on 10-17 come from the Phase I freeze (launchd.log: "edits: off (AMEM_EDITS_LIVE is not 1)"), not from it.
+- **Root cause:** the writer (`claude -p --model sonnet`) returned `"followed_grade": null` for item 0. The raw
+  reply is not kept (`--no-session-persistence`), so why it chose null is unknown; the digests were 17.6k and
+  39k chars, so the 60k cap is ruled out. No schema is enforced on the call.
+- **Main moved during the investigation:** another session committed `6228567` on local `main` (not pushed):
+  a null grade skips that item; the writer prompt gains "Both grades are always numbers, never null". The
+  daily routine runs from the main checkout, so `6228567` is live from the next 09:20 run.
+- **Defensive fix:** `worktree-p1-devgrade` @ `5e6a24f`, one commit on top of `6228567`. Any malformed item
+  (null, missing or out-of-range grade, bad turn, unknown source, bad text) is skipped and named; valid items
+  are kept; a reply with no valid item stays a session error (retried). One counter with main's names:
+  `skipped=N`, `sessions.meta.scan_skipped` + `scan_skipped_reasons`, daily `deviation_skipped=N` (a counted
+  warning, not a FAIL). Main's prompt line is unchanged. Tests: 27 fail on `6228567` and pass on `5e6a24f`;
+  full suite 1493 passed, 1 skipped. Not merged: merging into `main` changes the production routine.
+
+### The `dv13dedee-push-and-merge-policy` eval: not K7, not a regression
+
+K7 is `selftest-setup` (a push-guard miss for team branches); it passed on 10-17 02:05. The dv13dedee case
+(promoted 10-15) passed on 10-16 11:11 and failed on 10-17 02:47. Between those runs, agent-config `8a1e4b5`
+(10-16 14:58) changed PARENT.md from "never merge into main" to "merge when Vilmer asks; the guard asks
+first". The parent followed the new rule; all 4 forbid checks passed; only the `require` regex (tell Vilmer to
+merge main) failed. The grader encodes the old policy. Side finding: `GUARDED_SUBS` (agent-config
+`lib/parent_profile.py:216`) does not include `fetch`, so `git fetch . x:main` moves main without a guard
+prompt. Neither is changed here (live setup).
