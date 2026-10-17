@@ -49,6 +49,9 @@ def run(env: SimpleNamespace, night: str = N1, **kw: Any) -> dict[str, Any]:
         "evidence", "triage", "hypothesizer", "implementer", "stager", "replayer", "proposer", "sandbox")})
     rep = N.run_night(night=night, db_url=env.url, adapters=ad, **kw)
     assert N.validate_report(rep) == [], N.validate_report(rep)
+    for e in rep["experiments"]:                       # the writer is stricter than the (reader-side) validator
+        assert set(e["arms"]) == {"A", "B"} and isinstance(e["cost_usd"], float) and e["risk"] in N.RISKS
+        assert isinstance(e["confidence"], float)
     return rep
 
 
@@ -614,11 +617,16 @@ def test_validate_report_catches_contract_breaks() -> None:
            "verdict_reasons": [], "arms": {"A": {}, "B": {}}, "risk": "low", "confidence": 0.5, "cost_usd": 0.0,
            "status": "staged", "proposal_id": "0b0c9a5e-1111-4222-8333-944445555666", "evidence_refs": []}
     assert N.validate_report({**good, "experiments": [exp]}) == []
+    skipped = {**exp, "status": "skipped_budget", "experiment_id": None, "artifact_hash": None, "proposal_id": None,
+               "verdict": None, "arms": {}, "cost_usd": None, "risk": None, "confidence": None}
+    assert N.validate_report({**good, "experiments": [skipped]}) == []          # what the brief's reader accepts
     for bad in ({**good, "status": "done"}, {**good, "extra": 1}, {**good, "night": "tonight"},
                 {**good, "experiments": [{**exp, "proposal_id": None}]},
                 {**good, "experiments": [{**exp, "artifact_hash": "XYZ"}]},
                 {**good, "experiments": [{**exp, "experiment_id": "Exp_1"}]},
                 {**good, "experiments": [{**exp, "confidence": 1.5}]},
+                {**good, "experiments": [{**exp, "arms": {"A": {}, "C": {}}}]},
+                {**good, "experiments": [{**exp, "risk": "none"}]},
                 {**good, "pending_decisions": ["not-a-uuid"]},
                 {**good, "health": {**good["health"], "sandbox": "fine"}},
                 {**good, "costs": {**good["costs"], "total_usd": -1}}):

@@ -1680,15 +1680,15 @@ def validate_report(obj: Any) -> list[str]:
         if v is not None and v not in VERDICTS:
             errs.append(f"{w}.verdict {v!r} not in {VERDICTS}")
         need(e, "verdict_reasons", list, w)
-        arms = need(e, "arms", dict, w)
-        if isinstance(arms, dict) and not {"A", "B"} <= set(arms):
-            errs.append(f"{w}.arms needs A and B")
-        if e.get("risk") not in RISKS:
+        arms = need(e, "arms", dict, w)               # the writer always fills A and B; a reader accepts {}
+        if isinstance(arms, dict) and any(k not in ("A", "B") or not isinstance(v, dict) for k, v in arms.items()):
+            errs.append(f"{w}.arms may only hold the objects A and B")
+        if e.get("risk") is not None and e.get("risk") not in RISKS:
             errs.append(f"{w}.risk not in {RISKS}")
-        cf = need(e, "confidence", (int, float), w)
+        cf = need(e, "confidence", (int, float), w, True)
         if isinstance(cf, (int, float)) and not 0 <= cf <= 1:
             errs.append(f"{w}.confidence outside 0..1")
-        cu = need(e, "cost_usd", (int, float), w)
+        cu = need(e, "cost_usd", (int, float), w, True)
         if isinstance(cu, (int, float)) and cu < 0:
             errs.append(f"{w}.cost_usd is negative")
         if e.get("status") not in EXP_STATUSES:
