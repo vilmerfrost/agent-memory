@@ -247,7 +247,9 @@ Errors: a writer error, an invalid reply or a Jev error fails that session only.
 recorded in `sessions.meta.scan_error` (and `scan_errors` counts up), nothing is stored for
 it, and the scan goes on. The session is retried on the next scan. A missing Jev fixture
 (fixture mode) is not an error: the deviation is stored with `jev_verdict = null` and
-`jev_mode = fixture-missing`.
+`jev_mode = fixture-missing`. A deviation with a null grade (the writer could not grade it)
+is not an error either: only that deviation is skipped, the session's other findings are
+stored, and the count shows as `skipped=N` in the scan line and `sessions.meta.scan_skipped`.
 
 ## Incident scans
 

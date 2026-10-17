@@ -145,6 +145,20 @@ def test_one_session_error_does_not_stop_the_scan(setup_home: Home, db: str, wri
     assert _q(db, "select count(*) from sessions where meta ? 'scan_error'") == [(0,)]
 
 
+def test_a_null_grade_is_skipped_not_a_session_error(setup_home: Home, db: str, writer: Writer,  # noqa: F811
+                                                     fake_jev: FakeJev) -> None:  # noqa: F811
+    ids = _ingest(setup_home, db)
+    w = writer(envelope({"deviations": [finding(followed_grade=None), finding(turn=2)]}))
+    report = deviations.scan(session_id=ids["chat"], now=NOW)
+    (o,) = report.outcomes
+    assert o.status == "ok" and o.skipped == 1 and o.line().endswith(" skipped=1")
+    assert report.summary() == "deviations: sessions=1 found=1 edit=1 enforce=0 leave=0 errors=0 skipped=1"
+    assert "never null" in w.prompts[0]
+    assert _q(db, "select turn from deviations") == [(2,)]
+    assert _q(db, "select scanned_at is not null, meta ->> 'scan_skipped', meta ? 'scan_error' from sessions "
+                  "where session_id = %s", ids["chat"]) == [(True, "1", False)]
+
+
 def test_jev_error_fails_only_that_session(setup_home: Home, db: str, writer: Writer,  # noqa: F811
                                            fake_jev: FakeJev) -> None:  # noqa: F811
     ids = _ingest(setup_home, db)

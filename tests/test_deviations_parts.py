@@ -203,6 +203,18 @@ def test_parse_rejects_malformed(reply: str, message: str) -> None:
         parse_findings(reply, OFFERED)
 
 
+def test_parse_skips_a_null_grade_and_keeps_the_rest() -> None:
+    reply = _reply(finding(followed_grade=None), finding(ref="Brief", turn=2),
+                   finding(ref="Dod", result_grade=None))
+    findings, skipped = deviations.parse_reply(reply, OFFERED)
+    assert [f.instruction_ref for f in findings] == ["Brief"] and skipped == 2
+    # Only a null grade is skipped: a missing grade is still a malformed reply.
+    item = finding()
+    del item["followed_grade"]
+    with pytest.raises(FindingError, match="followed_grade must be a number in 0..1, got None"):
+        parse_findings(_reply(item), OFFERED)
+
+
 def test_parse_turn_0_means_the_first_turn() -> None:
     (f,) = parse_findings(_reply(finding(turn=0)), OFFERED)
     assert f.turn == 1
