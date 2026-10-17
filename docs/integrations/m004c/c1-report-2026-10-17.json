@@ -1,0 +1,334 @@
+{
+ "anchor": "2026-10-17",
+ "c1": "clickhouse",
+ "clickhouse": {
+  "cloud": true,
+  "db": "amem",
+  "host": "gsgozod89n.eu-west-1.aws.clickhouse.cloud",
+  "key_set": true,
+  "user": "amem_writer"
+ },
+ "dataset": "amem-synth",
+ "db_host": "127.0.0.1",
+ "finished_at": "2026-10-17T12:25:43+00:00",
+ "ok": true,
+ "seconds": 45.056,
+ "started_at": "2026-10-17T12:24:58+00:00",
+ "steps": [
+  {
+   "data": {
+    "clickhouse_rows_before": {
+     "deviations": 0,
+     "research_runs": 0,
+     "rsi_decisions": 0,
+     "rsi_eval_results": 0,
+     "rsi_proposals": 0,
+     "runs": 0,
+     "scores": 0,
+     "sessions": 0,
+     "skill_calls": 0
+    },
+    "cursor": false,
+    "supabase_rows": {
+     "deviations": 18,
+     "research_runs": 1,
+     "rsi_decisions": 1,
+     "rsi_eval_results": 2,
+     "rsi_proposals": 2,
+     "runs": 15,
+     "scores": 8,
+     "sessions": 16,
+     "skill_calls": 16
+    }
+   },
+   "detail": "ok",
+   "name": "preflight",
+   "ok": true,
+   "seconds": 16.717
+  },
+  {
+   "data": {
+    "batches": 9,
+    "dead_letters": 0,
+    "rows": 79,
+    "status": "ok"
+   },
+   "detail": "sync clickhouse: ok batches=9 rows=79 failed=0 2.8s",
+   "name": "sync_run",
+   "ok": true,
+   "seconds": 2.777
+  },
+  {
+   "data": {
+    "mismatches": [],
+    "off_gold": [],
+    "since": "2026-09-18"
+   },
+   "detail": "verify clickhouse since 2026-09-18: parity=yes",
+   "name": "verify",
+   "ok": true,
+   "seconds": 1.625
+  },
+  {
+   "data": {
+    "final": {
+     "deviations": 18,
+     "research_runs": 1,
+     "rsi_decisions": 1,
+     "rsi_eval_results": 2,
+     "rsi_proposals": 2,
+     "runs": 15,
+     "scores": 8,
+     "sessions": 16,
+     "skill_calls": 16
+    }
+   },
+   "detail": "ok",
+   "name": "final_counts",
+   "ok": true,
+   "seconds": 1.509
+  },
+  {
+   "data": {
+    "queries": [
+     {
+      "diffs": [],
+      "gold_rows": 2,
+      "name": "rule_gap",
+      "ok": true,
+      "params": {
+       "days": "30",
+       "min_n": "3"
+      },
+      "rows": 2,
+      "status": "ok"
+     },
+     {
+      "diffs": [],
+      "gold_rows": 4,
+      "name": "rule_weekly_rate",
+      "ok": true,
+      "params": {
+       "rule": "skill:synth-debugging:reproduce-before-fix",
+       "weeks": "8"
+      },
+      "rows": 4,
+      "status": "ok"
+     },
+     {
+      "diffs": [],
+      "gold_rows": 10,
+      "name": "rule_weekly_rate",
+      "ok": true,
+      "params": {
+       "weeks": "8"
+      },
+      "rows": 10,
+      "status": "ok"
+     },
+     {
+      "diffs": [],
+      "gold_rows": 12,
+      "name": "tokens_by_outcome",
+      "ok": true,
+      "params": {
+       "days": "30"
+      },
+      "rows": 12,
+      "status": "ok"
+     },
+     {
+      "diffs": [],
+      "gold_rows": 6,
+      "name": "skill_outcomes",
+      "ok": true,
+      "params": {
+       "days": "30",
+       "min_n": "1"
+      },
+      "rows": 6,
+      "status": "ok"
+     },
+     {
+      "diffs": [],
+      "gold_rows": 2,
+      "name": "skill_outcomes",
+      "ok": true,
+      "params": {
+       "days": "30",
+       "min_n": "3"
+      },
+      "rows": 2,
+      "status": "ok"
+     },
+     {
+      "diffs": [],
+      "gold_rows": 3,
+      "name": "routine_streaks",
+      "ok": true,
+      "params": {
+       "days": "30"
+      },
+      "rows": 3,
+      "status": "ok"
+     },
+     {
+      "diffs": [],
+      "gold_rows": 1,
+      "name": "research_runs",
+      "ok": true,
+      "params": {
+       "days": "90"
+      },
+      "rows": 1,
+      "status": "ok"
+     }
+    ]
+   },
+   "detail": "8/8 queries equal gold",
+   "name": "queries",
+   "ok": true,
+   "seconds": 2.672
+  },
+  {
+   "data": {
+    "batches": 6,
+    "dead_letters": 0,
+    "final": {
+     "deviations": 18,
+     "research_runs": 1,
+     "rsi_decisions": 1,
+     "rsi_eval_results": 2,
+     "rsi_proposals": 2,
+     "runs": 15,
+     "scores": 8,
+     "sessions": 16,
+     "skill_calls": 16
+    },
+    "rows": 31,
+    "rows_resent": 31,
+    "status": "ok"
+   },
+   "detail": "sync clickhouse: ok batches=6 rows=31 failed=0 1.6s; FINAL counts unchanged",
+   "name": "sync_rerun",
+   "ok": true,
+   "seconds": 3.096
+  },
+  {
+   "data": {
+    "probes": [
+     {
+      "expect": "allowed",
+      "got": "allowed: [{\"GRANTS FORMAT JSONEachRow\": \"GRANT SELECT, INSERT ON amem.* TO amem_writer\"}]",
+      "ok": true,
+      "probe": "grants"
+     },
+     {
+      "expect": "allowed",
+      "got": "allowed",
+      "ok": true,
+      "probe": "select"
+     },
+     {
+      "expect": "allowed",
+      "got": "allowed",
+      "ok": true,
+      "probe": "insert"
+     },
+     {
+      "expect": "allowed",
+      "got": "allowed: [{\"name\": \"amem\"}]",
+      "ok": true,
+      "probe": "databases"
+     },
+     {
+      "expect": "denied",
+      "got": "denied",
+      "ok": true,
+      "probe": "create database"
+     },
+     {
+      "expect": "denied",
+      "got": "denied",
+      "ok": true,
+      "probe": "create table"
+     },
+     {
+      "expect": "denied",
+      "got": "denied",
+      "ok": true,
+      "probe": "alter"
+     },
+     {
+      "expect": "denied",
+      "got": "denied",
+      "ok": true,
+      "probe": "create user"
+     },
+     {
+      "expect": "denied",
+      "got": "denied",
+      "ok": true,
+      "probe": "grant"
+     },
+     {
+      "expect": "denied",
+      "got": "denied",
+      "ok": true,
+      "probe": "users"
+     },
+     {
+      "expect": "denied",
+      "got": "denied",
+      "ok": true,
+      "probe": "query log"
+     }
+    ]
+   },
+   "detail": "11/11 probes ok",
+   "name": "grants",
+   "ok": true,
+   "seconds": 14.63
+  },
+  {
+   "data": {
+    "detail": "URLError: [Errno 8] nodename nor servname provided, or not known",
+    "status": "unavailable"
+   },
+   "detail": "status=unavailable; cursor unchanged",
+   "name": "failure_path",
+   "ok": true,
+   "seconds": 0.027
+  },
+  {
+   "data": {
+    "problems": []
+   },
+   "detail": "team sessions 2, team skill_calls 2, private sessions 3, private skill_calls 3, pseudonymous sessions 11",
+   "name": "team_masking",
+   "ok": true,
+   "seconds": 0.364
+  },
+  {
+   "data": {
+    "hits": {
+     "deviations": 0,
+     "research_runs": 0,
+     "rsi_decisions": 0,
+     "rsi_eval_results": 0,
+     "rsi_proposals": 0,
+     "runs": 0,
+     "scores": 0,
+     "sessions": 0,
+     "skill_calls": 0
+    },
+    "markers": 527
+   },
+   "detail": "9 tables scanned via tuple(*); rows with a marker: 0",
+   "name": "leak_scan",
+   "ok": true,
+   "seconds": 1.616
+  }
+ ],
+ "synthetic": true
+}

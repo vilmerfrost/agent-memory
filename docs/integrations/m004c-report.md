@@ -7,7 +7,7 @@ Status per provider:
 | Provider | State | What is verified against the real service |
 |---|---|---|
 | Supabase | authoritative store (unchanged) | n/a: Mission 004C used only disposable local Postgres |
-| ClickHouse Cloud | G-CH1, G-CH2 done; **G-CH3 (C1) pending approval** | service, schema, least-privilege writer (11/11 probes), read path from `amem evidence ask` |
+| ClickHouse Cloud | G-CH1, G-CH2, **G-CH3 (C1) done** (C1 PASS 2026-10-17, see section 8) | service, schema, least-privilege writer (11/11 probes), read path from `amem evidence ask` |
 | Langfuse Cloud EU | connected, synthetic only (C2 accepted) | traces and scores read back by `amem evidence ask` |
 | past.dev | **pending approval** (not connected) | nothing; code fixed against the 2026-10-17 API spec |
 | NCM on Modal | **pending approval** (no account step, no run) | upstream pins (commit, HF revisions, 4 sha256) |
@@ -84,13 +84,15 @@ verification, rollback, approval text). Status of its blockers:
 - Fixed on `rsi/m004c`: F1 (deviation sources/rule ids now `<prefix>:team` / pseudonym), F2 (team lessons
   detected by repo/scope), F3 (`AMEM_EGRESS_DENY` + team repo/project names; email-shaped labels null),
   F4 (`--tables`, `--since` on `sync plan|run`), F5 (past.dev replay key).
-- Still open: F6 (no CLI to dump/delete the past.dev corpus), F7 (team skill call without a session),
-  F8 (unknown-remote sessions not flagged team; proposed `AMEM_TEAM_PATHS`), F9 (a project named `team`).
+- Fixed later (b2f0de0, section 8): F8 (unknown repository ownership is `private` on export), F7, F9.
+- Still open: F6 (no CLI to dump/delete the past.dev corpus); ingestion stores the remote owner but not the
+  host, so `gitlab.example/vilmerfrost/x` would classify as own.
 - Counts in the draft are from 2026-10-16 (ClickHouse ~3,470 rows; past.dev ~60 records; Langfuse 0).
   Before approval: refresh them with the read-only SQL in section 5 of the draft and `amem sync plan`.
 
-Recommendation: no real backfill until F8 is fixed (work sessions with an unknown remote would otherwise be
-pseudonymized, not masked) and the owner has read the label list from query 5.2.
+Recommendation: F8 is fixed; the remaining gates for a real backfill are refreshed counts, the owner's read
+of the label list from query 5.2 and of `amem sync plan --json` (`masked`: team/private per table), and an
+owner `TRUNCATE` of the 9 ClickHouse tables (they hold the C1 synthetic rows; the writer cannot truncate).
 
 ## 5. NCM readiness
 
@@ -139,3 +141,52 @@ Known limitations:
 4. **Merge `rsi/m004c` into `main` (G-0)** after review; then the K7/K4 and migrate-Keychain fixes in their
    own mission.
 5. **Backfills (G-CH4, G-PD5)** only after F8, refreshed counts and the owner's read of the label list.
+
+## 8. Resume, 2026-10-17 afternoon
+
+Overnight (read-only, 13:15 CEST):
+- `amem-ingest` every 15 min, rc=0 (374 present, 0 new); `amem-sessions` rc=0 (team=55); undo-poll idle.
+- `amem-archive` 08:45 rc=0 (93 new versions, 0 errors).
+- `amem-daily` 09:20 **FAIL**: 1 deviation-writer error (`followed_grade` None from the model); 10-15 also
+  FAIL, 10-16 PASS. Still the frozen pre-Phase-I plist.
+- `routine-audit` 09:10 FAIL, 9 problems. New since 10-16: `ab-lessons-monthly` paused in the Desktop
+  scheduler; `config-check` unpushed ~/agent-config (10 local commits, expected: no push); eval
+  `dv13dedee-push-and-merge-policy` FAIL (push/merge guard area, belongs with K7/K4). Gone since 10-16:
+  `j-inject-readme`, `l-inject-comment`, `dv4ac4056`, `selftest-setup`.
+- `secret-scan`: 14 new findings, all false positives (fake keys in leak tests incl. e7eca35, the RFC 6238
+  test vector in `totp.ts`, pinned sha256 hashes in `ncm_worker.py`, the known pipeline-poc Dockerfile key).
+- **Phase I not activated**: agent-memory main 8594405, agent-config main 08d6348, `freeze-status` FROZEN.
+- Langfuse health ok (0.15 s). ClickHouse console session expired (spend read pending a sign-in).
+
+ClickHouse C1 (approved scope: synthetic only, disposable Postgres), PASS in 45.1 s at 12:25Z:
+| Step | s | Result |
+|---|---|---|
+| preflight (incl. waking the idle service) | 16.7 | DB local and seeded = gold; /ping ok |
+| sync_run | 2.8 | 9 batches, 79 rows, 0 failed |
+| verify | 1.6 | parity=yes |
+| final_counts | 1.5 | FINAL counts = gold in all 9 tables |
+| queries | 2.7 | 8/8 named queries = gold (rule_gap, rule_weekly_rate x2, tokens_by_outcome, skill_outcomes x2, routine_streaks, research_runs) |
+| sync_rerun | 3.1 | re-sent 31 lookback rows; FINAL counts unchanged (idempotent) |
+| grants | 14.6 | 11/11 |
+| failure_path | 0.03 | unavailable, cursor unchanged |
+| team_masking | 0.4 | team 2+2, private 3+3, pseudonymous sessions 11 |
+| leak_scan | 1.6 | 0 rows with a marker in 9 tables |
+
+Report: `m004c/c1-report-2026-10-17.json`. Warm query latency about 0.3 s each; cold start about 15 s.
+Storage: 79 rows (tens of KB; `system.parts` is not visible to the writer). SQL compatibility issues: none.
+Cost estimate: about 6 min awake at about $0.333/h = $0.03-0.04 from Trial credit; actual pending a console
+sign-in (usage also lags). The 79 synthetic rows stay in ClickHouse until the owner truncates them.
+
+Shared evidence, rerun with ClickHouse holding the C1 rows: Supabase (synthetic), ClickHouse Cloud and
+Langfuse Cloud all contributed; ClickHouse added `rule_gap` (quote-globs flagged: followed 0.34 vs
+objective 1.0) and 4 weekly rates; past.dev unavailable; 9 evidence rows recorded in the throwaway DB.
+
+F8 (b2f0de0, W4): export-side ownership classifier in `egress.py`: team (`meta.team`), own (team=false and
+remote owner in the owner accounts), else **private**. ClickHouse ships `private` for project/repo and
+`<prefix>:private` with `rule_id` null; past.dev refuses records tied to private repos; private names join
+the deny terms unless an own session uses them; `amem sync plan --json` reports `masked` team/private per
+table. Also F7 (unmatched skill calls private) and F9 (a project named `team`/`private` is pseudonymized).
+Synthetic counts own/team/private: sessions 14/2/0 -> 11/2/3, deviations 16/2/0 -> 15/2/1, skill_calls
+14/2/0 -> 11/2/3. Full suite 1898 passed, 1 skipped; 28 new/changed tests fail on the old code.
+
+past.dev G-PD1-G-PD3 approval request: `m004c/pastdev-gpd1.md`.
