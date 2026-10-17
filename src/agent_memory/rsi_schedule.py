@@ -405,7 +405,8 @@ def classify(rep: Mapping[str, Any]) -> tuple[str, list[str]]:
 @contextlib.contextmanager
 def term_guard() -> Iterator[dict[str, int]]:
     """While the night job runs, SIGTERM never kills it outright. Inside `Night.run` the night's own handler
-    turns it into a clean abort; outside it (the gate, unwinding, the final DB writes) it is only counted. So the
+    turns it into a clean abort; outside it (unwinding, the final DB writes) it is only counted. It wraps the
+    night run only (the gate before it is quick and has no watchdog armed). So the
     watchdog's last stage always gets to write its FAIL line. (launchd's own stop still ends with SIGKILL.)"""
     state = {"term": 0}
     if threading.current_thread() is not threading.main_thread():
