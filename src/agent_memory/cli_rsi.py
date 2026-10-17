@@ -72,7 +72,8 @@ def cmd_tracking_plan(args: argparse.Namespace) -> int:
 
 def cmd_freeze_status(args: argparse.Namespace) -> int:
     st = T.freeze_status()
-    line = "FROZEN" if st["frozen"] else "NOT FROZEN: " + "; ".join(st["reasons"])
+    line = ("FROZEN" + (" (stage-only: amem-daily stages proposals, nothing applies them)" if st["stage_only"] else "")
+            if st["frozen"] else "NOT FROZEN: " + "; ".join(st["reasons"]))
     return _out(args, st, f"rsi freeze-status: {line}", 0 if st["frozen"] else 1)
 
 

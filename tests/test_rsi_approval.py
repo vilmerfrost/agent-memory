@@ -494,7 +494,20 @@ def test_freeze_status(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     (home / "agent-config/improve/criteria.json").write_text(json.dumps({"max_changes_per_week": 0}))
     (tasks / "scheduled-tasks.json").write_text(json.dumps({"scheduledTasks": [{"id": "ab-lessons-monthly", "enabled": False}]}))
     st = T.freeze_status()
-    assert st["frozen"], st["reasons"]
+    assert st["frozen"] and not st["stage_only"], st["reasons"]
+    # Phase I: the edits step back on, in stage mode only. Still frozen (nothing applies), and labelled stage-only.
+    plist["EnvironmentVariables"] = {"AMEM_EDITS_LIVE": "1", "AMEM_EDITS_MODE": "stage"}
+    for p in (home / "Library/LaunchAgents", home / "agent-config/launchd"):
+        (p / "com.vilmerfrost.amem-daily.plist").write_bytes(plistlib.dumps(plist))
+    (home / "agent-config/improve/criteria.json").write_text(json.dumps({"max_changes_per_week": 0, "apply_mode": "stage"}))
+    st = T.freeze_status()
+    assert st["frozen"] and st["stage_only"], st["reasons"]
+    # Any other mode value is live editing again.
+    plist["EnvironmentVariables"] = {"AMEM_EDITS_LIVE": "1", "AMEM_EDITS_MODE": "apply"}
+    (home / "Library/LaunchAgents/com.vilmerfrost.amem-daily.plist").write_bytes(plistlib.dumps(plist))
+    st = T.freeze_status()
+    assert not st["frozen"] and not st["stage_only"] and st["reasons"] == [
+        "installed_plist: AMEM_EDITS_LIVE=1 (amem-daily edits step is live)"]
 
 
 # --------------------------------------------------------------------------- the real improve, end to end (opt-in)

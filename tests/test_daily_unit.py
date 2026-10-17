@@ -148,3 +148,54 @@ def test_plist_content() -> None:
     assert data["StartCalendarInterval"] == {"Hour": 9, "Minute": 20}
     assert data["StandardOutPath"] == data["StandardErrorPath"] == "/Users/vilmerfrost/.claude/parent/reports/launchd.log"
     assert data["RunAtLoad"] is False
+
+
+# ---------------------------------------------------------------- stage mode: proposal push (Mission 003.5 Phase I)
+
+
+def _fake_push(monkeypatch: pytest.MonkeyPatch, result: list[str] | Exception) -> list[dict]:
+    from agent_memory import rsi_approval
+    calls: list[dict] = []
+
+    def fake(**kw: object) -> list[str]:
+        calls.append(kw)
+        if isinstance(result, Exception):
+            raise result
+        return list(result)
+    monkeypatch.setattr(rsi_approval, "push_proposals", fake)
+    monkeypatch.setattr(daily, "_postgres_guard", lambda step, res: True)
+    return calls
+
+
+@pytest.mark.parametrize("env", [{}, {"AMEM_EDITS_LIVE": "1"}, {"AMEM_EDITS_MODE": "stage"}])
+def test_rsi_push_runs_only_in_stage_mode(monkeypatch: pytest.MonkeyPatch, env: dict[str, str]) -> None:
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+    calls = _fake_push(monkeypatch, ["phone"])
+    result = daily.DailyResult()
+    daily.step_rsi_push(result, push=True, notify=None)
+    assert calls == [] and result.rsi_push is None and result.failures == []
+    assert "rsi_push=" not in daily.log_lines(TS.strftime(daily.TS_FORMAT), result, 7)[0]   # legacy line unchanged
+
+
+def test_rsi_push_in_stage_mode_reaches_the_log_line(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("AMEM_EDITS_LIVE", "1")
+    monkeypatch.setenv("AMEM_EDITS_MODE", "stage")
+    calls = _fake_push(monkeypatch, ["phone", "phone"])
+    result = daily.DailyResult()
+    daily.step_rsi_push(result, push=False, notify={"NTFY_TOPIC": "t"})
+    assert calls == [{"push": False, "notify": {"NTFY_TOPIC": "t"}}]
+    (line,) = daily.log_lines(TS.strftime(daily.TS_FORMAT), result, 7)
+    assert line.endswith("tasks=0 edits_staged=0 rsi_push=2 7s")
+    (run,) = routines_log.parse_lines([line]).runs
+    assert run.status == "pass" and run.meta["rsi_push"] == 2 and run.meta["edits_staged"] == 0
+
+
+def test_rsi_push_failure_fails_the_step_and_keeps_the_proposals(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("AMEM_EDITS_LIVE", "1")
+    monkeypatch.setenv("AMEM_EDITS_MODE", "stage")
+    _fake_push(monkeypatch, RuntimeError("ntfy down"))
+    result = daily.DailyResult()
+    daily.step_rsi_push(result, push=True, notify=None)
+    assert result.rsi_push is None and result.verdict == "FAIL"
+    assert result.failures == ["rsi-push: RuntimeError: ntfy down"]
