@@ -110,7 +110,7 @@ def test_replay_jev_fixtures_match_their_states():
             found += 1
             assert jev.fixture_key(body["_replay_state"], qs) == p.stem and "_state" not in body
             assert set(body["answers"]) == {"effect", "harness_problem", "evidence_strength"}
-    assert found == 5
+    assert found == 6                     # 5 for bench/rsi-replay/scenarios.json + 1 for the M005 demo's no-effect night
 
 
 def test_jev_state_is_numbers_only_and_fixture_mode_never_goes_live(monkeypatch):

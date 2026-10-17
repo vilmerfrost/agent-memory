@@ -101,6 +101,11 @@ experiment replaces its evidence and its run dirs.
 - Checks run in `home-K`, made empty at staging. Anything a check leaves there (for example the agent's code,
   run by the check, writing to `$HOME`) makes that run an error (`check-home-modified`) and is removed.
   Entry scripts run with `python3 -I`; checks run with `PYTHONNOUSERSITE=1`.
+- An interrupt during a run (SIGINT / SIGTERM, the night's hard timeout) can kill the `docker run` client between
+  create and start. The container then stays in `Created` state: `--rm` never fires for it, and `run`'s
+  `rm -f` can come before the daemon finished the create. `Sandbox.reap_experiment` removes every container of the
+  experiment and polls until none appeared for 2 s; `run_replay` calls it on an interruption, and `amem rsi night`
+  after an abort or a wall-clock stop (found by the Mission 005 interruption scenario).
 - Docker Desktop's file sharing caches a path's entry for about a second: a container that starts right after
   a host path was deleted and made again gets ENOENT (measured: 7/8 runs failed with no wait, 4/8 after 0.5 s,
   0/8 after 1 s and 2 s). So each replay stages its inputs under a new path, and waits `SETTLE_S` (2 s) after it

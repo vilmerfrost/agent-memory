@@ -27,8 +27,8 @@ from typing import Any
 import pytest
 
 os.environ["AMEM_NO_DOTENV"] = "1"
-for _k in ("AMEM_JEV_LIVE", "TYPESAFE_API_KEY", "AMEM_JEV_FIXTURES_DIR", "AMEM_QUESTIONS_DIR", "AMEM_DB_URL",
-           "RSI_SANDBOX_DIR", "RSI_ARTIFACTS_DIR"):
+# RSI_SANDBOX_DIR stays: test_isolation.py (same session) needs the caller's temp root. Every sandbox here is explicit.
+for _k in ("AMEM_JEV_LIVE", "TYPESAFE_API_KEY", "AMEM_JEV_FIXTURES_DIR", "AMEM_QUESTIONS_DIR", "AMEM_DB_URL"):
     os.environ.pop(_k, None)
 
 import psycopg  # noqa: E402
