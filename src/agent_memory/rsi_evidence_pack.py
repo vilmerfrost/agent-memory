@@ -572,6 +572,10 @@ def _combine(statuses: Sequence[str]) -> str:
         return "skipped"
     if len(s) == 1:
         return next(iter(s))
+    if s == {"ok", "unavailable"}:
+        # some steps stopped by policy or egress (Mission 005.5, evidence.Unavailable), the rest answered: the
+        # provider works. Its unavailable steps stay visible as findings; health never turns that into error.
+        return "ok"
     return "partial" if "ok" in s else ("error" if "error" in s else "unavailable")
 
 

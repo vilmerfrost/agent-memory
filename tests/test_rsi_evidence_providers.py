@@ -406,6 +406,57 @@ def test_a_repo_scoped_rule_leaves_only_for_an_own_repo(db: str, m: Mocks, tmp_p
     assert all(repo not in r.body.decode() + json.dumps(r.query) for r in m.ch.requests + m.pd.requests)
 
 
+def test_pastdev_recall_needs_an_own_subject_rule(db: str, m: Mocks, tmp_path: Path) -> None:
+    """Open policy, a repo-scoped rule of a repo no session knows: the recall words never leave."""
+    rule = "claude-md:repo-no-session-knows:synth-client-deploy-gate"
+    rs = EP.build(provider_env(db, m), policy=open_policy(tmp_path), subject_rule=rule).retrievers
+    res = E.run_query(rs["pd"], "recall", {"query": "synth client deploy gate", "limit": "6"})
+    assert res.status == "unavailable" and "not positively own" in res.detail
+    assert m.pd.requests_to("POST", "/api/v1/recall") == []
+    rs = EP.build(provider_env(db, m), policy=open_policy(tmp_path), subject_rule=None).retrievers
+    res = E.run_query(rs["pd"], "recall", {"query": "synth client deploy gate", "limit": "6"})
+    assert res.status == "unavailable" and "unknown origin" in res.detail
+    rs = EP.build(provider_env(db, m), policy=open_policy(tmp_path), subject_rule=R1).retrievers
+    assert E.run_query(rs["pd"], "recall", {"query": "reproduce before fix", "limit": "6"}).status == "ok"
+
+
+def test_a_query_the_policy_does_not_list_is_unavailable_and_health_stays_ok(db: str, m: Mocks,
+                                                                             tmp_path: Path) -> None:
+    doc = json.loads(EP.POLICY_PATH.read_text())
+    doc["providers"]["clickhouse"]["queries"] = ["rule_gap"]
+    p = tmp_path / "narrow.json"
+    p.write_text(json.dumps(doc))
+    rs = EP.build(provider_env(db, m), policy=EP.load_policy(p)).retrievers
+    res = E.run_query(rs["ch"], "rule_weekly_rate", {"rule": R1, "weeks": "8"})
+    assert res.status == "unavailable" and "not approved" in res.detail
+    assert not any("sessions_total" in r.body.decode() for r in m.ch.requests)
+    pack = P.build_pack(cand(db), retrievers={**rs, "sb": E.SupabaseRetriever(lambda: psycopg.connect(db))})
+    # a policy stop next to answered queries: the provider works (never `error` in the night's health map)
+    assert pack.health["clickhouse"] == "ok" and pack.health["clickhouse"] in N.HEALTH_VALUES
+    assert any(x.via == "ch.rule_weekly_rate" and x.status == "unavailable" for x in pack.findings)
+    assert P._combine(["ok", "unavailable"]) == "ok" and P._combine(["ok", "error"]) == "partial"
+
+
+def test_a_malformed_provider_setting_never_breaks_the_pack(db: str, m: Mocks) -> None:
+    env = provider_env(db, m, AMEM_LANGFUSE_HOST="https://[cloud.langfuse.com")
+    prov = EP.build(env)
+    assert prov.states["langfuse"].reason == "configuration unreadable (ValueError)"
+    assert prov.states["clickhouse"].reason == ""
+    pack = P.build_pack(cand(db), environ=env, connect=lambda: psycopg.connect(db))
+    assert pack.health["langfuse"] == "unavailable" and pack.health["clickhouse"] == "ok"
+    assert pack.health["supabase"] == "ok"
+    rep = EP.probe(env, candidate_key=C1_KEY)
+    assert rep["providers"]["langfuse"]["status"] == "unavailable" and m.lf.requests == []
+
+
+def test_a_withheld_experiment_id_never_reaches_langfuse(db: str, m: Mocks) -> None:
+    env = provider_env(db, m, AMEM_EGRESS_DENY="c2synth")
+    pack = P.build_pack(cand(db), environ=env, connect=lambda: psycopg.connect(db))
+    stopped = [x for x in pack.findings if x.via == "lf.experiment_scores" and x.status == "unavailable"]
+    assert stopped and "withheld" in stopped[0].detail
+    assert not any("c2synth" in json.dumps(r.query) for r in m.lf.requests)
+
+
 def test_a_withheld_term_never_leaves(db: str, m: Mocks, tmp_path: Path) -> None:
     env = provider_env(db, m, AMEM_EGRESS_DENY="Reproduce")
     rep = EP.probe(env, policy=open_policy(tmp_path), candidate_key=C1_KEY)

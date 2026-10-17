@@ -72,7 +72,9 @@ RETRIEVER_OF = {v: k for k, v in SERVICES.items()}
 EXTERNAL = ("clickhouse", "langfuse", "pastdev")
 SWITCH_ENV = "AMEM_RSI_EVIDENCE_{}"              # .format("CLICKHOUSE") ...: "off" switches investigator reads off
 OFF = frozenset({"off", "0", "false", "no"})
-PASTDEV_BASE_URL = pastdev.BASE_URL              # module level so a test can point it at a local mock
+S1_NOTE = ("S1 provider queries (ClickHouse, Langfuse) are what delta_since runs with providers; the night passes "
+           "them only once rsi_night.PackEvidence.delta does (today its S1 reads Supabase only)")
+PASTDEV_BASE_URL = pastdev.BASE_URL             # module level so a test can point it at a local mock
 CONNECT_TIMEOUT_S = 10
 _QUERY_NAME = re.compile(r"\*|[a-z][a-z0-9_]{0,63}")
 _DIGITS = re.compile(r"[0-9]{1,6}")
@@ -479,8 +481,12 @@ def build(environ: Mapping[str, str] | None = None, *, connect: Callable[[], psy
     states["supabase"] = sb_state
     gate = EgressGate(ro, env)
 
-    def external(service: str, unconfigured: str, make: Callable[[Meter], Retriever]) -> None:
+    def external(service: str, problem: Callable[[], str], make: Callable[[Meter], Retriever]) -> None:
         p = pol.of(service)
+        try:                                     # no configuration value may make build() raise
+            unconfigured = problem()
+        except Exception as exc:  # noqa: BLE001 - e.g. a malformed URL: this provider is unavailable, not the pack
+            unconfigured = f"configuration unreadable ({type(exc).__name__})"
         st = ProviderState(service, configured=not unconfigured, approved=bool(p and p.read))
         st.reason = unconfigured or _switched_off(env, service) or _not_approved(p, pol)   # the gate order
         inner: Retriever | None = None
@@ -493,17 +499,24 @@ def build(environ: Mapping[str, str] | None = None, *, connect: Callable[[], psy
                                                     subject_rule=subject_rule, meter=st.meter)
         states[service] = st
 
-    ch_cfg = clickhouse.config(env)
-    external("clickhouse", f"{ch_cfg.problem}" if ch_cfg.problem else "",
-             lambda m: clickhouse.ClickHouseRetriever(ReadOnlyClickHouseClient(ch_cfg, meter=m)))
-    lf_probe = langfuse.LangfuseClient.from_env(env)
-    external("langfuse", f"{lf_probe.problem} (AMEM_LANGFUSE_HOST/_PUBLIC_KEY/_SECRET_KEY)" if lf_probe.problem else "",
-             lambda m: langfuse.LangfuseRetriever(ReadOnlyLangfuseClient.from_env(env, meter=m)))
-    pd_cfg = pastdev.config(env, base_url=PASTDEV_BASE_URL)
+    def ch_problem() -> str:
+        return clickhouse.config(env).problem
+
+    def lf_problem() -> str:
+        why = langfuse.LangfuseClient.from_env(env).problem
+        return f"{why} (AMEM_LANGFUSE_HOST/_PUBLIC_KEY/_SECRET_KEY)" if why else ""
+
+    def pd_problem() -> str:
+        return "" if pastdev.config(env, base_url=PASTDEV_BASE_URL) is not None else "not configured (AMEM_PASTDEV_KEY)"
+
     reads_env = {k: v for k, v in env.items() if k != "AMEM_SYNC_PASTDEV"}   # a sink switch stops writes only
-    external("pastdev", "" if pd_cfg is not None else "not configured (AMEM_PASTDEV_KEY)",
-             lambda m: pastdev.PastDevRetriever(ro or _no_db, pd_cfg, environ=reads_env,
-                                                client=ReadOnlyPastDevClient(pd_cfg, meter=m)))
+    external("clickhouse", ch_problem, lambda m: clickhouse.ClickHouseRetriever(
+        ReadOnlyClickHouseClient(clickhouse.config(env), meter=m)))
+    external("langfuse", lf_problem, lambda m: langfuse.LangfuseRetriever(
+        ReadOnlyLangfuseClient.from_env(env, meter=m)))
+    external("pastdev", pd_problem, lambda m: pastdev.PastDevRetriever(
+        ro or _no_db, pastdev.config(env, base_url=PASTDEV_BASE_URL), environ=reads_env,
+        client=ReadOnlyPastDevClient(pastdev.config(env, base_url=PASTDEV_BASE_URL), meter=m)))  # type: ignore[arg-type]
     return Providers(out, states, pol, env)
 
 
@@ -718,6 +731,7 @@ def probe(environ: Mapping[str, str] | None = None, *, policy: Policy | None = N
                           "from": cand_from},
             "window": {"since": window_since, "until": window_until},
             "timeout_s": lim.timeout_s,
+            "notes": [S1_NOTE],
             "health": {k: v["status"] for k, v in providers.items()},
             "providers": providers}
 
@@ -730,6 +744,7 @@ def render_text(rep: Mapping[str, Any]) -> str:
     cand = rep["candidate"]
     out.append(f"  candidate: {cand['key'] or '-'}" + (f" ({cand['from']})" if cand["from"] else "")
                + f"   window ({rep['window']['since']}, {rep['window']['until']}]")
+    out += [f"  note: {n}" for n in rep.get("notes") or []]
     for name, p in rep["providers"].items():
         head = f"  {name:<11} {p['status']:<11}"
         if name == "jev":

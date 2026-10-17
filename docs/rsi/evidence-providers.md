@@ -65,6 +65,12 @@ Nothing reaches the network before gate 4.
 | per query | Egress: no parameter names a withheld term; a repo-scoped rule leaves only for a positively own repo | `unavailable: ...` |
 | per query | The provider answers | `ok`, or `error` (HTTP error, timeout) |
 
+Gates 2, 3 (the query list) and the egress checks apply to the external providers. For Supabase, the
+authoritative store, only `read` in the policy counts; its `queries` entry is informational.
+
+When some of a provider's queries are stopped by policy or egress and the rest answer, the provider's health is
+`ok`; the stopped queries stay visible as `unavailable` findings. Only an HTTP error or a timeout makes it `error`.
+
 A sink kill switch (`AMEM_SYNC_<SINK>=off`) stops writes only. It does not stop investigator reads.
 
 `unavailable` and `error` never stop the night. The night's health map keeps its keys and states (supabase,
