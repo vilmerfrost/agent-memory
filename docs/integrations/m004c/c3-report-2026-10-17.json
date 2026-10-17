@@ -1,0 +1,300 @@
+{
+ "anchor": "2026-10-17",
+ "c3": "pastdev",
+ "credits": {
+  "baseline": 0.0,
+  "local_tally": 11.6,
+  "max": 100,
+  "used": 11.6
+ },
+ "dataset": "amem-synth",
+ "db_host": "127.0.0.1",
+ "finished_at": "2026-10-17T13:07:02+00:00",
+ "limits": {
+  "batch_max": 1,
+  "credit_cap_max": 250,
+  "ingestion_cap_max": 100,
+  "run_credits_max": 100
+ },
+ "ok": true,
+ "pastdev": {
+  "host": "api.past.dev",
+  "key_set": true
+ },
+ "seconds": 141.265,
+ "started_at": "2026-10-17T13:04:41+00:00",
+ "steps": [
+  {
+   "data": {
+    "cursor": false,
+    "links": 0,
+    "refuse_private": 2,
+    "refuse_team": 2,
+    "send": 8,
+    "usage": {
+     "balance_left": 150000,
+     "creditCap": 250,
+     "creditCapLeft": 250,
+     "credits": 0,
+     "ingestionCap": 100,
+     "ingestionCapLeft": 100,
+     "ingestions": 0,
+     "recalls": 0,
+     "slug": "default-project"
+    }
+   },
+   "detail": "ok",
+   "name": "preflight",
+   "ok": true,
+   "seconds": 0.519
+  },
+  {
+   "data": {
+    "bytes": 2271,
+    "credits_used_after": 0.0,
+    "estimate": {
+     "bytes": 2271,
+     "credits": 10,
+     "dataPoints": 8,
+     "fits": true
+    },
+    "local_credits": 10,
+    "masked": {
+     "private": 2,
+     "team": 2
+    },
+    "plan": {
+     "cost": 10,
+     "refused": 4,
+     "requests": 8,
+     "retired": 0,
+     "rows": 8
+    },
+    "send": 8
+   },
+   "detail": "8 to send, 4 refused (team 2, private 2); estimate 10 credits = local rule",
+   "name": "plan",
+   "ok": true,
+   "seconds": 1.172
+  },
+  {
+   "data": {
+    "completion_s": {
+     "n": 8,
+     "p50": 10.086,
+     "p95": 14.809
+    },
+    "credits_used_after": 10.0,
+    "ingestions": 8,
+    "links": 8,
+    "readiness": {
+     "comprehension": 0,
+     "consolidation": 0,
+     "failed": 0,
+     "raw": 0
+    },
+    "receipts": {
+     "202": 8
+    },
+    "rows": 8,
+    "settled": true,
+    "slow": [],
+    "status": "ok"
+   },
+   "detail": "sync pastdev: ok batches=8 rows=8 failed=0 81.3s; receipts {202: 8}; completed 8/8 within 180s; links 8; settled True",
+   "name": "sync_run",
+   "ok": true,
+   "seconds": 81.787
+  },
+  {
+   "data": {
+    "credits_used_after": 10.3,
+    "queries": [
+     {
+      "detail": null,
+      "foreign": [],
+      "hit_at_5": true,
+      "ok": true,
+      "query": "reproduce the failure before changing code",
+      "refs": 5,
+      "source_ids": 5,
+      "stale": [],
+      "status": "ok"
+     },
+     {
+      "detail": null,
+      "foreign": [],
+      "hit_at_5": true,
+      "ok": true,
+      "query": "does NCM solve easy sudoku puzzles",
+      "refs": 4,
+      "source_ids": 4,
+      "stale": [],
+      "status": "ok"
+     },
+     {
+      "detail": null,
+      "foreign": [],
+      "hit_at_5": true,
+      "ok": true,
+      "query": "why was the debugging skill proposal rejected",
+      "refs": 4,
+      "source_ids": 4,
+      "stale": [],
+      "status": "ok"
+     }
+    ]
+   },
+   "detail": "3/3 queries ok (only gold refs, all re-read); expected ref in top 5: 3/3",
+   "name": "recall",
+   "ok": true,
+   "seconds": 6.168
+  },
+  {
+   "data": {
+    "change": {
+     "credits": 1.0,
+     "estimate": 1,
+     "local_credits": 1,
+     "planned": [
+      "amem:edit/6139c987-08cf-53d5-a178-f03e7c2cefd7"
+     ],
+     "ref": "amem:edit/6139c987-08cf-53d5-a178-f03e7c2cefd7",
+     "requests": 1,
+     "status": "completed"
+    },
+    "credits_used_after": 11.3,
+    "replay": {
+     "credits": 0.0,
+     "new_ingestions": 0,
+     "requests": 8
+    },
+    "second_run": {
+     "rows": 0,
+     "sends": 0
+    }
+   },
+   "detail": "second run 0 sends; replay 8 stored receipts, 0 credits; changed record 1.0 credits = estimate",
+   "name": "duplicates",
+   "ok": true,
+   "seconds": 28.651
+  },
+  {
+   "data": {
+    "bad_host": {
+     "detail": "unreachable",
+     "key": "dummy",
+     "status": "unavailable"
+    },
+    "cap": {
+     "backoff": [],
+     "links_unchanged": true,
+     "sends": 1,
+     "status": "capped"
+    },
+    "credits_used_after": 11.3
+   },
+   "detail": "bad host: unavailable (unreachable), cursor unchanged; 429 project-cap-reached: capped after 1 request, no retry",
+   "name": "failure_path",
+   "ok": true,
+   "seconds": 1.06
+  },
+  {
+   "data": {
+    "credits_used_after": 11.6,
+    "delete_all": {
+     "calls": 1,
+     "deleted": 8,
+     "gone": 0
+    },
+    "later_run": {
+     "dead_letters": 0,
+     "rows": 0,
+     "sends": 0
+    },
+    "recall_rounds": 1,
+    "retired": 8,
+    "statuses": [
+     202
+    ],
+    "still_returned": []
+   },
+   "detail": "8 deleted in 1 call(s) (202), gone from recall after 1 round(s), retired 8, a later run sent nothing",
+   "name": "deletion",
+   "ok": true,
+   "seconds": 6.693
+  },
+  {
+   "data": {
+    "completion_s": {
+     "n": 8,
+     "p50": 10.086,
+     "p95": 14.809
+    },
+    "credits": {
+     "change": 1,
+     "local_estimate": 11.6,
+     "plan": 10,
+     "recalls": 6,
+     "used": 11.6,
+     "within_10pct": true
+    },
+    "credits_used_after": 11.6,
+    "ingest_s": {
+     "n": 17,
+     "p50": 0.525,
+     "p95": 0.633
+    },
+    "recall_s": {
+     "n": 6,
+     "p50": 0.688,
+     "p95": 0.931
+    }
+   },
+   "detail": "credits used 11.6 vs local estimate 11.6 (within 10%); ingest p50/p95 0.525/0.633s, recall p50/p95 0.688/0.931s",
+   "name": "metrics",
+   "ok": true,
+   "seconds": 1.059
+  },
+  {
+   "data": {
+    "bodies": {
+     "blocked_by_tripwire": [],
+     "decision_text_markers": 44,
+     "hits": [],
+     "scanned": 26
+    },
+    "credits_used_after": 11.6,
+    "recall_answers": {
+     "decision_text_markers": 53,
+     "hits": [],
+     "scanned": 6
+    },
+    "request_log": {
+     "decision_text_markers": 9,
+     "entries": 25,
+     "hits": [],
+     "ingest_keys_covered": "6/9",
+     "ingest_payloads_found": 6,
+     "page_keys": [
+      "endCursor",
+      "from",
+      "hasMore",
+      "payloadRetentionDays",
+      "project",
+      "requests",
+      "to",
+      "totalCount"
+     ],
+     "payloads_read": 25,
+     "read": true
+    }
+   },
+   "detail": "0 hits in 26 bodies, 25 stored payloads (6/9 ingest keys found) and 6 recall answers; decision_text markers seen (sent by design): 44",
+   "name": "leak_scan",
+   "ok": true,
+   "seconds": 14.147
+  }
+ ],
+ "synthetic": true
+}

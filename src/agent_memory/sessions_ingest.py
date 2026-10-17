@@ -31,7 +31,8 @@ from a skill home.
 Team repos (both tools): `meta.team` is true when the repo's git remote owner is not a
 personal owner (AMEM_PERSONAL_OWNERS, default `vilmerfrost`) or
 `<claude home>/parent/<repo>/profile.md` says `mode: team`. The edit step never edits a
-team repo's files.
+team repo's files. With the owner, `meta.remote_owner` and `meta.remote_host` (the remote's
+host, lowercase) are stored; integrations/egress.py reads them for export ownership.
 
 Tokens (session_tokens.py, docs/sessions-live.md): every row also gets its token totals,
 per-model breakdown, turns and last activity; a parent's `meta.subagent_tokens` sums its
@@ -196,7 +197,8 @@ def git_remote_url(cwd: str) -> str | None:
     return None
 
 
-_OWNER_RE = re.compile(r"^(?:[a-z][a-z0-9+.-]*://)?(?:[^@/]+@)?[^/:]+(?::\d+)?[:/]+([\w.-]+)/[\w.-]+?(?:\.git)?/?$")
+_OWNER_RE = re.compile(r"^(?:[a-z][a-z0-9+.-]*://)?(?:[^@/]+@)?([^/:]+)(?::\d+)?[:/]+([\w.-]+)/[\w.-]+?(?:\.git)?/?$")
+_HOST_RE = re.compile(r"[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?")
 
 
 def remote_owner(url: str | None) -> str | None:
@@ -205,7 +207,20 @@ def remote_owner(url: str | None) -> str | None:
     if not url:
         return None
     m = _OWNER_RE.match(url.strip())
-    return m.group(1) if m else None
+    return m.group(2) if m else None
+
+
+def remote_host(url: str | None) -> str | None:
+    """The host of a remote whose owner remote_owner reads, lowercase, without user or port:
+    `git@github.com:owner/repo.git` -> github.com, `https://u@gitlab.example.com:8443/o/r` ->
+    gitlab.example.com, an ssh alias `git@github-x:owner/repo` -> github-x (an alias is not
+    resolved). None when no owner is read or the host is not a plain host name (Mission 004C:
+    egress.py counts a session as own only on a github.com remote)."""
+    if not url:
+        return None
+    m = _OWNER_RE.match(url.strip())
+    host = m.group(1).lower() if m else ""
+    return host if _HOST_RE.fullmatch(host) else None
 
 
 def personal_owners() -> set[str]:
@@ -231,12 +246,18 @@ def profile_mode(repo: str | None) -> str | None:
 
 
 def team_info(cwd: str, repo: str | None, url: str | None = None) -> dict[str, Any]:
-    """`team`, plus `remote_owner` and `team_reason` when known. `url` (the remote a Codex
-    transcript recorded) wins over the repo's git config.
+    """`team`, plus `remote_owner`, `remote_host` and `team_reason` when known. `url` (the
+    remote a Codex transcript recorded) wins over the repo's git config.
+
+    The host is stored with the owner (Mission 004C): the owner alone cannot tell
+    `github.com/vilmerfrost/x` from `gitlab.example.com/vilmerfrost/x`, and egress.py counts a
+    session as own only on a github.com remote. A row stored before the host was kept has no
+    `remote_host` (egress: private) until a re-ingest or `amem sessions hosts` (session_hosts.py).
 
     No owner and no team profile -> {} (unknown): a re-ingest after the worktree was removed
     keeps what an earlier ingest stored, so a team flag is never lost to a cleanup."""
-    owner = remote_owner(url or git_remote_url(cwd))
+    url = url or git_remote_url(cwd)
+    owner = remote_owner(url)
     if profile_mode(repo) == "team":
         out: dict[str, Any] = {"team": True, "team_reason": "profile"}
     elif owner:
@@ -246,6 +267,9 @@ def team_info(cwd: str, repo: str | None, url: str | None = None) -> dict[str, A
         return {}
     if owner:
         out["remote_owner"] = owner
+        host = remote_host(url)
+        if host:
+            out["remote_host"] = host
     return out
 
 

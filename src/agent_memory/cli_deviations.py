@@ -1,4 +1,4 @@
-"""`amem sessions ingest|summarize|tokens|cost|find` and `amem deviations scan|report|reref|rules`
+"""`amem sessions ingest|summarize|tokens|cost|find|hosts` and `amem deviations scan|report|reref|rules`
 (docs/deviations.md, docs/sessions-live.md). `amem sessions ping` is session_live.main (cli.main
 routes it). `sessions summarize` without `--dry-run` needs AMEM_SUMMARY_LIVE=1 (else exit 2).
 
@@ -143,6 +143,33 @@ def cmd_sessions_dedupe_resumes(args: argparse.Namespace) -> int:
         return _err("sessions dedupe-resumes", exc)
     print(f"  applied: {got['updated']} updated, {got['deleted']} deleted, {got['skill_calls']} skill calls moved; "
           f"log {log} (undo: amem sessions dedupe-resumes --revert {log})")
+    return 0
+
+
+def cmd_sessions_hosts(args: argparse.Namespace) -> int:
+    """Mission 004C: re-derive meta.remote_host from local git config for rows stored before ingestion kept it."""
+    from agent_memory import session_hosts
+
+    if args.apply and args.revert:
+        print("amem: sessions hosts: --apply and --revert cannot be combined", file=sys.stderr)
+        return USAGE_EXIT
+    write = args.apply or args.revert
+    if (code := (_write_guard if write else _read_guard)("sessions hosts")) is not None:
+        return code
+    try:
+        if args.revert:
+            n = session_hosts.revert()
+            doc: dict[str, Any] = {"reverted": n}
+            line = f"sessions hosts: reverted {n} row(s) (remote_host_source = {session_hosts.SOURCE})"
+        else:
+            plan = session_hosts.plan()
+            applied = session_hosts.apply(plan) if args.apply else None
+            doc = {**plan.to_json(), "dry_run": not args.apply, "applied": applied}
+            line = plan.line() + (f"; applied: {applied} row(s) written (undo: amem sessions hosts --revert)"
+                                  if args.apply else "; dry run: nothing written (--apply to write)")
+    except (OSError, psycopg.Error) as exc:
+        return _err("sessions hosts", exc)
+    print(json.dumps(doc, sort_keys=True) if args.json else line)
     return 0
 
 
@@ -349,6 +376,14 @@ def register(sub: Any) -> None:
     p.add_argument("--projects-dir", type=Path, default=None,
                    help="Claude Code projects folder (default AMEM_PROJECTS_DIR or ~/.claude/projects)")
     p.set_defaults(func=cmd_sessions_dedupe_resumes)
+
+    p = s_sub.add_parser("hosts", help="re-derive meta.remote_host (export ownership, Mission 004C) for sessions "
+                                       "stored before ingestion kept it, from each repo's local .git/config (no "
+                                       "network); dry run unless --apply")
+    p.add_argument("--apply", action="store_true", help="write the rederived hosts (remote_host_source = rederived)")
+    p.add_argument("--revert", action="store_true", help="remove every host --apply wrote")
+    p.add_argument("--json", action="store_true", help="counts and one row per candidate session")
+    p.set_defaults(func=cmd_sessions_hosts)
 
     # Handled in cli.main before parsing (it must exit 0 even for bad arguments).
     s_sub.add_parser("ping", add_help=False,

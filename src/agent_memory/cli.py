@@ -21,11 +21,13 @@ from agent_memory import cli_handoffs
 from agent_memory import cli_evals
 from agent_memory import cli_rsi
 from agent_memory import cli_admin
+from agent_memory import cli_integrations
 from agent_memory import dedupe
 from agent_memory import cli_lessons
 from agent_memory import cli_scoring
 from agent_memory import cli_tasks
 from agent_memory import cli_skills
+from agent_memory import cli_synth
 
 
 def _db_host(url: str) -> str:
@@ -200,7 +202,9 @@ def build_parser() -> argparse.ArgumentParser:
     cli_evals.register(sub)
     cli_rsi.register(sub)
     cli_admin.register(sub)
+    cli_integrations.register(sub)
     cli_archive.register(sub)
+    cli_synth.register(sub)
 
     # Handled in main() before parsing: every argument goes to amem_digest as is.
     sub.add_parser("digest-self", add_help=False,
