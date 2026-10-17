@@ -324,3 +324,15 @@ policy or the triage questions from the investigator.
   `report-todos` prompt say the closing line goes inside REPORT.md. Commands: `docs/rsi/replay.md`, "Gate G2b".
   The demo's own hypotheses (`bench/rsi-demo/hypotheses/`) keep the short closing-line wording: they only run
   with the stub agent.
+
+### Mission 005.5 updates (2026-10-17, on `integration`)
+
+- **Provider access:** the night's S1 and S4 now use the real, policy-gated, read-only clients
+  (`rsi_evidence_providers.py`, `config/rsi-evidence-providers.json`, docs/rsi/evidence-providers.md). The stand-ins
+  remain only in the demo and the mock rehearsal. past.dev stays closed (`read: false`) until the owner approves
+  investigator recall. Live probe 2026-10-17: Supabase ok; ClickHouse and Langfuse unconfigured in the main env.
+- **Live replay wiring:** the night's SandboxReplayer passes the judge model, credential references and
+  `ensure_network`; live Jev triage and the Codex judge/implementer are booked as estimates, never provider-reported.
+- **Apply rule (B table, E2E success row):** the brief shows Reject / Details and withholds Apply for stand-in
+  evaluations; Apply needs an independent judge and live Jev on the bound sandbox-replay record.
+- **Scheduling and first-night limits:** docs/rsi/night-ops.md (jobs not installed).
