@@ -51,6 +51,8 @@ class HostSandbox(rs.Sandbox):
     """rs.Sandbox whose `run` executes on the host (see module doc). `fault(run_id, arm)` may return a RunResult
     (a simulated timeout or crash) or raise (an interrupt) before the command runs."""
 
+    settle_s = 0.0          # no Docker Desktop file-sharing cache to wait out on the host (rsi_replay.SETTLE_S)
+
     def __init__(self, root: Path, fault: Callable[[str, str], Any] | None = None):
         super().__init__(root)
         self.fault = fault

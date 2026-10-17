@@ -42,6 +42,7 @@ import importlib.util
 import json
 import os
 import re
+import secrets
 import shutil
 import sys
 import time
@@ -73,6 +74,12 @@ CHECK_LIMITS = {"memory": "512m", "cpus": "1", "pids": 128}
 ALWAYS_ON_KINDS = ("instruction", "settings", "hook", "lessons", "schedule", "code", "other")
 JUDGE_MODEL_DEFAULT = {"claude": "claude-sonnet-5-5", "codex": "gpt-6-luna"}
 MAX_PROMPT_ATTEMPT = 6000
+# Docker Desktop's file sharing caches each path's entry for about a second. A container that starts within
+# that time after a host file or dir at the same path was deleted and made again sees the old entry and gets
+# ENOENT (measured 2026-10-17, Docker 29.8.1, rmtree + recreate then `docker run`: 7/8 runs failed with no wait,
+# 4/8 after 0.5 s, 0/8 after 1 s and after 2 s). So a replay never reuses a staging path, prepares the arms
+# once, and waits SETTLE_S after it prepared or replaced anything a container mounts.
+SETTLE_S = 2.0
 
 
 class ReplayError(Exception):
@@ -494,6 +501,22 @@ def _now() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds")
 
 
+def tree_digest(root: Path) -> str:
+    """sha256 over a dir tree: relative paths, file bytes and modes, symlink targets."""
+    h = hashlib.sha256()
+    if not root.is_dir():
+        return ""
+    for p in sorted(root.rglob("*")):
+        rel = p.relative_to(root).as_posix().encode()
+        if p.is_symlink():
+            h.update(b"L" + rel + b"\0" + os.readlink(p).encode() + b"\0")
+        elif p.is_file():
+            h.update(b"F" + rel + b"\0" + oct(p.stat().st_mode & 0o777).encode() + b"\0" + p.read_bytes() + b"\0")
+        else:
+            h.update(b"D" + rel + b"\0")
+    return h.hexdigest()
+
+
 def _write_json(path: Path, obj: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f".{path.name}.tmp")
@@ -517,6 +540,8 @@ class _Replay:
         self.pairs: dict[tuple[str, int], dict[str, RunRecord]] = {}
         self.budget_stop: str | None = None
         self.prepared = False                     # an arm was built for this replay
+        self.home_digests: dict[str, str] = {}
+        self.settle_s = float(getattr(sb, "settle_s", SETTLE_S))
         self.manifest: dict | None = None
         self.baseline_id: str | None = None
         self.started = _now()
@@ -573,11 +598,30 @@ class _Replay:
 
     # ---- staging (read-only inputs for the containers, inside the experiment dir)
 
+    def settle(self, why: str) -> None:
+        """Wait out Docker Desktop's file-sharing cache after host paths were replaced (see SETTLE_S)."""
+        if self.settle_s > 0:
+            self.log("settle", why=why, seconds=self.settle_s)
+            time.sleep(self.settle_s)
+
+    def planned_run_ids(self) -> list[str]:
+        out = []
+        for rep in range(int(self.cfg.reps)):
+            for c in self.cases:
+                out.append(run_id_for(self.exp, c.id, "J", rep))
+                for arm in ("A", "B"):
+                    out += [run_id_for(self.exp, c.id, arm, rep), run_id_for(self.exp, c.id, arm, rep, "chk")]
+        return out
+
     def stage(self) -> None:
+        """Inputs for the containers, under a path no earlier replay used: a container that starts within about a
+        second after a host path was replaced can see the old entry (SETTLE_S). Older stage dirs are removed."""
         exp_dir = self.sb.experiment_dir(self.exp)
-        root = exp_dir / "replay"
-        if root.exists():
-            shutil.rmtree(root)
+        base = exp_dir / "replay"
+        if base.exists():
+            for old in base.iterdir():
+                shutil.rmtree(old) if old.is_dir() and not old.is_symlink() else old.unlink()
+        root = base / f"{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}-{secrets.token_hex(3)}"
         (root / "agent").mkdir(parents=True, mode=0o700)
         for name in AGENT_FILES:
             shutil.copyfile(AGENT_SRC / name, root / "agent" / name)
@@ -592,6 +636,13 @@ class _Replay:
             if c.hidden_check is not None:
                 shutil.copytree(c.hidden_check, d / "hidden", symlinks=False)
         self.stage_dir = root
+        runs = exp_dir / "runs"
+        for rid in self.planned_run_ids():           # deterministic ids: a re-run starts from empty run dirs
+            if (runs / rid).exists():
+                shutil.rmtree(runs / rid)
+        self.fresh_home("K")                         # the checks' home: empty, never the agent's
+        if self.cfg.judge in ("claude", "codex"):
+            self.fresh_home("J", claude_settings=True)
 
     # ---- one container run
 
@@ -606,9 +657,6 @@ class _Replay:
                   credential_name: str | None = None) -> Any:
         if self.budget is not None:
             self.budget.take_sandbox_run(run_id)         # BudgetExhausted propagates to run()
-        run_dir = self.sb.experiment_dir(self.exp) / "runs" / run_id
-        if run_dir.exists():
-            shutil.rmtree(run_dir)                       # a re-run of the same deterministic id starts clean
         self.log("run-start", run_id=run_id, arm=arm, network=network, timeout_s=timeout_s)
         res = self.sb.run(self.exp, arm, command, timeout_s=timeout_s, memory=str(limits["memory"]),
                           cpus=str(limits["cpus"]), pids=int(limits["pids"]), credentials=credentials,
@@ -629,9 +677,9 @@ class _Replay:
     def agent_command(self) -> tuple[list[str], str]:
         cfg = self.cfg
         if cfg.agent == "stub":
-            return (["python3", "/mnt/agent/stub_agent.py", "--case", "/mnt/case/case.json",
+            return (["python3", "-I", "/mnt/agent/stub_agent.py", "--case", "/mnt/case/case.json",
                      "--fixture", "/mnt/fixture", "--work", "/work"], "none")
-        entry = ["python3", "/mnt/agent/live_entry.py", "--fixture", "/mnt/fixture",
+        entry = ["python3", "-I", "/mnt/agent/live_entry.py", "--fixture", "/mnt/fixture",
                  "--prompt-file", "/mnt/case/prompt.txt", "--work", "/work", "--"]
         if cfg.agent == "claude":
             cmd = ["claude", "-p", "{PROMPT}", "--output-format", "stream-json", "--verbose",
@@ -694,12 +742,11 @@ class _Replay:
         d = self.stage_dir / "cases" / case.id
         cid = run_id_for(self.exp, case.id, rec.arm, rec.rep, "chk")
         rec.check_run_id = cid
-        self.fresh_home("K")
         mounts = [(str(self.stage_dir / "agent"), "/mnt/agent"), (str(d / "check"), "/mnt/check"),
                   (str(d / "fixture"), "/mnt/fixture"),
                   (str(self.sb.experiment_dir(self.exp) / "runs" / rec.run_id), "/mnt/result")]
-        cmd = ["python3", "/mnt/agent/check_entry.py", "--spec", "/mnt/check/check.json", "--result", "/mnt/result",
-               "--fixture", "/mnt/fixture", "--work", "/work"]
+        cmd = ["python3", "-I", "/mnt/agent/check_entry.py", "--spec", "/mnt/check/check.json",
+               "--result", "/mnt/result", "--fixture", "/mnt/fixture", "--work", "/work"]
         if (d / "hidden").is_dir():
             mounts.append((str(d / "hidden"), "/mnt/hidden"))
             cmd += ["--hidden", "/mnt/hidden"]
@@ -711,12 +758,16 @@ class _Replay:
             raise
         rec.check_duration_s = res.duration_s
         self.charge(cid, res.duration_s, None)
+        leftovers = self.clean_check_home()
         try:
             out = json.loads(res.stdout.strip().splitlines()[-1])
         except (ValueError, IndexError):
             out = None
         if res.timed_out or res.exit_code != 0 or not isinstance(out, dict):
             rec.error = f"check-error: exit {res.exit_code}{' (timeout)' if res.timed_out else ''}"
+            return
+        if leftovers:      # code the check ran (the agent's) wrote into the check's home: not a trustworthy check
+            rec.error = f"check-home-modified: {', '.join(leftovers[:3])}"
             return
         rec.check_exit, rec.check_passed = out.get("check_exit"), bool(out.get("check_passed"))
         rec.check_log, rec.diff, rec.diff_stat = str(out.get("log", "")), str(out.get("diff", "")), out.get("diff_stat") or {}
@@ -733,8 +784,21 @@ class _Replay:
 
     # ---- the pairs
 
-    def prepare_pair(self) -> bool:
-        """Fresh homes for both arms (an agent may have changed its home in the previous pair)."""
+    def clean_check_home(self) -> list[str]:
+        """Paths a check left in home-K (it starts with only .claude/ and .codex/); removed, and returned."""
+        home = self.sb.arm_home(self.exp, "K")
+        extra = sorted(p.relative_to(home).as_posix() for p in home.rglob("*")
+                       if p.relative_to(home).as_posix() not in (".claude", ".codex"))
+        for rel in sorted(extra, key=len, reverse=True):
+            p = home / rel
+            if p.is_dir() and not p.is_symlink():
+                shutil.rmtree(p, ignore_errors=True)
+            else:
+                p.unlink(missing_ok=True)
+        return extra
+
+    def prepare_arms(self) -> bool:
+        """Homes for both arms: A = the baseline, B = the baseline + the artifact (must be exact)."""
         self.prepared = True
         self.sb.prepare_arm(self.exp, self.baseline_id, "A", force=True)
         rep_b = self.sb.prepare_arm(self.exp, self.baseline_id, "B", force=True, artifact=self.h)
@@ -742,14 +806,28 @@ class _Replay:
             bad = [r["path"] for r in rep_b.get("overlay", []) if r.get("after_sha256") != r.get("home_sha256")]
             self.refusals.append(f"artifact-not-exact: the sanitizer changed {', '.join(bad) or 'the overlay'}")
             return False
+        self.home_digests = {arm: tree_digest(self.sb.arm_home(self.exp, arm)) for arm in ("A", "B")}
         return True
 
+    def homes_changed(self) -> list[str]:
+        return [arm for arm in ("A", "B") if tree_digest(self.sb.arm_home(self.exp, arm)) != self.home_digests.get(arm)]
+
     def run_pairs(self) -> None:
-        """Fill self.pairs as runs finish, so a budget stop or an interrupt keeps what already ran."""
+        """Fill self.pairs as runs finish, so a budget stop or an interrupt keeps what already ran. The arms
+        are prepared once; a home the previous pair's agent changed is prepared again before the next pair."""
+        if not self.prepare_arms():
+            return
+        self.settle("staged")
+        first = True
         for rep in range(int(self.cfg.reps)):
             for case in self.cases:
-                if not self.prepare_pair():
-                    return
+                changed = [] if first else self.homes_changed()
+                first = False
+                if changed:
+                    self.log("home-reset", arms=changed)
+                    if not self.prepare_arms():
+                        return
+                    self.settle("home-reset")
                 got: dict[str, RunRecord] = {}
                 self.pairs[(case.id, rep)] = got
                 order = ("B", "A") if blind_flip(self.exp, case.id, rep, "order") else ("A", "B")
@@ -802,8 +880,9 @@ class _Replay:
         model = self.cfg.judge_model or JUDGE_MODEL_DEFAULT[self.cfg.judge]
         if self.budget is not None and hasattr(self.budget, "take_call"):
             self.budget.take_call(model, stage="replay-judge")
-        self.fresh_home("J", claude_settings=True)
-        entry = ["python3", "/mnt/agent/live_entry.py", "--prompt-file", "/mnt/case/prompt.txt", "--work", "/work", "--"]
+        # home-J was made empty at staging and is not replaced per call (SETTLE_S); it holds no instructions.
+        entry = ["python3", "-I", "/mnt/agent/live_entry.py", "--prompt-file", "/mnt/case/prompt.txt",
+                 "--work", "/work", "--"]
         if self.cfg.judge == "claude":
             cmd = ["claude", "-p", "{PROMPT}", "--model", model, "--output-format", "json", "--permission-mode",
                    "dontAsk", "--permission-prompts", "none", "--settings", '{"disableAllHooks":true}',
@@ -965,9 +1044,13 @@ def _record(r: _Replay, result: ReplayResult, cfg: ReplayConfig, policy: V.Verdi
                "case_digests": {c.id: c.digest() for c in r.cases}, "arms": result.arms, "totals": result.totals,
                "budget_stop": result.budget_stop, "run_ids": [x.run_id for x in result.runs],
                "evidence_dir": str(result.evidence_dir)}
+    # Only an evaluation of this artifact touches its record. A caller or host problem (wrong experiment id, no
+    # artifact, Docker down) says nothing about the artifact: no record is written and an old one stays.
+    about_artifact = r.prepared or any(x.startswith(("stale-baseline", "artifact-not-exact")) for x in r.refusals)
+    if not about_artifact or not r.manifest:
+        r.log("not-recorded", reasons=list(v.reasons))
+        return result
     try:
-        if r.refusals and not r.manifest:
-            raise rs.SandboxError("no verified artifact")
         path = sb.record_eval(artifact=r.h, experiment=r.exp, arm="B", suite=SUITE, verdict=v.eval_verdict,
                               results=results, suite_version=SUITE_VERSION, model=cfg.model or cfg.agent,
                               effort=cfg.effort or "none", started_at=result.started_at,
@@ -976,11 +1059,8 @@ def _record(r: _Replay, result: ReplayResult, cfg: ReplayConfig, policy: V.Verdi
         r.log("recorded", path=str(path), verdict=v.eval_verdict)
     except (rs.SandboxError, OSError, ValueError) as exc:
         r.log("record-refused", error=str(exc)[:300])
-        old = sb.artifacts / r.h / "evals" / f"{SUITE}.json" if RA.HEX64.fullmatch(r.h or "") else None
-        # Only an evaluation of this artifact retires its old record; a caller mistake (wrong experiment id,
-        # Docker down) says nothing about the artifact and leaves the record alone.
-        about_artifact = r.prepared or any(x.startswith(("stale-baseline", "artifact-not-exact")) for x in r.refusals)
-        if old is not None and old.is_file() and about_artifact:
+        old = sb.artifacts / r.h / "evals" / f"{SUITE}.json"
+        if old.is_file():                    # no stale pass may survive a failed evaluation of this artifact
             aside = old.with_name(f"{SUITE}.json.superseded-{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}")
             os.replace(old, aside)
             r.log("superseded", old=str(old), aside=str(aside))

@@ -20,7 +20,8 @@ macOS host                                   Docker Desktop VM (linux/arm64)
 
 ## Layout
 
-`rsi_sandbox.py init` creates `~/sandbox/`, every directory mode 700:
+`rsi_sandbox.py init` creates `~/sandbox/`, every directory mode 700. `$RSI_SANDBOX_DIR` replaces
+`~/sandbox` for the CLI and for `Sandbox()` (tests and demos use a temp dir; Mission 005):
 
 | Path | Holds |
 |---|---|
@@ -85,7 +86,8 @@ shows up on the next build. Full apt pinning would need snapshot.debian.org.
   `--user 10001:10001`, `--init`.
 - `--memory` = `--memory-swap` (no swap), `--cpus`, `--pids-limit`. Defaults: 2g, 2, 512.
 - A wall-clock timeout (default 1200 s, max 4 h). On timeout the runner runs `docker kill`.
-- `--network rsi-internal` only.
+- `--network rsi-internal` only, or `--network none` (`run --network none`, Mission 005: the replay stub agent
+  and the replay checks). A `none` run takes no credentials and needs no `net-up`.
 - Env: only `HOME`, `CLAUDE_CONFIG_DIR=/home/rsi/.claude`, `CODEX_HOME=/home/rsi/.codex`,
   `HTTPS_PROXY`/`HTTP_PROXY=http://rsi-egress-proxy:3128`, `NO_PROXY`, `EXPERIMENT_ID`, `RSI_ARM`,
   plus named credentials. Never the host env. The docker CLI itself also gets a minimal env.

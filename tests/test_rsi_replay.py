@@ -212,7 +212,11 @@ def test_experiment_mismatch_leaves_an_existing_record_alone(tmp_path, monkeypat
     before = record(root, h)
     res, sb = replay(root, h, ["report-todos"], exp="exp-20261017-99")
     assert res.verdict.verdict == "INCONCLUSIVE" and res.verdict.reasons[0].startswith("experiment-mismatch")
-    assert sb.calls == [] and record(root, h) == before
+    assert sb.calls == [] and record(root, h) == before and res.eval_path is None
+    monkeypatch.setattr(rs, "docker_available", lambda: False)          # a host problem, not the artifact's
+    res, sb = replay(root, h, ["report-todos"])
+    assert res.verdict.reasons == ("sandbox-unavailable: docker or images/lock.json missing",)
+    assert sb.calls == [] and record(root, h) == before and res.eval_path is None
 
 
 def test_run_errors_and_timeouts_are_inconclusive(tmp_path, monkeypatch):
@@ -265,6 +269,43 @@ def test_interrupt_records_inconclusive_and_reraises(tmp_path, monkeypatch):
     assert record(root, h)["verdict"] == "inconclusive"
     rep = json.loads((root / "replays" / EXP / "replay.json").read_text())
     assert rep["verdict"]["verdict"] == "INCONCLUSIVE" and "interrupted: KeyboardInterrupt" in rep["errors"]
+
+
+def _bench_with(tmp_path: Path, case_id: str, **changes) -> Path:
+    bench = tmp_path / f"bench-{case_id}"
+    shutil.copytree(R.BENCH_DIR, bench)
+    p = bench / "cases" / f"{case_id}.json"
+    p.write_text(json.dumps({**json.loads(p.read_text()), **changes}))
+    return bench
+
+
+def test_arm_homes_are_prepared_once_and_reset_when_an_agent_changes_them(tmp_path, monkeypatch):
+    root, _, h = setup_root(tmp_path, monkeypatch, "closing-line")
+    case = json.loads((R.BENCH_DIR / "cases" / "fix-add.json").read_text())
+    bench = _bench_with(tmp_path, "fix-add", stub=[{"op": "run", "argv": ["sh", "-c", "echo x > $HOME/planted"]},
+                                                   *case["stub"]])
+    res = R.run_replay(h, R.load_cases(["fix-add"], bench=bench), R.ReplayConfig(reps=3), root=root,
+                       experiment_id=EXP, sandbox=HostSandbox(root))
+    assert res.verdict.verdict == "NO_EFFECT", res.verdict.reasons
+    events = [json.loads(x) for x in (res.evidence_dir / "log.jsonl").read_text().splitlines()]
+    assert [e["arms"] for e in events if e["event"] == "home-reset"] == [["A", "B"], ["A", "B"]]
+    assert all(r.check_passed for r in res.runs)        # every pair started from a clean home and still worked
+    # The unchanged stub homes of the plain bench are prepared exactly once.
+    res, _ = replay(root, h, ["fix-add"])
+    events = [json.loads(x) for x in (res.evidence_dir / "log.jsonl").read_text().splitlines()]
+    assert not [e for e in events if e["event"] == "home-reset"]
+
+
+def test_a_check_that_writes_into_its_home_is_not_trusted(tmp_path, monkeypatch):
+    root, _, h = setup_root(tmp_path, monkeypatch, "closing-line")
+    case = json.loads((R.BENCH_DIR / "cases" / "fix-add.json").read_text())
+    bench = _bench_with(tmp_path, "fix-add", check='touch "$HOME/.planted" && ' + case["check"])
+    res = R.run_replay(h, R.load_cases(["fix-add"], bench=bench), R.ReplayConfig(reps=3), root=root,
+                       experiment_id=EXP, sandbox=HostSandbox(root))
+    assert res.verdict.verdict == "INCONCLUSIVE"
+    assert all(r.error == "check-home-modified: .planted" for r in res.runs)
+    assert list(rs.Sandbox(root).arm_home(EXP, "K").iterdir()) != [] and \
+        not (rs.Sandbox(root).arm_home(EXP, "K") / ".planted").exists()
 
 
 def test_stub_agent_never_gets_credentials():
