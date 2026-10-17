@@ -267,7 +267,10 @@ def register(sub: argparse._SubParsersAction) -> None:
     rsi = sub.add_parser("rsi", help="RSI V1 approval-first: targets, baselines, proposals, decisions, promotion worker")
     s = rsi.add_subparsers(dest="rsi_cmd", required=True)
 
-    p = s.add_parser("targets", help="production files the loop may target (sha256, git state); read-only")
+    from agent_memory import rsi_night                 # `amem rsi night` (Mission 005, rsi_night.register)
+    rsi_night.register(s)
+
+    p = s.add_parser("targets",help="production files the loop may target (sha256, git state); read-only")
     p.add_argument("--no-schedules", action="store_true")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_targets)

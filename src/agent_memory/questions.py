@@ -47,7 +47,7 @@ MIN_QUESTIONS = 3
 MAX_QUESTIONS = 5
 # Question files Jev uses for something other than scoring routine runs. `amem score`
 # and `amem daily` never treat them as routines (docs/deviations.md).
-NOT_ROUTINES = frozenset({"deviation"})
+NOT_ROUTINES = frozenset({"deviation", "rsi-replay", "rsi-triage"})
 _ROUTINE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 _NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
