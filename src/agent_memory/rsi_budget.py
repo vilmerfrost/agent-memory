@@ -13,24 +13,40 @@ Caps:
 - a USD cap, checked before a call with the model's estimate (`cost_estimate_usd`) and after it with the real cost
 - bounded retries (`model_retries`, hard ceiling 2): a retry is a new call and counts against the model's cap
 
-The investigator never writes this config: the caps are data a human changes.
+What a call costs (the USD the cap sees), fail-closed for paid models (`PriceTable`, config/rsi-prices.json):
+- a cost the provider reports (Claude Code's total_cost_usd) is booked as reported
+- else the versioned price table: per token (Codex models) or a flat price per call (Jev)
+- a paid model the table does not name is priced with the table's high `default`; a paid call with neither a
+  cost nor token counts books `unknown_usage_usd`. A paid call is never booked at $0. Free stand-ins book $0.
+- the pre-call estimate of a paid model without a configured `cost_estimate_usd` comes from the table too.
+Each cost is booked once: a container run whose model call was already recorded (the live judge) is recorded
+with `cost_on_call=True` and carries no tokens or USD of its own.
+
+The investigator never writes these configs: the caps and prices are data a human changes.
 `sandbox/rsi_sandbox.py` replays (rsi_replay.run_replay) duck-type the same object: take_sandbox_run /
 record_run / remaining_s / take_call / record_call.
 """
 
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, TypeVar
+
+from agent_memory import config
 
 HARD_MAX_HYPOTHESES = 2          # contract 2.4: at most two hypotheses, whatever the config says
 HARD_MAX_EXPERIMENTS = 3
 HARD_MAX_RETRIES = 2
 HARD_MAX_WALL_CLOCK_S = 4 * 3600  # the sandbox's own MAX_TIMEOUT_S
 FREE_MODELS = ("stub", "fixture", "none")
+PRICES_FORMAT = "rsi-prices/1"
+PRICES_PATH = config.REPO_ROOT / "config" / "rsi-prices.json"
 _EPS = 1e-9
 
 T = TypeVar("T")
@@ -83,6 +99,153 @@ def _caps(d: Mapping[str, Any], key: str, *, number: bool) -> dict[str, Any]:
     return out
 
 
+# ---------------------------------------------------------------- prices
+
+
+class PriceConfigError(ValueError):
+    """The price table is missing, malformed or of another format."""
+
+
+@dataclass(frozen=True)
+class Price:
+    """One model's price. basis "tokens": USD per million tokens (cached input and cache writes default to the
+    input price); basis "call": a flat USD price per call. `unknown_usage_usd`: what a paid call that reported
+    neither a cost nor tokens books (None: the table default's)."""
+    basis: str
+    input_per_mtok: float = 0.0
+    cached_input_per_mtok: float | None = None
+    cache_write_per_mtok: float | None = None
+    output_per_mtok: float = 0.0
+    per_call_usd: float = 0.0
+    unknown_usage_usd: float | None = None
+
+    @classmethod
+    def from_dict(cls, d: Any, where: str) -> Price:
+        if not isinstance(d, Mapping):
+            raise PriceConfigError(f"{where} must be an object")
+        meta = {"source"}
+        rates = ("input_per_mtok", "cached_input_per_mtok", "cache_write_per_mtok", "output_per_mtok",
+                 "per_call_usd", "unknown_usage_usd")
+        extra = sorted(k for k in d if k not in {"basis", *rates, *meta} and not k.startswith("_"))
+        if extra:
+            raise PriceConfigError(f"{where}: unknown keys {extra}")
+        vals: dict[str, float] = {}
+        for k in rates:
+            if k in d:
+                v = d[k]
+                if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or not 0 <= v <= 1000:
+                    raise PriceConfigError(f"{where}.{k} must be a number in 0..1000, got {v!r}")
+                vals[k] = float(v)
+        basis = d.get("basis")
+        if basis == "tokens":
+            if vals.get("input_per_mtok", 0) <= 0 or "output_per_mtok" not in vals:
+                raise PriceConfigError(f"{where}: a tokens price needs input_per_mtok > 0 and output_per_mtok")
+            if "per_call_usd" in vals:
+                raise PriceConfigError(f"{where}: per_call_usd belongs to basis 'call'")
+        elif basis == "call":
+            if vals.get("per_call_usd", 0) <= 0:
+                raise PriceConfigError(f"{where}: a call price needs per_call_usd > 0")
+            if set(vals) - {"per_call_usd", "unknown_usage_usd"}:
+                raise PriceConfigError(f"{where}: token prices belong to basis 'tokens'")
+        else:
+            raise PriceConfigError(f"{where}.basis must be 'tokens' or 'call', got {basis!r}")
+        if "unknown_usage_usd" in vals and vals["unknown_usage_usd"] <= 0:
+            raise PriceConfigError(f"{where}.unknown_usage_usd must be > 0")
+        return cls(basis=basis, **vals)
+
+    def tokens_usd(self, tokens_in: int, tokens_out: int, cached: int = 0, cache_write: int = 0) -> float:
+        """USD for one call's tokens. `tokens_in` is all input; `cached` and `cache_write` are parts of it."""
+        cached = min(max(int(cached), 0), max(int(tokens_in), 0))
+        cache_write = min(max(int(cache_write), 0), max(int(tokens_in), 0) - cached)
+        plain = max(int(tokens_in), 0) - cached - cache_write
+        cr = self.input_per_mtok if self.cached_input_per_mtok is None else self.cached_input_per_mtok
+        cw = self.input_per_mtok if self.cache_write_per_mtok is None else self.cache_write_per_mtok
+        return (plain * self.input_per_mtok + cached * cr + cache_write * cw
+                + max(int(tokens_out), 0) * self.output_per_mtok) / 1_000_000
+
+
+@dataclass(frozen=True)
+class PriceTable:
+    """config/rsi-prices.json (rsi-prices/1): what the budget books for a paid call that reports no cost."""
+    models: Mapping[str, Price]
+    default: Price
+    version: str = ""
+    sha256: str = ""
+
+    @classmethod
+    def from_dict(cls, d: Any, *, sha256: str = "") -> PriceTable:
+        if not isinstance(d, Mapping) or d.get("format") != PRICES_FORMAT:
+            raise PriceConfigError(f"price table format must be {PRICES_FORMAT}")
+        extra = sorted(k for k in d if k not in ("format", "version", "models", "default") and not k.startswith("_"))
+        if extra:
+            raise PriceConfigError(f"price table: unknown keys {extra}")
+        if not isinstance(d.get("version"), str) or not d["version"]:
+            raise PriceConfigError("price table: version is a non-empty string")
+        raw = d.get("models")
+        if not isinstance(raw, Mapping):
+            raise PriceConfigError("price table: models must be an object")
+        models = {}
+        for name, p in raw.items():
+            if not isinstance(name, str) or not name or is_free_model(name):
+                raise PriceConfigError(f"price table: bad model name {name!r} (free stand-ins are never priced)")
+            models[name] = Price.from_dict(p, f"models.{name}")
+        default = Price.from_dict(d.get("default"), "default")
+        if default.basis != "tokens" or not default.unknown_usage_usd:
+            raise PriceConfigError("price table: default must be a tokens price with unknown_usage_usd > 0")
+        return cls(models=models, default=default, version=d["version"], sha256=sha256)
+
+    def describe(self) -> dict[str, Any]:
+        return {"format": PRICES_FORMAT, "version": self.version, "sha256": self.sha256}
+
+    def price(self, model: str) -> tuple[Price, bool]:
+        """(the model's price, whether the table names it)."""
+        p = self.models.get(model)
+        return (p, True) if p is not None else (self.default, False)
+
+    def unknown_usage_usd(self, model: str) -> float:
+        p, _ = self.price(model)
+        return float(p.unknown_usage_usd or self.default.unknown_usage_usd or 0.0)
+
+    def estimate(self, model: str) -> float:
+        """A paid call's pre-call estimate when the budget config has none: its flat price, else what a call with
+        unknown usage books."""
+        p, _ = self.price(model)
+        return p.per_call_usd if p.basis == "call" else self.unknown_usage_usd(model)
+
+    def book(self, model: str | None, *, reported_usd: float = 0.0, tokens_in: int = 0, tokens_out: int = 0,
+             tokens_cached: int = 0, tokens_cache_write: int = 0) -> tuple[float, str]:
+        """(USD to book, basis). basis: reported | table | default | call | unknown-usage | free | none.
+        A paid model (any name that is not a free stand-in) is never booked at 0."""
+        reported = float(reported_usd or 0.0)
+        if model is None:
+            return reported, ("reported" if reported > 0 else "none")
+        if is_free_model(model):
+            return reported, "free"
+        if reported > 0:
+            return reported, "reported"
+        p, named = self.price(model)
+        if p.basis == "call":
+            return p.per_call_usd, "call"
+        usd = p.tokens_usd(tokens_in, tokens_out, tokens_cached, tokens_cache_write)
+        if usd > 0:
+            return round(usd, 10), ("table" if named else "default")
+        return self.unknown_usage_usd(model), "unknown-usage"
+
+
+def load_prices(path: Path | None = None) -> PriceTable:
+    """The versioned price table (default config/rsi-prices.json). A bad file refuses (PriceConfigError)."""
+    path = Path(path or PRICES_PATH)
+    try:
+        raw = path.read_bytes()
+        data = json.loads(raw)
+    except (OSError, ValueError) as exc:
+        raise PriceConfigError(f"{path}: unreadable price table ({type(exc).__name__})") from None
+    return PriceTable.from_dict(data, sha256=hashlib.sha256(raw).hexdigest())
+
+
+# ---------------------------------------------------------------- the budget
+
+
 @dataclass(frozen=True)
 class BudgetConfig:
     max_hypotheses: int = 2
@@ -132,15 +295,20 @@ class BudgetConfig:
 
 @dataclass
 class Usage:
-    """What one call cost. Adapters return it with their value."""
+    """What one call cost. Adapters return it with their value. usd 0 = not reported: the price table books it.
+    tokens_in is all input; tokens_cached and tokens_cache_write are the parts of it priced differently."""
     tokens_in: int = 0
     tokens_out: int = 0
     usd: float = 0.0
+    tokens_cached: int = 0
+    tokens_cache_write: int = 0
 
 
 class Budget:
-    def __init__(self, cfg: BudgetConfig, *, clock: Callable[[], float] = time.monotonic) -> None:
+    def __init__(self, cfg: BudgetConfig, *, clock: Callable[[], float] = time.monotonic,
+                 prices: PriceTable | None = None) -> None:
         self.cfg = cfg
+        self.prices = prices if prices is not None else load_prices()
         self._clock = clock
         self._start = clock()
         self.calls: list[dict[str, Any]] = []
@@ -174,6 +342,20 @@ class Budget:
         if self.spent_usd() > self.cfg.max_usd + _EPS:
             raise self._stop("usd", f"spent {self.spent_usd():.4f} > cap {self.cfg.max_usd:.4f}")
 
+    def estimate(self, model: str) -> float:
+        """The pre-call USD estimate: the config's, else (a paid model) the price table's. Free stand-ins: 0."""
+        est = self.cfg.estimate(model)
+        if est > 0 or is_free_model(model):
+            return est
+        return self.prices.estimate(model)
+
+    def book(self, model: str | None, *, usd: float = 0.0, tokens_in: int = 0, tokens_out: int = 0,
+             tokens_cached: int = 0, tokens_cache_write: int = 0) -> tuple[float, str]:
+        """(USD to book, basis) for one call or run: the reported cost, else the price table (never 0 for a paid
+        model). The basis says which (PriceTable.book)."""
+        return self.prices.book(model, reported_usd=usd, tokens_in=tokens_in, tokens_out=tokens_out,
+                                tokens_cached=tokens_cached, tokens_cache_write=tokens_cache_write)
+
     # -- model calls ---------------------------------------------------------------------------------
     def take_call(self, model: str, stage: str) -> None:
         """Reserve one call of `model` before making it. Raises BudgetExhausted."""
@@ -181,15 +363,21 @@ class Budget:
         n = self._taken_calls.get(model, 0)
         if n >= self.cfg.call_cap(model):
             raise self._stop(f"calls:{model}", f"{stage}: cap {self.cfg.call_cap(model)}")
-        est = self.cfg.estimate(model)
+        est = self.estimate(model)
         if est > 0 and self.spent_usd() + est > self.cfg.max_usd + _EPS:
             raise self._stop("usd", f"{stage}: {model} estimate {est:.4f} over the cap {self.cfg.max_usd:.4f}")
         self._taken_calls[model] = n + 1
 
     def record_call(self, model: str, *, stage: str, tokens_in: int = 0, tokens_out: int = 0, usd: float = 0.0,
-                    duration_s: float = 0.0, ok: bool = True, error: str | None = None, attempt: int = 1) -> None:
+                    duration_s: float = 0.0, ok: bool = True, error: str | None = None, attempt: int = 1,
+                    tokens_cached: int = 0, tokens_cache_write: int = 0) -> None:
+        """Record one model call and book its cost: `usd` as reported (0 = not reported), else the price table.
+        A failed call is booked too: a call that died mid-turn was still billed."""
+        booked, basis = self.book(model, usd=usd, tokens_in=tokens_in or 0, tokens_out=tokens_out or 0,
+                                  tokens_cached=tokens_cached or 0, tokens_cache_write=tokens_cache_write or 0)
         self.calls.append({"model": model, "stage": stage, "tokens_in": int(tokens_in or 0),
-                           "tokens_out": int(tokens_out or 0), "usd": float(usd or 0.0),
+                           "tokens_out": int(tokens_out or 0), "usd": float(booked), "price_basis": basis,
+                           "tokens_cached": int(tokens_cached or 0), "tokens_cache_write": int(tokens_cache_write or 0),
                            "duration_s": round(float(duration_s or 0.0), 3), "ok": bool(ok),
                            "error": (error or None) and str(error)[:200], "attempt": attempt})
 
@@ -212,12 +400,14 @@ class Budget:
                 usage = getattr(exc, "usage", None) or Usage()
                 self.record_call(model, stage=stage, tokens_in=usage.tokens_in, tokens_out=usage.tokens_out,
                                  usd=usage.usd, duration_s=self._clock() - t0, ok=False,
-                                 error=f"{type(exc).__name__}: {exc}", attempt=attempt)
+                                 error=f"{type(exc).__name__}: {exc}", attempt=attempt,
+                                 tokens_cached=usage.tokens_cached, tokens_cache_write=usage.tokens_cache_write)
                 if isinstance(exc, retry_on) and attempt <= limit:
                     continue
                 raise
             self.record_call(model, stage=stage, tokens_in=usage.tokens_in, tokens_out=usage.tokens_out,
-                             usd=usage.usd, duration_s=self._clock() - t0, attempt=attempt)
+                             usd=usage.usd, duration_s=self._clock() - t0, attempt=attempt,
+                             tokens_cached=usage.tokens_cached, tokens_cache_write=usage.tokens_cache_write)
             return value
 
     # -- sandbox runs, experiments, hypotheses ---------------------------------------------------------
@@ -233,10 +423,22 @@ class Budget:
 
     def record_run(self, run_id: str, *, duration_s: float = 0.0, tokens_in: int = 0, tokens_out: int = 0,
                    usd: float = 0.0, model: str | None = None, exit_code: int | None = None,
-                   error: str | None = None) -> None:
+                   error: str | None = None, tokens_cached: int = 0, tokens_cache_write: int = 0,
+                   cost_on_call: bool = False, price_basis: str | None = None) -> None:
+        """Record one container run. A run of a paid model books its cost like record_call. cost_on_call: the
+        run's model call was recorded with record_call (the live judge), so the run books no tokens and no USD
+        (one cost, booked once). price_basis: the caller already priced `usd` (for example a CLI's per-run cap)."""
+        if cost_on_call:
+            tokens_in = tokens_out = tokens_cached = tokens_cache_write = 0
+            booked, basis = 0.0, "on-call"
+        else:
+            booked, basis = self.book(model, usd=usd, tokens_in=tokens_in or 0, tokens_out=tokens_out or 0,
+                                      tokens_cached=tokens_cached or 0, tokens_cache_write=tokens_cache_write or 0)
+            if price_basis and float(usd or 0.0) > 0:
+                basis = str(price_basis)[:40]
         self.runs.append({"run_id": str(run_id), "duration_s": round(float(duration_s or 0.0), 3),
                           "tokens_in": int(tokens_in or 0), "tokens_out": int(tokens_out or 0),
-                          "usd": float(usd or 0.0), "model": model, "exit_code": exit_code,
+                          "usd": float(booked), "price_basis": basis, "model": model, "exit_code": exit_code,
                           "error": (error or None) and str(error)[:200]})
 
     def take_experiment(self) -> None:
@@ -286,7 +488,7 @@ class Budget:
         providers = {k: {"requests": int(v["requests"]), "usd": float(v["usd"])}
                      for k, v in sorted(self.provider_requests.items())}
         return {"by_model": dict(sorted(by_model.items())), "sandbox_runs": len(self.runs),
-                "providers": providers, "total_usd": self.spent_usd()}
+                "providers": providers, "total_usd": self.spent_usd(), "prices": self.prices.describe()}
 
     def caps(self) -> dict[str, Any]:
         c = self.cfg

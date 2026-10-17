@@ -73,8 +73,8 @@ _SEVERITY = {"ok": 0, "fixture": 0, "live": 0, "skipped": 0, "stale": 1, "trunca
              "fixture-missing": 1, "error": 2, "unavailable": 2}
 
 # The investigator's own rules: never a hypothesis target, whatever the allowlist says.
-SELF_FILES = ("rsi-night.json", "rsi-triage.toml", "rsi-verdict-policy.json", "criteria.json", "fence.txt",
-              "pins.json")
+SELF_FILES = ("rsi-night.json", "rsi-triage.toml", "rsi-verdict-policy.json", "rsi-prices.json", "criteria.json",
+              "fence.txt", "pins.json")
 TARGET_KINDS = ("instruction", "lessons", "skill")
 NEW_TEXT_MAX = 200_000
 
