@@ -26,6 +26,12 @@ from agent_memory.integrations import refs
 STATUSES = ("ok", "unavailable", "error", "unknown-query", "bad-params")
 
 
+class Unavailable(Exception):
+    """Raised by a retriever's query() when policy, not failure, stops this one query (Mission 005.5: data not
+    approved for this provider, a withheld repo, a disabled provider). run_query answers `unavailable` with the
+    message as the detail, never `error`."""
+
+
 @dataclass
 class EvidenceRef:
     ref: str                                        # this record, in its own system (ch:, lf:, past:, amem:)
@@ -113,6 +119,8 @@ def run_query(r: Retriever, name: str, params: Mapping[str, str]) -> QueryResult
         return QueryResult(r.source, "unavailable", detail=h.detail)
     try:
         return QueryResult(r.source, "ok", r.query(name, checked))
+    except Unavailable as exc:
+        return QueryResult(r.source, "unavailable", detail=str(exc)[:200])
     except Exception as exc:  # noqa: BLE001 - one retriever's failure never blocks the others
         return QueryResult(r.source, "error", detail=type(exc).__name__)
 
