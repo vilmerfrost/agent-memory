@@ -915,17 +915,16 @@ def test_fts_baseline_over_the_corpus_the_sink_sends(db: Db, pdev: FakePastDev) 
 
 # ---------------------------------------------------------------- Mission 004C: reviewed backfill sets
 
-READ_ONLY = "-c default_transaction_read_only=on"
-
-
 def _canon_sha(obj: Any) -> str:
     return sha256(json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()
 
 
 def _preview(db: Db, pdev: FakePastDev, **kw: Any) -> dict[str, Any]:
-    """`amem sync plan --sink pastdev --contents` on a connection whose every transaction is read-only (as the
-    parent runs it against hosted Supabase: PGOPTIONS='-c default_transaction_read_only=on')."""
-    with psycopg.connect(db.app, options=READ_ONLY) as conn:
+    """`amem sync plan --sink pastdev --contents` on a session whose every transaction is read-only (`SET
+    default_transaction_read_only = on`; the parent sets the same with PGOPTIONS against hosted Supabase)."""
+    with psycopg.connect(db.app, autocommit=True) as conn:
+        conn.execute("SET default_transaction_read_only = on")
+        conn.autocommit = False
         assert conn.execute("show default_transaction_read_only").fetchone()[0] == "on"
         conn.rollback()
         out = sync.plan(sink(pdev), conn, contents=True, **kw)
