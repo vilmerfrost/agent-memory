@@ -747,7 +747,7 @@ class _Replay:
         rec.tool_calls, rec.final = parsed["tool_calls"], parsed["final"]
         rec.tokens_in, rec.tokens_out = parsed["tokens_in"], parsed["tokens_out"]
         rec.tokens_cached, rec.tokens_cache_write = parsed["tokens_cached"], parsed["tokens_cache_write"]
-        rec.cost_usd, rec.cost_basis = price(self.budget, rec.model, parsed)
+        rec.cost_usd, rec.cost_basis = price(self.budget, self.billed_model(rec), parsed)
         if rec.cost_basis == "unknown-usage" and cfg.agent == "claude" and cfg.max_budget_usd > 0:
             # No cost and no tokens (killed, unreadable): Claude Code enforced --max-budget-usd, so that cap is
             # the most this run can have cost.
@@ -761,8 +761,13 @@ class _Replay:
             rec.error = "agent reported an error" if parsed["is_error"] else "agent output unreadable"
         if rec.error is None and cfg.agent == "stub":
             rec.error = self.content_mismatch(arm, rec.instructions)
-        self.charge(rec.run_id, rec.duration_s, rec, model=rec.model)
+        self.charge(rec.run_id, rec.duration_s, rec, model=self.billed_model(rec))
         return rec
+
+    def billed_model(self, rec: RunRecord) -> str:
+        """The model a run is priced and booked as. A live agent without --model runs its CLI's default model:
+        booked under the agent's name, a paid model the price table does not name (its high default)."""
+        return rec.model or self.cfg.agent
 
     def content_mismatch(self, arm: str, seen: Sequence[Mapping[str, Any]]) -> str | None:
         """The stub reports the sha256 of every instruction file it read: arm A must see each changed file's

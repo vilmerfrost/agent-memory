@@ -318,3 +318,9 @@ policy or the triage questions from the investigator.
 - **The stub agent is a stand-in.** It proves the A/B harness, isolation and determinism, not that a real model
   follows the changed instruction. With reps 1 and 3 cases the verdict rests on 3 pairs (the policy minimum).
 - **Synthetic data only.** The `--rsi-demo` rows are outside gold.json; do not combine them with the egress checks.
+- **G2 follow-ups (fixed after G2; the live re-run G2b is written, not run):** the budget now books Codex judge
+  calls from tokens and Jev calls at a flat price from a versioned price table of assumed, unverified prices
+  (`config/rsi-prices.json`), never $0 for a paid model, each cost once; the `closing-line` candidate and the
+  `report-todos` prompt say the closing line goes inside REPORT.md. Commands: `docs/rsi/replay.md`, "Gate G2b".
+  The demo's own hypotheses (`bench/rsi-demo/hypotheses/`) keep the short closing-line wording: they only run
+  with the stub agent.

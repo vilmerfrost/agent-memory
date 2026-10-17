@@ -271,6 +271,23 @@ def test_live_replay_refuses_the_jev_call_that_would_pass_the_cap(tmp_path, monk
     assert not [c for c in b.calls if c["stage"] == "replay-jev"] and res.totals["jev_cost_usd"] == 0.0
 
 
+def test_a_codex_agent_without_a_model_is_priced_as_an_unnamed_paid_model(tmp_path, monkeypatch):
+    root, _, h = setup_root(tmp_path, monkeypatch, "closing-line")
+    out = judge_out({"input_tokens": 1000, "cached_input_tokens": 400, "output_tokens": 100})
+    sb = HostSandbox(root, fault=lambda rid, arm: {"exit_code": 0, "stdout": out} if arm in "AB" else None)
+    monkeypatch.setattr(sb, "net_status", lambda: {"internal": {"internal": True}, "proxy_running": True})
+    b = Budget(BudgetConfig.from_dict({"max_usd": 5.0, "max_sandbox_runs": 4}))
+    cfg = R.ReplayConfig(agent="codex", model=None, reps=1, judge="stub", jev="none")
+    res = R.run_replay(h, R.load_cases(["report-todos"]), cfg, root=root, experiment_id=EXP, sandbox=sb, budget=b)
+    want = (600 * 15 + 400 * 15 + 100 * 75) / 1e6                  # the default has no cached-input discount
+    assert [(r.cost_basis, r.tokens_cached) for r in res.runs] == [("default", 400)] * 2
+    assert all(r.cost_usd == pytest.approx(want) for r in res.runs)
+    agent_runs = [r for r in b.runs if r["model"] == "codex"]
+    assert len(agent_runs) == 2 and all(r["usd"] == pytest.approx(want) and r["price_basis"] == "default"
+                                        for r in agent_runs)
+    assert b.spent_usd() == pytest.approx(2 * want)
+
+
 def test_a_claude_run_with_no_usage_books_its_cli_cap(tmp_path, monkeypatch):
     b = budget(max_usd=1.0, max_sandbox_runs=15)
     res, _ = live_replay(tmp_path, monkeypatch, b, G2_JUDGE, agent_stdout="")
