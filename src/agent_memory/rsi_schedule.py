@@ -28,6 +28,7 @@ brief says why nothing ran. Nothing here writes outside routines.log, the RSI sa
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import re
@@ -37,7 +38,7 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -401,6 +402,25 @@ def classify(rep: Mapping[str, Any]) -> tuple[str, list[str]]:
     return "FAIL", items or [f"night: status {status}"]
 
 
+@contextlib.contextmanager
+def term_guard() -> Iterator[dict[str, int]]:
+    """While the night job runs, SIGTERM never kills it outright. Inside `Night.run` the night's own handler
+    turns it into a clean abort; outside it (the gate, unwinding, the final DB writes) it is only counted. So the
+    watchdog's last stage always gets to write its FAIL line. (launchd's own stop still ends with SIGKILL.)"""
+    state = {"term": 0}
+    if threading.current_thread() is not threading.main_thread():
+        yield state
+        return
+
+    def note(_signum: int, _frame: Any) -> None:
+        state["term"] += 1
+    old = signal.signal(signal.SIGTERM, note)
+    try:
+        yield state
+    finally:
+        signal.signal(signal.SIGTERM, old)
+
+
 class Watchdog:
     """The backstop above the night's own SIGALRM: SIGTERM after `term_s`, then `on_kill()` and a hard exit."""
 
@@ -478,14 +498,18 @@ def run_night_job(*, config_path: Path | None = None, night: str | None = None, 
         finish()
 
     guard = Watchdog(cfg.budget.wall_clock_s + HARD_GRACE_S, KILL_GRACE_S, killed) if watchdog else None
-    if guard:
-        guard.__enter__()
-    try:
-        rep = N.run_night(night=night, config_path=config_path, db_url=db_url, adapters=adapters)
-    finally:
+    with term_guard() as terms:
         if guard:
-            guard.__exit__(None, None, None)
+            guard.__enter__()
+        try:
+            rep = N.run_night(night=night, config_path=config_path, db_url=db_url, adapters=adapters)
+        finally:
+            if guard:
+                guard.__exit__(None, None, None)
     res.status, res.items = classify(rep)
+    if terms["term"] and rep.get("status") != "aborted":
+        res.items.append(f"signal: {terms['term']} SIGTERM outside the night's stages (noted, not obeyed)")
+        res.status = "FAIL"
     staged = [e for e in rep.get("experiments") or [] if e.get("status") == "staged"]
     costs = rep.get("costs") or {}
     res.fields.update(status=rep.get("status"), candidates=len(rep.get("candidates") or []),

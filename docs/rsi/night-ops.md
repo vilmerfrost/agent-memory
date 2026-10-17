@@ -60,7 +60,7 @@ The rules live in `schedule.prerequisites` of the night config.
 | Keeps production changes staged | the night stages artifacts and proposals only; it never calls decide, apply or promote (`FORBIDDEN_CALLS`, tested); promotion stays disabled |
 | No interactive prompts | stdin is `/dev/null`; `claude -p` gets `--permission-prompts none`; credentials are never read by the gate |
 | No host hooks | `AMEM_HOOK_OFF=1`; `claude -p` gets `--settings '{"disableAllHooks": true}'`, no tools, no MCP, no session file; sandbox containers have no host hooks |
-| Hard timeout | the night's own SIGALRM at `wall_clock_s` (clean abort); a watchdog sends SIGTERM 10 min later, then logs `FAIL hard timeout` and exits 124 after 2 more minutes |
+| Hard timeout | the night's own SIGALRM at `wall_clock_s` (clean abort); a watchdog sends SIGTERM 10 min later, then logs `FAIL hard timeout` and exits 124 after 2 more minutes. While the job runs, a SIGTERM outside the night's stages (unwinding, final DB writes) is noted, not obeyed (`term_guard`), so the watchdog's FAIL line is always written |
 
 Mapping of night statuses to the log line: `ok` → `PASS`; `partial`, `budget_exhausted`, `aborted`, other
 preflight failures → `FAIL` with items (`health langfuse: unavailable`, `budget: usd`, `experiment <id>: ...`);
@@ -109,7 +109,8 @@ Every booked cost carries its basis (`rsi_budget.COST_KINDS`); the report's `cos
 - **provider-reported** (`reported`): the provider's own CLI reported the call's cost (Claude Code's
   `total_cost_usd`). It is not reconciled with an invoice.
 - **estimate** (`table`, `call`, `default`, `unknown-usage`, `cli-cap`): `config/rsi-prices.json` (assumed prices,
-  read from third-party listings) or a per-run cap.
+  read from third-party listings) or a per-run cap. Live Jev (triage and replay) and the Codex sandbox implementer
+  report no cost, so they are always booked here, never as provider-reported.
 - **free** (`free`, `none`, `on-call`): stand-ins, check runs, and a judge run whose cost is booked on its call.
 
 No cost in the night is verified provider billing. Verification is manual: the morning after, compare the

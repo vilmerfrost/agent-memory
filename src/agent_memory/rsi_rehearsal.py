@@ -38,7 +38,7 @@ import sys
 import tempfile
 import time
 from collections.abc import Mapping
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -84,11 +84,13 @@ def check_workdir(work: Path) -> None:
 
 
 def routines_lines(night: str, now: datetime, *, daily: bool) -> str:
-    """A synthetic routines.log for the gate: archive and ingest passed; amem-daily only when `daily`."""
+    """A synthetic routines.log for the gate: archive and ingest passed; amem-daily only when `daily`. Archive and
+    daily are dated on the night's date (08:45, 09:20: always before `now`, since a night key is never later than
+    today's morning); ingest 30 minutes before `now`, so the 25 h rule holds at any time of day."""
     d = datetime.fromisoformat(night).replace(tzinfo=now.tzinfo)
     fmt = "%Y-%m-%dT%H:%M:%S%z"
-    lines = [f"{d.replace(hour=0, minute=8, second=31).strftime(fmt)} amem-ingest PASS heartbeat 5s",
-             f"{d.replace(hour=8, minute=45, second=9).strftime(fmt)} amem-archive PASS heartbeat 5s"]
+    lines = [f"{d.replace(hour=8, minute=45, second=9).strftime(fmt)} amem-archive PASS heartbeat 5s",
+             f"{(now - timedelta(minutes=30)).strftime(fmt)} amem-ingest PASS heartbeat 5s"]
     if daily:
         lines.append(f"{d.replace(hour=9, minute=20, second=4).strftime(fmt)} amem-daily PASS scored=16 "
                      "escalations=14 new=0 push=none tasks=10 deviations=8 707s")

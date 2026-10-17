@@ -706,7 +706,9 @@ def build_brief(rep: Mapping[str, Any], db: Db, *, artifacts_root: Path, report:
              "sandbox_runs": c.get("sandbox_runs") or 0,
              "providers": [{"name": text(k, 40), "requests": v.get("requests") or 0, "usd": v.get("usd") or 0}
                            for k, v in sorted((c.get("providers") or {}).items())],
-             "by_basis": [{"basis": text(k, 20), "kind": COST_KINDS.get(str(k), "estimate"),
+             "by_basis": [{"basis": text(k, 20),
+                           "kind": v.get("kind") if v.get("kind") in ("provider-reported", "estimate", "free")
+                           else COST_KINDS.get(str(k), "estimate"),          # the report's own label wins
                            "records": v.get("records") or 0, "usd": v.get("usd") or 0.0}
                           for k, v in sorted(_obj(c.get("by_basis")).items())],
              "reported_usd": c.get("reported_usd") if _num(c.get("reported_usd")) else None,

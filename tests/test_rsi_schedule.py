@@ -242,7 +242,7 @@ def test_live_replay_brings_the_network_up_and_down_only_when_asked(monkeypatch:
     monkeypatch.setattr(N, "sandbox_module", lambda: SimpleNamespace(Sandbox=Box))
 
     def fake_run(h: str, cases: Any, rc: Any, **kw: Any) -> Any:
-        events.append(("run", kw["ensure_network"], rc.judge, len(cases)))
+        events.append(("run", kw.get("ensure_network", False), rc.judge, len(cases)))
         return SimpleNamespace(verdict=SimpleNamespace(verdict="NO_EFFECT", reasons=["checks-equal"]), arms={},
                                artifact_hash=h, baseline_id="bl-1", eval_path=None, budget_stop=None, runs=[],
                                judge=None, jev=None)
@@ -268,11 +268,17 @@ def test_mock_rehearsal_config_keeps_the_limits_and_drops_every_paid_stage(tmp_p
         assert getattr(mock.budget, k) == getattr(first.budget, k), k
     assert mock.replay["credentials"] == mock.replay["judge_credentials"] == "none" and mock.replay["reps"] == 1
     assert S.prerequisites(S.schedule_section(mock.path)) == S.DEFAULT_PREREQS
-    now = datetime(2026, 10, 18, 22, 40, tzinfo=CEST)
-    log = write_log(tmp_path, R.routines_lines(NIGHT, now, daily=False))
-    assert S.check_prerequisites(log, NIGHT, now, S.DEFAULT_PREREQS) == ["prerequisite amem-daily: no run in routines.log"]
-    log.write_text(R.routines_lines(NIGHT, now, daily=True))
-    assert S.check_prerequisites(log, NIGHT, now, S.DEFAULT_PREREQS) == []
+    from agent_memory import rsi_approval as AP
+    for now in (datetime(2026, 10, 18, 12, 5, tzinfo=CEST), datetime(2026, 10, 18, 22, 40, tzinfo=CEST),
+                datetime(2026, 10, 19, 0, 30, tzinfo=CEST), datetime(2026, 10, 19, 8, 0, tzinfo=CEST),
+                datetime(2026, 10, 19, 11, 59, tzinfo=CEST)):     # the rehearsal works at any time of day
+        night = AP.night_key(now)
+        assert night == NIGHT
+        log = write_log(tmp_path, R.routines_lines(night, now, daily=False))
+        assert S.check_prerequisites(log, night, now, S.DEFAULT_PREREQS) == [
+            "prerequisite amem-daily: no run in routines.log"], now
+        log.write_text(R.routines_lines(night, now, daily=True))
+        assert S.check_prerequisites(log, night, now, S.DEFAULT_PREREQS) == [], now
     for bad in (R.D.REAL_HOME / "sandbox-dev" / "x", R.D.REAL_HOME / "sandbox" / "x"):
         with pytest.raises((R.RehearsalError, R.D.DemoError)):
             R.check_workdir(bad)
@@ -289,6 +295,22 @@ def test_paid_rehearsal_refuses_without_the_approved_cap(tmp_path: Path, monkeyp
         assert "needs Vilmer's approval" in err and "--approve-max-usd 1" in err and "Nothing ran." in err
     assert ran == [] and not (tmp_path / "w").exists()
     assert R.main(["--paid-plan"]) == 0 and "worst case $0.9100" in capsys.readouterr().out and ran == []
+
+
+def test_live_jev_triage_is_booked_as_an_estimate_not_as_reported(monkeypatch: pytest.MonkeyPatch) -> None:
+    from agent_memory import jev
+    from agent_memory.rsi_budget import Budget
+    ans = {"action": SimpleNamespace(value="experiment", probabilities={"experiment": 0.8}),
+           "impact": SimpleNamespace(value=2), "risk": SimpleNamespace(value=0), "testability": SimpleNamespace(value=1)}
+    monkeypatch.setattr(jev, "mode", lambda: "live")
+    monkeypatch.setattr(jev, "ask", lambda state, qs: ans)
+    t = N.JevTriage("live")
+    monkeypatch.setattr(t, "_questions", lambda: SimpleNamespace(jev_questions=lambda: []))
+    b = Budget(first_cfg().budget)
+    got = t.assess({"dedupe_key": "k"}, state="s", budget=b)
+    assert got is not None and got.mode == "live" and got.action == "experiment"
+    c = b.costs()
+    assert c["model_bases"] == {"jev-1.14.0": {"call": 0.01}} and c["reported_usd"] == 0.0 and c["estimated_usd"] == 0.01
 
 
 def test_paid_plan_lists_every_paid_call_and_fits_the_cap() -> None:
@@ -377,6 +399,23 @@ def test_watchdog_terms_then_kills(monkeypatch: pytest.MonkeyPatch) -> None:
         with S.Watchdog(5, 5, lambda: got.append("never"), exit=exited.append) as w2:
             pass
         assert w2.fired is None
+    finally:
+        signal.signal(signal.SIGTERM, old)
+
+
+def test_watchdog_always_reaches_its_fail_line_even_outside_the_nights_handler() -> None:
+    """SIGTERM at its default disposition (the night's handler is gone: unwinding, final DB writes) would kill the
+    job before the watchdog's FAIL line. term_guard keeps the process alive so the kill stage runs."""
+    old = signal.signal(signal.SIGTERM, signal.SIG_DFL)
+    try:
+        got: list[str] = []
+        exited: list[int] = []
+        with S.term_guard() as terms, S.Watchdog(0.05, 0.1, lambda: got.append("FAIL line"), exit=exited.append):
+            deadline = time.monotonic() + 5
+            while not exited and time.monotonic() < deadline:     # "blocked" outside Night._signals
+                time.sleep(0.01)
+        assert terms["term"] == 1 and got == ["FAIL line"] and exited == [S.EXIT_HARD_TIMEOUT]
+        assert signal.getsignal(signal.SIGTERM) == signal.SIG_DFL                      # restored afterwards
     finally:
         signal.signal(signal.SIGTERM, old)
 

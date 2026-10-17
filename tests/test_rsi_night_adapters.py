@@ -124,6 +124,9 @@ def test_sandbox_implementer_runs_the_agent_inside_the_sandbox(monkeypatch: pyte
     assert b.costs()["by_model"][model]["calls"] == 1
     if agent == "claude":
         assert b.costs()["by_model"]["opus"]["usd"] == 0.04 and "--allowedTools" in ran["command"]
+        assert b.costs()["model_bases"]["opus"] == {"reported": 0.04}
+    else:                    # Codex reports no cost: booked as an estimate, never as provider-reported
+        assert "reported" not in b.costs()["model_bases"]["codex"] and b.costs()["reported_usd"] == 0.0
 
 
 def test_default_adapters_follow_the_config(tmp_path: Path) -> None:

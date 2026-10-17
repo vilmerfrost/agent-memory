@@ -390,8 +390,8 @@ class JevTriage:
         model = jev.MODEL if live else "jev-fixture"
 
         def ask() -> tuple[dict[str, Any], Usage]:
-            if live:   # the wrapper does not expose usage: the configured per-call estimate is recorded
-                return jev.ask(state, qs), Usage(usd=budget.cfg.estimate(model))
+            if live:   # the wrapper reports no usage: the price table books its flat per-call price (an estimate,
+                return jev.ask(state, qs), Usage()    # never labelled provider-reported)
             jev._validate(state, qs)
             return jev._ask_fixture(state, qs), Usage()
         try:
@@ -737,8 +737,9 @@ class SandboxImplementer:
             if res.exit_code != 0 or res.timed_out:
                 raise ExperimentFailed(f"implementer exit {res.exit_code} timed_out={res.timed_out}")
             new = (box.arm_home(experiment_id, "I") / rel).read_text(encoding="utf-8")
-            # Claude reports its cost in the JSON envelope; for Codex the configured estimate is recorded.
-            return new, _envelope_usage(res.stdout) if self.agent == "claude" else Usage(usd=budget.cfg.estimate(model))
+            # Claude reports its cost in the JSON envelope; Codex reports none here, so the price table books it
+            # (an estimate, never labelled provider-reported).
+            return new, _envelope_usage(res.stdout) if self.agent == "claude" else Usage()
         return budget.call(model, "implement", run)
 
 
@@ -829,7 +830,8 @@ class SandboxReplayer:
         was_up = bool((box.net_status() or {}).get("proxy_running")) if box is not None else True
         try:
             r = rsi_replay.run_replay(artifact_hash, cases, rc, root=RA.sandbox_dir(), experiment_id=experiment_id,
-                                      budget=budget, baseline_id=baseline_id, ensure_network=ensure)
+                                      budget=budget, baseline_id=baseline_id,
+                                      **({"ensure_network": True} if ensure else {}))
         finally:
             if box is not None and not was_up:
                 with contextlib.suppress(Exception):
