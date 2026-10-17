@@ -868,6 +868,26 @@ class Sandbox:
         return {"killed_containers": killed, "released_locks": released,
                 "removed_records": self._prune_records(now, killed)}
 
+    def reap_experiment(self, experiment: str, *, quiet_s: float = 2.0, max_s: float = 20.0) -> list[str]:
+        """Remove every worker container of an aborted experiment, running or not. A `docker run` client that is
+        killed between create and start (an interrupt during `run`) leaves a container in `Created` state: `--rm`
+        never fires for it, and the `rm -f` in run's finally can run before the daemon finished the create. So poll
+        until no container of the experiment has appeared for `quiet_s` (or `max_s` passed)."""
+        _check_id(experiment, "experiment id")
+        removed: list[str] = []
+        start = quiet_since = time.monotonic()
+        while time.monotonic() - start < max_s:
+            ids = docker("ps", "-aq", "--filter", f"label={LABEL}=1", "--filter", "label=rsi.role=worker",
+                         "--filter", f"label=rsi.experiment={experiment}", check=False).stdout.split()
+            if ids:
+                docker("rm", "-f", *ids, check=False, timeout=60)
+                removed += [i for i in ids if i not in removed]
+                quiet_since = time.monotonic()
+            elif time.monotonic() - quiet_since >= quiet_s:
+                break
+            time.sleep(0.25)
+        return removed
+
     def _prune_records(self, now: float, removed: list[str]) -> list[str]:
         out = []
         live = {c["Name"].lstrip("/") for c in self._workers()}

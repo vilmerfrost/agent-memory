@@ -220,10 +220,15 @@ class FakeSandboxOps(N.SandboxOps):
 
     def __init__(self) -> None:
         self.recovered = 0
+        self.reaped: list[str] = []
 
     def recover(self) -> dict[str, Any]:
         self.recovered += 1
         return {"killed_containers": [], "released_locks": [], "removed_records": []}
+
+    def reap(self, experiments: Any) -> dict[str, Any]:
+        self.reaped += list(experiments)
+        return {e: [] for e in experiments}
 
 
 def adapters(**kw: Any) -> N.Adapters:

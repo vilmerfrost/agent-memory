@@ -1,0 +1,22 @@
+{
+  "_note": "Hand-written rsi-triage fixture for the M005 demo (src/agent_memory/rsi_demo.py, synth --rsi-demo): the Codex candidate, global AGENTS.md closing-line rule (fewer sessions, medium impact), no prior experiment. Not a live response.",
+  "_triage_state": "rsi candidate for a nightly sandbox experiment\nsource: deviations\nkind: edit_instruction\ntarget: ~/.codex/AGENTS.md\ntarget_in_scope: yes\nrule: agents-md:global:synth-m005-closing-line\nrecurrence: 1\nsessions: 2-4\nfollowed_grade: 0.2\nobjective_result: 0.5\nprior_experiments: none",
+  "model": "jev-1.14.0",
+  "usage": {"input_tokens": 0, "output_tokens": 0},
+  "answers": {
+    "action": {"type": "choice", "choice": "experiment", "confidence": 0.72,
+               "probabilities": {"experiment": 0.8, "wait": 0.2}},
+    "impact": {"type": "score", "score": 1.0, "confidence": 0.6,
+               "legend": {"0": "Low: rare or cosmetic", "1": "Medium: recurring, some harm to results",
+                          "2": "High: recurring and results clearly suffer"},
+               "probabilities": {"0": 0.15, "1": 0.6, "2": 0.25}},
+    "risk": {"type": "score", "score": 0.0, "confidence": 0.75,
+             "legend": {"0": "Low: a local wording change in one rule", "1": "Medium: changes how agents behave in common tasks",
+                        "2": "High: could break many workflows or safety rules"},
+             "probabilities": {"0": 0.77, "1": 0.18, "2": 0.05}},
+    "testability": {"type": "score", "score": 2.0, "confidence": 0.66,
+                    "legend": {"0": "Poor: needs long real sessions or human judgment", "1": "Fair: some replay tasks can show it",
+                               "2": "Good: a short replay clearly shows the difference"},
+                    "probabilities": {"0": 0.06, "1": 0.28, "2": 0.66}}
+  }
+}

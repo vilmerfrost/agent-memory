@@ -480,7 +480,19 @@ def _dget(obj: Any, name: str, default: Any = None) -> Any:
 
 
 class PackEvidence:
-    """rsi_evidence_pack (w-evidence, contract 2.3), imported lazily."""
+    """rsi_evidence_pack (w-evidence, contract 2.3), imported lazily. The pack reads the night's own database
+    (`db_url`, else the process default, as the night itself), never another one. `retrievers`: provider stand-ins
+    (tests and the synthetic demo); None = the providers the environment configures."""
+
+    db_url: str | None = None
+    retrievers: Mapping[str, Any] | None = None
+
+    def __init__(self, db_url: str | None = None, retrievers: Mapping[str, Any] | None = None) -> None:
+        self.db_url, self.retrievers = db_url, retrievers
+
+    def _connect(self) -> psycopg.Connection:
+        from agent_memory import store
+        return store.connect(self.db_url)
 
     def _mod(self) -> Any:
         try:
@@ -493,7 +505,15 @@ class PackEvidence:
         return self._mod().delta_since(since, conn=conn)
 
     def pack(self, candidate: Mapping[str, Any]) -> Any:
-        return self._mod().build_pack(candidate)
+        mod = self._mod()
+        kw = {"connect": self._connect} if self.db_url else {}     # no db_url: the store default, as the night
+        if self.retrievers is None:
+            return mod.build_pack(candidate, **kw)
+        rs = dict(self.retrievers)
+        if "sb" not in rs:
+            from agent_memory.integrations.evidence import SupabaseRetriever
+            rs["sb"] = SupabaseRetriever(self._connect)
+        return mod.build_pack(candidate, retrievers=rs, **kw)
 
     def render(self, pack: Any) -> str:
         return self._mod().render_for_model(pack)
@@ -573,9 +593,33 @@ def _envelope_usage(stdout: str) -> Usage:
         return Usage()
 
 
+# Env names the host-side model CLI never needs: stores, provider and cloud keys, anything secret-shaped. The night
+# process may hold them (an amem routine loads .env unless AMEM_NO_DOTENV=1); the `claude -p` child does not get
+# them. Its own login stays (CLAUDE_*, ANTHROPIC_*). Mission 005, K4 accounting (docs/rsi/m005-report.md).
+_MODEL_ENV_DROP_PREFIXES = ("AMEM_", "PG", "SUPABASE", "TYPESAFE", "CLICKHOUSE", "LANGFUSE", "PASTDEV", "NTFY",
+                            "AWS_", "AZURE_", "GOOGLE_", "GCP_", "OPENAI", "CODEX_", "GITHUB_", "GH_", "RSI_",
+                            "DATABASE", "DOCKER_")
+_MODEL_ENV_SECRET = re.compile(r"SECRET|PASSW|TOKEN|DB_URL|DATABASE_URL|PRIVATE_KEY|API_KEY|ACCESS_KEY|CREDENTIAL",
+                               re.I)
+
+
+def model_cli_env(environ: Mapping[str, str] | None = None) -> dict[str, str]:
+    """The environment for a host-side model CLI call (S5 `claude -p`): this process's env minus every store,
+    provider or secret-shaped name; the CLI's own login (CLAUDE_*, ANTHROPIC_*) stays."""
+    src = os.environ if environ is None else environ
+    out = {}
+    for k, v in src.items():
+        own = k.startswith(("CLAUDE_", "ANTHROPIC_"))
+        if not own and (k.upper().startswith(_MODEL_ENV_DROP_PREFIXES) or _MODEL_ENV_SECRET.search(k)):
+            continue
+        out[k] = v
+    return out
+
+
 class ClaudeCliHypothesizer:
     """S5 live (unverified in Mission 005): headless `claude -p` with the edit writer's configured model
-    (edits_writer.writer_model, AMEM_EDITS_MODEL, default opus) and distill's no-tools flags."""
+    (edits_writer.writer_model, AMEM_EDITS_MODEL, default opus) and distill's no-tools flags (`--tools ""`: it
+    cannot read or run anything). Its environment is `model_cli_env()`: no store or provider credential."""
 
     def __init__(self, cfg: Mapping[str, Any]) -> None:
         self.cfg = dict(cfg)
@@ -595,7 +639,8 @@ class ClaudeCliHypothesizer:
         timeout = float(self.cfg.get("timeout_s") or 600)
 
         def run() -> tuple[str, Usage]:
-            out = distill.run_cli(argv, prompt, timeout=max(1.0, min(timeout, budget.remaining_s())))
+            out = distill.run_cli(argv, prompt, timeout=max(1.0, min(timeout, budget.remaining_s())),
+                                  env=model_cli_env())
             return distill.parse_envelope(out), _envelope_usage(out)
         return budget.call(model, "hypothesize", run, retry_on=(distill.WriterError,))
 
@@ -788,6 +833,15 @@ class SandboxOps:
         except Exception as exc:  # noqa: BLE001 - recovery is best effort; the report says what failed
             return {"error": f"{type(exc).__name__}: {str(exc)[:200]}"}
 
+    def reap(self, experiments: Sequence[str]) -> dict[str, Any]:
+        """Remove every container of tonight's aborted experiments (Sandbox.reap_experiment): nothing may run them
+        any more, and an interrupted `docker run` can leave one in Created state."""
+        try:
+            box = sandbox_module().Sandbox(RA.sandbox_dir())
+            return {e: box.reap_experiment(e) for e in experiments}
+        except Exception as exc:  # noqa: BLE001 - best effort; the report says what failed
+            return {"error": f"{type(exc).__name__}: {str(exc)[:200]}"}
+
 
 def create_baseline(key: str) -> tuple[str, Path]:
     return rsi_targets.create_baseline([rsi_targets.untilde(key)])
@@ -807,13 +861,13 @@ class Adapters:
     baseline: Callable[[str], tuple[str, Path]] = create_baseline
 
 
-def default_adapters(cfg: NightConfig) -> Adapters:
+def default_adapters(cfg: NightConfig, db_url: str | None = None) -> Adapters:
     st = cfg.stages
     hyp: Hypothesizer = ClaudeCliHypothesizer(cfg.hypothesizer) if st["hypothesizer"] == "claude-cli" \
         else FixtureHypothesizer()
     impl: Implementer = SandboxImplementer(st["implementer"], cfg.implementer) if st["implementer"] != "stub" \
         else StubImplementer()
-    return Adapters(evidence=PackEvidence(), triage=JevTriage(st["triage"]), hypothesizer=hyp, implementer=impl,
+    return Adapters(evidence=PackEvidence(db_url), triage=JevTriage(st["triage"]), hypothesizer=hyp, implementer=impl,
                     stager=ImproveStager(), replayer=SandboxReplayer(st, cfg.replay), proposer=ApprovalProposer(),
                     sandbox=SandboxOps())
 
@@ -1000,12 +1054,15 @@ class Night:
             status = "budget_exhausted"
             self.notes.append(f"budget exhausted: {exc.kind}")
             self._unwind("budget")
+            if exc.kind == "wall_clock":                  # the hard timeout can cut a container run short
+                self._reap_tonight()
         except NightAborted as exc:
             status = "aborted"
             self.notes.append(f"interrupted by {exc}")
             self._unwind("aborted")
             rec = self.ad.sandbox.recover()
             self.notes.append("sandbox recover: " + json.dumps(rec, sort_keys=True, default=str)[:300])
+            self._reap_tonight()
         except Exception as exc:  # noqa: BLE001 - the night ends partial with the reason; nothing advances
             status = "partial"
             self.failed = True
@@ -1514,6 +1571,13 @@ class Night:
             c["meta"] = {**(c.get("meta") or {}), "attempts": counted, "history": hist}
 
     # -- unwinding, S9, the report ----------------------------------------------------------------------
+    def _reap_tonight(self) -> None:
+        """After a stop that can cut a container run short: no container of tonight's experiments may survive."""
+        ids = [e["experiment_id"] for e in self.report["experiments"] if e.get("experiment_id")]
+        reap = getattr(self.ad.sandbox, "reap", None)
+        if ids and callable(reap):
+            self.notes.append("sandbox reap: " + json.dumps(reap(ids), sort_keys=True, default=str)[:300])
+
     def _unwind(self, why: str) -> None:
         """After a stop: experiments still running are aborted, candidates still selected go back to deferred."""
         if self.conn is None or self.dry_run:
@@ -1593,8 +1657,8 @@ def run_night(*, night: str | None = None, config_path: Path | None = None, dry_
                "costs": {"by_model": {}, "sandbox_runs": 0, "providers": {}, "total_usd": 0.0},
                "health": {k: "skipped" for k in HEALTH_KEYS}, "pending_decisions": [], "notes": [f"config: {exc}"[:300]]}
         return rep
-    return Night(cfg, adapters or default_adapters(cfg), night=night, db_url=db_url, dry_run=dry_run, clock=clock,
-                 install_signals=install_signals).run()
+    return Night(cfg, adapters or default_adapters(cfg, db_url), night=night, db_url=db_url, dry_run=dry_run,
+                 clock=clock, install_signals=install_signals).run()
 
 
 # =========================================================================== the contract check

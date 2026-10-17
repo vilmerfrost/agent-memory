@@ -144,6 +144,9 @@ instruction targets), and anything else is rejected.
 
 ## 4. Wave 2: end-to-end synthetic demo (w-e2e)
 
+Done: `uv run python scripts/m005_demo.py --scenario all`; results, safety evidence, cost estimate and the
+activation plan are in `docs/rsi/m005-report.md`.
+
 Disposable Postgres + `amem synth seed` extended with repeated instruction failures; temp `RSI_SANDBOX_DIR` with a
 synthetic baseline and synthetic instruction targets (never the real `~/.claude`); stub agent in the real Docker
 sandbox (no network, no credentials). Scenarios: success (IMPROVES -> staged proposal -> brief), no-effect,
