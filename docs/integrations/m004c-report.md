@@ -271,3 +271,26 @@ first". The parent followed the new rule; all 4 forbid checks passed; only the `
 merge main) failed. The grader encodes the old policy. Side finding: `GUARDED_SUBS` (agent-config
 `lib/parent_profile.py:216`) does not include `fetch`, so `git fetch . x:main` moves main without a guard
 prompt. Neither is changed here (live setup).
+
+## 11. Merge readiness, ownership fix and the first-backfill proposal, 2026-10-17 evening
+
+Owner decisions: keep the past.dev project; do not push the local RSI commits; prepare (not run) the merge of
+`rsi/m004c` into local main and a small, reviewed first backfill; resolve ownership before any real export;
+the `git fetch . x:main` guard gap is its own safety task; verify the 2026-10-18 09:20 daily before Phase I.
+
+- **Ownership fixed (198fd3f..7096b70):** `own` now needs a github.com remote (`meta.remote_host`, stored at
+  ingest); any other host, an ssh alias or a missing host is `private`. Old rows have no host:
+  `amem sessions hosts` re-derives it from local git config (dry run on hosted: 173 candidates, 152 github.com,
+  21 no remote, 0 owner changes); `--apply` is a hosted write and needs its own approval.
+- **Reviewed-set tooling:** `sync plan --contents` (exact payloads + sha256), `sync run --only reviewed.json`
+  (refuses if any payload changed), `sync delete --only`. `scripts/ro_amem.py`: the Supabase pooler ignores
+  `PGOPTIONS`, so the wrapper forces read-only in the client and strips provider keys (probe: both UPDATEs
+  refused, 0 keys).
+- **Merge readiness:** `docs/integrations/m004c/merge-plan.md`. Final tip `876ec85` merges into main 5e6a24f
+  cleanly (tree `b363526`); full suite on the merged code 1992 passed, 1 skipped; no migrations, no dependency
+  change; one additive production change (ingest stores `meta.remote_host`).
+- **First backfill proposal:** `backfill-export-plan.md` 5.7-5.8: past.dev, exactly 2 own records (one RSI
+  test proposal and its rejection decision, 2 credits), reviewed set `reviewed-first.json` (outside the repo),
+  `review.ok` on hosted.
+- **Guard gap:** agent-config `fix/guard-fetch` @ `5160878` (not live): fetch/pull writes to protected
+  branches now ask; 9 new checks fail on the old code; real hook path proven in a sandboxed HOME.
