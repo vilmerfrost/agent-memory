@@ -190,3 +190,27 @@ Synthetic counts own/team/private: sessions 14/2/0 -> 11/2/3, deviations 16/2/0 
 14/2/0 -> 11/2/3. Full suite 1898 passed, 1 skipped; 28 new/changed tests fail on the old code.
 
 past.dev G-PD1-G-PD3 approval request: `m004c/pastdev-gpd1.md`.
+
+## 9. Owner decisions and past.dev G-PD2, 2026-10-17 evening
+
+Owner decisions (Mission 004C update):
+- **C1 accepted.** Actual ClickHouse billing is still to be read at the next console sign-in; it does not block
+  other synthetic work. `AMEM_PSEUDONYM_KEY` stays as it is: never regenerate it (pseudonyms must stay stable).
+- **past.dev G-PD1-G-PD3 approved**, synthetic only: dedicated `amem-rsi` project, max 250 credits, max 100
+  data points, 8 synthetic records plus 4 refused by the sanitizer, no real data, no recurring sync. Stop if the
+  project caps cannot be enforced or the data policy is violated.
+- Phase I stays on hold (investigate the deviation-writer failure on a dev branch only). Historical backfill
+  stays blocked. NCM and unattended promotion unchanged.
+
+G-PD2 (key via popup into this worktree's `.env.local`; run with no env file loaded and only
+`AMEM_PASTDEV_KEY` in the environment, so no hosted database URL or other cloud key was present):
+| Call | Result |
+|---|---|
+| health (`GET /ingest/<nil>`, free) | ok, 0.65 s |
+| `GET /usage` (free) | project slug `default-project`; `creditCap` null, `ingestionCap` null; 0 credits, 0 ingestions, 0 recalls; balance 150,000 left, 0 spent |
+
+**G-PD2 accept failed:** the key belongs to `default-project`, not `amem-rsi`, and no project caps are set.
+Per the owner's stop rule, **C3 was not started.** Nothing was sent to past.dev: both calls are free GETs
+with no content. Owner question 1 is answered: a project already existed (Pay as you go allows one).
+Needed before C3: in Settings > Projects, set this project's monthly credit cap to 250 and ingestion cap to
+100 (and rename it to `amem-rsi` if the console allows), then re-run G-PD2: `/usage` must show both caps.
