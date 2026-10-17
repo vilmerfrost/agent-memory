@@ -296,25 +296,37 @@ def run(sink: Sink, conn: psycopg.Connection, *, budget_s: float = 60.0, replay:
 
 
 def plan(sink: Sink, conn: psycopg.Connection, *, replay: bool = False,
-         environ: Mapping[str, str] | None = None) -> dict[str, Any]:
+         environ: Mapping[str, str] | None = None, contents: bool = False, limit: int | None = None,
+         cls: str | None = None) -> dict[str, Any]:
     """A dry run: what the next `run` (or a `--replay` backfill) would send, per table, against the
     client-side daily limits. Read-only: the connection is put in read-only mode, health() is not called
     (it may wake or write to the provider) and nothing is pushed. A sink may price batches with cost(), and
     report `masked` (Mission 004C, F8): rows masked (ClickHouse) or withheld (past.dev) as team and as private,
-    per table with own, and the owner accounts used, so the owner can review them before a backfill."""
+    per table with own, and the owner accounts used, so the owner can review them before a backfill.
+
+    `contents` (Mission 004C backfill review; a sink with describe()): also every outgoing record, as the exact
+    payload, its sha256, ownership class and size (`records`), the actions without content (`actions`: past.dev
+    retractions and ingestion checks) and the refused records with their reasons, never their content
+    (`refused_records`). `cls` keeps only records of that class; `limit` cuts each list (the totals stay)."""
+    was = conn.read_only
     conn.read_only = True
     try:
-        return _plan(sink, conn, replay=replay, environ=environ)
+        return _plan(sink, conn, replay=replay, environ=environ, contents=contents, limit=limit, cls=cls)
     finally:
         conn.rollback()
-        conn.read_only = False
+        conn.read_only = was
 
 
-def _plan(sink: Sink, conn: psycopg.Connection, *, replay: bool,
-          environ: Mapping[str, str] | None) -> dict[str, Any]:
+def _plan(sink: Sink, conn: psycopg.Connection, *, replay: bool, environ: Mapping[str, str] | None,
+          contents: bool = False, limit: int | None = None, cls: str | None = None) -> dict[str, Any]:
     meta = load(conn, sink.name)
     watermarks: dict[str, str] = {} if replay else dict(meta.get("watermarks") or {})
     tables: dict[str, dict[str, int]] = {}
+    describe = getattr(sink, "describe", None) if contents else None
+    if contents and describe is None:
+        raise ValueError(f"{sink.name}: no record preview (--contents)")
+    records: list[dict[str, Any]] = []
+    actions: list[dict[str, Any]] = []
     for batch in sink.batches(conn, watermarks, replay=replay):
         t = tables.setdefault(batch.table, {"batches": 0, "rows": 0, "bytes": 0})
         t["batches"] += 1
@@ -323,6 +335,9 @@ def _plan(sink: Sink, conn: psycopg.Connection, *, replay: bool,
         cost = getattr(sink, "cost", None)
         if cost is not None and batch.rows:
             t["cost"] = t.get("cost", 0) + int(cost(batch))
+        if describe is not None:
+            for e in describe(batch):
+                (records if "payload" in e else actions).append(e)
     max_rows, max_requests = limits(sink.name, environ)
     rows = sum(t["rows"] for t in tables.values())
     reqs = sum(t["batches"] for t in tables.values())
@@ -338,6 +353,20 @@ def _plan(sink: Sink, conn: psycopg.Connection, *, replay: bool,
         out["masked"] = masked
     if any("cost" in t for t in tables.values()):
         out["cost"] = sum(t.get("cost", 0) for t in tables.values())
+    review = getattr(sink, "review", None)      # Mission 004C: a reviewed set's check (past.dev --only)
+    if isinstance(review, dict):
+        out["review"] = review
+    if describe is not None:
+        refused_of = getattr(sink, "refused_records", None)
+        refused = list(refused_of()) if refused_of is not None else []
+        if cls is not None:
+            records = [r for r in records if r.get("class") == cls]
+            refused = [r for r in refused if r.get("class", cls) == cls]     # a count per table has no class
+        cut = (lambda xs: xs) if limit is None else (lambda xs: xs[:max(0, limit)])
+        out.update({"contents": {"class": cls, "limit": limit,
+                                 "sha256": "sha256 of the canonical JSON of payload (sorted keys, no spaces, UTF-8)"},
+                    "records_total": len(records), "records": cut(records),
+                    "refused_total": len(refused), "refused_records": cut(refused), "actions": actions})
     return out
 
 

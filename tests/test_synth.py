@@ -73,18 +73,26 @@ def test_markers_are_unique_and_every_row_says_synthetic() -> None:
 
 
 def test_unknown_ownership_cases_are_private_and_own_sessions_stay_own() -> None:
-    """Mission 004C (F8): sessions with no remote, a non-GitHub remote ingestion read no owner from, and an unknown
-    owner are private; own sessions (team false + the owner account) stay own. Before F8 all of them were own."""
+    """Mission 004C (F8): sessions with no remote, the owner's account name on a non-GitHub host, and an unknown
+    GitHub owner are private; own sessions (team false + the owner account + github.com) stay own. Before F8 all of
+    them were own; under the owner-only F8 rule (before the host was stored) the non-GitHub one was own."""
     ds = synth.build(ANCHOR)
     g = synth.gold(ds)
     by_id = {s["session_id"]: s for s in ds.rows["sessions"]}
     cases = {sid: by_id[sid]["meta"].get("synthetic_case") for sid in g["private"]["sessions"]}
     assert sorted(cases.values()) == sorted(synth.PRIVATE_CASES)
-    assert g["ownership"]["owner_accounts"] == ["vilmerfrost"]
+    (gitlab,) = (by_id[sid]["meta"] for sid, c in cases.items() if c == "non-github-remote")
+    assert (gitlab["team"], gitlab["remote_owner"]) == (False, "vilmerfrost") and gitlab["remote_host"] != "github.com"
+    assert all(s["meta"]["remote_host"] == "github.com" for s in ds.rows["sessions"]
+               if synth.egress.classify(s["meta"], ("vilmerfrost",)) == "own")
+    assert g["ownership"]["owner_accounts"] == ["vilmerfrost"] and g["ownership"]["own_hosts"] == ["github.com"]
     assert g["ownership"]["after"]["sessions"] == {"own": 11, "team": 2, "private": 3}
+    assert g["ownership"]["owner_only"]["sessions"] == {"own": 12, "team": 2, "private": 2}
     assert g["ownership"]["before"]["sessions"] == {"own": 14, "team": 2, "private": 0}
     assert g["ownership"]["after"]["skill_calls"] == {"own": 11, "team": 2, "private": 3}
+    assert g["ownership"]["owner_only"]["skill_calls"] == {"own": 12, "team": 2, "private": 2}
     assert g["ownership"]["after"]["deviations"] == {"own": 15, "team": 2, "private": 1}
+    assert g["ownership"]["owner_only"]["deviations"] == {"own": 15, "team": 2, "private": 1}
     assert g["clickhouse"]["private"] == {"sessions": 3, "deviations": 1, "skill_calls": 3}
     assert len(g["pastdev"]["refuse_private"]) == 2 and not set(g["pastdev"]["refuse_private"]) & set(g["pastdev"]["send"])
     keys = {r["metrics"]["rule_key"] for q in g["clickhouse"]["queries"] if q["name"] == "rule_weekly_rate" for r in q["rows"]}

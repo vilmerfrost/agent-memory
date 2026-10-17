@@ -817,7 +817,8 @@ def test_private_repo_names_are_sensitive_too(app: str, pg_url: str, tmp_path: P
     monkeypatch.setattr(egress, "_team", egress.NONE)                     # restored after the test
     with psycopg.connect(pg_url, autocommit=True) as conn:
         for sid, name, meta in (("lf-private", "client-notes", "{}"),
-                                ("lf-own", "agent-memory", '{"team": false, "remote_owner": "vilmerfrost"}')):
+                                ("lf-own", "agent-memory",
+                                 '{"team": false, "remote_owner": "vilmerfrost", "remote_host": "github.com"}')):
             conn.execute("insert into sessions (session_id, kind, project_dir, repo, project, transcript_bytes, env, meta) "
                          "values (%s, 'chat', '/lf-test', %s, %s, 1, 'prod', %s::jsonb)", (sid, name, name, meta))
     assert not L.sensitive("client-notes-tuned")                                     # not read yet

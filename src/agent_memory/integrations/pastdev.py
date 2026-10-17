@@ -62,6 +62,14 @@ Deletion is final (Mission 004B). The docs: "A deleted id cannot be sent again; 
 the record's amem: ref, so a record whose link is marked deleted is retired: never sent again, listed in
 `retired`. To bring one back would need a new id scheme or a new project; nothing here does that.
 
+Reviewed sets (Mission 004C, the first historical backfill). `amem sync plan --sink pastdev --contents --json`
+lists every item the next run would send (the exact payload, `payload_sha256`, ownership class, local credits and
+bytes) and every refused record with its reasons (never its content), reading in a read-only transaction. A
+reviewer cuts that JSON down to the chosen records. `amem sync run --sink pastdev --only FILE` then narrows every
+batch (sends, retractions, checks) to those refs and yields nothing at all when any reviewed ref has no current
+payload or another sha256 (the CLI checks first, read-only, and exits 1 before any provider call or write).
+`amem sync delete --sink pastdev --only FILE` deletes that set's data points again (delete_all with `refs`).
+
 Cost (Mission 004B, from the pricing page and the spec): 1 credit per 350 UTF-8 bytes of content, rounded
 up per item, at least 1 (local_credits); recall 0.1 credit. Credits are prepaid: at zero, sends answer 402
 out-of-credits and nothing is billed. A project credit cap (console) answers 429 project-cap-reached (a spend
@@ -443,6 +451,47 @@ def _key(items: list[dict[str, Any]]) -> str:
     return _sha({"items": items})
 
 
+def _item(rec: Record, content: str) -> dict[str, Any]:
+    """The exact ingest item for one record (the only shape that leaves; no metadata)."""
+    return {"id": rec.ref, "content": content, "timestamp": _ts(rec.at), "label": rec.fields["kind"],
+            "identity": IDENTITY}
+
+
+def payload_sha256(item: Mapping[str, Any]) -> str:
+    """The sha256 a reviewer signs off (Mission 004C backfill review): over the canonical JSON of the exact item
+    (sorted keys, no spaces, UTF-8), so a change to the content, time, label or identity changes it."""
+    return _sha(dict(item))
+
+
+# ---------------------------------------------------------------- reviewed sets (Mission 004C backfill review)
+
+REVIEW_SHA_RE = re.compile(r"[0-9a-f]{64}")
+
+
+class ReviewError(ValueError):
+    """The reviewed-set file is not usable (shape, a bad ref or hash, a duplicate, empty)."""
+
+
+def load_reviewed(data: Any) -> dict[str, str]:
+    """ref -> reviewed payload sha256 from a reviewed-set document: the JSON of `amem sync plan --sink pastdev
+    --contents --json` cut down to the chosen records (`{"records": [{"ref", "sha256", ...}, ...]}`), or a bare
+    list of such objects. Other keys are ignored."""
+    rows = data.get("records") if isinstance(data, Mapping) else data
+    if not isinstance(rows, list) or not rows:
+        raise ReviewError("a reviewed set lists at least one record: {\"records\": [{\"ref\": ..., \"sha256\": ...}]}")
+    out: dict[str, str] = {}
+    for r in rows:
+        ref, sha = (r.get("ref"), r.get("sha256")) if isinstance(r, Mapping) else (None, None)
+        if not isinstance(ref, str) or not _ours(ref):
+            raise ReviewError(f"not a past.dev record ref: {str(ref)[:80]!r}")
+        if not isinstance(sha, str) or not REVIEW_SHA_RE.fullmatch(sha):
+            raise ReviewError(f"{ref}: sha256 must be 64 lowercase hex characters")
+        if ref in out:
+            raise ReviewError(f"{ref}: listed twice")
+        out[ref] = sha
+    return out
+
+
 def _with(ev: EvidenceRef, **metrics: Any) -> EvidenceRef:
     m = {**ev.metrics, **metrics}
     return EvidenceRef(ev.ref, ev.source, ev.kind, ev.subject_refs, {k: v for k, v in m.items() if v is not None},
@@ -494,7 +543,7 @@ class PastDevSink:
                  client: Client | None = None, batch_max: int = BATCH_MAX, poll_s: float = POLL_S,
                  sleep: Callable[[float], None] = time.sleep, clock: Callable[[], float] = time.monotonic,
                  now: Callable[[], datetime] = lambda: datetime.now(UTC), tables: Sequence[str] | None = None,
-                 since: datetime | None = None):
+                 since: datetime | None = None, only: Mapping[str, str] | None = None):
         self._environ = environ
         self.cfg = cfg if cfg is not None else config(environ)
         self.client = _client(self.cfg, client, sleep)
@@ -512,6 +561,14 @@ class PastDevSink:
         self.retired: list[str] = []                         # refs deleted at past.dev: never sent again
         self.ownership: dict[str, dict[str, int]] = {}       # table -> records per class (F8), last batches() call
         self.owners: tuple[str, ...] = ()
+        # Mission 004C backfill review. `only`: a reviewed set (load_reviewed: ref -> payload sha256). Every batch is
+        # narrowed to those refs, and when any of them has no current payload or another sha256, batches() yields
+        # nothing at all (`review` says why). `classes`: ref -> (table, class) of every record of the last call.
+        if only is not None and (tables or since is not None):
+            raise ValueError("a reviewed set (--only) cannot be combined with --tables or --since")
+        self.only = dict(only) if only is not None else None
+        self.classes: dict[str, tuple[str, str]] = {}
+        self.review: dict[str, Any] | None = None
 
     @property
     def masked(self) -> dict[str, Any]:
@@ -535,7 +592,7 @@ class PastDevSink:
         links = _links(conn)
         now = _ts(self.now())
         self.refused, self.retired = [], []
-        self.ownership = {}
+        self.ownership, self.classes, self.review = {}, {}, None
         # Mission 004C (F3, F8): env terms + team and private repo names, read now
         deny = egress.env_terms(self._environ) | egress.team_names(conn, owners=owners)
         self.owners = owners
@@ -545,13 +602,31 @@ class PastDevSink:
                 egress.PRIVATE if rec.fields.get("private") is True else egress.OWN
             n = self.ownership.setdefault(rec.table, dict.fromkeys(egress.CLASSES, 0))
             n[cls] += 1
+            self.classes[rec.ref] = (rec.table, cls)
             content, reasons = sanitize_record(rec.fields, deny)
             if content is None:
                 self.refused.append((rec.ref, reasons))
             else:
                 ready[rec.ref] = (rec, content)
+        # 0. a reviewed set (Mission 004C backfill review): every reviewed ref must have a current payload with the
+        #    reviewed sha256, or nothing at all is yielded (no send, no retraction, no check)
+        states: dict[str, str] = {}
+        if self.only is not None:
+            why = dict(self.refused)
+            problems = [{"ref": ref, "reason": (f"refused: {', '.join(why[ref])}" if ref in why else "not found")
+                         if ref not in ready else "changed"}
+                        for ref, want in sorted(self.only.items())
+                        if ref not in ready or payload_sha256(_item(*ready[ref])) != want]
+            self.review = {"ok": not problems, "refs": len(self.only), "problems": problems, "states": states}
+            if problems:
+                return
+        only = self.only
+
+        def keep(ref: str) -> bool:
+            return only is None or ref in only
+
         # 1. retract: a live link whose record is gone or now refused
-        gone = sorted(sid for sid, m in links.items() if not m.get("deleted") and sid not in ready)
+        gone = sorted(sid for sid, m in links.items() if not m.get("deleted") and sid not in ready and keep(sid))
         for i in range(0, len(gone), DELETE_MAX):
             part = gone[i:i + DELETE_MAX]
             evs = [ev for sid in part if (ev := _evidence(sid, {"deleted": True, "deleted_at": now})) is not None]
@@ -563,27 +638,30 @@ class PastDevSink:
         for table in TABLES:
             todo = []
             for ref, (rec, content) in ready.items():
-                if rec.table != table:
+                if rec.table != table or not keep(ref):
                     continue
                 link = links.get(ref) or {}
                 if link.get("deleted"):
                     self.retired.append(ref)
+                    states[ref] = "retired"
                     continue
                 sha = _sha(content)
                 if link.get("sha256") == sha:
                     iid = _ingestion_id(link.get("ingestion_id"))
                     if link.get("status") == QUEUED and iid:
                         pending.setdefault(iid, []).append(_link(rec.ref, content, link))
+                        states[ref] = "check"
                         continue
                     if link.get("status") in DEAD or (link.get("status") in SENT and not replay):
+                        states[ref] = "dead-lettered" if link.get("status") in DEAD else "already-sent"
                         continue
                 if table not in self.tables or (self.since is not None and rec.at < self.since):
                     continue                                    # out of this run's scope (F4)
                 todo.append((rec, content, sha))
+                states[ref] = "send"
             for i in range(0, len(todo), self.batch_max):
                 part = todo[i:i + self.batch_max]
-                items = [{"id": rec.ref, "content": content, "timestamp": _ts(rec.at), "label": rec.fields["kind"],
-                          "identity": IDENTITY} for rec, content, _ in part]
+                items = [_item(rec, content) for rec, content, _ in part]
                 evs = [_link(rec.ref, content, {"sha256": sha, "status": QUEUED}) for rec, content, sha in part]
                 last = part[-1][0]
                 yield sync.Batch(table, items, f"{_ts(last.at)}|{last.ref}", evs, _key(items))
@@ -594,6 +672,25 @@ class PastDevSink:
     def cost(self, batch: sync.Batch) -> int:
         """Credits this batch would spend (local rule; a retraction or an ingestion check spends none)."""
         return 0 if batch.table in (RETRACT, CHECK) else local_credits(batch.rows)
+
+    def describe(self, batch: sync.Batch) -> list[dict[str, Any]]:
+        """`amem sync plan --contents` (Mission 004C backfill review): per item of a send batch, the exact payload
+        that would leave, its sha256 (payload_sha256), its class and its local credit and size estimate. A
+        retraction or an ingestion check carries no content: only the refs and the action."""
+        if batch.table == RETRACT:
+            return [{"action": "delete", "ref": r["id"]} for r in batch.rows]
+        if batch.table == CHECK:
+            return [{"action": "check", "ref": ev.subject_refs[0], "ingestion_id": batch.key}
+                    for ev in batch.evidence if ev.subject_refs]
+        return [{"ref": it["id"], "table": batch.table, "class": self.classes.get(it["id"], ("", egress.PRIVATE))[1],
+                 "payload": dict(it), "sha256": payload_sha256(it), "bytes": len(str(it["content"]).encode("utf-8")),
+                 "credits": local_credits([it])} for it in batch.rows]
+
+    def refused_records(self) -> list[dict[str, Any]]:
+        """The records of the last batches() call the sanitizer refused, with reasons and never their content."""
+        return [{"ref": ref, "table": self.classes.get(ref, ("", ""))[0],
+                 "class": self.classes.get(ref, ("", egress.PRIVATE))[1], "reasons": list(reasons)}
+                for ref, reasons in self.refused]
 
     def split(self, batch: sync.Batch) -> list[sync.Batch]:
         """One item per batch with a content-addressed key, so the sync loop can dead-letter only refused items."""
@@ -683,15 +780,18 @@ class PastDevSink:
 
 
 def delete_all(conn: psycopg.Connection, client: Client | None = None, *,
-               environ: Mapping[str, str] | None = None) -> dict[str, int]:
+               environ: Mapping[str, str] | None = None, refs: Iterable[str] | None = None) -> dict[str, int]:
     """Delete every past.dev data point linked in rsi_evidence (and not yet deleted), <= 1000 ids per call,
     and mark each link deleted. Works with AMEM_PASTDEV=off: it only removes what was sent. The deleted ids
     are retired (past.dev refuses them), but a record never sent before would still go on the next sync,
-    so set the kill switch first."""
+    so set the kill switch first. `refs` (Mission 004C, the rollback of a reviewed backfill: `amem sync delete
+    --only`): only these refs; a ref with no live link is left alone (counted as `not_linked`)."""
     client = client or _client(config(environ), None, time.sleep)
     if client is None:
         raise RuntimeError(f"past.dev is not configured ({KEY_ENV})")
-    ids = sorted(sid for sid, m in _links(conn).items() if not m.get("deleted"))
+    live = {sid for sid, m in _links(conn).items() if not m.get("deleted")}
+    wanted = None if refs is None else set(refs)
+    ids = sorted(live if wanted is None else live & wanted)
 
     def mark(part: list[str]) -> None:
         conn.execute("update rsi_evidence set metrics = metrics || %s, observed_at = now() "
@@ -700,7 +800,10 @@ def delete_all(conn: psycopg.Connection, client: Client | None = None, *,
         conn.commit()
 
     deleted, gone, calls = delete_ids(client, ids, done=mark)
-    return {"deleted": len(deleted), "gone": len(gone), "calls": calls}
+    out = {"deleted": len(deleted), "gone": len(gone), "calls": calls}
+    if wanted is not None:
+        out["not_linked"] = len(wanted - live)
+    return out
 
 
 # ---------------------------------------------------------------- the retriever

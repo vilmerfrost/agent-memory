@@ -651,6 +651,10 @@ class ClickHouseSink:
         self._owners = tuple(owners) if owners is not None else None
         self.owners: tuple[str, ...] = ()
         self.ownership: dict[str, dict[str, int]] = {}
+        # `amem sync plan --contents` (Mission 004C backfill review): each mapped row's class, and the rows the
+        # mapper dropped per table, of the last batches() call
+        self.row_classes: dict[tuple[str, str], str | None] = {}
+        self.dropped: dict[str, int] = {}
 
     @property
     def replay_scope(self) -> frozenset[str] | None:
@@ -673,7 +677,7 @@ class ClickHouseSink:
         version = next_version()
         self.owners = self._owners if self._owners is not None else egress.owner_accounts()
         self.deny = egress.env_terms() | egress.team_names(conn, owners=self.owners)
-        self.ownership = {}
+        self.ownership, self.row_classes, self.dropped = {}, {}, {}
         since = None if replay or self.lookback_days <= 0 else self._now() - timedelta(days=self.lookback_days)
         if since is not None and self.since is not None:
             since = max(since, self.since)
@@ -731,13 +735,33 @@ class ClickHouseSink:
         for r in rows:
             m = map_row(t, r, version, self.deny)
             if m is None:
+                self.dropped[t.name] = self.dropped.get(t.name, 0) + 1
                 continue
             mapped.append(m)
             cls = row_class(t, r)
+            self.row_classes[(t.name, str(m["id"]))] = cls
             if cls is not None:
                 n = self.ownership.setdefault(t.name, dict.fromkeys(egress.CLASSES, 0))
                 n[cls] += 1
         return Batch(t.name, mapped, format_mark(mark), key=token_of(t.name, body_of(mapped)) if mapped else "")
+
+    def describe(self, batch: Batch) -> list[dict[str, Any]]:
+        """`amem sync plan --contents` (Mission 004C backfill review): per row, the exact JSONEachRow object that
+        would be inserted, without `version` (the extraction time, new on every run), its sha256 over the canonical
+        JSON of that payload, its ownership class (None for a table without one) and its size on the wire."""
+        out = []
+        for row in batch.rows:
+            payload = {k: v for k, v in row.items() if k != "version"}
+            canon = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+            out.append({"ref": f"ch:{batch.table}/{row['id']}", "table": batch.table,
+                        "class": self.row_classes.get((batch.table, str(row["id"]))), "payload": payload,
+                        "sha256": hashlib.sha256(canon.encode("utf-8")).hexdigest(), "bytes": len(body_of([row]))})
+        return out
+
+    def refused_records(self) -> list[dict[str, Any]]:
+        """Rows the mapper dropped, per table: counts and the reason only (the key itself may be what was denied)."""
+        return [{"table": t, "count": n, "reasons": ["key is not a valid id, or names a denied term or an email"]}
+                for t, n in sorted(self.dropped.items())]
 
     @property
     def masked(self) -> dict[str, Any]:

@@ -280,7 +280,8 @@ class Seed:
                     started_at=t, ended_at=t + timedelta(minutes=30), last_activity_at=t + timedelta(minutes=30),
                     transcript_bytes=12345, skills=Jsonb([self.mk("skill")]), instructions=Jsonb([self.mk("instr")]),
                     # an own session, as sessions_ingest stores one (Mission 004C, F8: unknown ownership is private)
-                    meta=Jsonb({"team": False, "remote_owner": "vilmerfrost", "note": self.mk("smeta")}),
+                    meta=Jsonb({"team": False, "remote_owner": "vilmerfrost", "remote_host": "github.com",
+                                "note": self.mk("smeta")}),
                     tokens_input=tokens, tokens_output=tokens // 2,
                     tokens_cache_read=tokens * 3, tokens_cache_creation=10, models=Jsonb({self.mk("models"): {"calls": 1}}),
                     turns=4, tokens_updated_at=t + timedelta(minutes=31), title=self.mk("title"),
@@ -746,6 +747,9 @@ PRIVATE_METAS = {           # sessions of unknown ownership, as sessions_ingest 
     "chs-noremote": {},                                                  # no remote, or not a git repo
     "chs-nongithub": {"cwd": "/Users/x/work/tool"},                      # a remote whose owner it could not read
     "chs-otherowner": {"team": False, "remote_owner": "old-handle"},     # an owner that is not an owner account
+    # Mission 004C (backfill prep): the owner's account name on another host, and a row stored before the host was
+    "chs-gitlab": {"team": False, "remote_owner": "vilmerfrost", "remote_host": "gitlab.example.com"},
+    "chs-nohost": {"team": False, "remote_owner": "vilmerfrost"},
 }
 
 
@@ -787,10 +791,42 @@ def test_unknown_ownership_ships_private_everywhere(seed: Seed, pg_url: str, app
     (own_call,) = (i for i in seed.ids["skill_calls"] if i not in calls.values())
     assert (k[own_call]["project"], k[own_call]["skill"]) == (CH.pseudonym("chtest"), "dispatch")
     # what `amem sync plan` reports: rows per class
-    assert sink.masked["tables"] == {"sessions": {"own": 5, "team": 0, "private": 3},
-                                     "deviations": {"own": 10, "team": 0, "private": 4},
+    assert sink.masked["tables"] == {"sessions": {"own": 5, "team": 0, "private": 5},
+                                     "deviations": {"own": 10, "team": 0, "private": 6},
                                      "skill_calls": {"own": 1, "team": 0, "private": 4}}
-    assert (sink.masked["team"], sink.masked["private"], sink.masked["owner_accounts"]) == (0, 11, ["vilmerfrost"])
+    assert (sink.masked["team"], sink.masked["private"], sink.masked["owner_accounts"]) == (0, 15, ["vilmerfrost"])
+
+
+def test_plan_contents_previews_the_exact_rows_read_only(seed: Seed, pg_url: str, app: str, fake: FakeClickHouse,
+                                                         monkeypatch: pytest.MonkeyPatch) -> None:
+    """Mission 004C backfill review: `amem sync plan --sink clickhouse --contents` in a read-only session lists each
+    row as it will be inserted (without `version`), with its class; a run then inserts exactly those rows."""
+    with psycopg.connect(pg_url) as conn:
+        seed.session(conn, "chs-gl", meta=Jsonb({"team": False, "remote_owner": "vilmerfrost",
+                                                 "remote_host": "gitlab.example.com"}))
+        seed.session(conn, "chs-acme-1")                                  # a denied key: dropped, never listed
+    monkeypatch.setenv(egress.DENY_ENV, "acme")
+    sink = CH.ClickHouseSink(client_for(fake.svc.url))
+    with psycopg.connect(app, options="-c default_transaction_read_only=on") as conn:
+        out = sync.plan(sink, conn, replay=True, contents=True)
+        private = {r["ref"] for r in sync.plan(sink, conn, replay=True, contents=True, cls="private")["records"]}
+    assert fake.svc.requests == []
+    recs = {r["ref"]: r for r in out["records"]}
+    assert out["records_total"] == out["rows"] == len(recs) and "ch:sessions/chs-acme-1" not in recs
+    assert recs["ch:sessions/chs-1"]["class"] == "own" and recs["ch:sessions/chs-gl"]["class"] == "private"
+    assert recs["ch:sessions/chs-gl"]["payload"]["project"] == "private"
+    assert all(r["class"] is None for r in recs.values() if r["table"] == "runs")
+    for r in recs.values():
+        assert "version" not in r["payload"] and r["sha256"] == hashlib.sha256(json.dumps(
+            r["payload"], sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()
+    assert out["refused_records"] == [{"table": "sessions", "count": 1,
+                                       "reasons": ["key is not a valid id, or names a denied term or an email"]}]
+    assert "ch:sessions/chs-gl" in private and "ch:sessions/chs-1" not in private
+    with psycopg.connect(app) as conn:
+        assert sync.run(CH.ClickHouseSink(client_for(fake.svc.url)), conn, replay=True, environ={}).status == "ok"
+    for ref, r in recs.items():
+        table, rid = ref[len("ch:"):].split("/", 1)
+        assert {k: v for k, v in fake.by_id(table)[rid].items() if k != "version"} == r["payload"], ref
 
 
 def test_a_project_named_team_or_private_is_pseudonymized_not_taken_for_a_mask(seed: Seed, pg_url: str, app: str,

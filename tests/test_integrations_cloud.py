@@ -90,7 +90,8 @@ def app(pg_url: str) -> Iterator[str]:
         conn.execute(f"alter role amem_app with login password '{APP_PW}'")
         conn.execute("delete from rsi_checkpoints where job like 'sync:%'")
         # cloud-own: an own session as ingestion stores one (Mission 004C, F8: `{}` is unknown, so private)
-        for sid, project, meta in (("cloud-own", "agent-memory", '{"team": false, "remote_owner": "vilmerfrost"}'),
+        for sid, project, meta in (("cloud-own", "agent-memory",
+                                    '{"team": false, "remote_owner": "vilmerfrost", "remote_host": "github.com"}'),
                                    ("cloud-team", "pipeline-poc", '{"team": true}')):
             conn.execute("insert into sessions (session_id, kind, project_dir, project, repo, transcript_bytes, env, meta) "
                          "values (%s, 'chat', '/x', %s, %s, 1, 'prod', %s::jsonb) on conflict (session_id) do update "

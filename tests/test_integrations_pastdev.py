@@ -91,7 +91,7 @@ def seed(db: Db, t: Text = plain) -> dict[str, str]:
     with psycopg.connect(db.admin, autocommit=True) as c:
         for sid, team in (("pd-s1", False), ("pd-team", True)):
             # pd-s1: an own session as ingestion stores one (Mission 004C, F8: unknown ownership is private)
-            owner = {} if team else {"remote_owner": "vilmerfrost"}
+            owner = {} if team else {"remote_owner": "vilmerfrost", "remote_host": "github.com"}
             repos[sid] = T("sessions.repo", "pipeline-poc" if team else "agent-memory")
             c.execute("insert into sessions (session_id, kind, repo, project_dir, transcript_bytes, env, meta) "
                       "values (%s,'chat',%s,%s,1,'prod',%s)",
@@ -911,3 +911,144 @@ def test_fts_baseline_over_the_corpus_the_sink_sends(db: Db, pdev: FakePastDev) 
                                                    "excerpts": []}]}]
     r = PD.PastDevRetriever(lambda: psycopg.connect(db.app), pdev.cfg(), environ={})
     assert PD.evaluate({"quoting globs cuts zsh failures": [refs_["experiment"]]}, PD.recall_fn(r))["mrr"] == 1.0
+
+
+# ---------------------------------------------------------------- Mission 004C: reviewed backfill sets
+
+READ_ONLY = "-c default_transaction_read_only=on"
+
+
+def _canon_sha(obj: Any) -> str:
+    return sha256(json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()
+
+
+def _preview(db: Db, pdev: FakePastDev, **kw: Any) -> dict[str, Any]:
+    """`amem sync plan --sink pastdev --contents` on a connection whose every transaction is read-only (as the
+    parent runs it against hosted Supabase: PGOPTIONS='-c default_transaction_read_only=on')."""
+    with psycopg.connect(db.app, options=READ_ONLY) as conn:
+        assert conn.execute("show default_transaction_read_only").fetchone()[0] == "on"
+        conn.rollback()
+        out = sync.plan(sink(pdev), conn, contents=True, **kw)
+        with pytest.raises(psycopg.errors.ReadOnlySqlTransaction):        # the guard is real: a write fails
+            conn.execute("insert into rsi_checkpoints (job, run_key, status) values ('x', 'y', 'done')")
+    return out
+
+
+def _reviewed(out: dict[str, Any], refs: list[str]) -> dict[str, str]:
+    """What a reviewer keeps: the preview's JSON cut down to the chosen records."""
+    doc = {"records": [r for r in out["records"] if r["ref"] in refs]}
+    return PD.load_reviewed(json.loads(json.dumps(doc)))
+
+
+def test_plan_contents_is_the_exact_payload_and_runs_read_only(db: Db, pdev: FakePastDev) -> None:
+    refs_ = seed(db)
+    out = _preview(db, pdev)
+    assert pdev.svc.requests == []                                       # no provider call, not even health
+    recs = {r["ref"]: r for r in out["records"]}
+    assert sorted(recs) == sorted(refs_[k] for k in SENT) and out["records_total"] == len(SENT)
+    for r in recs.values():
+        p = r["payload"]
+        assert set(p) == {"id", "content", "timestamp", "label", "identity"} and p["id"] == r["ref"]
+        assert r["sha256"] == PD.payload_sha256(p) == _canon_sha(p)
+        assert r["class"] == "own" and r["credits"] == PD.local_credits([p]) and r["bytes"] == len(p["content"].encode())
+    refused = {r["ref"]: r for r in out["refused_records"]}
+    assert refused == {refs_["team_proposal"]: {"ref": refs_["team_proposal"], "table": "rsi_proposals", "class": "team",
+                                                "reasons": ["team"]},
+                       refs_["team_edit"]: {"ref": refs_["team_edit"], "table": "edits", "class": "team",
+                                            "reasons": ["team"]}}
+    assert out["actions"] == [] and out["cost"] == sum(r["credits"] for r in recs.values())
+    with psycopg.connect(db.app) as conn:                                # the real run sends exactly the preview
+        assert sync.run(sink(pdev), conn, environ={}).status == "ok"
+    sent = {it["id"]: it for r in pdev.ingest_requests() for it in r.json["items"]}
+    assert sent == {ref: r["payload"] for ref, r in recs.items()}
+
+
+def test_plan_contents_filters_by_class_and_limit(db: Db, pdev: FakePastDev) -> None:
+    seed(db)
+    own = _preview(db, pdev, cls="own", limit=2)
+    assert (len(own["records"]), own["records_total"], own["refused_total"]) == (2, len(SENT), 0)
+    assert own["contents"]["class"] == "own" and own["contents"]["limit"] == 2
+    team = _preview(db, pdev, cls="team")
+    assert (team["records_total"], team["refused_total"]) == (0, 2)
+    assert all("payload" not in r and "content" not in r for r in team["refused_records"])
+    assert own["rows"] == team["rows"] == len(SENT)                     # the plan's totals are not filtered
+
+
+def test_only_sends_just_the_reviewed_refs_and_a_rerun_is_a_no_op(db: Db, pdev: FakePastDev) -> None:
+    refs_ = seed(db)
+    out = _preview(db, pdev)
+    chosen = [refs_["experiment"], refs_["lesson"]]
+    only = _reviewed(out, chosen)
+    with psycopg.connect(db.app) as conn:
+        s = sink(pdev, only=only)
+        rep = sync.run(s, conn, environ={})
+        assert rep.status == "ok" and rep.rows == 2
+        assert s.review == {"ok": True, "refs": 2, "problems": [], "states": {r: "send" for r in chosen}}
+        assert sorted(pdev.sent_ids()) == sorted(chosen)
+        assert set(links(db)) == {f"past:{r}" for r in chosen}
+        s2 = sink(pdev, only=only)
+        assert sync.run(s2, conn, environ={}).rows == 0                  # a rerun: nothing new, still ok
+        assert s2.review["ok"] and set(s2.review["states"].values()) == {"already-sent"}
+    assert sorted(pdev.sent_ids()) == sorted(chosen)
+
+
+def test_only_refuses_everything_when_any_reviewed_payload_differs(db: Db, pdev: FakePastDev) -> None:
+    refs_ = seed(db)
+    out = _preview(db, pdev)
+    only = _reviewed(out, [refs_["proposal"], refs_["experiment"], refs_["lesson"]])
+    db.sql("update rsi_proposals set summary = 'quote every zsh glob' where id = %s", (refs_["proposal"].split("/")[1],))
+    tampered = {**_reviewed(out, [refs_["edit"]]), refs_["edit"]: "0" * 64}           # an edited file
+    ghost = {f"amem:edit/{uuid.uuid4()}": "1" * 64}
+    team = {refs_["team_edit"]: "2" * 64}
+    for bad, problem in ((only, {"ref": refs_["proposal"], "reason": "changed"}),
+                         (tampered, {"ref": refs_["edit"], "reason": "changed"}),
+                         (ghost, {"ref": next(iter(ghost)), "reason": "not found"}),
+                         (team, {"ref": refs_["team_edit"], "reason": "refused: team"})):
+        s = sink(pdev, only=bad)
+        with psycopg.connect(db.app) as conn:
+            rep = sync.run(s, conn, environ={})
+        assert rep.rows == 0 and rep.batches == 0 and s.review["ok"] is False and s.review["problems"] == [problem]
+    assert pdev.ingest_requests() == [] and pdev.svc.requests_to("POST", "/api/v1/data-points/delete") == []
+    assert links(db) == {}                                              # nothing sent, nothing linked
+
+
+def test_only_never_retracts_or_checks_outside_the_reviewed_set(db: Db, pdev: FakePastDev) -> None:
+    refs_ = seed(db)
+    with psycopg.connect(db.app) as conn:
+        sync.run(sink(pdev), conn, environ={})                          # everything sent once
+        db.sql("delete from lesson_candidates")                          # the lesson record is gone now
+        db.sql("update rsi_experiments set verdict = 'worse'")            # the experiment changed
+        out = _preview(db, pdev)
+        assert {a["ref"] for a in out["actions"]} == {refs_["lesson"]}    # an unrestricted run would delete it
+        only = _reviewed(out, [refs_["experiment"]])
+        s = sink(pdev, only=only)
+        assert sync.run(s, conn, environ={}).status == "ok"
+    assert pdev.svc.requests_to("POST", "/api/v1/data-points/delete") == []
+    assert refs_["lesson"] in pdev.points and "worse" in pdev.points[refs_["experiment"]]["content"]
+    assert s.review["states"] == {refs_["experiment"]: "send"}
+
+
+@pytest.mark.parametrize("doc, why", [
+    ({}, "at least one record"),
+    ({"records": []}, "at least one record"),
+    ([{"ref": "amem:session/x", "sha256": "a" * 64}], "not a past.dev record ref"),
+    ([{"ref": "amem:edit/00000000-0000-4000-8000-000000000001", "sha256": "A" * 64}], "64 lowercase hex"),
+    ([{"ref": "amem:edit/00000000-0000-4000-8000-000000000001", "sha256": "a" * 64}] * 2, "listed twice"),
+    ("not a list", "at least one record"),
+])
+def test_load_reviewed_rejects_a_bad_file(doc: Any, why: str) -> None:
+    with pytest.raises(PD.ReviewError, match=why):
+        PD.load_reviewed(doc)
+
+
+def test_delete_with_refs_removes_only_the_reviewed_ids(db: Db, pdev: FakePastDev) -> None:
+    ids = _evidence_rows(db, 5)
+    pdev.points.update({i: {} for i in ids})
+    never = f"amem:edit/{uuid.uuid4()}"
+    with psycopg.connect(db.app) as conn:
+        out = PD.delete_all(conn, PD.Client(pdev.cfg(), sleep=lambda s: None), refs=[ids[0], ids[1], never])
+    assert out == {"deleted": 2, "gone": 0, "calls": 1, "not_linked": 1}
+    (req,) = pdev.svc.requests_to("POST", "/api/v1/data-points/delete")
+    assert sorted(req.json["ids"]) == sorted(ids[:2]) and set(pdev.points) == set(ids[2:])
+    marked = {r[0] for r in db.sql("select external_ref from rsi_evidence where metrics ->> 'deleted' = 'true'")}
+    assert marked == {f"past:{i}" for i in ids[:2]}

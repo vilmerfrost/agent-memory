@@ -5,19 +5,24 @@ decided only from what sessions_ingest stored in `sessions.meta` (never a git or
 
     team      meta.team is true (sessions_ingest.team_info: the git remote owner is not a personal owner, a
               `mode: team` parent profile, or another session of the same repo in that ingest was team).
-    own       meta.team is false AND meta.remote_owner (case-insensitive) is an owner account. Ingestion writes
-              team = false only together with the remote owner it read, so this is positive knowledge: the
-              repo's git remote names one of the owner's accounts.
+    own       meta.team is false AND meta.remote_owner (case-insensitive) is an owner account AND
+              meta.remote_host (case-insensitive) is in OWN_HOSTS (github.com). Ingestion writes team = false
+              only together with the remote owner and host it read, so this is positive knowledge: the repo's
+              git remote is github.com/<one of the owner's accounts>/...
     private   everything else: no remote, not a git repo, a remote whose owner could not be read (a local path,
-              a single-segment URL), a remote owner that is not an owner account, a session ingested before
-              the flag existed, or no session at all.
+              a single-segment URL), a remote owner that is not an owner account, a remote on any other host
+              (`gitlab.example.com/vilmerfrost/x`, an ssh alias such as `github-work`: an alias is not
+              resolved), a session ingested before the team flag or the host was stored, or no session at all.
 
 Owner accounts: AMEM_OWNER_ACCOUNTS (comma-separated), else AMEM_PERSONAL_OWNERS (the list ingestion decided
 team = false from), else `vilmerfrost` (sessions_ingest.DEFAULT_PERSONAL_OWNERS). Each name must match
 ACCOUNT_RE or it is dropped (fewer accounts only ever means more private). Because ingestion stores
 team = false only for a personal owner, AMEM_OWNER_ACCOUNTS can narrow what counts as own but never widen it.
-Not decidable here: the remote's host. Ingestion stores the owner, not the host, so `gitlab.example/vilmerfrost/x`
-looks the same as `github.com/vilmerfrost/x` (own).
+
+Rows stored before ingestion kept the host (Mission 004C) have team = false and an owner but no remote_host, so
+they are private. A later ingest of the same transcript adds the host (the sessions upsert merges meta), and
+`amem sessions hosts` (session_hosts.py) re-derives it from the repo's local git config (dry run unless
+--apply; never the network).
 
 Rows tied to a session take its class: a deviation (team also when its own meta says so), a skill call (no
 matched session: private, F7). A row tied to repo names (a lesson's run repo and scope repo) is team when a team
@@ -75,6 +80,10 @@ PERSONAL_OWNERS_ENV = "AMEM_PERSONAL_OWNERS"          # = sessions_ingest.PERSON
 DEFAULT_OWNER_ACCOUNTS = ("vilmerfrost",)             # = sessions_ingest.DEFAULT_PERSONAL_OWNERS
 ACCOUNT_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,99}")  # lowercase; never a quote, so safe as a SQL literal
 OWNERS_TOKEN = "__amem_owner_accounts__"              # class_sql's placeholder; unbound SQL fails (no such column)
+OWN_HOSTS = ("github.com",)                           # the only remote host an own repo may live on
+if not all(ACCOUNT_RE.fullmatch(h) for h in OWN_HOSTS):  # written into SQL as literals: never a quote
+    raise ValueError("OWN_HOSTS must be plain lowercase host names")
+_HOSTS_SQL = "array[" + ", ".join(f"'{h}'" for h in OWN_HOSTS) + "]::text[]"
 
 
 def owner_accounts(environ: Mapping[str, str] | None = None) -> tuple[str, ...]:
@@ -101,8 +110,9 @@ def classify(meta: Any, owners: Iterable[str] | None = None) -> str:
     if _flag(m.get("team")) == "true":
         return TEAM
     accounts = {a.strip().lower() for a in (owner_accounts() if owners is None else owners)}
-    owner = m.get("remote_owner")
-    if _flag(m.get("team")) == "false" and isinstance(owner, str) and owner.strip().lower() in accounts:
+    owner, host = m.get("remote_owner"), m.get("remote_host")
+    if _flag(m.get("team")) == "false" and isinstance(owner, str) and owner.strip().lower() in accounts \
+            and isinstance(host, str) and host.strip().lower() in OWN_HOSTS:
         return OWN
     return PRIVATE
 
@@ -112,6 +122,7 @@ def class_sql(meta: str) -> str:
     list is the OWNERS_TOKEN placeholder: run the text through bind_owners before executing it."""
     return (f"(case when ({meta}) ->> 'team' = 'true' then 'team' "
             f"when ({meta}) ->> 'team' = 'false' and lower(btrim(({meta}) ->> 'remote_owner')) = any({OWNERS_TOKEN}) "
+            f"and lower(btrim(({meta}) ->> 'remote_host')) = any({_HOSTS_SQL}) "
             f"then 'own' else 'private' end)")
 
 

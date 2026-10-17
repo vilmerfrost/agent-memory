@@ -9,14 +9,17 @@ Nothing here is real. Every row is synthetic and says so: `meta.synthetic` where
 
 The story, ending the day before the anchor date (UTC):
 - 14 production sessions (6 Claude and 3 Codex in the owner's own repos, 2 team-flagged work sessions in
-  `pipeline-poc`, and 3 of unknown ownership in `client-notes`: no remote, a non-GitHub remote ingestion read no
-  owner from, and an owner that is not an owner account) and 2 sandbox sessions (the two runs of experiment
-  exp-20261017-c2synth, arms A and B, case a-split, rep 0).
+  `pipeline-poc`, and 3 of unknown ownership in `client-notes`: no remote, the owner's account name on a
+  non-GitHub host, and a GitHub owner that is not an owner account) and 2 sandbox sessions (the two runs of
+  experiment exp-20261017-c2synth, arms A and B, case a-split, rep 0).
 - Ownership (Mission 004C, F8; egress.py) is stored as sessions_ingest stores it: own sessions carry
-  `team: false` and `remote_owner` = the default owner account, team sessions `team: true`, private ones no team
-  flag or an unknown owner. Private rows ship `private` to ClickHouse (project, repo, a repo-scoped rule source
-  `claude-md:private` with no rule id, a repo-local skill label as null) and never reach past.dev (an edit on a
-  private deviation, a lesson scoped to the private repo). The unmatched skill call is private too (F7).
+  `team: false`, `remote_owner` = the default owner account and `remote_host` = github.com, team sessions
+  `team: true`, private ones no team flag, another host or an unknown owner. gold.json's `ownership` has the
+  counts under today's rule (`after`), under the F8 rule before the host was checked (`owner_only`: the
+  non-GitHub session was own) and before F8 (`before`). Private rows ship `private` to ClickHouse (project,
+  repo, a repo-scoped rule source `claude-md:private` with no rule id, a repo-local skill label as null) and
+  never reach past.dev (an edit on a private deviation, a lesson scoped to the private repo). The unmatched
+  skill call is private too (F7).
 - Rule R1 `skill:synth-debugging:reproduce-before-fix` is failed again and again: 10 deviations in 7 prod
   sessions, 4 Claude and 3 Codex. R2 (`claude-md:global:synth-quote-globs`) is broken without harm; R3 (Codex
   only) is rare.
@@ -45,7 +48,8 @@ gold.json (the sentinel is rsi_checkpoints job `synth:seed`).
 gold.json: per-table row counts, per-day counts per ClickHouse table (`amem sync verify`), the expected
 results of the ClickHouse named queries (as ClickHouseRetriever returns them, with the default owner accounts),
 the expected Supabase answers of the story, the past.dev records that may be sent, the team and private rows,
-the ownership counts (now, and under the pre-F8 rule), the Langfuse traces and the markers.
+the ownership counts (now, under the owner-only F8 rule and under the pre-F8 rule), the Langfuse traces and the
+markers.
 """
 
 from __future__ import annotations
@@ -89,6 +93,7 @@ R_PRIVATE = ("claude-md:@repo", "synth-client-deploy-gate")    # `@repo`: the se
 NIGHTLY, INGEST, HARVEST = "synth-nightly-deviations", "synth-skills-ingest", "synth-lessons-harvest"
 # Mission 004C (F8): ownership as sessions_ingest stores it, judged with the default owner accounts.
 OWNER = egress.DEFAULT_OWNER_ACCOUNTS[0]
+OWN_HOST = egress.OWN_HOSTS[0]
 OWN, TEAM = "own", "team"
 PRIVATE_CASES = ("no-remote", "non-github-remote", "unknown-owner")
 
@@ -308,16 +313,21 @@ class _Builder:
         name = "pipeline-poc" if team else "client-notes" if private else "own-app"
         proj = f"{name}-{mk('project')}"
         repo = f"acme-pipeline-poc-{mk('repo')}" if team else f"{name}-{mk('repo')}"
-        # ownership as sessions_ingest.team_info stores it (Mission 004C, F8)
+        # ownership as sessions_ingest.team_info stores it (Mission 004C, F8: owner and host)
         ownership: dict[str, Any]
         if owner == OWN:
-            ownership = {"team": False, "remote_owner": OWNER}
+            ownership = {"team": False, "remote_owner": OWNER, "remote_host": OWN_HOST}
         elif team:
             ownership = {"team": True}
-        else:       # no remote and a remote it read no owner from both store nothing; an unknown owner, team false
+        else:
             ownership = {"synthetic_case": owner}
-            if owner == "unknown-owner":
-                ownership.update(team=False, remote_owner=f"synth-other-{mk('meta.remote_owner')}")
+            if owner == "unknown-owner":            # a GitHub repo of an account that is not the owner's
+                ownership.update(team=False, remote_owner=f"synth-other-{mk('meta.remote_owner')}",
+                                 remote_host=OWN_HOST)
+            elif owner == "non-github-remote":      # the owner's account name on another host: not own
+                ownership.update(team=False, remote_owner=OWNER,
+                                 remote_host=f"git-{mk('meta.remote_host')}.synth.invalid")
+            # no-remote: ingestion stores nothing
         meta: dict[str, Any] = {"synthetic": True, "dataset": DATASET, **ownership,
                                 "branch": f"feature/{mk('meta.branch')}",
                                 "author_email": f"sam.synth.{mk('meta.author_email')}@example.com",
@@ -954,6 +964,18 @@ def gold(ds: Dataset, *, today: date | None = None) -> dict[str, Any]:
 
     def before(sid: str | None) -> str:                 # the pre-F8 rule: anything not flagged team was own
         return egress.TEAM if sid and ch.cls.get(sid) == egress.TEAM else egress.OWN
+
+    meta_of = {s["session_id"]: s["meta"] for s in rows["sessions"]}
+
+    def owner_only(sid: str | None) -> str:
+        """The F8 rule before the host was checked: team = false and an owner account was own on any host."""
+        m = meta_of.get(sid or "")
+        if m is None:
+            return egress.PRIVATE
+        if m.get("team") is True:
+            return egress.TEAM
+        own = m.get("team") is False and str(m.get("remote_owner") or "").strip().lower() == OWNER
+        return egress.OWN if own else egress.PRIVATE
     return {
         "dataset": DATASET, "version": VERSION, "synthetic": True, "anchor": ds.anchor.isoformat(),
         "queries_valid_until": (ds.anchor + timedelta(days=8)).isoformat(),
@@ -966,8 +988,9 @@ def gold(ds: Dataset, *, today: date | None = None) -> dict[str, Any]:
                      "skill_calls": sum(1 for k in rows["skill_calls"] if k["session_id"] in team_sessions)},
             "private": {t: len(private_rows.get(t, [])) for t in ("sessions", "deviations", "skill_calls")},
         },
-        "ownership": {"owner_accounts": [OWNER],
+        "ownership": {"owner_accounts": [OWNER], "own_hosts": list(egress.OWN_HOSTS),
                       "after": classes(lambda sid: ch.cls.get(sid, egress.PRIVATE) if sid else egress.PRIVATE),
+                      "owner_only": classes(owner_only),
                       "before": classes(before)},
         "questions": {"repeat_failures": {
             "params": {"days": "30", "min_n": "3"}, "top_rule": r1, "recurring": recurring,

@@ -247,15 +247,52 @@ def test_remote_owner(url: str, owner: str | None) -> None:
     assert sessions_ingest.remote_owner(url) == owner
 
 
+@pytest.mark.parametrize(("url", "host"), [
+    ("git@github-stupidhuman:stupidhumanAI/app.git", "github-stupidhuman"),     # an ssh alias: not resolved
+    ("https://github.com/vilmerfrost/agent-memory.git", "github.com"),
+    ("git@github.com:vilmerfrost/agent-memory.git", "github.com"),
+    ("ssh://git@GitHub.com:22/acme/repo", "github.com"),
+    ("https://user:tok3n@gitlab.example.com:8443/vilmerfrost/repo", "gitlab.example.com"),
+    ("https://github.com.evil.example/vilmerfrost/x", "github.com.evil.example"),
+    ("https://bitbucket.org/vilmerfrost/x/", "bitbucket.org"),
+    ("/Users/x/repos/local.git", None),                                          # no owner read: no host
+    ("file:///Users/x/repo", None),
+    ("", None),
+])
+def test_remote_host(url: str, host: str | None) -> None:
+    """Mission 004C (backfill prep): the host is read with the owner, lowercase, without user or port."""
+    assert sessions_ingest.remote_host(url) == host
+    assert (sessions_ingest.remote_owner(url) is None) == (host is None)
+
+
 def test_team_from_git_remote_owner(setup_home: Home) -> None:  # noqa: F811
     write_git_config(setup_home.repo, "git@github-team:acme/demo-repo.git")
     info = sessions_ingest.team_info(str(setup_home.repo / "src"), "demo-repo")  # a subfolder finds the repo
-    assert info == {"team": True, "remote_owner": "acme", "team_reason": "remote-owner"}
+    assert info == {"team": True, "remote_owner": "acme", "remote_host": "github-team", "team_reason": "remote-owner"}
     write_git_config(setup_home.repo, "https://github.com/VilmerFrost/demo-repo")
-    assert sessions_ingest.team_info(str(setup_home.repo), "demo-repo") == {"team": False,
-                                                                            "remote_owner": "VilmerFrost"}
+    assert sessions_ingest.team_info(str(setup_home.repo), "demo-repo") == {
+        "team": False, "remote_owner": "VilmerFrost", "remote_host": "github.com"}
     write_git_config(setup_home.repo, None)  # unknown: no flag, so a stored one is kept
     assert sessions_ingest.team_info(str(setup_home.repo), "demo-repo") == {}
+
+
+def test_the_owner_account_on_another_host_is_stored_with_its_host_and_is_not_own(setup_home: Home) -> None:  # noqa: F811
+    """Mission 004C (backfill prep): before, ingestion stored only the owner, so `gitlab.example.com/vilmerfrost/x`
+    looked like `github.com/vilmerfrost/x` and egress counted it own. Now the host is stored and only github.com is
+    own; the team flag is unchanged (still decided by the owner)."""
+    from agent_memory.integrations import egress
+
+    write_git_config(setup_home.repo, "https://gitlab.example.com/vilmerfrost/demo-repo.git")
+    info = sessions_ingest.team_info(str(setup_home.repo), "demo-repo")
+    assert info == {"team": False, "remote_owner": "vilmerfrost", "remote_host": "gitlab.example.com"}
+    assert egress.classify(info, ("vilmerfrost",)) == egress.PRIVATE
+    write_git_config(setup_home.repo, "git@github.com:vilmerfrost/demo-repo.git")
+    assert egress.classify(sessions_ingest.team_info(str(setup_home.repo), "demo-repo"), ("vilmerfrost",)) == egress.OWN
+    Rollout(tid(23), str(setup_home.repo), repo_url="https://gitlab.example.com/vilmerfrost/demo-repo") \
+        .user("Fix the build.").busy().write(setup_home)
+    row = _rows(setup_home)[f"codex:{tid(23)}"]                     # Codex: the recorded remote wins
+    assert (row.meta["remote_owner"], row.meta["remote_host"]) == ("vilmerfrost", "gitlab.example.com")
+    assert egress.classify(row.meta, ("vilmerfrost",)) == egress.PRIVATE
 
 
 def test_team_flag_survives_a_removed_worktree(setup_home: Home, pg_url: str, tmp_path: Path) -> None:  # noqa: F811

@@ -1,6 +1,10 @@
 """`amem sync ...` and `amem evidence query ...` (Mission 004A; blueprint Appendix 2).
 
     amem sync run --sink clickhouse|langfuse|pastdev [--budget S] [--replay] [--tables T1,T2] [--since DATE] [--json]
+    amem sync run --sink pastdev --only REVIEWED.json [--replay] [--json]
+                                                                (Mission 004C: only a reviewed set; refuses and
+                                                                sends nothing when a payload sha256 differs)
+    amem sync delete --sink pastdev --only REVIEWED.json [--json]   (rollback: delete that set's data points)
     amem sync status [--json]
     amem sync verify --sink clickhouse [--days N] [--json]
     amem sync schema --sink clickhouse [--cloud] [--db NAME] [--part all|admin|writer] [--hash-from-env]
@@ -9,6 +13,10 @@
     amem sync plan --sink clickhouse|langfuse|pastdev [--replay] [--tables T1,T2] [--since DATE] [--json]
                                                                 (dry run; read-only, sends nothing; `masked`:
                                                                 rows masked as team vs private, F8)
+    amem sync plan --sink pastdev|clickhouse --contents [--limit N] [--class own|team|private] [--only F] [--json]
+                                                                (Mission 004C: every outgoing record's exact
+                                                                payload, sha256, class, size; refused records
+                                                                with reasons, no content)
     amem evidence query --source sb|ch|lf|pd <named-query> [--param k=v ...] [--json]
     amem evidence ask <question> [--param k=v ...] [--record] [--json]     (questions.py: the investigator questions)
     amem evidence questions
@@ -38,9 +46,12 @@ from agent_memory.integrations import evidence as E, sync
 SOURCE_ADAPTER = {"ch": "clickhouse", "lf": "langfuse", "pd": "pastdev"}
 
 
-def sink_for(name: str, tables: list[str] | None = None, since: datetime | None = None) -> sync.Sink:
-    """The sink, narrowed to `tables` and to rows since `since` when given (Mission 004C, F4). Raises
-    ValueError for a table the sink does not have."""
+def sink_for(name: str, tables: list[str] | None = None, since: datetime | None = None,
+             only: dict[str, str] | None = None) -> sync.Sink:
+    """The sink, narrowed to `tables` and to rows since `since` when given (Mission 004C, F4), or to a reviewed
+    set (`only`, past.dev). Raises ValueError for a table the sink does not have or a bad combination."""
+    if only is not None and name != "pastdev":
+        raise ValueError(f"--only (a reviewed set) is for --sink pastdev, not {name}")
     if name == "clickhouse":
         from agent_memory.integrations import clickhouse
         return clickhouse.ClickHouseSink(tables=clickhouse.tables_named(tables) if tables else clickhouse.TABLES,
@@ -54,7 +65,7 @@ def sink_for(name: str, tables: list[str] | None = None, since: datetime | None 
                                      since=since)
     if name == "pastdev":
         from agent_memory.integrations import pastdev
-        return pastdev.PastDevSink(tables=tables, since=since)
+        return pastdev.PastDevSink(tables=tables, since=since, only=only)
     raise KeyError(name)
 
 
@@ -73,14 +84,34 @@ def _since_arg(text: str) -> datetime:
     return datetime(d.year, d.month, d.day, tzinfo=UTC)
 
 
+def _reviewed(path: str | None) -> dict[str, str] | None:
+    """The reviewed set in `--only FILE` (pastdev.load_reviewed). Raises ValueError with a short reason."""
+    if path is None:
+        return None
+    from pathlib import Path
+
+    from agent_memory.integrations import pastdev
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"--only {path}: not a readable JSON file ({type(exc).__name__})") from None
+    return pastdev.load_reviewed(data)
+
+
 def _scoped_sink(args: argparse.Namespace, cmd: str) -> sync.Sink | None:
     try:
-        return sink_for(args.sink, args.tables, args.since)
+        return sink_for(args.sink, args.tables, args.since, _reviewed(getattr(args, "only", None)))
     except ValueError as exc:
         print(f"amem: sync {cmd}: {exc}", file=sys.stderr)
     except (ImportError, AttributeError, KeyError) as exc:
         print(f"amem: sync {cmd}: adapter {args.sink} not available: {type(exc).__name__}", file=sys.stderr)
     return None
+
+
+def _refusal(cmd: str, review: dict[str, Any]) -> list[str]:
+    lines = [f"amem: sync {cmd}: REFUSED: the reviewed set does not match what would be sent now; nothing was sent"]
+    lines += [f"  {p['ref']}: {p['reason']}" for p in review["problems"]]
+    return lines
 
 
 def _scope(args: argparse.Namespace) -> dict[str, Any]:
@@ -114,15 +145,63 @@ def cmd_sync_run(args: argparse.Namespace) -> int:
     sink = _scoped_sink(args, "run")
     if sink is None:
         return 2
+    reviewed = getattr(sink, "only", None) is not None
     try:
         with store.connect() as conn:
+            if reviewed and not sync.switched_off(sink.name):
+                # Mission 004C backfill review: check the reviewed set read-only first. A mismatch sends nothing,
+                # calls nothing at the provider and writes nothing (not even the cursor).
+                sync.plan(sink, conn, replay=args.replay)
+                review = getattr(sink, "review", None) or {}
+                if not review.get("ok"):
+                    return _out(args, {"sink": sink.name, "status": "refused", "review": review},
+                                "\n".join(_refusal("run", review)), 1)
             rep = sync.run(sink, conn, budget_s=args.budget, replay=args.replay)
     except psycopg.Error as exc:
         print(f"amem: sync run failed: {type(exc).__name__}", file=sys.stderr)
         return 1
     scope = _scope(args)
     obj = {**rep.__dict__, **({"scope": scope} if scope else {})}
-    return _out(args, obj, rep.line(), 1 if rep.status == "failed" else 0)
+    review = getattr(sink, "review", None) if reviewed else None
+    if reviewed and review is not None:
+        obj["review"] = review
+        if not review.get("ok"):          # changed between the check and the run: the run sent nothing
+            obj["status"] = "refused"
+            return _out(args, obj, "\n".join(_refusal("run", review)), 1)
+    line = rep.line()
+    if reviewed and review is not None:
+        line += f" [reviewed set: {review['refs']} refs, {json.dumps(_tally(review['states']), sort_keys=True)}]"
+    return _out(args, obj, line, 1 if rep.status == "failed" else 0)
+
+
+def _tally(states: dict[str, str]) -> dict[str, int]:
+    out: dict[str, int] = {}
+    for s in states.values():
+        out[s] = out.get(s, 0) + 1
+    return out
+
+
+def cmd_sync_delete(args: argparse.Namespace) -> int:
+    """Mission 004C: the rollback of a reviewed past.dev backfill. Deletes only the refs of the reviewed set that
+    have a live link, marks those links deleted (the ids are retired for good)."""
+    from agent_memory.integrations import http, pastdev
+    try:
+        only = _reviewed(args.only) or {}
+    except ValueError as exc:
+        print(f"amem: sync delete: {exc}", file=sys.stderr)
+        return 2
+    try:
+        with store.connect() as conn:
+            out = pastdev.delete_all(conn, refs=only)
+    except RuntimeError as exc:
+        print(f"amem: sync delete: {exc}", file=sys.stderr)
+        return 2
+    except (psycopg.Error, http.HttpError) as exc:
+        print(f"amem: sync delete failed: {type(exc).__name__}: {str(exc)[:200]}", file=sys.stderr)
+        return 1
+    obj = {"sink": "pastdev", "refs": len(only), **out}
+    return _out(args, obj, f"sync delete pastdev: {out['deleted']} deleted, {out['gone']} already gone, "
+                           f"{out['not_linked']} never sent ({out['calls']} call(s)); deleted ids are retired")
 
 
 def cmd_sync_status(args: argparse.Namespace) -> int:
@@ -163,12 +242,18 @@ def cmd_sync_verify(args: argparse.Namespace) -> int:
 
 def cmd_sync_plan(args: argparse.Namespace) -> int:
     """What a run (or a --replay backfill) would send. Read-only connection; the provider is never called."""
+    if not args.contents and (args.limit is not None or args.cls is not None):
+        print("amem: sync plan: --limit and --class need --contents", file=sys.stderr)
+        return 2
     sink = _scoped_sink(args, "plan")
     if sink is None:
         return 2
     try:
         with store.connect() as conn:
-            out = sync.plan(sink, conn, replay=args.replay)
+            out = sync.plan(sink, conn, replay=args.replay, contents=args.contents, limit=args.limit, cls=args.cls)
+    except ValueError as exc:
+        print(f"amem: sync plan: {exc}", file=sys.stderr)
+        return 2
     except psycopg.Error as exc:
         print(f"amem: sync plan failed: {type(exc).__name__}", file=sys.stderr)
         return 1
@@ -186,7 +271,32 @@ def cmd_sync_plan(args: argparse.Namespace) -> int:
                      f"(owner accounts: {', '.join(masked['owner_accounts']) or 'none'})")
         lines += [f"    {t}: own={n['own']} team={n['team']} private={n['private']}"
                   for t, n in sorted(masked["tables"].items())]
-    return _out(args, out, "\n".join(lines))
+    review = out.get("review")
+    if review is not None and not review.get("ok"):
+        lines += _refusal("plan", review)
+    if args.contents:
+        lines += _contents_lines(out)
+    return _out(args, out, "\n".join(lines), 1 if review is not None and not review.get("ok") else 0)
+
+
+def _contents_lines(out: dict[str, Any]) -> list[str]:
+    """The text form of `--contents`: each record with its exact content (the JSON form has the whole payload)."""
+    lines = [f"  records: {len(out['records'])} of {out['records_total']} "
+             f"(class {out['contents']['class'] or 'any'}; sha256 = {out['contents']['sha256']})"]
+    for r in out["records"]:
+        cost = f", {r['credits']} credit(s)" if "credits" in r else ""
+        lines.append(f"  - {r['ref']} [{r['table']}, {r['class']}] sha256={r['sha256']} {r['bytes']} bytes{cost}")
+        body = r["payload"].get("content") if isinstance(r["payload"].get("content"), str) else \
+            json.dumps(r["payload"], sort_keys=True, ensure_ascii=False)
+        lines += [f"      {line}" for line in body.splitlines()]
+    lines.append(f"  refused: {len(out['refused_records'])} of {out['refused_total']} (no content)")
+    for r in out["refused_records"]:
+        who = r.get("ref") or f"{r.get('count')} row(s)"
+        lines.append(f"  - {who} [{r['table']}, {r.get('class', '-')}] {', '.join(r['reasons'])}")
+    if out["actions"]:
+        lines.append(f"  other actions (no content): {len(out['actions'])}")
+        lines += [f"  - {a['action']} {a['ref']}" for a in out["actions"]]
+    return lines
 
 
 def cmd_sync_schema(args: argparse.Namespace) -> int:
@@ -337,6 +447,19 @@ def _scope_args(q: argparse.ArgumentParser) -> None:
                         "for a run without --since. Retractions and ingestion checks are never narrowed")
 
 
+def _count_arg(text: str) -> int:
+    if not text.isdigit() or int(text) < 1:
+        raise argparse.ArgumentTypeError(f"--limit takes a whole number >= 1, got {text!r}")
+    return int(text)
+
+
+def _only_arg(q: argparse.ArgumentParser, what: str) -> None:
+    q.add_argument("--only", default=None, metavar="REVIEWED.json",
+                   help=f"pastdev, Mission 004C backfill review: {what}. The file is `sync plan --sink pastdev "
+                        "--contents --json` cut down to the chosen records ({\"records\": [{\"ref\", \"sha256\"}]}); "
+                        "not with --tables or --since")
+
+
 def register(sub: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
     p = sub.add_parser("sync", help="push Supabase evidence to ClickHouse / Langfuse / past.dev (docs/integrations/)")
     s = p.add_subparsers(dest="sync_command", required=True)
@@ -345,6 +468,8 @@ def register(sub: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
     q.add_argument("--budget", type=float, default=60.0, help="seconds; stops between batches")
     q.add_argument("--replay", action="store_true", help="start from no cursor (backfill; pushes are idempotent)")
     _scope_args(q)
+    _only_arg(q, "send only the records of this reviewed set; refuse (send nothing, exit 1) when any record's "
+                 "current payload sha256 differs from the reviewed one, or it is no longer sendable")
     q.add_argument("--json", action="store_true")
     q.set_defaults(func=cmd_sync_run)
     q = s.add_parser("status", help="each sink's cursor, last success, failing and dead tables")
@@ -359,8 +484,23 @@ def register(sub: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
     q.add_argument("--sink", required=True, choices=sync.SINKS)
     q.add_argument("--replay", action="store_true")
     _scope_args(q)
+    q.add_argument("--contents", action="store_true",
+                   help="also list every outgoing record: the exact payload, its sha256, class and credit/size "
+                        "estimate, and the refused records with reasons (no content). clickhouse and pastdev")
+    q.add_argument("--limit", type=_count_arg, default=None, metavar="N", help="with --contents: at most N records "
+                                                                              "(and N refused) listed")
+    q.add_argument("--class", dest="cls", choices=("own", "team", "private"), default=None,
+                   help="with --contents: only records of this ownership class")
+    _only_arg(q, "check this reviewed set as `run --only` would (read-only) and narrow the plan to it")
     q.add_argument("--json", action="store_true")
     q.set_defaults(func=cmd_sync_plan)
+    q = s.add_parser("delete", help="past.dev rollback: delete the data points of a reviewed set (only refs with a "
+                                    "live link); the ids are retired")
+    q.add_argument("--sink", required=True, choices=["pastdev"])
+    q.add_argument("--only", required=True, metavar="REVIEWED.json",
+                   help="the reviewed set that was sent (the same file as `sync run --only`)")
+    q.add_argument("--json", action="store_true")
+    q.set_defaults(func=cmd_sync_delete)
     q = s.add_parser("schema", help="print the sink's DDL and least-privilege user SQL (sends nothing)")
     q.add_argument("--sink", required=True, choices=["clickhouse"])
     q.add_argument("--cloud", action="store_true", help="ClickHouse Cloud DDL (no non-replicated settings)")

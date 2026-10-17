@@ -9,6 +9,7 @@ from agent_memory.integrations import egress
 from agent_memory.integrations.sanitize import sanitize_record
 
 OWN = "0b3e7d2a-8c1f-4f6e-9a2b-1c3d4e5f6a7b"
+OWN_META = '{"team": false, "remote_owner": "vilmerfrost", "remote_host": "github.com"}'
 
 
 def test_env_terms_are_case_insensitive_substrings() -> None:
@@ -35,7 +36,7 @@ def test_load_reads_every_team_repo_and_project(pg_url: str) -> None:
     rows = (("eg-team-1", "pipeline-poc", "pipeline-poc", '{"team": true}'),
             ("eg-team-2", None, "acme-portal", '{"team": true}'),
             ("eg-team-3", "scratch", "scratch", '{"team": true}'),
-            ("eg-own", "agent-memory", "agent-memory", '{"team": false, "remote_owner": "vilmerfrost"}'))
+            ("eg-own", "agent-memory", "agent-memory", OWN_META))
     with psycopg.connect(pg_url, autocommit=True) as conn:
         for sid, repo, project, meta in rows:
             conn.execute("insert into sessions (session_id, kind, project_dir, repo, project, transcript_bytes, env, meta) "
@@ -76,19 +77,28 @@ def test_owner_accounts_default_env_and_validation() -> None:
     assert egress.bind_owners(egress.OWNERS_TOKEN, []) == "array[]::text[]"
 
 
+GH = {"remote_host": "github.com"}
 CASES = (   # (meta as sessions_ingest stores it, class)
-    ({"team": True, "team_reason": "remote-owner", "remote_owner": "acme"}, "team"),
+    ({"team": True, "team_reason": "remote-owner", "remote_owner": "acme", **GH}, "team"),
+    ({"team": True, "team_reason": "remote-owner", "remote_owner": "acme", "remote_host": "gitlab.acme.io"}, "team"),
     ({"team": True, "team_reason": "profile"}, "team"),
     ({"team": True, "team_reason": "same-repo"}, "team"),
     ({"team": "true"}, "team"),
-    ({"team": False, "remote_owner": "vilmerfrost"}, "own"),
-    ({"team": False, "remote_owner": "VilmerFrost"}, "own"),                 # GitHub owners are case-insensitive
+    ({"team": False, "remote_owner": "vilmerfrost", **GH}, "own"),
+    ({"team": False, "remote_owner": "VilmerFrost", "remote_host": "GitHub.com"}, "own"),   # both case-insensitive
     ({}, "private"),                                                          # no remote / not a git repo
-    ({"cwd": "/Users/x/work/tool", "note": "non-GitHub remote: no owner read"}, "private"),
+    ({"cwd": "/Users/x/work/tool", "note": "a remote whose owner could not be read"}, "private"),
     ({"team": False}, "private"),                                             # no owner stored: unknown
-    ({"team": False, "remote_owner": "old-handle"}, "private"),              # an owner that is not an account
-    ({"team": False, "remote_owner": None}, "private"),
-    ({"remote_owner": "vilmerfrost"}, "private"),                            # no explicit team = false
+    ({"team": False, "remote_owner": "old-handle", **GH}, "private"),        # an owner that is not an account
+    ({"team": False, "remote_owner": None, **GH}, "private"),
+    ({"remote_owner": "vilmerfrost", **GH}, "private"),                      # no explicit team = false
+    # Mission 004C (backfill prep): own needs a github.com remote, so the owner's account name elsewhere is not own
+    ({"team": False, "remote_owner": "vilmerfrost", "remote_host": "gitlab.example.com"}, "private"),
+    ({"team": False, "remote_owner": "vilmerfrost", "remote_host": "github.com.evil.example"}, "private"),
+    ({"team": False, "remote_owner": "vilmerfrost", "remote_host": "github-work"}, "private"),   # an ssh alias
+    ({"team": False, "remote_owner": "vilmerfrost"}, "private"),             # stored before the host was kept
+    ({"team": False, "remote_owner": "vilmerfrost", "remote_host": None}, "private"),
+    ({"team": False, "remote_owner": "vilmerfrost", "remote_host": ""}, "private"),
     (None, "private"),
 )
 
@@ -116,7 +126,9 @@ def test_withheld_names_are_team_and_private_but_never_an_own_name(pg_url: str) 
             ("eg-p-2", "agent-memory", "agent-memory", "{}"),                                    # own name too
             ("eg-p-3", "old-tool", "old-tool", '{"team": false, "remote_owner": "old-handle"}'),
             ("eg-p-4", "scratch", "private", "{}"),                                              # placeholders
-            ("eg-own", "agent-memory", "agent-memory", '{"team": false, "remote_owner": "vilmerfrost"}'),
+            ("eg-own", "agent-memory", "agent-memory", OWN_META),
+            ("eg-p-5", "gitlab-tool", "gitlab-tool",                                             # not on github.com
+             '{"team": false, "remote_owner": "vilmerfrost", "remote_host": "gitlab.example.com"}'),
             ("eg-team", "pipeline-poc", "pipeline-poc", '{"team": true}'))
     with psycopg.connect(pg_url, autocommit=True) as conn:
         for sid, repo, project, meta in rows:
@@ -127,7 +139,7 @@ def test_withheld_names_are_team_and_private_but_never_an_own_name(pg_url: str) 
             narrowed = egress.team_names(conn, owners=())                 # no accounts: every name is withheld
         finally:
             conn.execute("delete from sessions where project_dir = '/eg'")
-    assert {"client-notes", "old-tool", "pipeline-poc"} <= set(d.terms)
+    assert {"client-notes", "old-tool", "pipeline-poc", "gitlab-tool"} <= set(d.terms)
     assert not {"agent-memory", "scratch", "private"} & set(d.terms)
     assert {"agent-memory", "client-notes", "old-tool", "pipeline-poc"} <= set(narrowed.terms)
 

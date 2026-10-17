@@ -110,7 +110,7 @@ def test_plan_counts_rows_masked_as_team_and_private(app: str, pg_url: str, monk
     from agent_memory.integrations import http
     monkeypatch.setattr(http, "request", lambda *a, **k: pytest.fail("plan must not call the provider"))
     with psycopg.connect(pg_url, autocommit=True) as conn:
-        for sid, meta in (("cli-int-own", '{"team": false, "remote_owner": "vilmerfrost"}'),
+        for sid, meta in (("cli-int-own", '{"team": false, "remote_owner": "vilmerfrost", "remote_host": "github.com"}'),
                           ("cli-int-team", '{"team": true}')):
             conn.execute("insert into sessions (session_id, kind, project_dir, transcript_bytes, env, meta) values "
                          "(%s, 'chat', '/x', 1, 'prod', %s::jsonb) on conflict do nothing", (sid, meta))
@@ -129,6 +129,98 @@ def test_plan_counts_rows_masked_as_team_and_private(app: str, pg_url: str, monk
     finally:
         with psycopg.connect(pg_url, autocommit=True) as conn:
             conn.execute("delete from sessions where session_id in ('cli-int-own', 'cli-int-team')")
+
+
+def _edit(pg_url: str, why: str) -> str:
+    with psycopg.connect(pg_url, autocommit=True) as conn:
+        return "amem:edit/" + str(conn.execute(
+            "insert into edits (status, instruction_source, rule_id, why) values ('kept', 'claude-md:global', "
+            "'cli-int-rule', %s) returning id", (why,)).fetchone()[0])
+
+
+def _cli_json(capsys: pytest.CaptureFixture[str], *args: str, code: int = 0) -> dict[str, Any]:
+    capsys.readouterr()
+    assert cli.main(list(args)) == code, args
+    return json.loads(capsys.readouterr().out)
+
+
+def test_plan_contents_and_a_reviewed_run(app: str, pg_url: str, tmp_path: Any, monkeypatch: pytest.MonkeyPatch,
+                                          capsys: pytest.CaptureFixture[str]) -> None:
+    """Mission 004C backfill review: `sync plan --contents` lists the exact payloads; `sync run --only FILE` checks
+    the reviewed set read-only first and refuses (exit 1, nothing called, nothing written) on any difference."""
+    from agent_memory.integrations import http
+    monkeypatch.setattr(http, "request", lambda *a, **k: pytest.fail("no provider call in this test"))
+    ref = _edit(pg_url, "quote zsh globs before a run")
+    try:
+        out = _cli_json(capsys, "sync", "plan", "--sink", "pastdev", "--contents", "--class", "own", "--json")
+        (rec,) = [r for r in out["records"] if r["ref"] == ref]
+        assert rec["class"] == "own" and "reason: quote zsh globs before a run" in rec["payload"]["content"]
+        assert {"records_total", "refused_records", "refused_total", "actions", "contents"} <= set(out)
+        reviewed = tmp_path / "reviewed.json"
+        reviewed.write_text(json.dumps({"records": [rec]}))
+        # the reviewed set matches: the check passes and the run goes on (unconfigured here: unavailable, exit 0)
+        got = _cli_json(capsys, "sync", "run", "--sink", "pastdev", "--only", str(reviewed), "--json")
+        assert got["status"] == "unavailable"
+        checked = _cli_json(capsys, "sync", "plan", "--sink", "pastdev", "--only", str(reviewed), "--json")
+        assert checked["review"]["ok"] is True and checked["rows"] == 1
+        with psycopg.connect(pg_url, autocommit=True) as conn:
+            conn.execute("delete from rsi_checkpoints where job = 'sync:pastdev'")
+            conn.execute("update edits set why = 'quote every zsh glob' where id = %s", (ref.split("/")[1],))
+        got = _cli_json(capsys, "sync", "run", "--sink", "pastdev", "--only", str(reviewed), "--json", code=1)
+        assert got["status"] == "refused" and got["review"]["problems"] == [{"ref": ref, "reason": "changed"}]
+        with psycopg.connect(pg_url) as conn:                 # refused before the run: not even the cursor moved
+            assert conn.execute("select count(*) from rsi_checkpoints where job = 'sync:pastdev'").fetchone()[0] == 0
+        capsys.readouterr()
+        assert cli.main(["sync", "run", "--sink", "pastdev", "--only", str(reviewed)]) == 1
+        assert "REFUSED" in capsys.readouterr().out
+        capsys.readouterr()
+        assert cli.main(["sync", "plan", "--sink", "pastdev", "--contents", "--limit", "1"]) == 0
+        assert "records: " in capsys.readouterr().out
+    finally:
+        with psycopg.connect(pg_url, autocommit=True) as conn:
+            conn.execute("delete from edits where rule_id = 'cli-int-rule'")
+
+
+def test_reviewed_set_and_contents_argument_errors(app: str, tmp_path: Any, monkeypatch: pytest.MonkeyPatch,
+                                                   capsys: pytest.CaptureFixture[str]) -> None:
+    from agent_memory.integrations import http
+    monkeypatch.setattr(http, "request", lambda *a, **k: pytest.fail("no provider call in this test"))
+    good = tmp_path / "good.json"
+    good.write_text(json.dumps([{"ref": "amem:edit/00000000-0000-4000-8000-000000000001", "sha256": "a" * 64}]))
+    bad = tmp_path / "bad.json"
+    bad.write_text("{not json")
+    for args in (["sync", "plan", "--sink", "pastdev", "--limit", "3"],          # --limit/--class need --contents
+                 ["sync", "plan", "--sink", "pastdev", "--class", "own"],
+                 ["sync", "plan", "--sink", "langfuse", "--contents"],            # no record preview for langfuse
+                 ["sync", "run", "--sink", "clickhouse", "--only", str(good)],     # --only is for pastdev
+                 ["sync", "run", "--sink", "pastdev", "--only", str(good), "--tables", "edits"],
+                 ["sync", "run", "--sink", "pastdev", "--only", str(bad)],
+                 ["sync", "run", "--sink", "pastdev", "--only", str(tmp_path / "missing.json")],
+                 ["sync", "delete", "--sink", "pastdev", "--only", str(bad)],
+                 ["sync", "delete", "--sink", "pastdev", "--only", str(good)]):    # no key: not configured
+        capsys.readouterr()
+        assert cli.main(args) == 2, args
+    with pytest.raises(SystemExit):
+        cli.main(["sync", "plan", "--sink", "pastdev", "--contents", "--limit", "0"])
+    capsys.readouterr()
+    assert cli.main(["sync", "run", "--sink", "pastdev", "--only", str(good)]) == 1      # not found: refused
+    assert "not found" in capsys.readouterr().out
+
+
+def test_previews_work_in_a_read_only_session(app: str, tmp_path: Any) -> None:
+    """The parent runs the previews against hosted Supabase with PGOPTIONS='-c default_transaction_read_only=on':
+    any write would fail the command."""
+    from conftest import base_env, run_amem
+
+    env = base_env(AMEM_DB_URL=app, PGOPTIONS="-c default_transaction_read_only=on", RSI_SANDBOX_DIR=str(tmp_path))
+    for args in (("sync", "plan", "--sink", "pastdev", "--contents", "--json"),
+                 ("sync", "plan", "--sink", "clickhouse", "--replay", "--contents", "--limit", "5", "--json"),
+                 ("sessions", "hosts", "--json")):
+        res = run_amem(*args, env=env)
+        assert res.returncode == 0, (args, res.stderr)
+        json.loads(res.stdout)
+    res = run_amem("sync", "run", "--sink", "pastdev", "--json", env=env)    # a run writes its cursor: it fails here
+    assert res.returncode == 1 and "ReadOnlySqlTransaction" in res.stderr
 
 
 @pytest.mark.parametrize("sink", ["clickhouse", "langfuse", "pastdev"])
