@@ -166,6 +166,11 @@ class SupabaseRetriever:
     def __init__(self, connect: Callable[[], psycopg.Connection]):
         self._connect = connect
 
+    @property
+    def connect(self) -> Callable[[], psycopg.Connection]:
+        """The connection factory (Mission 005: evidence packs re-read subject refs through it, read-only)."""
+        return self._connect
+
     def health(self) -> Health:
         try:
             with self._connect() as conn:

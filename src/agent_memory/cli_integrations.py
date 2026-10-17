@@ -536,3 +536,5 @@ def register(sub: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
     q.add_argument("--param", action="append", default=[], metavar="K=V")
     q.add_argument("--json", action="store_true")
     q.set_defaults(func=cmd_evidence_query)
+    from agent_memory import rsi_evidence_pack        # Mission 005: `evidence pack` and `evidence delta` (read-only)
+    rsi_evidence_pack.register_cli(e)
