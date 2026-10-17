@@ -243,7 +243,7 @@ hosted (5.7).
 
 ### 5.0 Preconditions
 
-1. This branch is merged and the full suite is green on `integration`.
+1. `rsi/m004c` is merged into local main (separately approved, `merge-plan.md`) and the full suite is green.
 2. The owner has approved the text in 5.8 (with the record list filled in).
 3. Ownership of the chosen records is resolved: each record is `own` in the preview. Optional, separately
    approved: `amem sessions hosts --apply` on hosted, after reading its dry run (section 1.2). Without it, only
@@ -255,19 +255,20 @@ hosted (5.7).
 
 ```sh
 cd ~/Projects/agent-memory
-env -u AMEM_PASTDEV_KEY PGOPTIONS='-c default_transaction_read_only=on' \
-  uv run amem sync plan --sink pastdev --contents --class own --json > "$TMPDIR/pd-preview.json"
-env -u AMEM_PASTDEV_KEY PGOPTIONS='-c default_transaction_read_only=on' \
-  uv run amem sync plan --sink pastdev --contents --class private --json > "$TMPDIR/pd-private.json"
-env -u AMEM_PASTDEV_KEY PGOPTIONS='-c default_transaction_read_only=on' \
-  uv run amem sessions hosts --json > "$TMPDIR/hosts-dry-run.json"
+uv run python scripts/ro_amem.py sync plan --sink pastdev --contents --class own --json > "$TMPDIR/pd-preview.json"
+uv run python scripts/ro_amem.py sync plan --sink pastdev --contents --class private --json > "$TMPDIR/pd-private.json"
+uv run python scripts/ro_amem.py sessions hosts --json > "$TMPDIR/hosts-dry-run.json"
 jq '{records_total, refused_total, cost, masked}' "$TMPDIR/pd-preview.json"
 jq -r '.records[] | [.ref, .table, .class, .credits, .bytes] | @tsv' "$TMPDIR/pd-preview.json"
 ```
 
-`PGOPTIONS` makes every transaction of the session read-only; `sync plan` also opens its own read-only
-transaction. If the connection refuses the startup option, stop and use the direct (non-pooler) connection
-string; do not drop the option. The preview files hold decision text: keep them local, delete them after 5.6.
+**Read-only, verified 2026-10-17.** The Supabase session pooler silently ignores `PGOPTIONS`
+(`default_transaction_read_only` stayed `off`), and `env -u AMEM_PASTDEV_KEY` does not keep the key out because
+amem loads its env files itself. `scripts/ro_amem.py` fixes both: after amem's own env loading it removes every
+provider key and sets every sink kill switch to `off`, and it forces each psycopg connection read-only in the
+client. Prove it before the preview: `uv run python scripts/ro_amem.py probe` must print `update refused` twice
+and `provider keys in env: 0`. `sync plan` also opens its own read-only transaction. The preview files hold
+decision text: keep them outside the repo (mode 700), delete them after 5.6.
 
 ### 5.2 Review (the reviewer)
 
@@ -288,8 +289,7 @@ jq -r '.records[] | [.ref, .class, .sha256] | @tsv' reviewed.json         # ever
    expected credits):
 
 ```sh
-env -u AMEM_PASTDEV_KEY PGOPTIONS='-c default_transaction_read_only=on' \
-  uv run amem sync plan --sink pastdev --only reviewed.json --json | jq '{review, rows, cost}'
+uv run python scripts/ro_amem.py sync plan --sink pastdev --only reviewed.json --json | jq '{review, rows, cost}'
 ```
 
 ### 5.3 Usage baseline (free GET)
@@ -314,11 +314,10 @@ again from 5.1.
 ```sh
 # 1. links: exactly the reviewed refs, all completed (read-only; psql with the hosted URL, or the SQL editor
 #    inside `begin read only; ... rollback;`)
-PGOPTIONS='-c default_transaction_read_only=on' psql "<hosted db url>" -c \
-  "select external_ref, metrics->>'status', metrics->>'sha256' from rsi_evidence where system = 'pastdev' order by 1;"
+psql "<hosted db url>" -c "begin read only; select external_ref, metrics->>'status', metrics->>'sha256'
+  from rsi_evidence where system = 'pastdev' order by 1; rollback;"     # PGOPTIONS is ignored by the pooler
 # 2. what was sent is what was reviewed: every state already-sent, review ok
-env -u AMEM_PASTDEV_KEY PGOPTIONS='-c default_transaction_read_only=on' \
-  uv run amem sync plan --sink pastdev --only reviewed.json --json | jq '.review'
+uv run python scripts/ro_amem.py sync plan --sink pastdev --only reviewed.json --json | jq '.review'
 uv run amem sync status --json | jq '.[] | select(.sink == "pastdev")'          # no failing, dead_letters 0
 # 3. /usage delta = the expected credits (within 10%; the meter can lag a minute)
 uv run python -c "import json; from agent_memory.integrations import pastdev as p; \
@@ -349,13 +348,32 @@ ref. Delete the local preview, run and usage files.
 
 ### 5.7 Record list (the parent fills this from hosted)
 
+Filled 2026-10-17 from hosted, read-only (`scripts/ro_amem.py` semantics, probe passed), code 7096b70.
+Only 2 records are `own` today: old sessions have no `remote_host` yet, so everything tied to them is `private`
+(see "Hosted counts" below). Both payloads were read in full: no person, employer, client, work repo, branch,
+path, host, email or secret. The payloads and the reviewed set live outside the repo in
+`~/.claude/parent/agent-memory/exports/m004c-backfill-2026-10-17/` (`pastdev-preview-own.json`,
+`reviewed-first.json`, `reviewed-first-check.json`: `review.ok` true, both states `send`, cost 2).
+
 | # | ref | table | class | sha256 (first 12) | credits | reviewer note |
 |---|---|---|---|---|---|---|
-| 1 | | | own | | | |
-| ... | | | own | | | |
-| <=10 | | | own | | | |
+| 1 | `amem:proposal/ee814446-946b-490a-9437-987b90c85625` | rsi_proposals | own | 5618650d0ee4 | 1 | Mission 003.5 G3 test proposal ("tests the deployed amem-decide. Not a change."), result rejected, night 2026-10-16 |
+| 2 | `amem:decision/fe05755e-2834-4285-87db-33c73f0c170f` | rsi_decisions | own | 4544a8820c3d | 1 | the matching rejection decision, night 2026-10-16 |
 
-Totals: [N] records, [C] credits, [B] bytes. Preview taken at [time] from commit [sha].
+Totals: 2 records, 2 credits, 380 bytes. Preview taken 2026-10-17 14:09Z from commit 7096b70.
+
+Hosted counts at the same time (read-only):
+- past.dev, all classes: 2 sendable (above); 64 refused: lesson_candidates private 49 / team 5, edits private 4 /
+  team 6.
+- `amem sessions hosts` dry run: 173 candidate sessions; 152 would be re-derived to github.com (own), 21 have no
+  local remote, 0 owner changes. `--apply` is a hosted data write: separate approval (it would turn many of the
+  64 refused records and the ClickHouse rows `own`).
+- ClickHouse plan (not part of this proposal): 3,766 rows in 11 requests; sessions/skill_calls/deviations own 0,
+  private 2,162, team 383 (all for want of a host).
+
+Where it runs: the main checkout after `rsi/m004c` is merged (separately approved). `AMEM_PASTDEV_KEY` goes into
+the main checkout's `.env.local` through the secret popup together with `AMEM_PASTDEV=off` as the default; the one
+run passes `AMEM_PASTDEV=on` in the process env, so no routine or stray command can reach past.dev.
 
 ### 5.8 Approval text (fill the brackets)
 
@@ -365,3 +383,13 @@ Totals: [N] records, [C] credits, [B] bytes. Preview taken at [time] from commit
 > `amem sync run --sink pastdev --only reviewed.json`. Verification and rollback as in
 > `docs/integrations/m004c/backfill-export-plan.md` section 5. Not approved: any other record, `--replay`,
 > recurring sync, recall from routines, ClickHouse, Langfuse, `amem sessions hosts --apply`.
+
+Filled for the first backfill (2026-10-17):
+
+> I approve one import to past.dev project `default-project` (amem-rsi) of exactly the 2 own-class decision
+> records listed in reviewed-first.json (sha256 of the file: b23e5a2150d3df4fd870d8863bed0940db838cbee22d3eb5c0666db17e9a8855),
+> reviewed on 2026-10-17. Each record's payload sha256 is in the file; the run sends nothing if any differs.
+> Estimated 2 credits (project cap 250). Command, once: `AMEM_PASTDEV=on amem sync run --sink pastdev --only
+> reviewed-first.json`. Verification and rollback as in `docs/integrations/m004c/backfill-export-plan.md`
+> section 5. Not approved: any other record, `--replay`, recurring sync, recall from routines, ClickHouse,
+> Langfuse, `amem sessions hosts --apply`.
