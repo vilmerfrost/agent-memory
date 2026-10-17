@@ -1,6 +1,6 @@
 """`amem synth ...`: the synthetic RSI dataset (Mission 004C; see synth.py).
 
-    amem synth seed --db-url URL [--anchor YYYY-MM-DD] [--out DIR] [--json]
+    amem synth seed --db-url URL [--anchor YYYY-MM-DD] [--out DIR] [--rsi-demo] [--json]
 
 Local disposable Postgres only (localhost, 127.0.0.1, ::1). The URL is never printed, only its host.
 """
@@ -29,6 +29,8 @@ def _date(value: str) -> date:
 def cmd_seed(args: argparse.Namespace) -> int:
     try:
         rep = synth.seed(args.db_url, args.anchor, out=args.out)
+        if args.rsi_demo:
+            rep["rsi_demo"] = synth.seed_m005(args.db_url)
     except synth.UnsafeTarget as exc:
         print(f"amem: synth seed refused: {exc}", file=sys.stderr)
         return 2
@@ -44,6 +46,11 @@ def cmd_seed(args: argparse.Namespace) -> int:
         rows = sum(rep["counts"].values())
         print(f"synth {rep['status']}: SYNTHETIC dataset {rep['dataset']} v{rep['version']} on {rep['host']}, "
               f"anchor {rep['anchor']}, {rows} rows, {rep['markers']} markers; gold: {rep['gold']}")
+        if "rsi_demo" in rep:
+            m = rep["rsi_demo"]
+            print(f"synth {m['status']}: SYNTHETIC dataset {m['dataset']} v{m['version']} (rule {m['rule']}, "
+                  f"{sum(m['counts'].values())} rows at {m['now']}); candidates "
+                  + ", ".join(sorted(m["candidate_keys"].values())))
     return 0
 
 
@@ -55,5 +62,8 @@ def register(sub: Any) -> None:
     q.add_argument("--anchor", type=_date, default=None,
                    help="UTC date the story ends before (default: today; reuse keeps the seeded one)")
     q.add_argument("--out", type=Path, default=Path("synth-out"), help="directory for gold.json (default synth-out)")
+    q.add_argument("--rsi-demo", action="store_true",
+                   help="also add the Mission 005 investigator rows: Claude and Codex sessions that repeat one "
+                        "instruction failure, a few days before now (outside gold.json)")
     q.add_argument("--json", action="store_true")
     q.set_defaults(func=cmd_seed)

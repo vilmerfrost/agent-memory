@@ -1,0 +1,16 @@
+{
+  "format": "rsi-replay-scenarios/1",
+  "note": "Synthetic A/B scenarios for the stub agent. Baseline home: home/. Candidate: candidates/<name>/ (the after bytes of each file it holds). Expected verdicts hold for the stub agent with reps >= policy min_pairs / cases.",
+  "scenarios": [
+    {"name": "improves", "candidate": "closing-line", "cases": ["report-todos"], "expect": "IMPROVES",
+     "why": "The baseline's vague closing-line rule leaves REPORT.md without the required last line; the candidate's exact rule adds it."},
+    {"name": "no-effect", "candidate": "closing-line", "cases": ["fix-add"], "expect": "NO_EFFECT",
+     "why": "The closing-line rule is about reports; the bug fix is the same in both arms."},
+    {"name": "worse", "candidate": "no-edit-existing", "cases": ["docs-typo"], "expect": "WORSE",
+     "why": "The candidate forbids editing existing files, so the typo fix lands in README_new.md and the check fails."},
+    {"name": "mixed-improves", "candidate": "closing-line", "cases": ["docs-typo", "fix-add", "report-todos"], "expect": "IMPROVES",
+     "why": "One case improves, none gets worse."},
+    {"name": "mixed-worse", "candidate": "no-edit-existing", "cases": ["docs-typo", "fix-add", "report-todos"], "expect": "WORSE",
+     "why": "Two cases get worse; a regression in any case blocks the candidate."}
+  ]
+}

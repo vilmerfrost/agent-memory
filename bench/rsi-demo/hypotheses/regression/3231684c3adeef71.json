@@ -1,0 +1,1 @@
+{"hypotheses": [{"what": "Never edit existing files: put every change in a new file next to the original", "why": "Sessions that rewrote an existing report lost its closing line; a fresh file each time should keep the last line intact.", "target": "~/.claude/CLAUDE.md", "expected": "fewer closing-line deviations", "risk": "medium", "confidence": 0.5}]}

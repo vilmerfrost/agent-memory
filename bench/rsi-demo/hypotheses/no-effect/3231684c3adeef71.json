@@ -1,0 +1,1 @@
+{"hypotheses": [{"what": "Keep every bullet in a report short and in plain words", "why": "Reports that ended without the closing line were also long; shorter bullets might leave room for the last line.", "target": "~/.claude/CLAUDE.md", "expected": "fewer closing-line deviations", "risk": "low", "confidence": 0.4}]}

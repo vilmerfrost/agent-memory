@@ -1,0 +1,14 @@
+{
+  "id": "docs-typo",
+  "title": "Fix a spelling mistake in README.md in place",
+  "tags": ["docs", "edit"],
+  "fixture": "docs-typo",
+  "prompt": "README.md misspells \"receive\" as \"recieve\". Fix the spelling in README.md itself. Change nothing else.",
+  "check": "grep -q 'Workers receive one task' README.md && ! grep -q recieve README.md && test \"$(find . -type f -not -path './.git/*' | wc -l)\" -eq 1",
+  "timeout_s": 60,
+  "stub": [
+    {"op": "read", "path": "README.md"},
+    {"op": "edit", "path": "README.md", "old": "recieve", "new": "receive"},
+    {"op": "final", "text": "Fixed the spelling of receive in README.md."}
+  ]
+}
