@@ -50,13 +50,14 @@ touched: `tests/rsi_night_support.py` (`FakeSandboxOps.reap`, so the fakes stay 
 ## B. Test results
 
 All runs: Docker 29.8.1, `rsi-worker:m003` from `sandbox/images/lock.json`, `AMEM_NO_DOTENV=1`, local
-Postgres containers only. Commit `5087e27` on `worktree-m005-e2e`.
+Postgres containers only. Branch `worktree-m005-e2e` (code as of `442b26b`; the sandbox suites, the isolation suite
+and `--scenario all` ran on the same code minus the demo's step-9 print; the success demo re-ran on `442b26b`: OK,
+exit 0, with the Apply / Reject / Details commands printed).
 
 | Suite | Command | Result |
 |---|---|---|
-| Unit + integration (full) | `uv run --quiet pytest -q -p no:cacheprovider` | PENDING_FULL |
-| Wiring (new) | `uv run --quiet pytest -q -p no:cacheprovider tests/test_rsi_e2e_wiring.py` | 28 passed |
-| Night (wave 1, after the wiring changes) | `uv run --quiet pytest -q -p no:cacheprovider tests/test_rsi_night*.py` | included in the full run |
+| Unit + integration (full) | `uv run --quiet pytest -q -p no:cacheprovider` | **2211 passed, 1 skipped** in 354 s on `442b26b` (the same single skip as in the earlier run on `5087e27`) |
+| Wiring (new, part of the full run) | `uv run --quiet pytest -q -p no:cacheprovider tests/test_rsi_e2e_wiring.py` | 29 passed |
 | Sandbox suites, one run (Docker) | `env AMEM_NO_DOTENV=1 uv run --quiet pytest sandbox/tests/test_sandbox_units.py sandbox/tests/test_rsi_formats.py sandbox/tests/test_replay_docker.py sandbox/tests/test_m005_e2e_docker.py sandbox/tests/test_m005_safety_docker.py -s -rA -p no:cacheprovider` | **56 passed** in 145 s: units + formats 35, replay 6, E2E scenarios 10 (new), safety 5 (new) |
 | Isolation (Docker) | `env AMEM_NO_DOTENV=1 RSI_SANDBOX_DIR=<scratch>/w-e2e-iso/sandbox uv run --quiet pytest sandbox/tests/test_isolation.py -s -rA -p no:cacheprovider` | **76 passed** in 49 s (mount guard, read-only rootfs, no host files, env allowlist, no docker socket, non-root / no caps, cgroup limits, timeout kill, recover / cleanup, no direct internet / host / metadata / DNS, egress proxy allowlist + SNI check). Its dummy-key tests reach api.anthropic.com / api.openai.com through the proxy and get 401 (no cost). |
 | Demo (one command) | `uv run python scripts/m005_demo.py --scenario all` | **3/3 OK**, exit 0 (B.1) |
@@ -159,7 +160,7 @@ proposal 7a73a3c1-...: CLI decision refused (no TTY / agent marker); rsi_writer 
 
 | Requirement | Evidence |
 |---|---|
-| Sandbox filesystem and network isolation | `test_isolation.py` 76 passed (temp root ending in `/sandbox`); every demo / scenario container run: `--network none`, `--read-only`, `--cap-drop ALL`, non-root, real worker image (asserted from each run's docker argv) |
+| Sandbox filesystem and network isolation | `test_isolation.py` 76 passed (temp root ending in `/sandbox`); in the success and injection scenarios every container run's docker argv is checked: the locked worker image, `--network none`, `--read-only`, no credential name (`--cap-drop ALL`, non-root and the limits come from the same argv builder that `test_isolation.py` proves) |
 | Production credentials inaccessible | worker env = `ENV_ALLOWLIST` + the image's own ENV (5 telemetry switches) and nothing secret-shaped; no `/Users`, no `~/.ssh`, `.git-credentials`, `.netrc`, `gh` or Codex auth file in the container; the stub runs with `credentials=none` (a credential with `--network none` is refused). Host side: the demo env is an allowlist (no `AMEM_SUPABASE_*`, provider keys, agent markers), `AMEM_NO_DOTENV=1`, local `AMEM_DB_URL`, Keychain admin item behind a tripwire (0 hits in every run). The live hypothesizer's env is scrubbed (`model_cli_env`). |
 | No sandbox worker can push or merge | `test_sandbox_worker_cannot_push_or_merge_without_network`: `git push https://github.com/...` rc 128 (no route, no DNS), push / fetch / merge against the host repos fail (not visible in the container), TCP to github.com fails. `..._through_the_egress_proxy` (the live-agent network): push rc 128, `CONNECT tunnel failed, response 403` |
 | K7 Git guard fix active | B.3 |
@@ -194,11 +195,20 @@ that could read an env file:
 trees `~/.agents/skills`, `~/.claude/scheduled-tasks`, `~/agent-config/agents`, `~/agent-config/hooks`,
 agent-config `HEAD` and `git status`, the full `~/sandbox` listing (path, size, mtime) and every LaunchAgent plist.
 
-PENDING_FP
+| When | Overall sha256 | Diff |
+|---|---|---|
+| Before any wave-2 work (2026-10-17 ~17:30 UTC) | `f3e116a600369b7db6468c87e8669e2331f6dcbb0724a6edf8e91507e683da27` | – |
+| After all demo, scenario, safety, isolation and replay runs (~18:12 UTC) | `f3e116a600369b7db6468c87e8669e2331f6dcbb0724a6edf8e91507e683da27` | none |
+| After the final demo re-run (~18:15 UTC) | `f3e116a600369b7db6468c87e8669e2331f6dcbb0724a6edf8e91507e683da27` | none |
+
+Selected items (unchanged): `~/.claude/CLAUDE.md` `e8f31039…`, `~/.codex/AGENTS.md` `da6832b1…`, agent-config
+HEAD `0c2f8f9` with a clean status, `~/.agents/skills` tree `d3cfb211…`, `~/sandbox` listing `276427dc…`,
+LaunchAgents `1daec8f2…`. The demo and the success scenario also compare the fingerprint in-run
+(`production_unchanged`).
 
 No hosted DB connection: every amem process ran with `AMEM_NO_DOTENV=1` and `AMEM_DB_URL` =
-`postgresql://postgres:postgres@127.0.0.1:<port>/...` (a throwaway container); every demo / scenario run asserts
-`db_host == 127.0.0.1` and 0 Keychain tripwire hits; the worktree holds no env file.
+`postgresql://postgres:postgres@127.0.0.1:<port>/...` (a throwaway container). The demo asserts
+`db_host == 127.0.0.1`; the demo and every scenario assert 0 Keychain tripwire hits; the worktree holds no env file.
 
 ## C. Architecture
 
@@ -292,8 +302,10 @@ policy or the triage questions from the investigator.
   reports `partial` (the checkpoint still advances).
 - **Index DDL:** `PROPOSED_INDEXES` is not applied (a hosted schema change, G4). Without it the delta queries are
   bounded sequential scans.
-- **Phase I dependency:** Phase I (I1-I3, stage-only amem-daily) is approved but not yet run; `rsi/m005` must not
-  merge before it is verified (G5). The existing `rsi-nightly` LaunchAgent is unrelated to `amem rsi night`.
+- **Phase I dependency:** Phase I (I1-I3, stage-only amem-daily) was approved on 2026-10-17 to run after the
+  2026-10-18 gate check; this worker did not check whether it ran, and `freeze-status` still showed
+  `apply_mode` legacy. `rsi/m005` must not merge before Phase I is verified (G5). The existing `rsi-nightly`
+  LaunchAgent is unrelated to `amem rsi night`.
 - **Self-approval boundary:** the investigator's code never writes a decision (tested), and the role `rsi_writer`
   cannot (tested). In production that role boundary holds only once routines run as `amem_app` (least-privilege
   E3); until then a process that loads the main checkout's `.env.local` holds the full `postgres` DSN.
