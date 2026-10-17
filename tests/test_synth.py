@@ -59,6 +59,8 @@ def test_markers_are_unique_and_every_row_says_synthetic() -> None:
     assert len(names) == len(set(names)) > 400 and all(n.startswith("ZZLEAK-") for n in names)
     assert {m["policy"] for m in ds.markers} == {synth.STRICT, synth.DECISION}
     assert not [m for m in ds.markers if m["team"] and m["policy"] != synth.STRICT]
+    assert not [m for m in ds.markers if m["private"] and m["policy"] != synth.STRICT]          # Mission 004C (F8)
+    assert [m for m in ds.markers if m["private"]]
     for t, rows in ds.rows.items():
         for r in rows:
             blob = json.dumps(synth._jsonable(r))
@@ -68,6 +70,27 @@ def test_markers_are_unique_and_every_row_says_synthetic() -> None:
     for m in ds.markers:
         col = m["column"].split(".", 1)[0]
         assert col not in allow.get(m["table"], set()) or col in ("project", "repo"), m   # project/repo: masked
+
+
+def test_unknown_ownership_cases_are_private_and_own_sessions_stay_own() -> None:
+    """Mission 004C (F8): sessions with no remote, a non-GitHub remote ingestion read no owner from, and an unknown
+    owner are private; own sessions (team false + the owner account) stay own. Before F8 all of them were own."""
+    ds = synth.build(ANCHOR)
+    g = synth.gold(ds)
+    by_id = {s["session_id"]: s for s in ds.rows["sessions"]}
+    cases = {sid: by_id[sid]["meta"].get("synthetic_case") for sid in g["private"]["sessions"]}
+    assert sorted(cases.values()) == sorted(synth.PRIVATE_CASES)
+    assert g["ownership"]["owner_accounts"] == ["vilmerfrost"]
+    assert g["ownership"]["after"]["sessions"] == {"own": 11, "team": 2, "private": 3}
+    assert g["ownership"]["before"]["sessions"] == {"own": 14, "team": 2, "private": 0}
+    assert g["ownership"]["after"]["skill_calls"] == {"own": 11, "team": 2, "private": 3}
+    assert g["ownership"]["after"]["deviations"] == {"own": 15, "team": 2, "private": 1}
+    assert g["clickhouse"]["private"] == {"sessions": 3, "deviations": 1, "skill_calls": 3}
+    assert len(g["pastdev"]["refuse_private"]) == 2 and not set(g["pastdev"]["refuse_private"]) & set(g["pastdev"]["send"])
+    keys = {r["metrics"]["rule_key"] for q in g["clickhouse"]["queries"] if q["name"] == "rule_weekly_rate" for r in q["rows"]}
+    assert "claude-md:private:unknown" in keys and not [k for k in keys if "client-notes" in k]
+    skills = {r["metrics"]["skill"] for q in g["clickhouse"]["queries"] if q["name"] == "skill_outcomes" for r in q["rows"]}
+    assert "synth-client-release" not in skills and "synth-debugging" in skills
 
 
 @pytest.mark.parametrize("url, ok", [
@@ -179,9 +202,21 @@ def test_gold_matches_a_clickhouse_sync(seeded: tuple[str, dict, Path], pseudony
                 assert all(E.usable(conn, ev) for ev in res.refs)
         wire = "\n".join(f"{x.path} {json.dumps(x.query)} {x.body.decode('utf-8', 'replace')}" for x in svc.requests)
     assert "ZZLEAK" not in wire and "sk-ant-" not in wire and "@example.com" not in wire
-    team = set(gold["team"]["sessions"])
-    assert {i for i, s in fake.by_id("sessions").items() if s["project"] == "team"} == team
-    assert all(s["project"].startswith("p_") for i, s in fake.by_id("sessions").items() if i not in team)
+    for name in ("client-notes", "synth-client-release", "synth-client-deploy-gate", "synth-other-"):   # F8, F7
+        assert name not in wire, name
+    team, private = set(gold["team"]["sessions"]), set(gold["private"]["sessions"])
+    sessions = fake.by_id("sessions")
+    assert {i for i, s in sessions.items() if s["project"] == "team"} == team
+    assert {i for i, s in sessions.items() if s["project"] == s["repo"] == "private"} == private and private
+    assert all(s["project"].startswith("p_") and s["repo"].startswith("p_")              # own sessions: pseudonyms
+               for i, s in sessions.items() if i not in team | private)
+    devs = fake.by_id("deviations")
+    assert all((devs[i]["instruction_source"], devs[i]["rule_id"]) == ("claude-md:private", None)
+               for i in gold["private"]["deviations"])
+    calls = fake.by_id("skill_calls")
+    assert {calls[i]["project"] for i in gold["private"]["skill_calls"]} == {"private"}
+    assert sorted(str(calls[i]["skill"]) for i in gold["private"]["skill_calls"]) == \
+        ["None", "synth-debugging", "synth-handoff"]                  # the repo-local skill's label is withheld
 
 
 def test_pastdev_gets_only_sanitized_non_team_decision_text(seeded: tuple[str, dict, Path]) -> None:
@@ -191,6 +226,7 @@ def test_pastdev_gets_only_sanitized_non_team_decision_text(seeded: tuple[str, d
         corpus = PD.corpus(conn)
     assert sorted(ref for ref, _ in corpus) == gold["pastdev"]["send"]
     assert not set(gold["pastdev"]["refuse_team"]) & {ref for ref, _ in corpus}
+    assert gold["pastdev"]["refuse_private"] and not set(gold["pastdev"]["refuse_private"]) & {ref for ref, _ in corpus}
     text = "\n".join(c for _, c in corpus)
     strict = [m["marker"] for m in gold["markers"] if m["policy"] == synth.STRICT and m["marker"] in text]
     assert strict == [] and "sk-ant-" not in text and "@example.com" not in text and "/Users/" not in text

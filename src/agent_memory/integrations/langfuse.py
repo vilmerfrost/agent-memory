@@ -959,7 +959,7 @@ class LangfuseSink:
 
     def batches(self, conn: psycopg.Connection, watermarks: Mapping[str, str], *, replay: bool) -> Iterator[Batch]:
         mark = "" if replay else watermarks.get(TABLE, "")
-        egress.use_team_names(egress.team_names(conn))      # Mission 004C: sensitive() denies team repos too
+        egress.use_team_names(egress.team_names(conn))      # Mission 004C: sensitive() denies team/private repos too
         self.skipped = []
         for wm, path in self._logs():
             if wm <= mark:

@@ -810,6 +810,23 @@ def test_egress_deny_terms_and_team_repos_are_sensitive(app: str, pg_url: str, t
         assert [why for _, why in sink.refused] == ["case looks sensitive"]       # run B: its identity names the repo
 
 
+def test_private_repo_names_are_sensitive_too(app: str, pg_url: str, tmp_path: Path,
+                                              monkeypatch: pytest.MonkeyPatch) -> None:
+    """Mission 004C (F8): sandbox runs carry no repo, so nothing is masked by ownership here; but the names the sink
+    reads now include repos of unknown ownership (private), never an own repo's name."""
+    monkeypatch.setattr(egress, "_team", egress.NONE)                     # restored after the test
+    with psycopg.connect(pg_url, autocommit=True) as conn:
+        for sid, name, meta in (("lf-private", "client-notes", "{}"),
+                                ("lf-own", "agent-memory", '{"team": false, "remote_owner": "vilmerfrost"}')):
+            conn.execute("insert into sessions (session_id, kind, project_dir, repo, project, transcript_bytes, env, meta) "
+                         "values (%s, 'chat', '/lf-test', %s, %s, 1, 'prod', %s::jsonb)", (sid, name, name, meta))
+    assert not L.sensitive("client-notes-tuned")                                     # not read yet
+    with MockService() as svc, psycopg.connect(app) as conn:
+        FakeLangfuse(svc)
+        assert sync.run(L.LangfuseSink(client_for(svc), tmp_path), conn, environ={}).status == "ok"
+    assert L.sensitive("client-notes-tuned") and not L.sensitive("agent-memory-tuned")
+
+
 def test_since_skips_runs_that_started_before_it(app: str, tmp_path: Path) -> None:
     """Mission 004C (F4): `--since`. The _tree runs started on 2026-10-16."""
     _tree(tmp_path)

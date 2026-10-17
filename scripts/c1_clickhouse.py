@@ -22,8 +22,8 @@ Steps, each timed, into one JSON report (default: next to gold.json, c1-report.j
   sync_rerun    a second run: status ok, and the FINAL counts are unchanged (re-sent rows deduplicate)
   grants        `amem sync grants --sink clickhouse`: read and insert allowed; DDL, users, grants denied
   failure_path  a run against a bad host (no credentials sent): `unavailable`, the cursor unchanged
-  team_masking  sessions and skill_calls: project/repo is 'team' exactly on the gold team rows, else a
-                pseudonym (p_<16 hex>) or null
+  team_masking  sessions and skill_calls: project/repo is 'team' exactly on the gold team rows, 'private' exactly
+                on the gold private rows (unknown ownership, Mission 004C F8), else a pseudonym (p_<16 hex>) or null
   leak_scan     as the writer, per table: rows whose toString(tuple(*)) holds a ZZLEAK marker, an sk-ant- key
                 or an @example.com address: 0
 
@@ -66,7 +66,8 @@ PLAN = {
     "sync_rerun": "a second sync run: status ok; FINAL counts unchanged",
     "grants": "amem sync grants --sink clickhouse: 11 probes ok (read/insert allowed, DDL/users/grants denied)",
     "failure_path": f"sync run against {BAD_URL} (no credentials): unavailable, cursor unchanged",
-    "team_masking": "sessions/skill_calls project ('team' only on gold team rows, else p_<hex> or null)",
+    "team_masking": "sessions/skill_calls project ('team'/'private' only on gold team/private rows, else p_<hex> "
+                    "or null)",
     "leak_scan": "per table: count rows whose toString(tuple(*)) contains " + ", ".join(NEEDLES) + " -> 0",
 }
 
@@ -252,30 +253,32 @@ def run_c1(db_url: str, gold: Mapping[str, Any], *, environ: Mapping[str, str] |
                 {"status": rep.status, "detail": rep.detail[:200]}
 
         def team_masking() -> tuple[bool, str, dict[str, Any]]:
-            team = set(gold["team"].get("sessions", []))
-            team_calls = set(gold["team"].get("skill_calls", []))
+            # Mission 004C (F8): a gold private row (unknown ownership) ships 'private', a team row 'team', every
+            # other row a pseudonym or null
+            masks = {"team": gold["team"], "private": gold.get("private", {})}
+            want = {t: {i: m for m, rows in masks.items() for i in rows.get(t, [])} for t in ("sessions", "skill_calls")}
             bad = []
             sess = client.select(f"SELECT id, project, repo FROM {cfg.db}.sessions FINAL FORMAT JSONEachRow", {})
-            for r in sess:
-                for col in ("project", "repo"):
-                    v = r.get(col)
-                    if r["id"] in team and v != "team":
-                        bad.append(f"sessions {r['id']}.{col}={v!r} (team row)")
-                    elif r["id"] not in team and not (v is None or PSEUDO_RE.fullmatch(str(v))):
-                        bad.append(f"sessions {r['id']}.{col} is neither a pseudonym nor null")
             calls = client.select(f"SELECT id, project FROM {cfg.db}.skill_calls FINAL FORMAT JSONEachRow", {})
-            for r in calls:
-                v = r.get("project")
-                if r["id"] in team_calls and v != "team":
-                    bad.append(f"skill_calls {r['id']}.project={v!r} (team row)")
-                elif r["id"] not in team_calls and not (v is None or PSEUDO_RE.fullmatch(str(v))):
-                    bad.append(f"skill_calls {r['id']}.project is neither a pseudonym nor null")
-            n_team = sum(r.get("project") == "team" for r in sess)
-            n_calls = sum(r.get("project") == "team" for r in calls)
-            ok = not bad and n_team == ch_gold["team"]["sessions"] and n_calls == ch_gold["team"]["skill_calls"]
+            for t, rows, cols in (("sessions", sess, ("project", "repo")), ("skill_calls", calls, ("project",))):
+                for r in rows:
+                    for col in cols:
+                        v, m = r.get(col), want[t].get(r["id"])
+                        if m and v != m:
+                            bad.append(f"{t} {r['id']}.{col}={v!r} ({m} row)")
+                        elif not m and not (v is None or PSEUDO_RE.fullmatch(str(v))):
+                            bad.append(f"{t} {r['id']}.{col} is neither a pseudonym nor null")
+            n = {(t, m): sum(r.get("project") == m for r in rows)
+                 for t, rows in (("sessions", sess), ("skill_calls", calls)) for m in masks}
+            priv = ch_gold.get("private", {})
+            ok = not bad and n["sessions", "team"] == ch_gold["team"]["sessions"] \
+                and n["skill_calls", "team"] == ch_gold["team"]["skill_calls"] \
+                and n["sessions", "private"] == priv.get("sessions", 0) \
+                and n["skill_calls", "private"] == priv.get("skill_calls", 0)
             pseudo = sum(1 for r in sess if r.get("project") and PSEUDO_RE.fullmatch(str(r["project"])))
-            return ok, f"team sessions {n_team}, team skill_calls {n_calls}, pseudonymous sessions {pseudo}" + \
-                (f"; {bad[:3]}" if bad else ""), {"problems": bad[:20]}
+            return ok, (f"team sessions {n['sessions', 'team']}, team skill_calls {n['skill_calls', 'team']}, "
+                        f"private sessions {n['sessions', 'private']}, private skill_calls {n['skill_calls', 'private']}, "
+                        f"pseudonymous sessions {pseudo}") + (f"; {bad[:3]}" if bad else ""), {"problems": bad[:20]}
 
         def leak_scan() -> tuple[bool, str, dict[str, Any]]:
             needles = "[" + ", ".join(f"'{n}'" for n in NEEDLES) + "]"

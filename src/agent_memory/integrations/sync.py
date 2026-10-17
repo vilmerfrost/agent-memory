@@ -299,7 +299,9 @@ def plan(sink: Sink, conn: psycopg.Connection, *, replay: bool = False,
          environ: Mapping[str, str] | None = None) -> dict[str, Any]:
     """A dry run: what the next `run` (or a `--replay` backfill) would send, per table, against the
     client-side daily limits. Read-only: the connection is put in read-only mode, health() is not called
-    (it may wake or write to the provider) and nothing is pushed. A sink may price batches with cost()."""
+    (it may wake or write to the provider) and nothing is pushed. A sink may price batches with cost(), and
+    report `masked` (Mission 004C, F8): rows masked (ClickHouse) or withheld (past.dev) as team and as private,
+    per table with own, and the owner accounts used, so the owner can review them before a backfill."""
     conn.read_only = True
     try:
         return _plan(sink, conn, replay=replay, environ=environ)
@@ -331,6 +333,9 @@ def _plan(sink: Sink, conn: psycopg.Connection, *, replay: bool,
         v = getattr(sink, attr, None)
         if isinstance(v, list):
             out[attr] = len(v)
+    masked = getattr(sink, "masked", None)      # Mission 004C (F8): rows masked or withheld as team vs private
+    if isinstance(masked, dict):
+        out["masked"] = masked
     if any("cost" in t for t in tables.values()):
         out["cost"] = sum(t.get("cost", 0) for t in tables.values())
     return out

@@ -87,12 +87,16 @@ def _artifact(c: psycopg.Connection, n: int) -> str:
 def seed(db: Db, t: Text = plain) -> dict[str, str]:
     """One of each record (personal), plus a team proposal and a team edit. Returns the amem: refs."""
     T = t
+    repos: dict[str, str] = {}
     with psycopg.connect(db.admin, autocommit=True) as c:
         for sid, team in (("pd-s1", False), ("pd-team", True)):
+            # pd-s1: an own session as ingestion stores one (Mission 004C, F8: unknown ownership is private)
+            owner = {} if team else {"remote_owner": "vilmerfrost"}
+            repos[sid] = T("sessions.repo", "pipeline-poc" if team else "agent-memory")
             c.execute("insert into sessions (session_id, kind, repo, project_dir, transcript_bytes, env, meta) "
                       "values (%s,'chat',%s,%s,1,'prod',%s)",
-                      (sid, T("sessions.repo", "pipeline-poc" if team else "agent-memory"),
-                       T("sessions.project_dir", "-Users-x"), Jsonb({"team": team, "note": T("sessions.meta", "x")})))
+                      (sid, repos[sid], T("sessions.project_dir", "-Users-x"),
+                       Jsonb({"team": team, **owner, "note": T("sessions.meta", "x")})))
         devs = []
         for sid in ("pd-s1", "pd-team"):
             devs.append(str(c.execute(
@@ -163,7 +167,7 @@ def seed(db: Db, t: Text = plain) -> dict[str, str]:
             "insert into lessons (slug, title, rule, scope_repo, scope_task, evidence, evals, promoted_to) "
             "values (%s,%s,%s,%s,%s,%s,%s,%s) returning id",
             (T("lessons.slug", "quote-globs"), T("lessons.title", "Quote globs in zsh"), T("lessons.rule", "quote"),
-             T("lessons.scope_repo", "agent-memory"), T("lessons.scope_task", "t"), T("lessons.evidence", "e"),
+             repos["pd-s1"], T("lessons.scope_task", "t"), T("lessons.evidence", "e"),       # an own repo (F8)
              T("lessons.evals", "v"), T("lessons.promoted_to", "p"))).fetchone()[0])
         c.execute("insert into lesson_candidates (run_id, decision, reason, lesson_id) values (%s,'accept',%s,%s)",
                   (run, T("lesson_candidates.reason", "gate 0.8"), les))
@@ -645,6 +649,42 @@ def test_a_lesson_from_a_team_repo_is_a_team_item(db: Db, pdev: FakePastDev) -> 
         assert ref not in sent and (ref, ["team"]) in s.refused, ref
     assert own in sent and refs_["lesson"] in sent
     assert "pipeline-poc" not in "\n".join(r.body.decode() for r in pdev.svc.requests)
+
+
+def test_records_tied_to_a_repo_of_unknown_ownership_are_private(db: Db, pdev: FakePastDev) -> None:
+    """Mission 004C (F8): a proposal, its decision, an edit or a lesson tied to a session or repo that is not
+    positively the owner's is refused like a team item, and the private repo's name is a deny term."""
+    refs_ = seed(db)
+    db.sql("insert into sessions (session_id, kind, repo, project, project_dir, transcript_bytes, env, meta) "
+           "values ('pd-private', 'chat', 'client-notes', 'client-notes', '-x', 1, 'prod', '{}')")       # no remote
+    dev = str(db.sql("insert into deviations (source_key, session_id, instruction_source, instruction_ref, what, why, "
+                     "how, followed_grade, result_grade, rule_id, rule_title) values ('dev:pd-private', 'pd-private', "
+                     "'claude-md:global', 'r', 'w', 'y', 'h', 0.2, 0.5, 'shell-habits', 'Shell') returning id")[0][0])
+    db.sql("update rsi_proposals set evidence_refs = evidence_refs || %s::text[] where id = %s",
+           ([f"amem:deviation/{dev}"], refs_["proposal"].split("/")[1]))
+    db.sql("update edits set deviation_ids = deviation_ids || %s::uuid[] where id = %s", ([dev], refs_["edit"].split("/")[1]))
+    with psycopg.connect(db.admin, autocommit=True) as c:          # a proposal citing a session that does not exist
+        ghost = str(c.execute("insert into rsi_proposals (artifact_hash, title, summary, evidence_refs, targets, status) "
+                              "values (%s, 'Ghost', 'quote globs', %s, %s, 'promoted') returning id",
+                              (_artifact(c, 9), ["amem:session/pd-gone"], ["~/.claude/CLAUDE.md"])).fetchone()[0])
+    by_scope = _lesson(db, "unknown-scope", "accept", run_meta={}, scope_repo="client-notes")
+    by_run = _lesson(db, "unknown-run-repo", "reject", run_meta={"repo": "never-ingested"}, scope_repo=None)
+    global_lesson = _lesson(db, "no-repo", "accept", run_meta={}, scope_repo=None)        # tied to no repo: own
+    named = str(db.sql("insert into edits (status, instruction_source, rule_id, why) values "
+                       "('kept', 'claude-md:global', 'x', 'port the client-notes exporter') returning id")[0][0])
+    s = sink(pdev)
+    with psycopg.connect(db.app) as conn:
+        assert sync.run(s, conn, environ={}).status == "ok"
+        corpus = dict(PD.corpus(conn))
+    private = (refs_["proposal"], refs_["decision"], refs_["edit"], f"amem:proposal/{ghost}", by_scope, by_run)
+    for ref in private:
+        assert (ref, ["private"]) in s.refused and ref not in pdev.sent_ids() and ref not in corpus, ref
+    assert (f"amem:edit/{named}", ["deny"]) in s.refused                        # the private repo's name never leaves
+    assert {refs_["experiment"], refs_["lesson"], global_lesson} <= set(pdev.sent_ids())       # own: still sent
+    assert "client-notes" not in "\n".join(r.body.decode() for r in pdev.svc.requests)
+    assert s.masked["tables"]["rsi_proposals"] == {"own": 0, "team": 1, "private": 2}
+    assert s.masked["tables"]["lesson_candidates"] == {"own": 2, "team": 0, "private": 2}
+    assert (s.masked["team"], s.masked["private"], s.masked["owner_accounts"]) == (2, 6, ["vilmerfrost"])
 
 
 def test_a_record_naming_a_denied_term_is_refused(db: Db, pdev: FakePastDev) -> None:

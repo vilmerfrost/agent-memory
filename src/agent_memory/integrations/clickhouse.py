@@ -11,7 +11,9 @@ null, so free text in a label column cannot leak. A row whose key is not a valid
 `ch:<table>/<id>` always maps 1:1 to `amem:<entity>/<id>` and no rsi_evidence link is written per row.
 Mission 004C: a label, id or pseudonym value that matches the egress deny list (egress.py: AMEM_EGRESS_DENY
 plus every team repo and project in Supabase) or is email-shaped ships as null, and a row whose key does
-is dropped; a deviation's repo-scoped instruction source is masked (see REPO_PREFIXES).
+is dropped; a deviation's repo-scoped instruction source is masked (see REPO_PREFIXES). F8: unknown repo
+ownership is private (egress.py): a session, deviation or skill call that is not positively own ships
+`private` (or `team`) for its project, repo and repo-scoped source, never a pseudonym (see `_SESSION_CLASS`).
 
 Shape. Database `amem` (AMEM_CLICKHOUSE_DB), one `ReplacingMergeTree(version)` table per entity,
 `ORDER BY id`, `SETTINGS non_replicated_deduplication_window = 1000` (a plain MergeTree keeps no insert
@@ -229,6 +231,8 @@ class Table:
     lookback: bool = True       # False for append-only tables
     source: str = ""            # the Supabase table when it differs from `name` (Mission 004B: research_runs)
     where: str = ""             # a fixed SQL filter on the source rows
+    owner: str = ""             # SQL: the row's ownership class (egress.class_sql), selected as `_own` (F8)
+    rule_of: tuple[str, str] = ()   # (source col, rule col): the rule ships null when the source is masked
 
     @property
     def src(self) -> str:
@@ -248,18 +252,27 @@ def _cols(spec: str, **exprs: str) -> tuple[Col, ...]:
     return tuple(out)
 
 
-# Project and repo names are not sent as such (Mission 004B: ClickHouse Cloud is a third party). A team row
-# (an employer repo: sessions.meta.team, see sessions_ingest) sends the literal 'team'; any other value becomes
-# a keyed pseudonym (HMAC-SHA256 with AMEM_PSEUDONYM_KEY, which never leaves the Mac). No key: null.
-_TEAM_MASK = "case when meta ->> 'team' = 'true' then 'team' else {col} end"
-_SKILL_TEAM_MASK = ("case when exists (select 1 from sessions s where s.session_id = skill_calls.session_id "
-                    "and s.meta ->> 'team' = 'true') then 'team' else project end")
+# Project and repo names are not sent as such (Mission 004B: ClickHouse Cloud is a third party). Each row of a
+# table with an `owner` expression gets its ownership class (egress.py: own | team | private; Mission 004C, F8)
+# as the hidden column `_own`. Only an own row ships a project or repo, and only as a keyed pseudonym (HMAC-SHA256
+# with AMEM_PSEUDONYM_KEY, which never leaves the Mac; no key: null). A team or private row ships the literal
+# 'team' or 'private', decided by `_own`, never by the value: a real project named `team` or `private` is
+# pseudonymized like any other (F9). The SQL already nulls the name of a non-own row, so it never leaves Postgres.
+# Skill calls take their session's class; a call no session matched is private (F7), and its skill label (like
+# any non-own call's) ships only when the skill was also called in an own session: a skill seen only in team or
+# private work may be a repo's own skill.
+_SESSION_CLASS = egress.class_sql("meta")
+_SKILL_CLASS = (f"coalesce((select {egress.class_sql('s.meta')} from sessions s "
+                f"where s.session_id = skill_calls.session_id), 'private')")
+_OWN_ONLY = "case when {cls} = 'own' then {col} end"
+_OWN_SKILL = (f"case when {_SKILL_CLASS} = 'own' or exists (select 1 from skill_calls k join sessions s "
+              f"on s.session_id = k.session_id where k.skill = skill_calls.skill and {egress.class_sql('s.meta')} = 'own') "
+              "then skill end")
 PSEUDONYM_ENV = "AMEM_PSEUDONYM_KEY"
 
 
 def pseudonym(value: str, environ: Mapping[str, str] | None = None) -> str | None:
-    if value == "team":
-        return "team"
+    """A keyed pseudonym `p_<16 hex>` of any value, `team` and `private` included (F9). No key: None."""
     key = ((os.environ if environ is None else environ).get(PSEUDONYM_ENV) or "").strip()
     if len(key) < 32:
         return None
@@ -268,8 +281,9 @@ def pseudonym(value: str, environ: Mapping[str, str] | None = None) -> str | Non
 
 # Mission 004C (F1): a deviation's instruction source names a repo when it is a repo's own file
 # (`claude-md:<repo>`, `agents-md:<repo>`; deviations.repo_scoped), and its rule_id is a slug of a heading in
-# that file. A team row sends `<prefix>:team` and no rule_id; any other repo-scoped source sends
-# `<prefix>:<pseudonym of the repo>` (no key: null). Global, skill, agent and routine sources stay as they are.
+# that file. A team or private row (F8: the deviation's or its session's class; no session: private) sends
+# `<prefix>:team` / `<prefix>:private` and no rule_id; an own row sends `<prefix>:<pseudonym of the repo>`
+# (no key: null), whatever the repo is called (F9). Global, skill, agent and routine sources stay as they are.
 REPO_PREFIXES = ("claude-md", "agents-md")
 _GLOBAL_SOURCES = frozenset(f"{p}:global" for p in REPO_PREFIXES)
 _PSEUDO_RE = re.compile(r"p_[0-9a-f]{16}")
@@ -282,20 +296,21 @@ def repo_scoped(source: str) -> bool:
 
 _DEV_REPO_SCOPED = ("((starts_with(instruction_source, 'claude-md:') or starts_with(instruction_source, 'agents-md:')) "
                     "and instruction_source not in ('claude-md:global', 'agents-md:global'))")
-_DEV_TEAM = ("(meta ->> 'team' = 'true' or exists (select 1 from sessions s where s.session_id = deviations.session_id "
-             "and s.meta ->> 'team' = 'true'))")
-_DEV_SOURCE = (f"case when {_DEV_REPO_SCOPED} and {_DEV_TEAM} then split_part(instruction_source, ':', 1) || ':team' "
-               "else instruction_source end")
-_DEV_RULE = f"case when {_DEV_REPO_SCOPED} and {_DEV_TEAM} then null else rule_id end"
+_DEV_CLASS = (f"(case when deviations.meta ->> 'team' = 'true' then 'team' else coalesce((select "
+              f"{egress.class_sql('s.meta')} from sessions s where s.session_id = deviations.session_id), 'private') end)")
+_DEV_SOURCE = (f"case when {_DEV_REPO_SCOPED} and {_DEV_CLASS} <> 'own' then split_part(instruction_source, ':', 1) "
+               f"|| ':' || {_DEV_CLASS} else instruction_source end")
+_DEV_RULE = f"case when {_DEV_REPO_SCOPED} and {_DEV_CLASS} <> 'own' then null else rule_id end"
 
 
-def source_value(source: str, environ: Mapping[str, str] | None = None) -> str | None:
-    """An instruction source as ClickHouse holds it: a repo-scoped source's repo becomes its pseudonym."""
+def source_value(source: str, environ: Mapping[str, str] | None = None, cls: str = egress.OWN) -> str | None:
+    """An instruction source as ClickHouse holds it: a repo-scoped source of an own row gets the pseudonym of its
+    repo (always: a repo named `team` too, F9); of a team or private row, the mask (`<prefix>:<class>`)."""
     if not repo_scoped(source):
         return source
     prefix, repo = source.split(":", 1)
-    if repo == "team" or _PSEUDO_RE.fullmatch(repo):
-        return source
+    if cls != egress.OWN:
+        return f"{prefix}:{cls if cls in egress.MASKS else egress.PRIVATE}"
     p = pseudonym(repo, environ)
     return f"{prefix}:{p}" if p else None
 
@@ -303,12 +318,13 @@ def source_value(source: str, environ: Mapping[str, str] | None = None) -> str |
 def rule_param(rule: str, environ: Mapping[str, str] | None = None) -> str:
     """A rule key (`<source>:<rule_id>`) as ClickHouse holds it, so `rule` filters keep working on the Mac's
     names: `claude-md:agent-memory:x` -> `claude-md:p_...:x`. A key that already holds a pseudonym (from an
-    earlier answer), `team` or `global` is sent as it is. Raises ValueError without a pseudonym key."""
+    earlier answer), a mask (`team`, `private`) or `global` is sent as it is. Raises ValueError without a
+    pseudonym key."""
     prefix, sep, rest = rule.partition(":")
     if not sep or prefix not in REPO_PREFIXES:
         return rule
     repo, sep2, tail = rest.partition(":")
-    if repo in ("global", "team") or _PSEUDO_RE.fullmatch(repo):
+    if repo in ("global", *egress.MASKS) or _PSEUDO_RE.fullmatch(repo):
         return rule
     p = pseudonym(repo, environ)
     if p is None:
@@ -333,7 +349,9 @@ TABLES: tuple[Table, ...] = (
                 "ts:created_at,started_at,ended_at,last_activity_at,outcome_at "
                 "int:transcript_bytes,turns,tokens_input,tokens_output,tokens_cache_read,tokens_cache_creation "
                 "float:duration_seconds,active_seconds,api_seconds,tool_seconds int:lines_added,lines_removed",
-                id="session_id", project=_TEAM_MASK.format(col="project"), repo=_TEAM_MASK.format(col="repo"))),
+                id="session_id", project=_OWN_ONLY.format(cls=_SESSION_CLASS, col="project"),
+                repo=_OWN_ONLY.format(cls=_SESSION_CLASS, col="repo")),
+          owner=_SESSION_CLASS),
     Table("runs", "id", "created_at", "greatest(created_at, finished_at)",
           _cols("id:id label:routine,source,status ts:started_at,finished_at,created_at float:duration_s",
                 duration_s="extract(epoch from finished_at - started_at)")),
@@ -341,12 +359,14 @@ TABLES: tuple[Table, ...] = (
           _cols("id:id,session_id source:instruction_source label:rule_id id:instruction_sha int:turn "
                 "float:followed_grade,result_grade,objective_result label:result_outcome,jev_verdict "
                 "float:jev_confidence label:jev_mode,writer_model ts:created_at",
-                instruction_source=_DEV_SOURCE, rule_id=_DEV_RULE)),
+                instruction_source=_DEV_SOURCE, rule_id=_DEV_RULE),
+          owner=_DEV_CLASS, rule_of=("instruction_source", "rule_id")),
     Table("scores", "id", "created_at", "created_at",
           _cols("id:id,run_id label:question,kind float:value_num,confidence label:jev_mode ts:created_at")),
     Table("skill_calls", "id", "created_at", "created_at",
           _cols("id:id ts:ts label:skill,invoked_by,agent pseudo:project bool:backfill id:session_id ts:created_at",
-                project=_SKILL_TEAM_MASK)),
+                project=_OWN_ONLY.format(cls=_SKILL_CLASS, col="project"), skill=_OWN_SKILL),
+          owner=_SKILL_CLASS),
     Table("rsi_proposals", "id", "created_at", "greatest(created_at, decided_at, promoted_at, reverted_at)",
           _cols("id:id,artifact_hash,experiment_id,candidate_id label:status float:confidence "
                 "ts:created_at,expires_at,decided_at,promoted_at,reverted_at")),
@@ -509,11 +529,17 @@ def _is_id(s: str) -> bool:
 _TEXT_KINDS = frozenset({"label", "pseudo", "source", "id"})
 
 
-def _value(kind: str, v: Any, deny: egress.Deny = egress.NONE) -> Any:
+def _value(kind: str, v: Any, deny: egress.Deny = egress.NONE, cls: str = egress.OWN) -> Any:
+    """One value as it may leave. `cls`: the row's ownership class (F8); a team or private row's pseudo column
+    ships the mask, and its repo-scoped source `<prefix>:<mask>`, whatever the value (F9)."""
+    if kind == "pseudo" and cls != egress.OWN:
+        return cls if cls in egress.MASKS else egress.PRIVATE
     if v is None:
         return None
     if kind in _TEXT_KINDS:             # Mission 004C (F3): a denied or email-shaped value never leaves, as is
         s = str(v)                      # or as a pseudonym: it ships as null
+        if kind == "source" and cls != egress.OWN and repo_scoped(s):
+            return source_value(s, cls=cls)
         if deny.match(s) or egress.email_like(s):
             return None
     if kind == "label":
@@ -536,12 +562,25 @@ def _value(kind: str, v: Any, deny: egress.Deny = egress.NONE) -> Any:
     raise ValueError(f"unknown column kind {kind!r}")
 
 
+def row_class(t: Table, raw: Mapping[str, Any]) -> str | None:
+    """The row's ownership class from its `_own` column (F8); None for a table without ownership. A table with
+    ownership whose row lacks a known class is private."""
+    if not t.owner:
+        return None
+    c = raw.get("_own")
+    return c if c in egress.CLASSES else egress.PRIVATE
+
+
 def map_row(t: Table, raw: Mapping[str, Any], version: int, deny: egress.Deny = egress.NONE) -> dict[str, Any] | None:
     """The allowlist mapper: only t.cols, each coerced by kind; None when the key is not a valid id, or is
-    denied or email-shaped (egress)."""
-    out = {c.name: _value(c.kind, raw.get(c.name), deny) for c in t.cols}
+    denied or email-shaped (egress). A team or private row's project/repo and repo-scoped source are masks, and
+    the rule of a masked source is null (F8)."""
+    cls = row_class(t, raw) or egress.OWN
+    out = {c.name: _value(c.kind, raw.get(c.name), deny, cls) for c in t.cols}
     if not out.get("id"):
         return None
+    if t.rule_of and cls != egress.OWN and repo_scoped(str(raw.get(t.rule_of[0]) or "")):
+        out[t.rule_of[1]] = None
     out["version"] = version
     return out
 
@@ -595,7 +634,7 @@ class ClickHouseSink:
 
     def __init__(self, client: Client | None = None, *, batch_size: int = BATCH_SIZE, lookback_days: int | None = None,
                  now: Callable[[], datetime] | None = None, tables: Sequence[Table] = TABLES, auto_schema: bool = True,
-                 since: datetime | None = None):
+                 since: datetime | None = None, owners: Sequence[str] | None = None):
         self.client = client if client is not None else Client()
         self.batch_size = batch_size
         self.lookback_days = self.client.cfg.lookback_days if lookback_days is None else lookback_days
@@ -607,6 +646,11 @@ class ClickHouseSink:
         self.auto_schema = auto_schema and not self.client.cfg.cloud      # Cloud: the owner runs the DDL once
         self._schema_ready = False
         self.deny = egress.NONE         # the egress deny list, read at the start of every batches() call
+        # Mission 004C (F8): the owner accounts (egress.owner_accounts, read at the start of every batches() call
+        # unless given) and, per table, the mapped rows by ownership class (`amem sync plan` shows them).
+        self._owners = tuple(owners) if owners is not None else None
+        self.owners: tuple[str, ...] = ()
+        self.ownership: dict[str, dict[str, int]] = {}
 
     @property
     def replay_scope(self) -> frozenset[str] | None:
@@ -627,7 +671,9 @@ class ClickHouseSink:
 
     def batches(self, conn: psycopg.Connection, watermarks: Mapping[str, str], *, replay: bool) -> Iterator[Batch]:
         version = next_version()
-        self.deny = egress.load(conn)
+        self.owners = self._owners if self._owners is not None else egress.owner_accounts()
+        self.deny = egress.env_terms() | egress.team_names(conn, owners=self.owners)
+        self.ownership = {}
         since = None if replay or self.lookback_days <= 0 else self._now() - timedelta(days=self.lookback_days)
         if since is not None and self.since is not None:
             since = max(since, self.since)
@@ -646,9 +692,15 @@ class ClickHouseSink:
                upto: Mark | None = None) -> Iterator[list[dict[str, Any]]]:
         changed = sql.SQL(t.changed)
         key = sql.SQL('{}::text collate "C"').format(sql.Identifier(t.key))
-        cols = sql.SQL(", ").join(
-            sql.SQL("{} as {}").format(sql.SQL(c.expr) if c.expr else sql.Identifier(c.name), sql.Identifier(c.name))
-            for c in t.cols)
+
+        def expr(text: str) -> sql.SQL:             # the owner accounts are bound here (validated names only)
+            return sql.SQL(egress.bind_owners(text, self.owners))
+
+        parts = [sql.SQL("{} as {}").format(expr(c.expr) if c.expr else sql.Identifier(c.name), sql.Identifier(c.name))
+                 for c in t.cols]
+        if t.owner:
+            parts.append(sql.SQL("{} as _own").format(expr(t.owner)))
+        cols = sql.SQL(", ").join(parts)
         while True:
             conds: list[sql.Composable] = [sql.SQL(t.where)] if t.where else []
             args: list[Any] = []
@@ -675,8 +727,26 @@ class ClickHouseSink:
             after = (rows[-1]["_changed"], rows[-1]["_key"])
 
     def _batch(self, t: Table, rows: Sequence[Mapping[str, Any]], version: int, mark: Mark) -> Batch:
-        mapped = [m for m in (map_row(t, r, version, self.deny) for r in rows) if m is not None]
+        mapped = []
+        for r in rows:
+            m = map_row(t, r, version, self.deny)
+            if m is None:
+                continue
+            mapped.append(m)
+            cls = row_class(t, r)
+            if cls is not None:
+                n = self.ownership.setdefault(t.name, dict.fromkeys(egress.CLASSES, 0))
+                n[cls] += 1
         return Batch(t.name, mapped, format_mark(mark), key=token_of(t.name, body_of(mapped)) if mapped else "")
+
+    @property
+    def masked(self) -> dict[str, Any]:
+        """Rows of the last batches() call masked as team and as private, in total and per table (with own), for
+        `amem sync plan` (F8). A lookback re-send counts again, as in the plan's row counts."""
+        return {egress.TEAM: sum(n[egress.TEAM] for n in self.ownership.values()),
+                egress.PRIVATE: sum(n[egress.PRIVATE] for n in self.ownership.values()),
+                "tables": {t: dict(n) for t, n in sorted(self.ownership.items())},
+                "owner_accounts": list(self.owners)}
 
     def split(self, batch: Batch) -> list[Batch]:
         """One row per batch, each with its own dedup token (sync dead-letters only the refused rows)."""

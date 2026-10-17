@@ -104,6 +104,33 @@ def test_tables_and_since_narrow_plan_and_run(app: str, tmp_path: Any, monkeypat
     assert rep["status"] == "unavailable" and rep["scope"] == {"tables": ["runs"], "since": "2026-10-01"}
 
 
+def test_plan_counts_rows_masked_as_team_and_private(app: str, pg_url: str, monkeypatch: pytest.MonkeyPatch,
+                                                    capsys: pytest.CaptureFixture[str]) -> None:
+    """Mission 004C (F8): the owner reviews team vs private masking before a backfill."""
+    from agent_memory.integrations import http
+    monkeypatch.setattr(http, "request", lambda *a, **k: pytest.fail("plan must not call the provider"))
+    with psycopg.connect(pg_url, autocommit=True) as conn:
+        for sid, meta in (("cli-int-own", '{"team": false, "remote_owner": "vilmerfrost"}'),
+                          ("cli-int-team", '{"team": true}')):
+            conn.execute("insert into sessions (session_id, kind, project_dir, transcript_bytes, env, meta) values "
+                         "(%s, 'chat', '/x', 1, 'prod', %s::jsonb) on conflict do nothing", (sid, meta))
+    try:
+        out = _plan(capsys, "--sink", "clickhouse", "--tables", "sessions")
+        n = out["masked"]["tables"]["sessions"]
+        assert n["own"] >= 1 and n["team"] >= 1 and n["private"] >= 1          # cli-int-s1: no ownership stored
+        assert out["masked"]["owner_accounts"] == ["vilmerfrost"] and out["masked"]["private"] == n["private"]
+        monkeypatch.setenv("AMEM_OWNER_ACCOUNTS", "someone-else")
+        assert _plan(capsys, "--sink", "clickhouse", "--tables", "sessions")["masked"]["tables"]["sessions"]["own"] == 0
+        assert "team" in _plan(capsys, "--sink", "pastdev")["masked"]
+        capsys.readouterr()
+        assert cli.main(["sync", "plan", "--sink", "clickhouse", "--replay", "--tables", "sessions"]) == 0
+        text = capsys.readouterr().out
+        assert "masked: team=" in text and "private=" in text and "(owner accounts: someone-else)" in text
+    finally:
+        with psycopg.connect(pg_url, autocommit=True) as conn:
+            conn.execute("delete from sessions where session_id in ('cli-int-own', 'cli-int-team')")
+
+
 @pytest.mark.parametrize("sink", ["clickhouse", "langfuse", "pastdev"])
 def test_plan_is_a_read_only_dry_run(app: str, sink: str, tmp_path: Any, monkeypatch: pytest.MonkeyPatch,
                                      capsys: pytest.CaptureFixture[str]) -> None:

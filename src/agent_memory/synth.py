@@ -8,8 +8,15 @@ Nothing here is real. Every row is synthetic and says so: `meta.synthetic` where
 `synth-claude-opus`, routines `synth-nightly-deviations`, rule ids `synth-...` or skill `synth-debugging`).
 
 The story, ending the day before the anchor date (UTC):
-- 11 production sessions (6 Claude, 3 Codex, 2 team-flagged work sessions in `pipeline-poc`) and 2 sandbox
-  sessions (the two runs of experiment exp-20261017-c2synth, arms A and B, case a-split, rep 0).
+- 14 production sessions (6 Claude and 3 Codex in the owner's own repos, 2 team-flagged work sessions in
+  `pipeline-poc`, and 3 of unknown ownership in `client-notes`: no remote, a non-GitHub remote ingestion read no
+  owner from, and an owner that is not an owner account) and 2 sandbox sessions (the two runs of experiment
+  exp-20261017-c2synth, arms A and B, case a-split, rep 0).
+- Ownership (Mission 004C, F8; egress.py) is stored as sessions_ingest stores it: own sessions carry
+  `team: false` and `remote_owner` = the default owner account, team sessions `team: true`, private ones no team
+  flag or an unknown owner. Private rows ship `private` to ClickHouse (project, repo, a repo-scoped rule source
+  `claude-md:private` with no rule id, a repo-local skill label as null) and never reach past.dev (an edit on a
+  private deviation, a lesson scoped to the private repo). The unmatched skill call is private too (F7).
 - Rule R1 `skill:synth-debugging:reproduce-before-fix` is failed again and again: 10 deviations in 7 prod
   sessions, 4 Claude and 3 Codex. R2 (`claude-md:global:synth-quote-globs`) is broken without harm; R3 (Codex
   only) is rare.
@@ -17,16 +24,16 @@ The story, ending the day before the anchor date (UTC):
   experiment exp-20261017-c2synth -> eval results (no-effect on Claude, worse on Codex) -> a reject decision.
   The experiment's two sandbox runs are linked in rsi_evidence to the two synthetic Langfuse traces that C2
   created (trace id = refs.trace_id(refs.run_key(...))): arm A passed, arm B failed with tool errors.
-- Runs (a nightly routine on a fail streak, an ingest, a lessons harvest), scores, skill calls, a lesson and
-  two lesson decisions, a team proposal and edit (never sent to past.dev), one NCM research run.
+- Runs (a nightly routine on a fail streak, an ingest, a lessons harvest), scores, skill calls, two lessons and
+  three lesson decisions, a team proposal and edit (never sent to past.dev), one NCM research run.
 
 Leak markers. Every text and identifying column (titles, summaries, prompts, paths, emails, person, repo and
 branch names, a fake `sk-ant-` key, jsonb) holds a unique marker `ZZLEAK-<nnnn>`. Label and id columns (which
 ClickHouse receives by design) never hold one. Each marker has a policy:
     strict          must never leave Supabase (ClickHouse, Langfuse, past.dev)
-    decision_text   a non-team decision record's text: past.dev receives it after sanitizing, by design;
-                    ClickHouse and Langfuse never do
-gold.json lists every marker with its table, column, row key, policy and team flag.
+    decision_text   a non-team, non-private decision record's text: past.dev receives it after sanitizing, by
+                    design; ClickHouse and Langfuse never do
+gold.json lists every marker with its table, column, row key, policy and team and private flags.
 
 Determinism. Ids are uuid5 over fixed names; times are offsets from the anchor (default: today, UTC); markers
 are numbered in build order. The same anchor always gives the same rows and the same gold.json.
@@ -36,8 +43,9 @@ refuses a database that holds rows in the tables it fills, and on a database it 
 gold.json (the sentinel is rsi_checkpoints job `synth:seed`).
 
 gold.json: per-table row counts, per-day counts per ClickHouse table (`amem sync verify`), the expected
-results of the ClickHouse named queries (as ClickHouseRetriever returns them), the expected Supabase answers
-of the story, the past.dev records that may be sent, the team rows, the Langfuse traces and the markers.
+results of the ClickHouse named queries (as ClickHouseRetriever returns them, with the default owner accounts),
+the expected Supabase answers of the story, the past.dev records that may be sent, the team and private rows,
+the ownership counts (now, and under the pre-F8 rule), the Langfuse traces and the markers.
 """
 
 from __future__ import annotations
@@ -59,7 +67,7 @@ from psycopg import sql
 from psycopg.conninfo import conninfo_to_dict
 from psycopg.types.json import Jsonb
 
-from agent_memory.integrations import refs
+from agent_memory.integrations import clickhouse as _ch, egress, refs
 
 DATASET = "amem-synth"
 VERSION = 1
@@ -77,7 +85,12 @@ BASELINE = "synth-baseline-1"
 R1 = ("skill:synth-debugging", "reproduce-before-fix")
 R2 = ("claude-md:global", "synth-quote-globs")
 R3 = ("agents-md:global", "synth-no-compound-cmds")
+R_PRIVATE = ("claude-md:@repo", "synth-client-deploy-gate")    # `@repo`: the session's own repo (repo-scoped)
 NIGHTLY, INGEST, HARVEST = "synth-nightly-deviations", "synth-skills-ingest", "synth-lessons-harvest"
+# Mission 004C (F8): ownership as sessions_ingest stores it, judged with the default owner accounts.
+OWNER = egress.DEFAULT_OWNER_ACCOUNTS[0]
+OWN, TEAM = "own", "team"
+PRIVATE_CASES = ("no-remote", "non-github-remote", "unknown-owner")
 
 # The tables seed fills, in insert order (foreign keys first).
 TABLES = ("sessions", "deviations", "runs", "scores", "skill_calls", "lessons", "lesson_candidates",
@@ -144,6 +157,7 @@ class Dataset:
     rows: dict[str, list[dict[str, Any]]] = field(default_factory=lambda: defaultdict(list))
     markers: list[dict[str, Any]] = field(default_factory=list)
     team: dict[str, list[str]] = field(default_factory=lambda: defaultdict(list))
+    private: dict[str, list[str]] = field(default_factory=lambda: defaultdict(list))   # F8: unknown ownership
     ids: dict[str, Any] = field(default_factory=dict)            # named ids of the story
 
     def counts(self) -> dict[str, int]:
@@ -175,30 +189,37 @@ def trace_ids() -> dict[str, dict[str, str]]:
     return out
 
 
-# sid, tool, category, model, effort, outcome, team, days before anchor, hour (UTC), topic
+# sid, tool, category, model, effort, outcome, ownership (own | team | a private case), days before anchor,
+# hour (UTC), topic
 _SESSIONS = (
-    ("synth-claude-01", "claude", "chat", "synth-claude-opus", "high", "shipped", False, 20, 9,
+    ("synth-claude-01", "claude", "chat", "synth-claude-opus", "high", "shipped", OWN, 20, 9,
      "fix a flaky import test"),
-    ("synth-claude-02", "claude", "worker", "synth-claude-opus", "high", "failed", False, 18, 14,
+    ("synth-claude-02", "claude", "worker", "synth-claude-opus", "high", "failed", OWN, 18, 14,
      "patch the retry loop"),
-    ("synth-claude-03", "claude", "chat", "synth-claude-sonnet", "medium", "pushed", False, 15, 10,
+    ("synth-claude-03", "claude", "chat", "synth-claude-sonnet", "medium", "pushed", OWN, 15, 10,
      "rename the config loader"),
-    ("synth-claude-04", "claude", "worker", "synth-claude-opus", "high", "partial", False, 11, 16,
+    ("synth-claude-04", "claude", "worker", "synth-claude-opus", "high", "partial", OWN, 11, 16,
      "debug the date parser"),
-    ("synth-claude-05", "claude", "parent", "synth-claude-sonnet", "medium", "committed", False, 6, 11,
+    ("synth-claude-05", "claude", "parent", "synth-claude-sonnet", "medium", "committed", OWN, 6, 11,
      "split the sync job"),
-    ("synth-claude-06", "claude", "chat", "synth-claude-opus", "high", "shipped", False, 3, 13,
+    ("synth-claude-06", "claude", "chat", "synth-claude-opus", "high", "shipped", OWN, 3, 13,
      "tidy the CLI help"),
-    ("codex:synth-01", "codex", "chat", "synth-gpt-codex", "high", "failed", False, 17, 15,
+    ("codex:synth-01", "codex", "chat", "synth-gpt-codex", "high", "failed", OWN, 17, 15,
      "fix the cache key bug"),
-    ("codex:synth-02", "codex", "worker", "synth-gpt-codex", "high", "shipped", False, 12, 9,
+    ("codex:synth-02", "codex", "worker", "synth-gpt-codex", "high", "shipped", OWN, 12, 9,
      "add a parser test"),
-    ("codex:synth-03", "codex", "chat", "synth-gpt-codex", "medium", "abandoned", False, 5, 17,
+    ("codex:synth-03", "codex", "chat", "synth-gpt-codex", "medium", "abandoned", OWN, 5, 17,
      "chase a timeout"),
-    ("synth-team-01", "claude", "worker", "synth-claude-opus", "high", "shipped", True, 14, 10,
+    ("synth-team-01", "claude", "worker", "synth-claude-opus", "high", "shipped", TEAM, 14, 10,
      "pipeline retry guard"),
-    ("codex:synth-team-02", "codex", "worker", "synth-gpt-codex", "high", "failed", True, 8, 15,
+    ("codex:synth-team-02", "codex", "worker", "synth-gpt-codex", "high", "failed", TEAM, 8, 15,
      "pipeline schema drift"),
+    ("synth-private-01", "claude", "chat", "synth-claude-opus", "high", "shipped", "no-remote", 13, 11,
+     "draft the client export notes"),
+    ("codex:synth-private-02", "codex", "worker", "synth-gpt-codex", "medium", "partial", "non-github-remote", 9, 14,
+     "patch the vendor sync script"),
+    ("synth-private-03", "claude", "worker", "synth-claude-sonnet", "medium", "committed", "unknown-owner", 4, 10,
+     "rename the report fields"),
 )
 # session, rule, followed, result, objective (None: not measured), minutes after the nightly scan started
 _DEVIATIONS = (
@@ -214,14 +235,15 @@ _DEVIATIONS = (
     ("synth-claude-06", R2, 0.25, 0.75, 1.0, 30),
     ("codex:synth-02", R3, 0.5, 0.75, 1.0, 25), ("codex:synth-03", R3, 0.25, 0.5, None, 45),
     ("sandbox:B", R1, 0.5, 0.5, 0.5, 10),
+    ("synth-private-01", R_PRIVATE, 0.25, 0.5, 0.5, 30),
 )
-_JEV = {R1: "edit_instruction", R2: "leave", R3: "enforce"}
+_JEV = {R1: "edit_instruction", R2: "leave", R3: "enforce", R_PRIVATE: "edit_instruction"}
 # routine, source, [(days before anchor, status)], hour, base duration (s), duration step (s)
 _RUNS = (
     (NIGHTLY, "launchd", ((8, "pass"), (7, "pass"), (6, "pass"), (5, "fail"), (4, "error"), (3, "skip"),
                           (2, "fail"), (1, "fail")), 3, 40, 5),
     (INGEST, "launchd", ((4, "pass"), (3, "pass"), (2, "pass"), (1, "pass")), 4, 12, 1),
-    (HARVEST, "scheduled-task", ((16, "pass"), (9, "pass")), 5, 90, 0),
+    (HARVEST, "scheduled-task", ((16, "pass"), (12, "pass"), (9, "pass")), 5, 90, 0),
 )
 # skill, session (None: a call no session matched), minutes after the session started
 _SKILL_CALLS = (
@@ -232,7 +254,9 @@ _SKILL_CALLS = (
     ("synth-dispatch", "synth-claude-03", 5), ("synth-dispatch", "synth-claude-05", 5),
     ("synth-dispatch", "synth-claude-06", 5),
     ("synth-handoff", "codex:synth-02", 50), ("synth-handoff", "synth-claude-06", 55),
-    ("synth-handoff", None, 0),
+    ("synth-handoff", None, 0),                                         # no session matched: private (F7)
+    ("synth-debugging", "synth-private-01", 10),                        # a known skill: its label ships
+    ("synth-client-release", "codex:synth-private-02", 20),             # a repo-local skill: label null
 )
 
 
@@ -244,10 +268,11 @@ class _Builder:
     def ts(self, days: float, hour: float = 0, minute: float = 0) -> datetime:
         return self.midnight - timedelta(days=days) + timedelta(hours=hour, minutes=minute)
 
-    def mk(self, table: str, column: str, key: Any, policy: str = STRICT, team: bool = False) -> str:
+    def mk(self, table: str, column: str, key: Any, policy: str = STRICT, team: bool = False,
+           private: bool = False) -> str:
         m = f"{MARKER_PREFIX}{len(self.ds.markers) + 1:04d}"
         self.ds.markers.append({"marker": m, "table": table, "column": column, "key": str(key), "policy": policy,
-                                "team": team})
+                                "team": team, "private": private})
         return m
 
     def add(self, table: str, row: dict[str, Any]) -> dict[str, Any]:
@@ -258,29 +283,42 @@ class _Builder:
 
     def sessions(self) -> None:
         start_of: dict[str, datetime] = {}
-        for i, (sid, tool, cat, model, effort, outcome, team, d, h, topic) in enumerate(_SESSIONS):
-            start_of[sid] = self._session(i, sid, tool, cat, model, effort, outcome, team, self.ts(d, h), topic,
+        for i, (sid, tool, cat, model, effort, outcome, owner, d, h, topic) in enumerate(_SESSIONS):
+            start_of[sid] = self._session(i, sid, tool, cat, model, effort, outcome, owner, self.ts(d, h), topic,
                                           env="prod")
         for j, (arm, t) in enumerate(sorted(trace_ids().items())):
             sid = t["session_id"]
             start_of[f"sandbox:{arm}"] = self._session(len(_SESSIONS) + j, sid, "claude", "eval", "synth-claude-sonnet",
-                                                       "low", None, False, self.ts(10, 12, 30 * j),
+                                                       "low", None, OWN, self.ts(10, 12, 30 * j),
                                                        f"sandbox run {arm} of {EXP_C2}", env="sandbox", kind="headless",
                                                        experiment=EXP_C2)
             self.ds.ids[f"sandbox_session_{arm}"] = sid
         self.ds.ids["session_start"] = start_of
 
-    def _session(self, i: int, sid: str, tool: str, cat: str, model: str, effort: str, outcome: str | None, team: bool,
+    def _session(self, i: int, sid: str, tool: str, cat: str, model: str, effort: str, outcome: str | None, owner: str,
                  start: datetime, topic: str, *, env: str, kind: str | None = None,
                  experiment: str | None = None) -> datetime:
+        team, private = owner == TEAM, owner in PRIVATE_CASES
+
         def mk(col: str) -> str:
-            return self.mk("sessions", col, sid, STRICT, team)
+            return self.mk("sessions", col, sid, STRICT, team, private)
 
         active = 900.0 + 150 * i
         end = start + timedelta(seconds=active + 600)
-        proj = f"pipeline-poc-{mk('project')}" if team else f"own-app-{mk('project')}"
-        repo = f"acme-pipeline-poc-{mk('repo')}" if team else f"own-app-{mk('repo')}"
-        meta: dict[str, Any] = {"synthetic": True, "dataset": DATASET, "team": team,
+        name = "pipeline-poc" if team else "client-notes" if private else "own-app"
+        proj = f"{name}-{mk('project')}"
+        repo = f"acme-pipeline-poc-{mk('repo')}" if team else f"{name}-{mk('repo')}"
+        # ownership as sessions_ingest.team_info stores it (Mission 004C, F8)
+        ownership: dict[str, Any]
+        if owner == OWN:
+            ownership = {"team": False, "remote_owner": OWNER}
+        elif team:
+            ownership = {"team": True}
+        else:       # no remote and a remote it read no owner from both store nothing; an unknown owner, team false
+            ownership = {"synthetic_case": owner}
+            if owner == "unknown-owner":
+                ownership.update(team=False, remote_owner=f"synth-other-{mk('meta.remote_owner')}")
+        meta: dict[str, Any] = {"synthetic": True, "dataset": DATASET, **ownership,
                                 "branch": f"feature/{mk('meta.branch')}",
                                 "author_email": f"sam.synth.{mk('meta.author_email')}@example.com",
                                 "person": f"Sam Synth {mk('meta.person')}",
@@ -289,7 +327,7 @@ class _Builder:
             meta["api_key"] = f"sk-ant-api03-{mk('meta.api_key')}-SYNTHETICKEY000000"
         turns = 12 + i
         row = {"session_id": sid, "kind": kind or cat, "tool": tool, "repo": repo,
-               "project_dir": f"/Users/synth-dev/work/{mk('project_dir')}/{'pipeline-poc' if team else 'own-app'}",
+               "project_dir": f"/Users/synth-dev/work/{mk('project_dir')}/{name}",
                "started_at": start, "ended_at": end, "last_activity_at": end, "transcript_bytes": 40_000 + 1000 * i,
                "skills": [s for s, sess, _ in _SKILL_CALLS if sess == sid] or [],
                "instructions": [f"/Users/synth-dev/.claude/CLAUDE.md#{mk('instructions')}"],
@@ -310,7 +348,14 @@ class _Builder:
         self.add("sessions", row)
         if team:
             self.ds.team["sessions"].append(sid)
+        if private:
+            self.ds.private["sessions"].append(sid)
         return start
+
+    def ownership(self, sid: str | None) -> str:
+        """own | team | private of a session id (None or unknown: private), by egress.classify."""
+        s = next((r for r in self.ds.rows["sessions"] if r["session_id"] == sid), None) if sid else None
+        return egress.classify(s["meta"], (OWNER,)) if s else egress.PRIVATE
 
     def deviations(self) -> None:
         sessions = {r["session_id"]: r for r in self.ds.rows["sessions"]}
@@ -323,9 +368,10 @@ class _Builder:
             did = uid(f"deviation:{sid}:{k}")
             s = sessions[sid]
             team = bool(s["meta"].get("team"))
+            private = self.ownership(sid) == egress.PRIVATE
 
-            def mk(col: str, did: uuid.UUID = did, team: bool = team) -> str:
-                return self.mk("deviations", col, did, STRICT, team)
+            def mk(col: str, did: uuid.UUID = did, team: bool = team, private: bool = private) -> str:
+                return self.mk("deviations", col, did, STRICT, team, private)
 
             why = f"SYNTHETIC: it trusted the stack trace; flagged by Sam Synth {mk('why')}"
             if sid == "synth-claude-02":
@@ -333,6 +379,7 @@ class _Builder:
             if sid == "codex:synth-01" and k == 0:
                 why += f"; ask sam.synth.{mk('why.email')}@example.com"
             src, rid = rule
+            src = src.replace("@repo", s["repo"])               # a repo-scoped source names the session's repo
             self.add("deviations", {
                 "id": did, "source_key": f"synth-dev-{mk('source_key')}", "session_id": sid, "instruction_source": src,
                 "instruction_ref": f"~/.agents/skills/synth-debugging/SKILL.md#L{12 + k} {mk('instruction_ref')}",
@@ -346,6 +393,8 @@ class _Builder:
                 "result_outcome": s["outcome"], "objective_result": objective})
             if team:
                 self.ds.team["deviations"].append(str(did))
+            if private:
+                self.ds.private["deviations"].append(str(did))
 
     # ------------------------------------------------------------ runs, scores, skill calls, lessons
 
@@ -389,13 +438,14 @@ class _Builder:
             cid = uid(f"skill_call:{i}")
             s = sessions.get(sess) if sess else None
             team = bool(s and s["meta"].get("team"))
+            private = self.ownership(sess) == egress.PRIVATE           # no matched session: private too (F7)
 
-            def mk(col: str, cid: uuid.UUID = cid, team: bool = team) -> str:
-                return self.mk("skill_calls", col, cid, STRICT, team)
+            def mk(col: str, cid: uuid.UUID = cid, team: bool = team, private: bool = private) -> str:
+                return self.mk("skill_calls", col, cid, STRICT, team, private)
 
             at = (s["started_at"] if s else self.ts(2, 20)) + timedelta(minutes=minute)
             tool = s["tool"] if s else "claude"
-            proj = (f"pipeline-poc-{mk('project')}" if team else f"own-app-{mk('project')}")
+            proj = f"{'pipeline-poc' if team else 'client-notes' if private else 'own-app'}-{mk('project')}"
             self.add("skill_calls", {"id": cid, "ts": at, "skill": skill, "invoked_by": tool if s else "me",
                                      "agent": tool, "cwd": f"/Users/synth-dev/work/{mk('cwd')}", "project": proj,
                                      "backfill": False, "source_key": f"synth-skill-{mk('source_key')}",
@@ -403,27 +453,44 @@ class _Builder:
                                      "logged_session": f"synth-log-{mk('logged_session')}"})
             if team:
                 self.ds.team["skill_calls"].append(str(cid))
+            if private:
+                self.ds.private["skill_calls"].append(str(cid))
 
     def lessons(self) -> None:
-        lid = uid("lesson:repro-first")
+        """Two lessons: one scoped to an own repo (its decision may go to past.dev) and, Mission 004C (F8), one
+        scoped to the private `client-notes` repo (never sent)."""
         mk = self.mk
-        self.add("lessons", {
-            "id": lid, "slug": "synth-repro-first",
-            "title": f"SYNTHETIC: reproduce the failure before the fix {mk('lessons', 'title', lid, DECISION)}",
-            "rule": f"SYNTHETIC: write a failing test before you edit code {mk('lessons', 'rule', lid)}",
-            "scope_repo": f"own-app-{mk('lessons', 'scope_repo', lid)}", "status": "trial",
-            "source_run_ids": [self.ds.ids[f"run:{HARVEST}:9"]],
-            "evidence": f"SYNTHETIC: seen in three sessions, notes in /Users/synth-dev/{mk('lessons', 'evidence', lid)}",
-            "evals": "synth-eval", "since": self.ds.anchor - timedelta(days=9),
-            "created_at": self.ts(9, 5, 5), "updated_at": self.ts(9, 5, 5)})
+        repo_of = {r["session_id"]: r["repo"] for r in self.ds.rows["sessions"]}
+        lid, plid = uid("lesson:repro-first"), uid("lesson:client-export")
+        for les, slug, title, rule, scope, d, private in (
+                (lid, "synth-repro-first", "reproduce the failure before the fix",
+                 "write a failing test before you edit code", repo_of["synth-claude-01"], 9, False),
+                (plid, "synth-client-export", "check the export columns first", "diff the column list before a run",
+                 repo_of["synth-private-01"], 12, True)):
+            self.add("lessons", {
+                "id": les, "slug": slug,
+                "title": f"SYNTHETIC: {title} {mk('lessons', 'title', les, STRICT if private else DECISION, private=private)}",
+                "rule": f"SYNTHETIC: {rule} {mk('lessons', 'rule', les, private=private)}",
+                "scope_repo": scope, "status": "trial", "source_run_ids": [self.ds.ids[f"run:{HARVEST}:{d}"]],
+                "evidence": f"SYNTHETIC: seen in three sessions, notes in /Users/synth-dev/"
+                            f"{mk('lessons', 'evidence', les, private=private)}",
+                "evals": "synth-eval", "since": self.ds.anchor - timedelta(days=d),
+                "created_at": self.ts(d, 5, 5), "updated_at": self.ts(d, 5, 5)})
+            if private:
+                self.ds.private["lessons"].append(str(les))
         self.ds.ids["lesson"] = lid
         for d, decision, why, lesson in ((9, "accept", "the repro step was skipped in three sessions", lid),
-                                         (16, "reject", "a one-off, not a pattern", None)):
+                                         (16, "reject", "a one-off, not a pattern", None),
+                                         (12, "accept", "the export broke twice on a renamed column", plid)):
             run = self.ds.ids[f"run:{HARVEST}:{d}"]
+            private = lesson == plid
             self.add("lesson_candidates", {
                 "run_id": run, "decision": decision,
-                "reason": f"SYNTHETIC: {why} {mk('lesson_candidates', 'reason', run, DECISION)}",
+                "reason": f"SYNTHETIC: {why} "
+                          f"{mk('lesson_candidates', 'reason', run, STRICT if private else DECISION, private=private)}",
                 "lesson_id": lesson, "considered_at": self.ts(d, 5, 10)})
+            if private:
+                self.ds.private["lesson_candidates"].append(str(run))
 
     # ------------------------------------------------------------ the RSI story
 
@@ -551,30 +618,38 @@ class _Builder:
                 "created_at": self.ts(10, 13, minute)})
             evals[str(eid)] = {"model": model, "verdict": verdict}
 
-        # improve edits: an earlier, reverted attempt at R1; a team one; a kept one for R2
-        e1, e2, e3 = uid("edit:r1"), uid("edit:r1:team"), uid("edit:r2")
-        for eid, rule, status, team, ds_, created, pushed, reverted in (
-                (e1, R1, "reverted", False, [d["id"] for d in r1_own[:3]], self.ts(16, 5), self.ts(16, 6), self.ts(15, 6)),
-                (e2, R1, "suggested", True, [d["id"] for d in r1_team], self.ts(7, 5), None, None),
-                (e3, R2, "kept", False, [d["id"] for d in r2[:1]], self.ts(5, 5), self.ts(5, 6), None)):
-            policy = STRICT if team else DECISION
+        # improve edits: an earlier, reverted attempt at R1; a team one; a kept one for R2; and (Mission 004C, F8)
+        # one built on the private session's repo-scoped deviation (never sent to past.dev)
+        e1, e2, e3, e4 = uid("edit:r1"), uid("edit:r1:team"), uid("edit:r2"), uid("edit:private")
+        priv_devs = [d for d in devs if d["rule_id"] == R_PRIVATE[1]]
+        priv_rule = (priv_devs[0]["instruction_source"], R_PRIVATE[1])
+        for eid, rule, status, team, private, ds_, created, pushed, reverted in (
+                (e1, R1, "reverted", False, False, [d["id"] for d in r1_own[:3]], self.ts(16, 5), self.ts(16, 6),
+                 self.ts(15, 6)),
+                (e2, R1, "suggested", True, False, [d["id"] for d in r1_team], self.ts(7, 5), None, None),
+                (e3, R2, "kept", False, False, [d["id"] for d in r2[:1]], self.ts(5, 5), self.ts(5, 6), None),
+                (e4, priv_rule, "suggested", False, True, [d["id"] for d in priv_devs], self.ts(12, 5), None, None)):
+            policy = STRICT if team or private else DECISION
             self.add("edits", {
-                "id": eid, "improve_id": f"synth-improve-{mk('edits', 'improve_id', eid, team=team)}",
+                "id": eid, "improve_id": f"synth-improve-{mk('edits', 'improve_id', eid, team=team, private=private)}",
                 "status": status,
                 "target_path": f"/Users/synth-dev/.agents/skills/synth-debugging/SKILL.md#"
-                               f"{mk('edits', 'target_path', eid, team=team)}",
+                               f"{mk('edits', 'target_path', eid, team=team, private=private)}",
                 "instruction_source": rule[0], "rule_id": rule[1],
-                "rule_title": f"SYNTHETIC rule title {mk('edits', 'rule_title', eid, team=team)}",
+                "rule_title": f"SYNTHETIC rule title {mk('edits', 'rule_title', eid, team=team, private=private)}",
                 "instruction_sha_before": _sha(f"synth-before:{eid}"), "instruction_sha_after": _sha(f"synth-after:{eid}"),
                 "deviation_ids": ds_, "verdict": "edit_instruction", "jev_confidence": 0.625,
-                "why": f"SYNTHETIC: sessions skipped the step this rule asks for {mk('edits', 'why', eid, policy, team)}",
-                "summary": f"SYNTHETIC: added one line to the rule {mk('edits', 'summary', eid, policy, team)}",
+                "why": f"SYNTHETIC: sessions skipped the step this rule asks for "
+                       f"{mk('edits', 'why', eid, policy, team, private)}",
+                "summary": f"SYNTHETIC: added one line to the rule {mk('edits', 'summary', eid, policy, team, private)}",
                 "pushed_at": pushed, "reverted_at": reverted,
                 "meta": {"synthetic": True, "team": team, "kind": "add-line",
-                         "branch": f"improve/{mk('edits', 'meta.branch', eid, team=team)}"},
+                         "branch": f"improve/{mk('edits', 'meta.branch', eid, team=team, private=private)}"},
                 "created_at": created})
             if team:
                 self.ds.team["edits"].append(str(eid))
+            if private:
+                self.ds.private["edits"].append(str(eid))
 
         # evidence: the two C2 Langfuse traces, and one NCM research run
         for arm, passed in (("A", True), ("B", False)):
@@ -604,7 +679,8 @@ class _Builder:
             "created_at": self.ts(4, 9)})
         self.ds.ids.update({"rule": r1key, "candidate": str(c1), "proposal": str(p1), "team_proposal": str(p2),
                             "decision": str(d1), "artifact": art1, "edits": [str(e1), str(e2)], "edit_r2": str(e3),
-                            "evals": evals, "r1_own_deviations": [str(d["id"]) for d in r1_own]})
+                            "edit_private": str(e4), "evals": evals,
+                            "r1_own_deviations": [str(d["id"]) for d in r1_own]})
 
     def _prod(self, sid: str) -> bool:
         return any(r["session_id"] == sid and r["env"] == "prod" for r in self.ds.rows["sessions"])
@@ -621,6 +697,7 @@ def build(anchor: date) -> Dataset:
     b.rsi()
     b.ds.ids.pop("session_start", None)
     b.ds.team = dict(b.ds.team)
+    b.ds.private = dict(b.ds.private)
     return b.ds
 
 
@@ -672,11 +749,29 @@ class _CH:
         self.ds, self.today = ds, today
         self.prod = {s["session_id"]: s for s in ds.rows["sessions"] if (s["env"] or "prod") not in ("sandbox", "eval")}
         self.excluded = {s["session_id"] for s in ds.rows["sessions"] if s["env"] in ("sandbox", "eval")}
+        # Mission 004C (F8): the ownership class of every session (default owner accounts), and the skill label
+        # each call ships with (a non-own call: only a skill also called in an own session)
+        self.cls = {s["session_id"]: egress.classify(s["meta"], (OWNER,)) for s in ds.rows["sessions"]}
+        own_skills = {k["skill"] for k in ds.rows["skill_calls"] if self.cls.get(k["session_id"]) == egress.OWN}
+        self.skill = {str(k["id"]): k["skill"] if self.cls.get(k["session_id"]) == egress.OWN or k["skill"] in own_skills
+                      else None for k in ds.rows["skill_calls"]}
+
+    def rule_key(self, d: Mapping[str, Any]) -> str:
+        """`<source>:<rule_id or unknown>` as ClickHouse holds it: a team or private row's repo-scoped source is
+        `<prefix>:<class>` with no rule id. An own repo-scoped source would ship as a keyed pseudonym, which gold
+        cannot know, so the dataset has none."""
+        cls = egress.TEAM if d["meta"].get("team") else self.cls.get(d["session_id"], egress.PRIVATE)
+        src, rid = d["instruction_source"], d["rule_id"]
+        if _ch.repo_scoped(src):
+            if cls == egress.OWN:
+                raise ValueError(f"own repo-scoped source in the synthetic dataset: {d['id']}")
+            src, rid = f"{src.split(':', 1)[0]}:{cls}", None
+        return f"{src}:{rid or 'unknown'}"
 
     def rule_gap(self, days: int = 90, min_n: int = 3, rule: str = "") -> list[dict[str, Any]]:
         groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
         for d in self.ds.rows["deviations"]:
-            key = f"{d['instruction_source']}:{d['rule_id'] or 'unknown'}"
+            key = self.rule_key(d)
             if d["created_at"].date() >= self.today - timedelta(days=days) and d["session_id"] not in self.excluded \
                     and (not rule or key == rule):
                 groups[key].append(d)
@@ -702,7 +797,7 @@ class _CH:
         cutoff = _monday(self.today) - timedelta(weeks=weeks)
         groups: dict[tuple[date, str], list[dict[str, Any]]] = defaultdict(list)
         for d in self.ds.rows["deviations"]:
-            key = f"{d['instruction_source']}:{d['rule_id'] or 'unknown'}"
+            key = self.rule_key(d)
             if d["session_id"] in started and _monday(started[d["session_id"]]) >= cutoff and (not rule or key == rule):
                 groups[(_monday(started[d["session_id"]]), key)].append(d)
         out = []
@@ -731,8 +826,8 @@ class _CH:
         return out
 
     def skill_outcomes(self, days: int = 30, min_n: int = 3) -> list[dict[str, Any]]:
-        pairs = {(k["session_id"], k["skill"]) for k in self.ds.rows["skill_calls"]
-                 if k["skill"] and k["session_id"] and k["ts"].date() >= self.today - timedelta(days=days)}
+        pairs = {(k["session_id"], self.skill[str(k["id"])]) for k in self.ds.rows["skill_calls"]
+                 if self.skill[str(k["id"])] and k["session_id"] and k["ts"].date() >= self.today - timedelta(days=days)}
         groups: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
         for sid, skill in sorted(pairs):
             if sid in self.prod:
@@ -835,10 +930,30 @@ def gold(ds: Dataset, *, today: date | None = None) -> dict[str, Any]:
                              "codex_sessions": sum(prod[s]["tool"] == "codex" for s in ss)}
     team_sessions = set(ds.team.get("sessions", []))
     team_rows = {k: sorted(v) for k, v in ds.team.items()}
+    private_rows = {k: sorted(v) for k, v in ds.private.items()}
+    private_runs = set(private_rows.get("lesson_candidates", []))
     pastdev_send = sorted([refs.amem("proposal", ds.ids["proposal"]), refs.amem("decision", ds.ids["decision"]),
                            refs.amem("experiment", EXP_C2), refs.amem("experiment", EXP_NCM),
                            refs.amem("edit", ds.ids["edits"][0]), refs.amem("edit", ds.ids["edit_r2"])]
-                          + [refs.amem("run", str(lc["run_id"])) for lc in rows["lesson_candidates"]])
+                          + [refs.amem("run", str(lc["run_id"])) for lc in rows["lesson_candidates"]
+                             if str(lc["run_id"]) not in private_runs])
+    refuse_private = sorted([refs.amem("edit", e) for e in private_rows.get("edits", [])]
+                            + [refs.amem("run", r) for r in private_runs])
+
+    def classes(rule: Any) -> dict[str, dict[str, int]]:
+        """Rows per ownership class in the three tables that carry one, under `rule(session id) -> class`."""
+        out: dict[str, dict[str, int]] = {}
+        for t, sid_of, team_of in (("sessions", lambda r: r["session_id"], lambda r: False),
+                                   ("deviations", lambda r: r["session_id"], lambda r: bool(r["meta"].get("team"))),
+                                   ("skill_calls", lambda r: r["session_id"], lambda r: False)):
+            n = dict.fromkeys(egress.CLASSES, 0)
+            for r in rows[t]:
+                n[egress.TEAM if team_of(r) else rule(sid_of(r))] += 1
+            out[t] = n
+        return out
+
+    def before(sid: str | None) -> str:                 # the pre-F8 rule: anything not flagged team was own
+        return egress.TEAM if sid and ch.cls.get(sid) == egress.TEAM else egress.OWN
     return {
         "dataset": DATASET, "version": VERSION, "synthetic": True, "anchor": ds.anchor.isoformat(),
         "queries_valid_until": (ds.anchor + timedelta(days=8)).isoformat(),
@@ -849,7 +964,11 @@ def gold(ds: Dataset, *, today: date | None = None) -> dict[str, Any]:
             "queries": [{"name": n, "params": p, "rows": _expected(ch, n, p)} for n, p in GOLD_QUERIES],
             "team": {"sessions": len(team_sessions),
                      "skill_calls": sum(1 for k in rows["skill_calls"] if k["session_id"] in team_sessions)},
+            "private": {t: len(private_rows.get(t, [])) for t in ("sessions", "deviations", "skill_calls")},
         },
+        "ownership": {"owner_accounts": [OWNER],
+                      "after": classes(lambda sid: ch.cls.get(sid, egress.PRIVATE) if sid else egress.PRIVATE),
+                      "before": classes(before)},
         "questions": {"repeat_failures": {
             "params": {"days": "30", "min_n": "3"}, "top_rule": r1, "recurring": recurring,
             "r1": {"n": len(r1_devs), "sessions": len(r1_sessions),
@@ -865,8 +984,10 @@ def gold(ds: Dataset, *, today: date | None = None) -> dict[str, Any]:
                      "traces": {arm: {**t, "check_passed": arm == "A"} for arm, t in tr.items()}},
         "pastdev": {"send": pastdev_send,
                     "refuse_team": sorted([refs.amem("proposal", ds.ids["team_proposal"]),
-                                           refs.amem("edit", ds.ids["edits"][1])])},
+                                           refs.amem("edit", ds.ids["edits"][1])]),
+                    "refuse_private": refuse_private},
         "team": team_rows,
+        "private": private_rows,
         "markers": ds.markers,
     }
 

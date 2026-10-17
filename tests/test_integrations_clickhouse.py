@@ -279,7 +279,9 @@ class Seed:
         cols = dict(session_id=sid, kind=category, tool="claude", project_dir=self.mk("pdir"), repo="agent-memory",
                     started_at=t, ended_at=t + timedelta(minutes=30), last_activity_at=t + timedelta(minutes=30),
                     transcript_bytes=12345, skills=Jsonb([self.mk("skill")]), instructions=Jsonb([self.mk("instr")]),
-                    meta=Jsonb({"note": self.mk("smeta")}), tokens_input=tokens, tokens_output=tokens // 2,
+                    # an own session, as sessions_ingest stores one (Mission 004C, F8: unknown ownership is private)
+                    meta=Jsonb({"team": False, "remote_owner": "vilmerfrost", "note": self.mk("smeta")}),
+                    tokens_input=tokens, tokens_output=tokens // 2,
                     tokens_cache_read=tokens * 3, tokens_cache_creation=10, models=Jsonb({self.mk("models"): {"calls": 1}}),
                     turns=4, tokens_updated_at=t + timedelta(minutes=31), title=self.mk("title"),
                     title_updated_at=t, category=category, project="chtest", model="claude-test-1", model_last=self.mk("ml"),
@@ -735,6 +737,100 @@ def test_denied_and_email_shaped_values_never_leave(seed: Seed, pg_url: str, app
     deny = egress.env_terms({egress.DENY_ENV: "acme"})
     assert CH.map_row(t, {"id": "r-acme-1", "routine": "x"}, 1, deny) is None
     assert CH.map_row(t, {"id": "r1", "routine": "ACME-daily", "source": "a@b.co"}, 1, deny)["routine"] is None
+
+
+# ---------------------------------------------------------------- Mission 004C (F8, F7, F9): unknown ownership
+
+
+PRIVATE_METAS = {           # sessions of unknown ownership, as sessions_ingest stores them
+    "chs-noremote": {},                                                  # no remote, or not a git repo
+    "chs-nongithub": {"cwd": "/Users/x/work/tool"},                      # a remote whose owner it could not read
+    "chs-otherowner": {"team": False, "remote_owner": "old-handle"},     # an owner that is not an owner account
+}
+
+
+def _call(seed: Seed, conn: psycopg.Connection, skill: str, project: str, sid: str | None) -> str:
+    return seed.ins(conn, "skill_calls", ts=seed.now, skill=skill, invoked_by="me", agent="claude", project=project,
+                    source_key=seed.mk("skey"), session_id=sid)
+
+
+def test_unknown_ownership_ships_private_everywhere(seed: Seed, pg_url: str, app: str, fake: FakeClickHouse) -> None:
+    with psycopg.connect(pg_url) as conn:
+        priv = [seed.session(conn, sid, repo=f"client-notes-{i}", project=f"client-notes-{i}",
+                             meta=Jsonb({**m, "note": seed.mk("pmeta")}))
+                for i, (sid, m) in enumerate(PRIVATE_METAS.items())]
+        devs = [seed.deviation(conn, sid, f"claude-md:client-notes-{i}", "client-deploy-gate", 0.2, 0.9)
+                for i, sid in enumerate(priv)]
+        glob = seed.deviation(conn, priv[0], "claude-md:global", "explaining/core-rule", 0.2, 0.9)   # the owner's rule
+        own = seed.deviation(conn, "chs-1", "claude-md:agent-memory", "own-rule", 0.2, 0.9)
+        calls = {"known": _call(seed, conn, "dispatch", "client-notes-0", priv[0]),         # chs-1 calls it too
+                 "repo_skill": _call(seed, conn, "client-notes-release", "client-notes-1", priv[1]),
+                 "unmatched": _call(seed, conn, "dispatch", "client-notes-0", None),          # F7
+                 "unmatched_repo_skill": _call(seed, conn, "client-notes-helper", "agent-memory", None)}
+    sink = CH.ClickHouseSink(client_for(fake.svc.url))
+    with psycopg.connect(app) as conn:
+        assert sync.run(sink, conn, replay=True, environ={}).status == "ok"
+    wire = _wire(fake)
+    for name in ("client-notes", "client-deploy-gate", "agent-memory", "old-handle", "ZZLEAK"):
+        assert name not in wire, name
+    sessions = fake.by_id("sessions")
+    assert all((sessions[sid]["project"], sessions[sid]["repo"]) == ("private", "private") for sid in priv)
+    assert (sessions["chs-1"]["project"], sessions["chs-1"]["repo"]) == (CH.pseudonym("chtest"), CH.pseudonym("agent-memory"))
+    d = fake.by_id("deviations")
+    assert all((d[x]["instruction_source"], d[x]["rule_id"]) == ("claude-md:private", None) for x in devs)
+    assert (d[glob]["instruction_source"], d[glob]["rule_id"]) == ("claude-md:global", "explaining/core-rule")
+    assert (d[own]["instruction_source"], d[own]["rule_id"]) == (f"claude-md:{CH.pseudonym('agent-memory')}", "own-rule")
+    k = fake.by_id("skill_calls")
+    assert {n: (k[i]["project"], k[i]["skill"]) for n, i in calls.items()} == {
+        "known": ("private", "dispatch"), "repo_skill": ("private", None),
+        "unmatched": ("private", "dispatch"), "unmatched_repo_skill": ("private", None)}
+    (own_call,) = (i for i in seed.ids["skill_calls"] if i not in calls.values())
+    assert (k[own_call]["project"], k[own_call]["skill"]) == (CH.pseudonym("chtest"), "dispatch")
+    # what `amem sync plan` reports: rows per class
+    assert sink.masked["tables"] == {"sessions": {"own": 5, "team": 0, "private": 3},
+                                     "deviations": {"own": 10, "team": 0, "private": 4},
+                                     "skill_calls": {"own": 1, "team": 0, "private": 4}}
+    assert (sink.masked["team"], sink.masked["private"], sink.masked["owner_accounts"]) == (0, 11, ["vilmerfrost"])
+
+
+def test_a_project_named_team_or_private_is_pseudonymized_not_taken_for_a_mask(seed: Seed, pg_url: str, app: str,
+                                                                             fake: FakeClickHouse) -> None:
+    """F9: the mask comes from the row's ownership class (`_own`), never from the value."""
+    with psycopg.connect(pg_url) as conn:
+        for name in ("team", "private"):
+            seed.session(conn, f"chs-named-{name}", repo=name, project=name)        # own sessions named like a mask
+        d1 = seed.deviation(conn, "chs-named-team", "claude-md:team", "real-rule", 0.2, 0.9)
+        d2 = seed.deviation(conn, "chs-named-private", "agents-md:private", "real-rule", 0.2, 0.9)
+        seed.session(conn, "chs-team", repo="pipeline-poc", project="pipeline-poc", meta=Jsonb({"team": True}))
+    with psycopg.connect(app) as conn:
+        assert sync.run(CH.ClickHouseSink(client_for(fake.svc.url)), conn, replay=True, environ={}).status == "ok"
+    s = fake.by_id("sessions")
+    for name in ("team", "private"):
+        p = CH.pseudonym(name)
+        assert p and p.startswith("p_") and (s[f"chs-named-{name}"]["project"], s[f"chs-named-{name}"]["repo"]) == (p, p)
+    assert s["chs-team"]["project"] == "team"
+    d = fake.by_id("deviations")
+    assert (d[d1]["instruction_source"], d[d1]["rule_id"]) == (f"claude-md:{CH.pseudonym('team')}", "real-rule")
+    assert (d[d2]["instruction_source"], d[d2]["rule_id"]) == (f"agents-md:{CH.pseudonym('private')}", "real-rule")
+    t = next(t for t in CH.TABLES if t.name == "sessions")
+    assert CH.map_row(t, {"id": "x", "project": "team", "_own": "own"}, 1)["project"] == CH.pseudonym("team")
+    assert CH.map_row(t, {"id": "x", "project": "p_0123456789abcdef", "_own": "private"}, 1)["project"] == "private"
+    assert CH.map_row(t, {"id": "x", "project": "agent-memory"}, 1)["project"] == "private"     # no class: private
+    assert CH.map_row(t, {"id": "x", "project": "agent-memory", "_own": "weird"}, 1)["project"] == "private"
+
+
+def test_plan_counts_rows_masked_as_team_and_private(seed: Seed, pg_url: str, app: str) -> None:
+    with psycopg.connect(pg_url) as conn:
+        seed.session(conn, "chs-team", repo="pipeline-poc", project="pipeline-poc", meta=Jsonb({"team": True}))
+        seed.session(conn, "chs-unknown", repo="client-notes", project="client-notes", meta=Jsonb({}))
+    offline = CH.Client(CH.Config("https://ch.example.invalid:8443", "amem_writer", "k"))
+    with psycopg.connect(app) as conn:
+        out = sync.plan(CH.ClickHouseSink(offline), conn, replay=True)
+        narrow = sync.plan(CH.ClickHouseSink(offline, owners=()), conn, replay=True)   # AMEM_OWNER_ACCOUNTS narrowed
+    assert out["masked"]["tables"]["sessions"] == {"own": 5, "team": 1, "private": 1}
+    assert (out["masked"]["team"], out["masked"]["private"], out["masked"]["owner_accounts"]) == (1, 1, ["vilmerfrost"])
+    assert narrow["masked"]["tables"]["sessions"] == {"own": 0, "team": 1, "private": 6}
+    assert narrow["masked"]["owner_accounts"] == [] and narrow["rows"] == out["rows"]          # masked, not dropped
 
 
 # ---------------------------------------------------------------- Mission 004C (F4): --tables and --since

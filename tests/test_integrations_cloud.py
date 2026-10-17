@@ -80,7 +80,8 @@ def test_pseudonyms_are_keyed_stable_and_never_the_name() -> None:
     assert "agent" not in a
     assert CH.pseudonym("agent-memory", {CH.PSEUDONYM_ENV: "j" * 40}) != a          # another key, another pseudonym
     assert CH.pseudonym("agent-memory", {}) is None and CH.pseudonym("agent-memory", {CH.PSEUDONYM_ENV: "short"}) is None
-    assert CH.pseudonym("team", {}) == "team"
+    # Mission 004C (F9): `team` is a value like any other (the mask comes from the row's class, not the value)
+    assert CH.pseudonym("team", {}) is None and CH.pseudonym("team", {CH.PSEUDONYM_ENV: KEY}).startswith("p_")
 
 
 @pytest.fixture
@@ -88,7 +89,9 @@ def app(pg_url: str) -> Iterator[str]:
     with psycopg.connect(pg_url, autocommit=True) as conn:
         conn.execute(f"alter role amem_app with login password '{APP_PW}'")
         conn.execute("delete from rsi_checkpoints where job like 'sync:%'")
-        for sid, project, meta in (("cloud-own", "agent-memory", "{}"), ("cloud-team", "pipeline-poc", '{"team": true}')):
+        # cloud-own: an own session as ingestion stores one (Mission 004C, F8: `{}` is unknown, so private)
+        for sid, project, meta in (("cloud-own", "agent-memory", '{"team": false, "remote_owner": "vilmerfrost"}'),
+                                   ("cloud-team", "pipeline-poc", '{"team": true}')):
             conn.execute("insert into sessions (session_id, kind, project_dir, project, repo, transcript_bytes, env, meta) "
                          "values (%s, 'chat', '/x', %s, %s, 1, 'prod', %s::jsonb) on conflict (session_id) do update "
                          "set project = excluded.project, repo = excluded.repo, meta = excluded.meta",

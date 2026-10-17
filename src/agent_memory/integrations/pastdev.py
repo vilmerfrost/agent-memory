@@ -3,8 +3,9 @@
 past.dev is an external SaaS. It receives only the sanitized decision records built here (sanitize.py):
 one per proposal, decision or rejection, experiment, edit and lesson decision, each at most CAP_BYTES. No
 transcripts, file contents, prompts, paths, emails, hosts, secrets, ids other than the record's own
-`amem:` ref, nothing from a team repo, and nothing that names a term on the egress deny list (egress.py:
-AMEM_EGRESS_DENY plus every team repo and project, read at the start of each run). One past.dev project is
+`amem:` ref, nothing from a team repo, nothing tied to a repo or session whose ownership is not positively the
+owner's (Mission 004C, F8: `private`, egress.py), and nothing that names a term on the egress deny list (egress.py:
+AMEM_EGRESS_DENY plus every team and private repo and project, read at the start of each run). One past.dev project is
 dedicated to RSI; its project key (`past_sk_...`) is read from AMEM_PASTDEV_KEY only (this module never
 reads an env file). Without a key, everything here is `unavailable`. AMEM_PASTDEV=off stops the sink
 (sync.switched_off) and the retriever.
@@ -54,7 +55,7 @@ rsi_evidence link (metrics.sha256).
 Watermarks: proposals, experiments and edits change status after they are first written and have no
 updated_at column, so change detection is by content: a record is sent when its link is missing or holds
 another sha256. The watermark (`<record time>|<ref>` of the last record pushed) shows how far a table got.
-A link whose record is gone or now refused (a team item, a secret) is retracted first: deleted at past.dev
+A link whose record is gone or now refused (a team or private item, a secret) is retracted first: deleted at past.dev
 and marked deleted. --replay re-sends every completed record that is not retired (same keys: see above).
 
 Deletion is final (Mission 004B). The docs: "A deleted id cannot be sent again; use a new id." The id is
@@ -237,7 +238,19 @@ def _team_sql(arr: str) -> str:
             f"and s.meta ->> 'team' = 'true'))")
 
 
+def _private_sql(arr: str) -> str:
+    """True when any amem:deviation/ or amem:session/ ref in `arr` (text[]) is not positively own (Mission 004C,
+    F8; egress.py): its session is team or private, or the ref resolves to no session at all."""
+    own = egress.class_sql("s.meta")
+    return (f"exists (select 1 from unnest({arr}) as r(ref) where "
+            f"(starts_with(r.ref, 'amem:deviation/') and not exists (select 1 from deviations d join sessions s "
+            f"on s.session_id = d.session_id where ('amem:deviation/' || d.id::text) = r.ref and {own} = 'own')) "
+            f"or (starts_with(r.ref, 'amem:session/') and not exists (select 1 from sessions s "
+            f"where ('amem:session/' || s.session_id) = r.ref and {own} = 'own')))")
+
+
 _DEVS = "array(select 'amem:deviation/' || v::text from unnest({}.deviation_ids) v)"
+_PROPOSAL_REFS = "p.evidence_refs || coalesce(c.evidence_refs, '{}'::text[]) || coalesce(e.devs, '{}'::text[])"
 
 _PROPOSALS_SQL = f"""
 select p.id::text as id, p.title, p.summary, p.rationale, p.status, p.result, p.created_at, x.night,
@@ -246,8 +259,9 @@ select p.id::text as id, p.title, p.summary, p.rationale, p.status, p.result, p.
            as decision,
        (coalesce(p.meta ->> 'team' = 'true', false) or coalesce(x.meta ->> 'team' = 'true', false)
         or coalesce(c.metrics ->> 'team' = 'true', false) or coalesce(e.meta ->> 'team' = 'true', false)
-        or {_team_sql("p.evidence_refs || coalesce(c.evidence_refs, '{}'::text[]) || coalesce(e.devs, '{}'::text[])")})
-           as team
+        or {_team_sql(_PROPOSAL_REFS)})
+           as team,
+       {_private_sql(_PROPOSAL_REFS)} as private
 from rsi_proposals p
 left join rsi_experiments x on x.id = p.experiment_id
 left join rsi_candidates c on c.id = p.candidate_id
@@ -264,17 +278,23 @@ _EXPERIMENTS_SQL = ("select id, night, kind, hypothesis, status, verdict, meta, 
                     "order by created_at, id")
 _EDITS_SQL = f"""
 select e.id::text as id, e.status, e.instruction_source, e.rule_id, e.rule_title, e.why, e.summary, e.verdict, e.meta,
-       e.created_at, (coalesce(e.meta ->> 'team' = 'true', false) or {_team_sql(_DEVS.format("e"))}) as team
+       e.created_at, (coalesce(e.meta ->> 'team' = 'true', false) or {_team_sql(_DEVS.format("e"))}) as team,
+       {_private_sql(_DEVS.format("e"))} as private
 from edits e order by e.created_at, e.id
 """
 # Mission 004C (F2): ingestion never sets runs.meta.team, so a lesson is also a team item when its run's repo
 # (runs.meta.repo) or the lesson's scope_repo is a team repo: a repo or project of any session flagged team.
-_LESSONS_SQL = """
+# F8: and a private item when one of those names is not a repo or project of an own session (an unknown repo).
+_LESSONS_SQL = f"""
 select lc.run_id::text as id, lc.decision, lc.reason, lc.considered_at, l.slug, l.title,
        (coalesce(r.meta ->> 'team' = 'true', false)
         or exists (select 1 from sessions s where s.meta ->> 'team' = 'true'
                    and (s.repo in (r.meta ->> 'repo', l.scope_repo) or s.project in (r.meta ->> 'repo', l.scope_repo))))
-           as team
+           as team,
+       exists (select 1 from (values (r.meta ->> 'repo'), (l.scope_repo)) as n(v) where btrim(n.v) <> ''
+               and not exists (select 1 from sessions s where (s.repo = n.v or s.project = n.v)
+                               and {egress.class_sql('s.meta')} = 'own'))
+           as private
 from lesson_candidates lc join runs r on r.id = lc.run_id left join lessons l on l.id = lc.lesson_id
 where lc.decision in ('accept', 'reject')
 order by lc.considered_at, lc.run_id
@@ -311,18 +331,24 @@ def _team(*metas: Any) -> bool:
     return any(isinstance(m, Mapping) and m.get("team") is True for m in metas)
 
 
-def build_records(conn: psycopg.Connection) -> list[Record]:
-    """Every decision record, in table order (TABLES) and time order. Reads only; refuses nothing (sanitize does)."""
+def build_records(conn: psycopg.Connection, owners: Sequence[str] | None = None) -> list[Record]:
+    """Every decision record, in table order (TABLES) and time order. Reads only; refuses nothing (sanitize does).
+    `owners`: the owner accounts for the ownership rule (default: egress.owner_accounts())."""
+    accounts = egress.owner_accounts() if owners is None else owners
+
+    def q(text: str) -> str:
+        return egress.bind_owners(text, accounts)
+
     out: list[Record] = []
     proposals: dict[str, dict[str, Any]] = {}
     with conn.cursor(row_factory=dict_row) as cur:
-        for p in cur.execute(_PROPOSALS_SQL).fetchall():
+        for p in cur.execute(q(_PROPOSALS_SQL)).fetchall():
             rat = p["rationale"] if isinstance(p["rationale"], Mapping) else {}
             f = {"kind": "proposal", "ref": refs.amem("proposal", p["id"]),
                  "rule": _rule(p["instruction_source"], p["rule_id"]) or _rule(p["c_source"], p["rule_key"]),
                  "hypothesis": p["summary"] or p["title"], "change_kind": rat.get("kind") or p["e_kind"] or p["c_kind"],
                  "result": _result(p["status"], p["result"]), "decision": p["decision"], "reason": rat.get("why"),
-                 "night": p["night"] or _night(p["created_at"]), "team": bool(p["team"])}
+                 "night": p["night"] or _night(p["created_at"]), "team": bool(p["team"]), "private": bool(p["private"])}
             proposals[p["id"]] = f
             out.append(Record("rsi_proposals", f["ref"], p["created_at"], f))
         for d in cur.execute(_DECISIONS_SQL).fetchall():
@@ -330,7 +356,8 @@ def build_records(conn: psycopg.Connection) -> list[Record]:
             f = {"kind": "rejection" if d["action"] == "reject" else "decision", "ref": refs.amem("decision", d["id"]),
                  "rule": base.get("rule"), "hypothesis": base.get("hypothesis"), "change_kind": base.get("change_kind"),
                  "result": d["worker_result"], "decision": d["action"], "reason": d["reason"],
-                 "night": _night(d["decided_at"]), "team": base.get("team") is True}
+                 "night": _night(d["decided_at"]), "team": base.get("team") is True,
+                 "private": base.get("private") is True}
             out.append(Record("rsi_decisions", f["ref"], d["decided_at"], f))
         for x in cur.execute(_EXPERIMENTS_SQL).fetchall():
             hyp = x["hypothesis"] if isinstance(x["hypothesis"], Mapping) else {}
@@ -340,16 +367,17 @@ def build_records(conn: psycopg.Connection) -> list[Record]:
                  "change_kind": x["kind"], "result": _result(x["status"], x["verdict"]),
                  "night": x["night"] or _night(x["created_at"]), "team": _team(meta, hyp)}
             out.append(Record("rsi_experiments", f["ref"], x["created_at"], f))
-        for e in cur.execute(_EDITS_SQL).fetchall():
+        for e in cur.execute(q(_EDITS_SQL)).fetchall():
             meta = e["meta"] if isinstance(e["meta"], Mapping) else {}
             f = {"kind": "edit", "ref": refs.amem("edit", e["id"]), "rule": _rule(e["instruction_source"], e["rule_id"]),
                  "hypothesis": e["summary"] or e["rule_title"], "change_kind": meta.get("kind") or e["verdict"],
-                 "result": e["status"], "reason": e["why"], "night": _night(e["created_at"]), "team": bool(e["team"])}
+                 "result": e["status"], "reason": e["why"], "night": _night(e["created_at"]), "team": bool(e["team"]),
+                 "private": bool(e["private"])}
             out.append(Record("edits", f["ref"], e["created_at"], f))
-        for lc in cur.execute(_LESSONS_SQL).fetchall():
+        for lc in cur.execute(q(_LESSONS_SQL)).fetchall():
             f = {"kind": "lesson", "ref": refs.amem("run", lc["id"]), "rule": _rule("lessons", lc["slug"]),
                  "hypothesis": lc["title"], "decision": lc["decision"], "reason": lc["reason"],
-                 "night": _night(lc["considered_at"]), "team": bool(lc["team"])}
+                 "night": _night(lc["considered_at"]), "team": bool(lc["team"]), "private": bool(lc["private"])}
             out.append(Record("lesson_candidates", f["ref"], lc["considered_at"], f))
     return out
 
@@ -358,7 +386,7 @@ def corpus(conn: psycopg.Connection, environ: Mapping[str, str] | None = None) -
     """(ref, content) for every record the sink may send: exactly what past.dev receives."""
     out = []
     deny = egress.load(conn, environ)
-    for rec in build_records(conn):
+    for rec in build_records(conn, egress.owner_accounts(environ)):
         content, _ = sanitize_record(rec.fields, deny)
         if content is not None:
             out.append((rec.ref, content))
@@ -482,6 +510,17 @@ class PastDevSink:
         self.replay_scope = frozenset(self.tables) if tables else None     # sync.run: the cursors a replay resets
         self.refused: list[tuple[str, list[str]]] = []      # (ref, reasons) from the last batches() call
         self.retired: list[str] = []                         # refs deleted at past.dev: never sent again
+        self.ownership: dict[str, dict[str, int]] = {}       # table -> records per class (F8), last batches() call
+        self.owners: tuple[str, ...] = ()
+
+    @property
+    def masked(self) -> dict[str, Any]:
+        """Records of the last batches() call withheld as team and as private (never sent), in total and per
+        table (with own), for `amem sync plan` (Mission 004C, F8)."""
+        return {egress.TEAM: sum(n[egress.TEAM] for n in self.ownership.values()),
+                egress.PRIVATE: sum(n[egress.PRIVATE] for n in self.ownership.values()),
+                "tables": {t: dict(n) for t, n in sorted(self.ownership.items())},
+                "owner_accounts": list(self.owners)}
 
     def health(self) -> Health:
         if switched_off(self._environ):
@@ -491,13 +530,21 @@ class PastDevSink:
         return self.client.health()
 
     def batches(self, conn: psycopg.Connection, watermarks: Mapping[str, str], *, replay: bool) -> Iterator[sync.Batch]:
-        records = build_records(conn)
+        owners = egress.owner_accounts(self._environ)
+        records = build_records(conn, owners)
         links = _links(conn)
         now = _ts(self.now())
         self.refused, self.retired = [], []
-        deny = egress.load(conn, self._environ)        # Mission 004C (F3): env terms + team repos, read now
+        self.ownership = {}
+        # Mission 004C (F3, F8): env terms + team and private repo names, read now
+        deny = egress.env_terms(self._environ) | egress.team_names(conn, owners=owners)
+        self.owners = owners
         ready: dict[str, tuple[Record, str]] = {}
         for rec in records:
+            cls = egress.TEAM if rec.fields.get("team") is True else \
+                egress.PRIVATE if rec.fields.get("private") is True else egress.OWN
+            n = self.ownership.setdefault(rec.table, dict.fromkeys(egress.CLASSES, 0))
+            n[cls] += 1
             content, reasons = sanitize_record(rec.fields, deny)
             if content is None:
                 self.refused.append((rec.ref, reasons))

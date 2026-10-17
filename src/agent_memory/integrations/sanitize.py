@@ -22,8 +22,9 @@ or refuses it. Every text field goes through, in this order:
    (20+ characters with a digit and a letter). The record's own ref id is kept.
 5. Whitespace collapsed, each field cut to its cap.
 
-The record is refused (`None`) when it is a team item (`team` or `meta.team` true), it names a term on the
-egress deny list (Mission 004C; raw fields or final text), its kind or ref is not one we send, a secret
+The record is refused (`None`) when it is a team item (`team` or `meta.team` true), a private item (`private`
+true: tied to a repo or session whose ownership is not positively the owner's, Mission 004C F8, egress.py), it
+names a term on the egress deny list (Mission 004C; raw fields or final text), its kind or ref is not one we send, a secret
 shape survives (checked before and after scrubbing, on the final text too), the result is not stable under
 a second pass, or the final text exceeds CAP_BYTES. The same record always gives the same bytes.
 """
@@ -174,6 +175,8 @@ def sanitize_record(record: Mapping[str, Any], deny: egress.Deny = egress.NONE) 
     (AMEM_EGRESS_DENY, a team repo or project) is refused, never scrubbed."""
     if _team(record):
         return None, ["team"]
+    if record.get("private") is True:                # Mission 004C (F8): tied to a repo of unknown ownership
+        return None, ["private"]
     if any(deny.match(record.get(f)) for f in (*TEXT_FIELDS, "ref")):
         return None, ["deny"]
     kind = record.get("kind")

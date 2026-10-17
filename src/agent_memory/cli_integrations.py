@@ -7,7 +7,8 @@
                                                                 (prints SQL for the owner; sends nothing)
     amem sync grants --sink clickhouse [--json]   (as the writer: probes read/insert allowed, DDL/users denied)
     amem sync plan --sink clickhouse|langfuse|pastdev [--replay] [--tables T1,T2] [--since DATE] [--json]
-                                                                (dry run; read-only, sends nothing)
+                                                                (dry run; read-only, sends nothing; `masked`:
+                                                                rows masked as team vs private, F8)
     amem evidence query --source sb|ch|lf|pd <named-query> [--param k=v ...] [--json]
     amem evidence ask <question> [--param k=v ...] [--record] [--json]     (questions.py: the investigator questions)
     amem evidence questions
@@ -179,6 +180,12 @@ def cmd_sync_plan(args: argparse.Namespace) -> int:
              + (f", ~{out['cost']} credits" if "cost" in out else "")
              + (f" [scope {json.dumps(scope, sort_keys=True)}]" if scope else "")]
     lines += [f"  {t}: {v['rows']} rows, {v['batches']} batches, {v['bytes']} bytes" for t, v in sorted(out["tables"].items())]
+    masked = out.get("masked")
+    if masked:                                  # Mission 004C (F8): review before a backfill
+        lines.append(f"  masked: team={masked['team']} private={masked['private']} "
+                     f"(owner accounts: {', '.join(masked['owner_accounts']) or 'none'})")
+        lines += [f"    {t}: own={n['own']} team={n['team']} private={n['private']}"
+                  for t, n in sorted(masked["tables"].items())]
     return _out(args, out, "\n".join(lines))
 
 

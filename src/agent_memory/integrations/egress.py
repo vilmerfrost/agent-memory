@@ -1,11 +1,36 @@
-"""The egress deny list: names that must never leave the Mac, through any sink (Mission 004C, F3).
+"""What may leave the Mac, through any sink: repo ownership and the egress deny list (Mission 004C, F3, F8).
 
-Two sources, joined at the start of every sync run:
+Ownership (F8: "unknown repository ownership must default to private"). Every session is one of three classes,
+decided only from what sessions_ingest stored in `sessions.meta` (never a git or network call):
+
+    team      meta.team is true (sessions_ingest.team_info: the git remote owner is not a personal owner, a
+              `mode: team` parent profile, or another session of the same repo in that ingest was team).
+    own       meta.team is false AND meta.remote_owner (case-insensitive) is an owner account. Ingestion writes
+              team = false only together with the remote owner it read, so this is positive knowledge: the
+              repo's git remote names one of the owner's accounts.
+    private   everything else: no remote, not a git repo, a remote whose owner could not be read (a local path,
+              a single-segment URL), a remote owner that is not an owner account, a session ingested before
+              the flag existed, or no session at all.
+
+Owner accounts: AMEM_OWNER_ACCOUNTS (comma-separated), else AMEM_PERSONAL_OWNERS (the list ingestion decided
+team = false from), else `vilmerfrost` (sessions_ingest.DEFAULT_PERSONAL_OWNERS). Each name must match
+ACCOUNT_RE or it is dropped (fewer accounts only ever means more private). Because ingestion stores
+team = false only for a personal owner, AMEM_OWNER_ACCOUNTS can narrow what counts as own but never widen it.
+Not decidable here: the remote's host. Ingestion stores the owner, not the host, so `gitlab.example/vilmerfrost/x`
+looks the same as `github.com/vilmerfrost/x` (own).
+
+Rows tied to a session take its class: a deviation (team also when its own meta says so), a skill call (no
+matched session: private, F7). A row tied to repo names (a lesson's run repo and scope repo) is team when a team
+session has that repo or project, own when every name is a repo or project of an own session, else private.
+`classify` is the rule in Python, `class_sql` the same rule as SQL (with `bind_owners`).
+
+The deny list. Two sources, joined at the start of every sync run:
 
     AMEM_EGRESS_DENY   comma-separated terms, set locally (never sent anywhere). Matched case-insensitively
                        as substrings: `acme` denies `acme-portal` and `Acme`.
-    team names         every repo and project of a session with meta.team = true (an employer work repo,
-                       flagged by sessions_ingest), read from Supabase by the sink.
+    withheld names     every repo and project of a team session, and of a private session unless an own session
+                       has the same name (then the name is the owner's own repo name too), read from Supabase by
+                       the sink.
 
 What a match does:
 - ClickHouse: a label, pseudonym-source or id value that matches, or is email-shaped, ships as null; a row
@@ -14,12 +39,12 @@ What a match does:
 - Langfuse: `langfuse.sensitive()` is true, so a model or tool name ships as `redacted` and a run whose
   identity (experiment id, case, run id) matches is refused.
 
-A team name shorter than MIN_TEAM_TERM characters, and a generic placeholder that sessions_ingest.project_of
-gives to work outside a repo (`unknown`, `evals`, `scratch`, `home`, and `routine:*`), never becomes a term:
-those are not employer names, and as substrings they would null nearly every label. An explicit
-AMEM_EGRESS_DENY term is always used as given.
+A withheld name shorter than MIN_TEAM_TERM characters, and a generic placeholder that sessions_ingest.project_of
+gives to work outside a repo (`unknown`, `evals`, `scratch`, `home`, and `routine:*`) or a mask label (`team`,
+`private`), never becomes a term: those are not employer names, and as substrings they would null nearly every
+label. An explicit AMEM_EGRESS_DENY term is always used as given.
 
-Langfuse's `sensitive(text)` has no connection, so the Langfuse sink stores the team names it read for this
+Langfuse's `sensitive(text)` has no connection, so the Langfuse sink stores the names it read for this
 process with `use_team_names` (replaced on every run); `current()` joins them with the env terms.
 """
 
@@ -33,14 +58,77 @@ from typing import Any
 
 import psycopg
 
+from agent_memory import config as amem_config
+
 DENY_ENV = "AMEM_EGRESS_DENY"
 MIN_TEAM_TERM = 3
-GENERIC_NAMES = frozenset({"unknown", "evals", "scratch", "home", "team", "global"})
+GENERIC_NAMES = frozenset({"unknown", "evals", "scratch", "home", "team", "private", "global"})
 EMAIL_RE = re.compile(r"[^@\s/]+@[^@\s/]+\.[A-Za-z]{2,}")
 
-TEAM_NAMES_SQL = """
-select distinct v from sessions s cross join lateral (values (s.repo), (s.project)) as x(v)
-where s.meta ->> 'team' = 'true' and v is not null
+# ---------------------------------------------------------------- ownership (F8)
+
+OWN, TEAM, PRIVATE = "own", "team", "private"
+CLASSES = (OWN, TEAM, PRIVATE)
+MASKS = (TEAM, PRIVATE)
+OWNER_ACCOUNTS_ENV = "AMEM_OWNER_ACCOUNTS"
+PERSONAL_OWNERS_ENV = "AMEM_PERSONAL_OWNERS"          # = sessions_ingest.PERSONAL_OWNERS_ENV (a test pins it)
+DEFAULT_OWNER_ACCOUNTS = ("vilmerfrost",)             # = sessions_ingest.DEFAULT_PERSONAL_OWNERS
+ACCOUNT_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,99}")  # lowercase; never a quote, so safe as a SQL literal
+OWNERS_TOKEN = "__amem_owner_accounts__"              # class_sql's placeholder; unbound SQL fails (no such column)
+
+
+def owner_accounts(environ: Mapping[str, str] | None = None) -> tuple[str, ...]:
+    """The owner's accounts, lowercase and sorted: AMEM_OWNER_ACCOUNTS, else AMEM_PERSONAL_OWNERS, else the
+    default. A name that does not match ACCOUNT_RE is dropped."""
+    if environ is None:
+        amem_config.load_env()
+        environ = os.environ
+    raw = (environ.get(OWNER_ACCOUNTS_ENV) or "").strip() or (environ.get(PERSONAL_OWNERS_ENV) or "").strip()
+    names = raw.split(",") if raw else DEFAULT_OWNER_ACCOUNTS
+    return tuple(sorted({n.strip().lower() for n in names if ACCOUNT_RE.fullmatch(n.strip().lower())}))
+
+
+def _flag(v: Any) -> str | None:
+    """A jsonb value as `->>` gives it: true -> 'true', false -> 'false', a string as is."""
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    return None if v is None else str(v)
+
+
+def classify(meta: Any, owners: Iterable[str] | None = None) -> str:
+    """own | team | private for one session's stored meta (the rule in the module docstring)."""
+    m = meta if isinstance(meta, Mapping) else {}
+    if _flag(m.get("team")) == "true":
+        return TEAM
+    accounts = {a.strip().lower() for a in (owner_accounts() if owners is None else owners)}
+    owner = m.get("remote_owner")
+    if _flag(m.get("team")) == "false" and isinstance(owner, str) and owner.strip().lower() in accounts:
+        return OWN
+    return PRIVATE
+
+
+def class_sql(meta: str) -> str:
+    """The same rule as SQL text over a sessions.meta jsonb expression: 'team' | 'own' | 'private'. The owner
+    list is the OWNERS_TOKEN placeholder: run the text through bind_owners before executing it."""
+    return (f"(case when ({meta}) ->> 'team' = 'true' then 'team' "
+            f"when ({meta}) ->> 'team' = 'false' and lower(btrim(({meta}) ->> 'remote_owner')) = any({OWNERS_TOKEN}) "
+            f"then 'own' else 'private' end)")
+
+
+def bind_owners(text: str, owners: Iterable[str]) -> str:
+    """`text` with OWNERS_TOKEN replaced by a text[] literal of the owner accounts. Only ACCOUNT_RE names are
+    written (no quote can reach the SQL); none left: an empty array, so nothing is own."""
+    names = sorted({m for m in (n.strip().lower() for n in owners) if ACCOUNT_RE.fullmatch(m)})
+    return text.replace(OWNERS_TOKEN, "array[" + ", ".join(f"'{n}'" for n in names) + "]::text[]")
+
+
+# ---------------------------------------------------------------- the deny list
+
+TEAM_NAMES_SQL = f"""
+with c as (select s.repo, s.project, {class_sql('s.meta')} as cls from sessions s),
+n as (select x.v, c.cls from c cross join lateral (values (c.repo), (c.project)) as x(v) where x.v is not null)
+select distinct v from n
+where cls = 'team' or (cls = 'private' and v not in (select v from n where cls = 'own'))
 """
 
 
@@ -80,14 +168,18 @@ def team_terms(names: Iterable[Any]) -> Deny:
     return Deny(tuple(sorted(out)))
 
 
-def team_names(conn: psycopg.Connection) -> Deny:
-    """Every repo and project of a team session, as deny terms (a read; works on a read-only connection)."""
-    return team_terms(r[0] for r in conn.execute(TEAM_NAMES_SQL).fetchall())
+def team_names(conn: psycopg.Connection, environ: Mapping[str, str] | None = None, *,
+               owners: Iterable[str] | None = None) -> Deny:
+    """Every withheld repo and project name (team, and private unless an own session has the name), as deny
+    terms (a read; works on a read-only connection). `owners`: the owner accounts (default: from `environ`, else
+    the process env)."""
+    q = bind_owners(TEAM_NAMES_SQL, owner_accounts(environ) if owners is None else owners)
+    return team_terms(r[0] for r in conn.execute(q).fetchall())
 
 
 def load(conn: psycopg.Connection, environ: Mapping[str, str] | None = None) -> Deny:
-    """The deny list for one sync run: the env terms and the team names in Supabase now."""
-    return env_terms(environ) | team_names(conn)
+    """The deny list for one sync run: the env terms and the withheld names in Supabase now."""
+    return env_terms(environ) | team_names(conn, environ)
 
 
 _team = NONE
