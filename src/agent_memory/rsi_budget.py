@@ -44,7 +44,14 @@ HARD_MAX_HYPOTHESES = 2          # contract 2.4: at most two hypotheses, whateve
 HARD_MAX_EXPERIMENTS = 3
 HARD_MAX_RETRIES = 2
 HARD_MAX_WALL_CLOCK_S = 4 * 3600  # the sandbox's own MAX_TIMEOUT_S
+HARD_MAX_AB_PAIRS = 60           # rsi_replay: 3 cases x 20 reps
 FREE_MODELS = ("stub", "fixture", "none")
+# What each price basis means for the human reading the costs (Mission 005.5: verified provider billing vs local
+# estimates). "reported": the provider's own CLI reported the cost of the call (Claude Code's total_cost_usd); it is
+# not reconciled with the provider's invoice. Every other paid basis is a local estimate from config/rsi-prices.json
+# or a cap. Free stand-ins and costs booked on another record cost nothing here.
+COST_KINDS = {"reported": "provider-reported", "table": "estimate", "default": "estimate", "call": "estimate",
+              "unknown-usage": "estimate", "cli-cap": "estimate", "free": "free", "none": "free", "on-call": "free"}
 PRICES_FORMAT = "rsi-prices/1"
 PRICES_PATH = config.REPO_ROOT / "config" / "rsi-prices.json"
 _EPS = 1e-9
@@ -259,6 +266,7 @@ class BudgetConfig:
     model_retries: int = 1
     cost_estimate_usd: Mapping[str, float] = field(default_factory=dict)
     sandbox_run_estimate_usd: float = 0.0
+    max_ab_pairs: int = HARD_MAX_AB_PAIRS     # cases x reps of one replay (the night refuses a bigger replay)
 
     @classmethod
     def from_dict(cls, d: Mapping[str, Any]) -> BudgetConfig:
@@ -280,6 +288,7 @@ class BudgetConfig:
             model_retries=_int(d, "model_retries", 1, 0, HARD_MAX_RETRIES),
             cost_estimate_usd=_caps(d, "cost_estimate_usd", number=True),
             sandbox_run_estimate_usd=_num(d, "sandbox_run_estimate_usd", 0.0, 0.0, 100.0),
+            max_ab_pairs=_int(d, "max_ab_pairs", HARD_MAX_AB_PAIRS, 1, HARD_MAX_AB_PAIRS),
         )
 
     def call_cap(self, model: str) -> int:
@@ -488,10 +497,36 @@ class Budget:
         providers = {k: {"requests": int(v["requests"]), "usd": float(v["usd"])}
                      for k, v in sorted(self.provider_requests.items())}
         return {"by_model": dict(sorted(by_model.items())), "sandbox_runs": len(self.runs),
-                "providers": providers, "total_usd": self.spent_usd(), "prices": self.prices.describe()}
+                "providers": providers, "total_usd": self.spent_usd(), "prices": self.prices.describe(),
+                **self.cost_bases()}
+
+    def cost_bases(self) -> dict[str, Any]:
+        """Where each booked USD came from (COST_KINDS): `by_basis` {basis: {kind, records, usd}}, `model_bases`
+        {model: {basis: usd}}, and the split `reported_usd` (provider-reported) vs `estimated_usd` (local
+        estimates). Provider request costs are booked as `call` estimates."""
+        by_basis: dict[str, dict[str, Any]] = {}
+        model_bases: dict[str, dict[str, float]] = {}
+        for rec in [*self.calls, *self.runs]:
+            basis = str(rec.get("price_basis") or "none")
+            b = by_basis.setdefault(basis, {"kind": COST_KINDS.get(basis, "estimate"), "records": 0, "usd": 0.0})
+            b["records"] += 1
+            b["usd"] = round(b["usd"] + float(rec["usd"]), 6)
+            if rec.get("model") and (rec["usd"] or basis not in ("none", "on-call")):
+                mb = model_bases.setdefault(str(rec["model"]), {})
+                mb[basis] = round(mb.get(basis, 0.0) + float(rec["usd"]), 6)
+        prov = round(sum(p["usd"] for p in self.provider_requests.values()), 6)
+        if prov:
+            b = by_basis.setdefault("call", {"kind": "estimate", "records": 0, "usd": 0.0})
+            b["records"] += sum(int(p["requests"]) for p in self.provider_requests.values())
+            b["usd"] = round(b["usd"] + prov, 6)
+        reported = round(sum(v["usd"] for v in by_basis.values() if v["kind"] == "provider-reported"), 6)
+        estimated = round(sum(v["usd"] for v in by_basis.values() if v["kind"] == "estimate"), 6)
+        return {"by_basis": dict(sorted(by_basis.items())),
+                "model_bases": {k: dict(sorted(v.items())) for k, v in sorted(model_bases.items())},
+                "reported_usd": reported, "estimated_usd": estimated}
 
     def caps(self) -> dict[str, Any]:
         c = self.cfg
         return {"max_hypotheses": self.hypothesis_cap(), "max_experiments": c.max_experiments,
                 "max_sandbox_runs": c.max_sandbox_runs, "wall_clock_s": c.wall_clock_s, "max_usd": c.max_usd,
-                "model_calls": dict(c.model_calls), "model_retries": c.model_retries}
+                "model_calls": dict(c.model_calls), "model_retries": c.model_retries, "max_ab_pairs": c.max_ab_pairs}

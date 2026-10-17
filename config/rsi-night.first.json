@@ -1,0 +1,89 @@
+{
+  "format": "rsi-night-config/1",
+  "_note": "First unattended night (Mission 005.5, docs/rsi/night-ops.md 'First-night limits'). Smallest useful scope: 1 experiment, at most 2 hypotheses, 3 A/B pairs, live Codex blind judge + live Jev, a hard wall clock, max_usd 1.00, no retries, no promotion (the night never decides; Apply stays Vilmer's terminal command). Basis: Gate G2b measured $0.0234 for 6 Haiku runs + 3 Codex judge calls + 1 Jev call. Expected night: about $0.10 plus the Sonnet hypothesizer call; worst case the budget allows: $0.91 (`amem rsi night-job --plan --config config/rsi-night.first.json`). Not active: only the launchd job (not installed) would use it. The investigator only reads this file.",
+  "budget": {
+    "max_hypotheses": 2,
+    "max_experiments": 1,
+    "max_ab_pairs": 3,
+    "max_sandbox_runs": 15,
+    "wall_clock_s": 2700,
+    "max_usd": 1.0,
+    "model_retries": 0,
+    "default_model_calls": 0,
+    "free_model_calls": 200,
+    "model_calls": {
+      "jev-1.14.0": 6,
+      "sonnet": 1,
+      "gpt-6-luna": 3
+    },
+    "cost_estimate_usd": {
+      "jev-1.14.0": 0.01,
+      "sonnet": 0.4,
+      "gpt-6-luna": 0.05,
+      "claude-haiku-5-5": 0.05,
+      "default": 1.0
+    },
+    "sandbox_run_estimate_usd": 0.05
+  },
+  "stages": {
+    "triage": "live",
+    "hypothesizer": "claude-cli",
+    "implementer": "stub",
+    "replay_agent": "claude",
+    "judge": "codex",
+    "replay_jev": "live"
+  },
+  "candidates": {
+    "max_considered": 5,
+    "max_attempts": 2,
+    "window_days_max": 7,
+    "skill_score_below": 0.5,
+    "skill_min_scored": 3,
+    "finding_min_n": 5,
+    "max_finding_candidates": 5
+  },
+  "triage": {
+    "weights": {
+      "impact": 0.35,
+      "recurrence": 0.25,
+      "testability": 0.2,
+      "risk": 0.15,
+      "history": 0.25
+    },
+    "min_rank": 0.0
+  },
+  "hypothesizer": {
+    "model": "sonnet",
+    "timeout_s": 300,
+    "max_prompt_chars": 24000
+  },
+  "implementer": {
+    "model": null,
+    "timeout_s": 600,
+    "credentials": "none"
+  },
+  "replay": {
+    "cases": null,
+    "reps": 1,
+    "model": "claude-haiku-5-5",
+    "effort": null,
+    "credentials": "keychain:rsi-sandbox/anthropic",
+    "credential_name": null,
+    "max_budget_usd": 0.05,
+    "judge_model": "gpt-6-luna",
+    "judge_credentials": "keychain:rsi-sandbox/openai",
+    "judge_credential_name": "CODEX_API_KEY",
+    "ensure_network": true
+  },
+  "staging": {
+    "timeout_s": 300
+  },
+  "schedule": {
+    "_note": "Completion checkpoints for `amem rsi night-job` (rsi_schedule.py): each routine's latest routines.log line must be a PASS; same_night = dated on the night key's date (the 09:20 amem-daily and 08:45 amem-archive of that day); max_age_h = younger than that.",
+    "prerequisites": [
+      {"routine": "amem-daily", "same_night": true},
+      {"routine": "amem-archive", "same_night": true},
+      {"routine": "amem-ingest", "same_night": false, "max_age_h": 25}
+    ]
+  }
+}

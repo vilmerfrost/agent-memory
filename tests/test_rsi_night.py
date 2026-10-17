@@ -261,6 +261,50 @@ def test_signal_aborts_recovers_and_keeps_the_checkpoint(env: SimpleNamespace, s
     assert signal.getsignal(signal.SIGTERM) is not None                           # handlers restored, not left armed
 
 
+class CountingHypothesizer(N.FixtureHypothesizer):
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls = 0
+
+    def reply(self, candidate: Any, **kw: Any) -> str:
+        self.calls += 1
+        return super().reply(candidate, **kw)
+
+
+def test_interrupted_experiment_resumes_next_night_without_a_new_model_call(env: SimpleNamespace) -> None:
+    """Mission 005.5 (unattended nights): launchd's SIGTERM, or the job's watchdog, stops the night mid-replay. The
+    next night re-runs the interrupted hypothesis first, from the candidate's pending list: no new hypothesizer
+    call, the same delta window (the checkpoint did not advance), and this time it stages."""
+    seed_rule(env.url, RULE_A, "a")
+    hyp = CountingHypothesizer()
+    r1 = run(env, hypothesizer=hyp, sandbox=FakeSandboxOps(),
+             replayer=FakeReplayer(on_replay=lambda _b: os.kill(os.getpid(), signal.SIGTERM)))
+    assert r1["status"] == "aborted" and r1["experiments"][0]["status"] == "interrupted" and hyp.calls == 1
+    interrupted = r1["experiments"][0]["hypothesis"]["what"]
+    r2 = run(env, N2, hypothesizer=hyp)
+    assert r2["status"] == "ok" and r2["checkpoint"]["before"] is None and r2["checkpoint"]["advanced"]
+    assert r2["experiments"][0]["hypothesis"]["what"] == interrupted and r2["experiments"][0]["status"] == "staged"
+    assert hyp.calls == 1 and "hypothesizer-fixture" not in r2["costs"]["by_model"]
+    assert [r[0] for r in rows(env.url, "select status from rsi_experiments order by created_at")] == ["aborted",
+                                                                                                    "evaluated"]
+
+
+def test_replay_judgments_reach_the_report_and_the_experiment_row(env: SimpleNamespace) -> None:
+    seed_rule(env.url, RULE_A, "a")
+    judge = {"mode": "codex", "judged": 3, "wins_a": 1, "wins_b": 2, "ties": 0, "unfired_b": 0, "errors": 0,
+             "b_winrate": 0.6667, "pairs": [{"case": "x"}]}                 # non-scalar fields are dropped
+    jev_ = {"mode": "live", "status": "ok", "effect": "improves", "confidence": 0.76, "harness_problem": 0.06,
+            "evidence_strength": 0.64, "error": None, "state_key": "k"}
+    rep = run(env, replayer=FakeReplayer(judge=judge, jev=jev_))
+    e = rep["experiments"][0]
+    assert e["judge"] == {k: v for k, v in judge.items() if k != "pairs"}
+    assert e["jev"] == {k: v for k, v in jev_.items() if k != "state_key"}
+    assert rep["experiments"][1]["judge"] is None                              # skipped: never judged
+    ((meta,),) = rows(env.url, "select meta from rsi_experiments")
+    assert meta["judge"]["b_winrate"] == 0.6667 and meta["jev"]["effect"] == "improves"
+    assert N.validate_report({**rep, "experiments": [{**e, "judge": "codex"}]}) != []
+
+
 def _budget_case(env: SimpleNamespace, rep: dict[str, Any], kind: str) -> None:
     assert rep["status"] == "budget_exhausted", rep["notes"]
     assert any(kind in n for n in rep["notes"]), rep["notes"]
@@ -584,6 +628,9 @@ def test_claude_cli_hypothesizer_records_cost_and_uses_the_configured_model(env:
     assert rep["costs"]["by_model"]["opus"] == {"calls": 1, "tokens_in": 900, "tokens_out": 80, "usd": 0.12}
     argv, info = [json.loads(x) for x in fake_claude.read_text().splitlines()]
     assert argv[:3] == ["-p", "--model", "opus"] and "--tools" in argv and argv[argv.index("--tools") + 1] == ""
+    # unattended (Mission 005.5): host hooks off, permission prompts denied instead of waiting
+    assert json.loads(argv[argv.index("--settings") + 1]) == {"disableAllHooks": True}
+    assert argv[argv.index("--permission-prompts") + 1] == "none"
     assert info["untrusted"] is True                                              # evidence went in its envelope
     ((meta,),) = rows(env.url, "select meta from rsi_experiments")
     assert meta["costs"]["usd"] == 0.0                                            # S5 ran before the experiment

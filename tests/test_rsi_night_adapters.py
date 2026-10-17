@@ -25,14 +25,15 @@ def budget(**kw: Any) -> Budget:
 def test_pack_evidence_delegates_to_rsi_evidence_pack(monkeypatch: pytest.MonkeyPatch) -> None:
     seen: dict[str, Any] = {}
     fake = SimpleNamespace(
-        delta_since=lambda since, *, conn: seen.setdefault("delta", (since, conn)) and "DELTA",
+        delta_since=lambda since, *, conn, **kw: seen.setdefault("delta", (since, conn, kw)) and "DELTA",
+        default_retrievers=lambda connect=None: {"supabase": "SB"},
         build_pack=lambda cand: seen.setdefault("pack", dict(cand)) and "PACK",
         render_for_model=lambda pack: f"rendered:{pack}")
     monkeypatch.setitem(__import__("sys").modules, "agent_memory.rsi_evidence_pack", fake)
     monkeypatch.setattr(agent_memory, "rsi_evidence_pack", fake, raising=False)
     ev = N.PackEvidence()
     assert ev.delta("2026-10-18T00:00:00+00:00", conn="CONN") == "DELTA"
-    assert seen["delta"] == ("2026-10-18T00:00:00+00:00", "CONN")
+    assert seen["delta"] == ("2026-10-18T00:00:00+00:00", "CONN", {"retrievers": {"supabase": "SB"}})
     assert ev.pack({"dedupe_key": "k"}) == "PACK" and ev.render("PACK") == "rendered:PACK"
 
 
@@ -124,6 +125,9 @@ def test_sandbox_implementer_runs_the_agent_inside_the_sandbox(monkeypatch: pyte
     assert b.costs()["by_model"][model]["calls"] == 1
     if agent == "claude":
         assert b.costs()["by_model"]["opus"]["usd"] == 0.04 and "--allowedTools" in ran["command"]
+        assert b.costs()["model_bases"]["opus"] == {"reported": 0.04}
+    else:                    # Codex reports no cost: booked as an estimate, never as provider-reported
+        assert "reported" not in b.costs()["model_bases"]["codex"] and b.costs()["reported_usd"] == 0.0
 
 
 def test_default_adapters_follow_the_config(tmp_path: Path) -> None:
