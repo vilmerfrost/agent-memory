@@ -204,8 +204,10 @@ def keychain_present(ref: str, *, runner: Callable[..., Any] | None = None) -> s
     exe = (os.environ.get(RSI_SECURITY_ENV, "").strip() or os.environ.get(SECURITY_ENV, "").strip()
            or "/usr/bin/security")
     run = runner or subprocess.run
+    keychain = (os.environ.get("AMEM_RSI_KEYCHAIN") or "").strip()      # rehearsal only (temp HOME); see rsi_sandbox
+    extra = [str(Path(keychain).expanduser())] if keychain else []
     try:
-        proc = run([exe, "find-generic-password", "-s", service, "-a", account], capture_output=True, timeout=10,
+        proc = run([exe, "find-generic-password", "-s", service, "-a", account, *extra], capture_output=True, timeout=10,
                    check=False, stdin=subprocess.DEVNULL)
     except (OSError, subprocess.TimeoutExpired) as exc:
         return f"keychain lookup failed ({type(exc).__name__})"

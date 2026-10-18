@@ -325,3 +325,27 @@ def test_lock_exclusive_and_stale_release(sb):
     sb.acquire_lock("e1.A", ttl_s=60)           # a stale lock (dead pid) is taken over
     p.write_text(json.dumps({"pid": os.getpid(), "host": socket.gethostname(), "created": 0, "expires": 1}))
     assert sb._lock_stale(p)                     # expired
+
+
+def test_credentials_keychain_file_override(tmp_path, monkeypatch):
+    """The paid rehearsal runs under a temp HOME, which hides the login keychain from `security` (exit 44):
+    AMEM_RSI_KEYCHAIN names the keychain file to search. Unset (production), the argv is unchanged."""
+    calls = []
+
+    class P:
+        returncode, stdout = 0, f"{DUMMY}\n"
+
+    def fake_runner(argv, **kw):
+        calls.append(argv)
+        return P()
+    kc = tmp_path / "login.keychain-db"
+    kc.write_bytes(b"")
+    monkeypatch.setenv(rs.KEYCHAIN_FILE_ENV, str(kc))
+    assert rs.load_credentials("keychain:rsi-sandbox/openai", name="OPENAI_API_KEY", runner=fake_runner) == {"OPENAI_API_KEY": DUMMY}
+    assert calls[-1] == ["/usr/bin/security", "find-generic-password", "-s", "rsi-sandbox", "-a", "openai", "-w", str(kc)]
+    monkeypatch.setenv(rs.KEYCHAIN_FILE_ENV, str(tmp_path / "missing.keychain-db"))
+    with pytest.raises(rs.CredentialError, match="not a keychain file"):
+        rs.load_credentials("keychain:rsi-sandbox/openai", name="OPENAI_API_KEY", runner=fake_runner)
+    monkeypatch.delenv(rs.KEYCHAIN_FILE_ENV)
+    rs.load_credentials("keychain:rsi-sandbox/openai", name="OPENAI_API_KEY", runner=fake_runner)
+    assert calls[-1][-1] == "-w"

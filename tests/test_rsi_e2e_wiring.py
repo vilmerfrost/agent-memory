@@ -342,3 +342,29 @@ def test_demo_jev_fixtures_hash_to_their_state() -> None:
         else:
             assert jev.fixture_key(body["_replay_state"], replay) == p.stem, p.name
         assert "_state" not in body                     # tests/test_tasks_state.py reserves "_state" for routines
+
+
+def test_model_cli_env_home_override_is_rehearsal_only() -> None:
+    """AMEM_RSI_MODEL_HOME (set only by the paid rehearsal) gives the host `claude -p` the real HOME for its login;
+    the variable itself never reaches the child."""
+    env = N.model_cli_env({"PATH": "/usr/bin", "HOME": "/tmp/fake", "AMEM_RSI_MODEL_HOME": "/Users/real"})
+    assert env == {"PATH": "/usr/bin", "HOME": "/Users/real"}
+    assert N.model_cli_env({"PATH": "/usr/bin", "HOME": "/h"})["HOME"] == "/h"
+
+
+def test_live_rehearsal_is_not_ok_unless_the_night_ran() -> None:
+    """2026-10-18: the first paid rehearsal printed REHEARSAL OK although the night failed its credentials preflight."""
+    from agent_memory import rsi_rehearsal as R
+    failed = {"gate": {"status": "SKIP"}, "night_job": {"status": "FAIL", "items": ["credentials replay agent"],
+              "fields": {"status": "preflight_failed"}}, "experiment": {}, "brief_job": {"status": "PASS"},
+              "report": {"costs": {"total_usd": 0.0}}, "max_usd": 1.0,
+              "fingerprint": {"before": "a", "after": "a"}, "checks": {"synthetic_production_unchanged": True,
+              "scratch_agent_config_unchanged": True, "db_host": "127.0.0.1"}}
+    probs = R.problems_of(failed, live=True)
+    assert any("did not run to the end" in p for p in probs)
+    assert any("no experiment to a verdict" in p for p in probs)
+    ran = {**failed, "night_job": {"status": "PASS", "fields": {"status": "ok"}},
+           "experiment": {"verdict": "NO_EFFECT", "status": "rejected"}, "report": {"costs": {"total_usd": 1.2}}}
+    probs = R.problems_of(ran, live=True)
+    assert not any("did not run" in p or "no experiment" in p for p in probs)
+    assert any("over the approved $1.00" in p for p in probs)
