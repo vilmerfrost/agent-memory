@@ -382,6 +382,12 @@ class GatedRetriever:
         self.meter = meter or Meter()
         self.source = RETRIEVER_OF[service]
 
+    @property
+    def owner_off(self) -> bool:
+        """Closed by the owner's choice (a switch or the evidence policy), not by a fault: the night reports it
+        as skipped. An unconfigured, unreachable or broken provider stays unavailable (a fault)."""
+        return self.block.startswith(("switched off", "not approved"))
+
     def health(self) -> Health:
         if self.block or self.inner is None:
             return Health(False, self.block)

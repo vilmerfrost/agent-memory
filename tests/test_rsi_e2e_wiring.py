@@ -368,3 +368,21 @@ def test_live_rehearsal_is_not_ok_unless_the_night_ran() -> None:
     probs = R.problems_of(ran, live=True)
     assert not any("did not run" in p or "no experiment" in p for p in probs)
     assert any("over the approved $1.00" in p for p in probs)
+
+
+def test_a_long_target_never_cuts_the_evidence_block(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """2026-10-18 review: the prompt was cut at max_prompt_chars from the end, which could drop the evidence
+    block's END line and the reply-shape instructions. The target text now gives way first."""
+    script, seen = tmp_path / "claude", tmp_path / "prompt.txt"
+    script.write_text(FAKE_CLAUDE.replace("sys.stdin.read()", f"open({str(seen)!r}, 'w').write(sys.stdin.read())")
+                      .format(py=sys.executable))
+    script.chmod(0o755)
+    monkeypatch.setenv("AMEM_EDITS_CLAUDE", str(script))
+    monkeypatch.setenv("FAKE_ENV_LOG", str(tmp_path / "env.json"))
+    evidence = "BEGIN-EVIDENCE nonce\n" + ("{\"i\": 1}\n" * 900) + "END-EVIDENCE nonce\n"
+    b = Budget(BudgetConfig.from_dict({"max_usd": 5.0, "model_calls": {"opus": 2}}))
+    N.ClaudeCliHypothesizer({"max_prompt_chars": 12_000}).reply(
+        {"dedupe_key": "k", "target": "~/.claude/CLAUDE.md"}, evidence_text=evidence, targets=["~/.claude/CLAUDE.md"],
+        cap=2, target_text="x" * 12_000, budget=b)
+    prompt = seen.read_text()
+    assert len(prompt) <= 12_000 and "END-EVIDENCE nonce" in prompt and evidence in prompt

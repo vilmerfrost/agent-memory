@@ -566,6 +566,11 @@ def default_retrievers(environ: Mapping[str, str] | None = None,
     return EP.build(environ, connect=connect, subject_rule=subject_rule).retrievers
 
 
+def _owner_off(retriever: Any) -> bool:
+    """A provider the owner switched off or did not approve (GatedRetriever.owner_off): skipped, not a fault."""
+    return bool(getattr(retriever, "owner_off", False))
+
+
 def _combine(statuses: Sequence[str]) -> str:
     s = {("error" if x in ("bad-params", "unknown-query") else x) for x in statuses}
     if not s:
@@ -756,6 +761,9 @@ def build_pack(candidate: Mapping[str, Any], *, retrievers: Mapping[str, Retriev
     if sb_read != "skipped":
         per_source_status["supabase"].append(sb_read)
     health = {s: _combine(per_source_status.get(s, [])) for s in SOURCES}
+    for retr in RETRIEVERS:
+        if _owner_off(rs.get(retr)):            # the raw retriever (the runner wraps it)
+            health[SERVICE[retr]] = "skipped"
     cut_steps = any(len(res.refs) > max(limits.per_source, 1) * 3 for _, res in done)
     pack = EvidencePack(c.key, findings, health, bool(dropped) or cut_steps,
                         (now or (lambda: datetime.now(UTC)))().isoformat(timespec="seconds"), limits,
@@ -1111,6 +1119,9 @@ def delta_since(checkpoint_ts: str | datetime | None, *, conn: psycopg.Connectio
                                                "error" if state == "timeout" else "unavailable")
         for svc, sts in stat.items():
             d.health[svc] = _combine(sts)
+        for retr in ("ch", "lf", "pd"):
+            if _owner_off(retrievers.get(retr)):
+                d.health[SERVICE[retr]] = "skipped"
         live = _raws(done, 10)
         subjects += [s for raw in live for s in raw.ev.subject_refs if s.startswith("amem:")]
     found = existing(conn, subjects) if subjects else set()

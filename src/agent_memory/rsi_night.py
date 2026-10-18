@@ -663,11 +663,13 @@ class ClaudeCliHypothesizer:
         argv = [*distill.writer_argv(edits_writer.CLAUDE_ENV, model=model), *UNATTENDED_CLAUDE_FLAGS]
         cand = {k: candidate.get(k) for k in ("dedupe_key", "source", "kind", "target", "rule_key", "seen_count")}
         cand["metrics"] = {k: v for k, v in (candidate.get("metrics") or {}).items() if isinstance(v, (int, float))}
-        prompt = HYPOTHESIS_PROMPT.format(cap=cap, targets=", ".join(targets),
-                                          candidate=json.dumps(cand, sort_keys=True, default=str),
-                                          target=candidate.get("target") or "(choose from the list)",
-                                          target_text=target_text[:12_000], evidence=evidence_text)
-        prompt = prompt[: int(self.cfg.get("max_prompt_chars") or 24_000)]
+        limit = int(self.cfg.get("max_prompt_chars") or 24_000)
+        fields = dict(cap=cap, targets=", ".join(targets), candidate=json.dumps(cand, sort_keys=True, default=str),
+                      target=candidate.get("target") or "(choose from the list)", evidence=evidence_text)
+        # The target text gives way first, so a long prompt never cuts the nonce-delimited evidence block (its END
+        # line) or the reply-shape instructions; the final cut stays as a backstop only.
+        room = limit - len(HYPOTHESIS_PROMPT.format(target_text="", **fields))
+        prompt = HYPOTHESIS_PROMPT.format(target_text=target_text[: max(0, min(12_000, room))], **fields)[:limit]
         timeout = float(self.cfg.get("timeout_s") or 600)
 
         def run() -> tuple[str, Usage]:
@@ -1162,6 +1164,7 @@ class Night:
         self.allowlist = list(self.ad.targets())
         self.budget.check()
         if not self.dry_run:
+            self._reconcile_orphans()
             AP.checkpoint(self.conn, JOB, self.night, "running",
                           meta={"started_at": self.report["started_at"], "config_sha256": self.cfg.sha256})
             self.marked_running = True
@@ -1642,6 +1645,25 @@ class Night:
         reap = getattr(self.ad.sandbox, "reap", None)
         if ids and callable(reap):
             self.notes.append("sandbox reap: " + json.dumps(reap(ids), sort_keys=True, default=str)[:300])
+
+    def _reconcile_orphans(self) -> None:
+        """Under the night lock: an earlier night that was hard-killed (watchdog exit 124, power loss) never ran
+        _unwind. Its experiments still 'planned'/'running' are aborted and its 'selected' candidates go back to
+        deferred, so tonight's pool can pick them again. Its pending hypotheses are not recovered."""
+        assert self.conn is not None
+        try:
+            n_exp = self.conn.execute(
+                "update rsi_experiments set status = 'aborted', finished_at = now(), meta = meta || %s "
+                "where night <> %s and status in ('planned', 'running')",
+                (Jsonb({"reason": "orphaned: an earlier night stopped without unwinding"}), self.night)).rowcount
+            n_cand = self.conn.execute(
+                "update rsi_candidates set status = 'deferred', decided_reason = %s where status = 'selected'",
+                ("orphaned: an earlier night stopped without unwinding",)).rowcount
+        except psycopg.Error as exc:
+            raise PreflightFailed(f"orphan reconcile failed ({type(exc).__name__})") from None
+        if n_exp or n_cand:
+            self.notes.append(f"reconciled an earlier stopped night: experiments aborted={n_exp}, "
+                              f"candidates deferred={n_cand}")
 
     def _unwind(self, why: str) -> None:
         """After a stop: experiments still running are aborted, candidates still selected go back to deferred."""

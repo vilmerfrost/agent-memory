@@ -304,7 +304,7 @@ def test_build_pack_default_retrievers_are_the_real_gated_clients(db: str, m: Mo
     assert rs["pd"].block.startswith("not approved")                  # the committed policy keeps past.dev closed
     pack = P.build_pack(cand(db), environ=provider_env(db, m), connect=lambda: psycopg.connect(db))
     assert pack.health["clickhouse"] == "ok" and pack.health["langfuse"] == "ok"
-    assert pack.health["pastdev"] == "unavailable" and m.pd.requests == []
+    assert pack.health["pastdev"] == "skipped" and m.pd.requests == []    # closed by the owner: not a fault
     f = {x.ref: x for x in pack.findings}
     gap = f[f"ch:q.rule_gap/{R1}"]
     assert gap.status == "ok" and gap.authority == f"amem:deviation/{DEV0_ID}" and gap.n == 7 and gap.ts
@@ -320,7 +320,7 @@ def test_delta_with_the_real_providers(db: str, m: Mocks) -> None:
     rs = P.default_retrievers(provider_env(db, m), lambda: psycopg.connect(db))
     with P._read_only(lambda: psycopg.connect(db))() as conn:
         d = P.delta_since(None, conn=conn, retrievers=rs)
-    assert d.health["clickhouse"] == "ok" and d.health["pastdev"] == "unavailable"
+    assert d.health["clickhouse"] == "ok" and d.health["pastdev"] == "skipped"
     assert any(f.via == "ch.rule_gap" and f.n == 7 and f.status == "ok" for f in d.findings)
 
 
@@ -350,7 +350,7 @@ def test_a_provider_http_error_is_error_and_the_night_continues(night: SimpleNam
                       adapters=adapters(evidence=N.PackEvidence(night.url), replayer=FakeReplayer("IMPROVES")))
     assert N.validate_report(rep) == []
     assert rep["health"]["clickhouse"] == "error" and rep["health"]["langfuse"] in ("ok", "skipped")
-    assert rep["health"]["pastdev"] == "unavailable"            # not approved: never asked
+    assert rep["health"]["pastdev"] == "skipped"                # not approved: never asked, not a fault
     assert rep["status"] in ("ok", "partial") and rep["checkpoint"]["advanced"]
     assert rep["experiments"] and rep["experiments"][0]["status"] == "staged"      # the night still did its work
     assert m.ch.requests_to("POST", "/") and m.pd.requests == []
@@ -368,6 +368,28 @@ def test_a_provider_timeout_is_error_and_the_rest_answers(db: str, m: Mocks, tmp
     lf = rep["providers"]["langfuse"]
     assert lf["status"] == "error" and "timeout" in lf["reason"]
     assert rep["health"]["clickhouse"] == rep["health"]["supabase"] == rep["health"]["pastdev"] == "ok"
+
+
+def test_a_night_with_pastdev_closed_by_policy_is_ok_not_partial(night: SimpleNamespace, m: Mocks,
+                                                                  monkeypatch: pytest.MonkeyPatch) -> None:
+    """2026-10-18 review: with the committed policy (past.dev read: false) every real night ended `partial`, so the
+    night-job logged FAIL and routine-audit raised it daily. An owner-closed provider is `skipped`; a configured
+    provider that fails still makes the night partial (test above)."""
+    seed_rule(night.url, RULE_A, "a")
+    with psycopg.connect(night.url) as conn:
+        conn.execute("update sessions set created_at = now() - interval '2 hours'")
+        conn.execute("update deviations set created_at = now() - interval '2 hours'")
+    for k, v in provider_env(None, m).items():
+        monkeypatch.setenv(k, v)
+    rep = N.run_night(night="2026-10-18", db_url=night.url,
+                      adapters=adapters(evidence=N.PackEvidence(night.url), replayer=FakeReplayer("IMPROVES")))
+    assert N.validate_report(rep) == []
+    assert rep["health"]["pastdev"] == "skipped" and rep["health"]["clickhouse"] == "ok"
+    assert rep["status"] == "ok" and rep["checkpoint"]["advanced"] and m.pd.requests == []
+    monkeypatch.delenv("AMEM_LANGFUSE_HOST")                    # an approved provider without its config: a fault
+    rep = N.run_night(night="2026-10-19", db_url=night.url,
+                      adapters=adapters(evidence=N.PackEvidence(night.url), replayer=FakeReplayer("IMPROVES")))
+    assert rep["health"]["langfuse"] == "unavailable" and rep["status"] == "partial"
 
 
 # ---------------------------------------------------------------- not approved for this data: unavailable
