@@ -1099,3 +1099,117 @@ def seed(db_url: str, anchor: date | None = None, *, out: Path | str = "synth-ou
     path = write_gold(gold(ds), Path(out))
     return {"status": status, "host": host, "dataset": DATASET, "version": VERSION, "synthetic": True,
             "anchor": ds.anchor.isoformat(), "counts": ds.counts(), "markers": len(ds.markers), "gold": str(path)}
+
+
+# ---------------------------------------------------------------- Mission 005: the nightly-investigator demo rows
+#
+# `amem synth seed --rsi-demo` adds a second, separate synthetic story for `amem rsi night` (docs/rsi/m005-report.md):
+# Claude and Codex sessions that keep failing ONE instruction, the closing-line rule. Claude sessions fail it in
+# the global CLAUDE.md (`claude-md:global`), Codex sessions in the global AGENTS.md (`agents-md:global`): two
+# candidates for the same failure, one per instruction file. The rows sit a few days before the seeding time (not
+# the story anchor), so a first night's delta (the last 7 days) sees them; seed the base story with an anchor a
+# month back to keep it out of that window. An earlier, reverted improve edit of the same rule is the history the
+# evidence pack finds. These rows are outside gold.json (no leak markers): do not combine --rsi-demo with the
+# ClickHouse / Langfuse / past.dev egress checks.
+
+M005_DATASET = "amem-synth-m005"
+M005_VERSION = 1
+M005_SENTINEL = ("synth:seed-m005", f"{M005_DATASET}/v{M005_VERSION}")
+M005_RULE = "synth-m005-closing-line"
+M005_TITLE = "Closing line"
+M005_SOURCES = {"claude": "claude-md:global", "codex": "agents-md:global"}
+M005_TABLES = ("sessions", "deviations", "edits")
+# session id, tool, kind, model, outcome, hours before the seeding time, followed grades (one deviation each)
+_M005_SESSIONS = (
+    ("synth-m005-claude-01", "claude", "chat", "synth-claude-opus", "shipped", 110, (0.25, 0.125)),
+    ("synth-m005-claude-02", "claude", "worker", "synth-claude-sonnet", "partial", 86, (0.25,)),
+    ("synth-m005-claude-03", "claude", "chat", "synth-claude-opus", "committed", 62, (0.125,)),
+    ("synth-m005-claude-04", "claude", "chat", "synth-claude-opus", "shipped", 30, (0.25,)),
+    ("codex:synth-m005-01", "codex", "chat", "synth-gpt-codex", "shipped", 98, (0.25,)),
+    ("codex:synth-m005-02", "codex", "worker", "synth-gpt-codex", "failed", 74, (0.125,)),
+    ("codex:synth-m005-03", "codex", "chat", "synth-gpt-codex", "partial", 40, (0.25,)),
+)
+
+
+def m005_candidate_keys() -> dict[str, str]:
+    """The rsi_candidates dedupe keys `amem rsi night` builds for the two groups (rsi_night._deviation_sightings)."""
+    return {tool: f"dev:{src}:{M005_RULE}" for tool, src in M005_SOURCES.items()}
+
+
+def build_m005(now: datetime) -> dict[str, list[dict[str, Any]]]:
+    """The Mission 005 rows, `now` = the seeding time. Same `now`, same rows."""
+    from agent_memory import deviations as DV
+    rows: dict[str, list[dict[str, Any]]] = {t: [] for t in M005_TABLES}
+    for i, (sid, tool, kind, model, outcome, hours, grades) in enumerate(_M005_SESSIONS):
+        start = now - timedelta(hours=hours)
+        end = start + timedelta(minutes=25)
+        src = M005_SOURCES[tool]
+        rows["sessions"].append({
+            "session_id": sid, "kind": kind, "tool": tool, "repo": "own-app-m005",
+            "project_dir": "/Users/synth-dev/work/own-app-m005", "started_at": start, "ended_at": end,
+            "last_activity_at": end, "created_at": start, "scanned_at": end + timedelta(minutes=2),
+            "transcript_bytes": 30_000 + 1000 * i, "skills": [], "instructions": [src],
+            "meta": {"synthetic": True, "dataset": M005_DATASET, "team": False, "remote_owner": OWNER,
+                     "remote_host": OWN_HOST},
+            "title": f"SYNTHETIC: write the weekly status report ({i + 1})", "category": kind, "model": model,
+            "outcome": outcome, "outcome_at": end, "env": "prod",
+            "summary": "SYNTHETIC summary: a status report that ended without the required closing line"})
+        for k, followed in enumerate(grades):
+            did = uid(f"m005:deviation:{sid}:{k}")
+            rows["deviations"].append({
+                "id": did, "source_key": f"synth-m005-dev-{sid}-{k}", "session_id": sid, "instruction_source": src,
+                "instruction_ref": M005_TITLE, "turn": 6 + k,
+                "what": "SYNTHETIC: ended the report without the closing line the instructions ask for",
+                "why": "SYNTHETIC: the rule only says to mention the skills used; it never names the exact last line",
+                "how": "SYNTHETIC: state the exact closing line every report must end with",
+                "followed_grade": followed, "result_grade": 0.5, "jev_verdict": "edit_instruction",
+                "jev_confidence": 0.8, "jev_mode": "fixture", "jev_answers": {"synthetic": True},
+                "writer_model": "synth-writer", "created_at": end + timedelta(minutes=5 + k),
+                "rule_id": M005_RULE, "rule_title": M005_TITLE, "instruction_sha": _sha(f"synth:{src}"),
+                "meta": {"synthetic": True, "dataset": M005_DATASET}, "result_outcome": outcome,
+                "objective_result": DV.objective_result(outcome, kind)})
+    eid = uid("m005:edit:closing-line")
+    rows["edits"].append({
+        "id": eid, "improve_id": "synth-m005-improve-1", "status": "reverted",
+        "target_path": "~/.claude/CLAUDE.md", "instruction_source": M005_SOURCES["claude"], "rule_id": M005_RULE,
+        "rule_title": M005_TITLE, "instruction_sha_before": _sha("synth-m005-before"),
+        "instruction_sha_after": _sha("synth-m005-after"), "deviation_ids": [], "verdict": "edit_instruction",
+        "jev_confidence": 0.6, "why": "SYNTHETIC: an earlier rewording of the closing-line rule",
+        "summary": "SYNTHETIC: reworded the rule; reverted after the deviations kept coming",
+        "pushed_at": now - timedelta(days=20), "reverted_at": now - timedelta(days=19),
+        "meta": {"synthetic": True, "dataset": M005_DATASET}, "created_at": now - timedelta(days=20, hours=1)})
+    return rows
+
+
+def seed_m005(db_url: str, *, now: datetime | None = None,
+              connect: Callable[..., psycopg.Connection] = psycopg.connect) -> dict[str, Any]:
+    """Add the Mission 005 rows to a migrated local database (the base story may or may not be there). Idempotent:
+    a database that already holds them (sentinel rsi_checkpoints job `synth:seed-m005`) is reused as is."""
+    host = check_local(db_url)
+    with connect(db_url) as conn:
+        if not _migrated(conn):
+            raise SeedError("the database is not migrated (run `amem db migrate` against it first)")
+        prior = conn.execute("select meta from rsi_checkpoints where job = %s and run_key = %s",
+                             M005_SENTINEL).fetchone()
+        if prior is not None:
+            meta = dict(prior[0])
+            status, at, counts = "reused", str(meta.get("now")), dict(meta.get("counts") or {})
+        else:
+            at_dt = (now or datetime.now(UTC)).astimezone(UTC).replace(microsecond=0)
+            rows = build_m005(at_dt)
+            sids = [r["session_id"] for r in rows["sessions"]]
+            if conn.execute("select count(*) from sessions where session_id = any(%s)", (sids,)).fetchone()[0]:
+                raise SeedError("the Mission 005 session ids exist without the sentinel; use a fresh database")
+            for t in M005_TABLES:
+                for row in rows[t]:
+                    _insert(conn, t, row)
+            counts = {t: len(rows[t]) for t in M005_TABLES}
+            at = at_dt.isoformat()
+            conn.execute("insert into rsi_checkpoints (job, run_key, status, finished_at, meta) values "
+                         "(%s, %s, 'done', now(), %s)",
+                         (*M005_SENTINEL, Jsonb({"dataset": M005_DATASET, "version": M005_VERSION, "synthetic": True,
+                                                 "now": at, "counts": counts})))
+            conn.commit()
+            status = "seeded"
+    return {"status": status, "host": host, "dataset": M005_DATASET, "version": M005_VERSION, "synthetic": True,
+            "now": at, "counts": counts, "rule": M005_RULE, "candidate_keys": m005_candidate_keys()}

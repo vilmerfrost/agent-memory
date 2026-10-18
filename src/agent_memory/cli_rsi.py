@@ -72,7 +72,8 @@ def cmd_tracking_plan(args: argparse.Namespace) -> int:
 
 def cmd_freeze_status(args: argparse.Namespace) -> int:
     st = T.freeze_status()
-    line = "FROZEN" if st["frozen"] else "NOT FROZEN: " + "; ".join(st["reasons"])
+    line = ("FROZEN" + (" (stage-only: amem-daily stages proposals, nothing applies them)" if st["stage_only"] else "")
+            if st["frozen"] else "NOT FROZEN: " + "; ".join(st["reasons"]))
     return _out(args, st, f"rsi freeze-status: {line}", 0 if st["frozen"] else 1)
 
 
@@ -232,6 +233,23 @@ def cmd_show(args: argparse.Namespace) -> int:
     return _out(args, dict(p), "\n".join(f"{k}: {v}" for k, v in p.items() if k not in ("meta",)))
 
 
+def cmd_brief(args: argparse.Namespace) -> int:
+    """The morning brief (rsi_brief). Read-only. --push refuses unless AMEM_RSI_BRIEF_PUSH=1 (off in Mission 005)."""
+    from agent_memory import rsi_brief as BR
+    if args.push and not BR.push_allowed():
+        print(f"amem: rsi brief: {BR.PUSH_OFF}", file=sys.stderr)
+        return 2
+    try:
+        brief = BR.make_brief(night=args.night, root=args.root.expanduser() if args.root else None)
+    except BR.ReportError as exc:
+        print(f"amem: rsi brief: {exc}", file=sys.stderr)
+        return 1
+    if args.push:
+        brief["push"] = BR.push_brief(brief)
+    print(json.dumps(brief, sort_keys=True, default=str) if args.json else BR.render_markdown(brief))
+    return 0
+
+
 def cmd_checkpoint(args: argparse.Namespace) -> int:
     guard = _write_guard if args.op == "mark" else _read_guard
     if (code := guard("rsi checkpoint")) is not None:
@@ -250,7 +268,14 @@ def register(sub: argparse._SubParsersAction) -> None:
     rsi = sub.add_parser("rsi", help="RSI V1 approval-first: targets, baselines, proposals, decisions, promotion worker")
     s = rsi.add_subparsers(dest="rsi_cmd", required=True)
 
-    p = s.add_parser("targets", help="production files the loop may target (sha256, git state); read-only")
+    from agent_memory import rsi_night                 # `amem rsi night` (Mission 005, rsi_night.register)
+    rsi_night.register(s)
+    from agent_memory import rsi_evidence_providers    # `amem rsi evidence-probe` (Mission 005.5, read-only)
+    rsi_evidence_providers.register(s)
+    from agent_memory import rsi_schedule              # `amem rsi night-job` / `brief-job` (Mission 005.5)
+    rsi_schedule.register(s)
+
+    p = s.add_parser("targets",help="production files the loop may target (sha256, git state); read-only")
     p.add_argument("--no-schedules", action="store_true")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_targets)
@@ -325,6 +350,13 @@ def register(sub: argparse._SubParsersAction) -> None:
     p.add_argument("proposal")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_show)
+
+    p = s.add_parser("brief", help="the morning brief for a night report (read-only; Apply / Reject / Details commands)")
+    p.add_argument("--night", help="night key (default: the latest night with a report)")
+    p.add_argument("--root", type=Path, help="the RSI sandbox root (default: RSI_SANDBOX_DIR or ~/sandbox)")
+    p.add_argument("--push", action="store_true", help="also send a summary push (refused unless AMEM_RSI_BRIEF_PUSH=1)")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_brief)
 
     p = s.add_parser("checkpoint", help="dependency-aware scheduling: mark or check a job's run")
     p.add_argument("op", choices=["mark", "check"])

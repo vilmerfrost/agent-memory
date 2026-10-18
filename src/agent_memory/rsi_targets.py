@@ -333,13 +333,17 @@ def freeze_status() -> dict[str, Any]:
     ac, h = agent_config_dir(), home()
     reasons: list[str] = []
     checks: dict[str, Any] = {}
+    staging = False
     label = "com.vilmerfrost.amem-daily"
     for name, path in (("installed_plist", h / "Library" / "LaunchAgents" / f"{label}.plist"),
                        ("repo_plist", ac / "launchd" / f"{label}.plist")):
         try:
             env = plistlib.loads(path.read_bytes()).get("EnvironmentVariables") or {}
-            checks[name] = {"AMEM_EDITS_LIVE": env.get("AMEM_EDITS_LIVE")}
-            if env.get("AMEM_EDITS_LIVE") == "1":
+            live, mode_env = env.get("AMEM_EDITS_LIVE") == "1", str(env.get("AMEM_EDITS_MODE") or "").strip()
+            checks[name] = {"AMEM_EDITS_LIVE": env.get("AMEM_EDITS_LIVE"), "AMEM_EDITS_MODE": env.get("AMEM_EDITS_MODE")}
+            if live and mode_env == "stage":       # edits.stage_mode(): proposals only, production is only read
+                staging = True
+            elif live:
                 reasons.append(f"{name}: AMEM_EDITS_LIVE=1 (amem-daily edits step is live)")
         except (OSError, plistlib.InvalidFileException):
             checks[name] = {"error": "unreadable"}
@@ -359,4 +363,5 @@ def freeze_status() -> dict[str, Any]:
         checks[f"task:{t}"] = st
         if t == "ab-lessons-monthly" and st.get("enabled") and not (ab_guard and mode == "stage"):
             reasons.append("ab-lessons-monthly is enabled and writes lessons.md directly")
-    return {"frozen": not reasons, "reasons": reasons, "checks": checks}
+    # frozen = no automated writer can change production. stage_only = some writer is on, but only stages.
+    return {"frozen": not reasons, "stage_only": not reasons and staging, "reasons": reasons, "checks": checks}

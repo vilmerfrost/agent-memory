@@ -1,0 +1,42 @@
+# Jev's triage of one RSI candidate for the nightly investigator `amem rsi night` (docs/rsi/m005-plan.md 2.4).
+# Not a routine: `amem score` and `amem daily` skip this file (questions.NOT_ROUTINES).
+#
+# Jev's state holds only structured candidate fields: source, kind, target, rule key, bucketed recurrence and
+# grades, whether the target is in scope, and the verdicts of earlier experiments on the same candidate.
+# Never transcript text, never retrieved provider content, never model output. The final rank is computed by
+# deterministic code (rsi_night.rank) from these answers; Jev never selects or approves anything by itself.
+
+threshold = 0.6
+pass_question = "action"
+pass_options = ["experiment"]
+
+[[questions]]
+name = "action"
+kind = "choice"
+prompt = """A nightly investigator can run one sandbox experiment that edits one instruction file for AI coding
+agents and compares it with the unchanged file. Decide whether this candidate deserves tonight's experiment.
+recurrence counts how often the problem was seen; sessions counts the distinct sessions. followed_grade is how
+well agents followed the rule (1 = fully, 0 = ignored); objective_result is how good the sessions' results were.
+prior_experiments lists earlier experiments on the same candidate and their verdicts.
+target_in_scope says whether the file may be edited by the investigator at all."""
+[questions.options]
+experiment = "Worth an experiment now: the problem recurs, the target is in scope, and a change to the instruction text can plausibly fix it."
+wait = "Keep it for a later night: too rare, out of scope, already tested without effect, or not fixable by editing instruction text."
+
+[[questions]]
+name = "impact"
+kind = "score"
+prompt = "How much would agents' results improve if this problem were fixed?"
+levels = ["Low: rare or cosmetic", "Medium: recurring, some harm to results", "High: recurring and results clearly suffer"]
+
+[[questions]]
+name = "risk"
+kind = "score"
+prompt = "How risky is changing the target instruction file for this problem?"
+levels = ["Low: a local wording change in one rule", "Medium: changes how agents behave in common tasks", "High: could break many workflows or safety rules"]
+
+[[questions]]
+name = "testability"
+kind = "score"
+prompt = "How well can a short sandbox replay of agent tasks show whether a change helps?"
+levels = ["Poor: needs long real sessions or human judgment", "Fair: some replay tasks can show it", "Good: a short replay clearly shows the difference"]

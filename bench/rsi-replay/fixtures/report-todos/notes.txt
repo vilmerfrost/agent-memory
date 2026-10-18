@@ -1,0 +1,8 @@
+Sprint notes (synthetic)
+
+TODO: rotate the sandbox API key before the spend cap resets
+Done: pinned the worker image digests
+TODO: add a retry limit to the nightly judge call
+TODO: document the stale-baseline refusal
+Idea: one internal network per run
+TODO: prune old replay evidence after 30 days

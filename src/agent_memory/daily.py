@@ -80,6 +80,7 @@ class DailyResult:
     distilled: distill.Report | None = None  # None: the distill step was off or failed early
     deviations: deviations.ScanReport | None = None  # None: off, not due this week, or failed early
     edits: Any = None  # edits.Report; None: the edits step was off or failed early
+    rsi_push: list[str] | None = None  # one result per pushed proposal; None: not stage mode, or failed early
     failures: list[str] = field(default_factory=list)
     lines: list[str] = field(default_factory=list)  # what was appended to the routines log
 
@@ -485,6 +486,23 @@ def step_edits(result: DailyResult, *, push: bool, notify: Mapping[str, str] | N
         result.fail(f"edits: {n} error{'s' if n != 1 else ''}; first: {first.source} {first.rule_id}: {first.reason}")
 
 
+def step_rsi_push(result: DailyResult, *, push: bool, notify: Mapping[str, str] | None) -> None:
+    """Stage mode only (AMEM_EDITS_LIVE=1 and AMEM_EDITS_MODE=stage): one push per newly staged proposal, with
+    Reject and the terminal Apply line (`amem rsi push`, docs/rsi/approval.md). Nothing here changes production."""
+    from agent_memory import edits, rsi_approval  # lazy, like step_edits
+
+    if not (edits.live() and edits.stage_mode()):
+        return
+    if not _postgres_guard("rsi-push", result):
+        return
+    try:
+        result.rsi_push = rsi_approval.push_proposals(push=push, notify=dict(notify) if notify is not None else None)
+    except Exception as exc:  # the proposals stay staged; the next run pushes them
+        result.fail(f"rsi-push: {_exc(exc)}")
+        return
+    _err(f"rsi-push: {len(result.rsi_push)} proposal(s) {' '.join(result.rsi_push)}".rstrip())
+
+
 def step_escalations(
     result: DailyResult, *, push: bool, state_file: Path, now: datetime, notify: Mapping[str, str] | None
 ) -> None:
@@ -527,6 +545,9 @@ def log_lines(ts: str, result: DailyResult, secs: int) -> list[str]:
         e = result.edits
         head += (f"edits={e.edits} edits_kept={e.kept} edits_reverted={e.reverted} "
                  f"edits_suggested={e.suggested} edit_errors={e.errors} ")
+    if result.rsi_push is not None:  # stage mode only, so legacy lines stay the same
+        staged = result.edits.count("staged") if result.edits is not None else 0
+        head += f"edits_staged={staged} rsi_push={len(result.rsi_push)} "
     head += f"{secs}s"
     return [head, *(f"{ts} {NAME}-fail {reason}" for reason in result.failures)]
 
@@ -557,6 +578,7 @@ def run_daily(
     step_escalations(result, push=push, state_file=state_path(state), now=now, notify=notify)
     step_deviations(result, state_file=state_path(state), now=now)
     step_edits(result, push=push, notify=notify)
+    step_rsi_push(result, push=push, notify=notify)
     secs = int(time.monotonic() - start)
     result.lines = log_lines(now.strftime(TS_FORMAT), result, secs)
     log_file.parent.mkdir(parents=True, exist_ok=True)

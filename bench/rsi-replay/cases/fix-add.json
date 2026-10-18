@@ -1,0 +1,16 @@
+{
+  "id": "fix-add",
+  "title": "Fix add() so the unit tests pass, without editing the tests",
+  "tags": ["bugfix", "python", "tests"],
+  "fixture": "fix-add",
+  "prompt": "The unit tests fail: run `python3 -m unittest discover -s tests`. add() in calc.py subtracts instead of adding. Fix calc.py so the tests pass. Do not edit the tests. Finish with one sentence on what was wrong.",
+  "check": "python3 -m unittest discover -s tests -q && cmp -s tests/test_calc.py \"$FIXTURE_DIR\"/tests/test_calc.py",
+  "timeout_s": 120,
+  "stub": [
+    {"op": "run", "argv": ["python3", "-m", "unittest", "discover", "-s", "tests", "-q"]},
+    {"op": "read", "path": "calc.py"},
+    {"op": "edit", "path": "calc.py", "old": "return a - b", "new": "return a + b"},
+    {"op": "run", "argv": ["python3", "-m", "unittest", "discover", "-s", "tests", "-q"]},
+    {"op": "final", "text": "add() returned a - b; it now returns a + b and the tests pass."}
+  ]
+}
