@@ -401,6 +401,9 @@ def test_rls_on_new_tables_and_api_roles_revoked(db: str) -> None:
     assert rows == {"sessions": True, "deviations": True}
     migration = (deviations.config.MIGRATIONS_DIR / "20261016010000_sessions_deviations.sql").read_text()
     with psycopg.connect(db) as conn:
+        # Lock first: the grants update the tables' pg_class rows, then the migration's ALTER TABLE
+        # waits for a running autovacuum ANALYZE, which waits on those rows: a deadlock.
+        conn.execute("lock table public.sessions, public.deviations in access exclusive mode")
         for role in ("anon", "authenticated"):
             if not conn.execute("select 1 from pg_roles where rolname = %s", (role,)).fetchone():
                 conn.execute(f"create role {role}")
