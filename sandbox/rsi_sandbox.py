@@ -70,6 +70,20 @@ CREDENTIAL_NAMES = ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "CODEX_API_KEY")
 # The only Keychain items the runner reads: the dedicated, spend-capped sandbox keys. A mistyped spec can
 # then never pull a personal login (for example Claude Code's own Keychain item) into a worker.
 KEYCHAIN_ITEMS = (("rsi-sandbox", "anthropic"), ("rsi-sandbox", "openai"))
+# A keychain FILE to search instead of the user's default list. Unset in production (launchd runs with the real
+# HOME). The paid rehearsal sets it: its temp HOME hides the login keychain from `security` (exit 44).
+KEYCHAIN_FILE_ENV = "AMEM_RSI_KEYCHAIN"
+
+
+def keychain_file_args(environ=None) -> list[str]:
+    """[path] when AMEM_RSI_KEYCHAIN names an existing keychain file, else []."""
+    raw = ((os.environ if environ is None else environ).get(KEYCHAIN_FILE_ENV) or "").strip()
+    if not raw:
+        return []
+    path = Path(raw).expanduser()
+    if not path.is_file() or not path.name.endswith((".keychain", ".keychain-db")):
+        raise CredentialError(f"{KEYCHAIN_FILE_ENV} is not a keychain file")
+    return [str(path)]
 
 ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 ARM_RE = re.compile(r"^[A-Z]$")
@@ -187,7 +201,8 @@ def load_credentials(spec: str, name: str | None = None, runner=subprocess.run) 
         cred_name = name or "ANTHROPIC_API_KEY"
         if cred_name not in CREDENTIAL_NAMES:
             raise CredentialError(f"credential name not allowed: {cred_name}")
-        proc = runner(["/usr/bin/security", "find-generic-password", "-s", service, "-a", account, "-w"],
+        proc = runner(["/usr/bin/security", "find-generic-password", "-s", service, "-a", account, "-w",
+                       *keychain_file_args()],
                       capture_output=True, text=True, timeout=60)
         if proc.returncode != 0 or not proc.stdout.strip():
             raise CredentialError(f"keychain item not found: {service}/{account}")

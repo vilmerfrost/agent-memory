@@ -157,7 +157,9 @@ def run_rehearsal(work: Path, *, first: Path = FIRST_CONFIG, db_url: str | None 
         reports = work / "reports"
         env = D.demo_env(world, hypotheses=D.BENCH / "hypotheses" / "success")
         if live:     # live Jev, and the sandbox items' presence check on the real Keychain (attributes only)
-            env.update(passed, AMEM_JEV_LIVE="1", AMEM_RSI_SECURITY="/usr/bin/security")
+            env.update(passed, AMEM_JEV_LIVE="1", AMEM_RSI_SECURITY="/usr/bin/security",
+                       AMEM_RSI_KEYCHAIN=str(D.REAL_HOME / "Library" / "Keychains" / "login.keychain-db"),
+                       AMEM_RSI_MODEL_HOME=str(D.REAL_HOME))
         now = datetime.now().astimezone()
         night = AP.night_key(now)
         with D.environ(env):
@@ -194,6 +196,7 @@ def run_rehearsal(work: Path, *, first: Path = FIRST_CONFIG, db_url: str | None 
             report={k: report.get(k) for k in ("status", "checkpoint", "delta", "candidates", "health", "costs",
                                                "pending_decisions", "notes")},
             experiment=exp, eval_problems=problems, checks=checks,
+            max_usd=(json.loads(Path(cfgp).read_bytes()).get("budget") or {}).get("max_usd"),
             rehearsal_checkpoint=checkpoint_rows(world.db_url), routines_log=log.read_text().splitlines())
     finally:
         if pg is not None:
@@ -226,11 +229,18 @@ def problems_of(r: Mapping[str, Any], *, live: bool = False) -> list[str]:
     nj = r.get("night_job") or {}
     if not live and (nj.get("status") != "PASS" or (nj.get("fields") or {}).get("status") != "ok"):
         p.append(f"night job {nj.get('status')} {nj.get('items')}")
-    if live and nj.get("status") not in ("PASS", "FAIL"):
-        p.append(f"night job {nj.get('status')} {nj.get('items')}")
+    if live and (nj.get("status") != "PASS" or (nj.get("fields") or {}).get("status") != "ok"):
+        p.append(f"the live night did not run to the end: {nj.get('status')} {nj.get('items')}")
     exp = r.get("experiment") or {}
     if not live and (exp.get("verdict") != "IMPROVES" or exp.get("status") != "staged" or not exp.get("proposal_id")):
         p.append(f"experiment {exp.get('status')} {exp.get('verdict')} {exp.get('verdict_reasons')}")
+    if live and exp.get("verdict") not in ("IMPROVES", "NO_EFFECT", "WORSE", "INCONCLUSIVE"):
+        p.append(f"the live night ran no experiment to a verdict: {exp.get('status')} {exp.get('verdict')}")
+    if live:
+        spent = float(((r.get("report") or {}).get("costs") or {}).get("total_usd") or 0.0)
+        cap = r.get("max_usd")
+        if cap is not None and spent > float(cap):
+            p.append(f"the live night spent ${spent:.4f}, over the approved ${float(cap):.2f}")
     if exp.get("status") == "staged" and r.get("eval_problems") not in ([], None):
         p.append(f"agent-config eval_problems: {r.get('eval_problems')}")
     bj = r.get("brief_job") or {}

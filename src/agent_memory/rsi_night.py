@@ -634,6 +634,11 @@ def model_cli_env(environ: Mapping[str, str] | None = None) -> dict[str, str]:
         if not own and (k.upper().startswith(_MODEL_ENV_DROP_PREFIXES) or _MODEL_ENV_SECRET.search(k)):
             continue
         out[k] = v
+    # The paid rehearsal runs the night under a temp HOME; the host CLI's own login lives in the real one
+    # (Keychain + ~/.claude), so the rehearsal names it here. Unset in production (launchd has the real HOME).
+    home = (src.get("AMEM_RSI_MODEL_HOME") or "").strip()
+    if home:
+        out["HOME"] = home
     return out
 
 

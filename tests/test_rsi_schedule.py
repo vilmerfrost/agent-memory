@@ -562,3 +562,17 @@ def test_brief_job_fails_visibly_while_the_night_runs_or_without_a_report(env: S
         box.release(held)
     assert [r.status for r in log_runs(env, "amem-rsi-brief")] == ["fail", "fail"]
     assert not env.reports.exists()
+
+
+def test_keychain_present_searches_the_named_keychain_file(monkeypatch, tmp_path) -> None:
+    """Rehearsal only: AMEM_RSI_KEYCHAIN is appended so a temp HOME still sees the login keychain."""
+    seen: list[list[str]] = []
+    monkeypatch.setenv("AMEM_RSI_SECURITY", "/usr/bin/security")
+    monkeypatch.setenv("AMEM_RSI_KEYCHAIN", str(tmp_path / "login.keychain-db"))
+    assert S.keychain_present("keychain:rsi-sandbox/openai",
+                              runner=lambda argv, **k: seen.append(argv) or SimpleNamespace(returncode=0)) is None
+    assert seen[-1] == ["/usr/bin/security", "find-generic-password", "-s", "rsi-sandbox", "-a", "openai",
+                        str(tmp_path / "login.keychain-db")]
+    monkeypatch.delenv("AMEM_RSI_KEYCHAIN")
+    S.keychain_present("keychain:rsi-sandbox/openai", runner=lambda argv, **k: seen.append(argv) or SimpleNamespace(returncode=0))
+    assert seen[-1][-1] == "openai"
