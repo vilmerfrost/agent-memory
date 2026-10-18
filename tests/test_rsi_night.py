@@ -696,3 +696,21 @@ def test_cli_night_help_and_bad_night(env: SimpleNamespace) -> None:
     assert r.returncode == 2 and rep["status"] == "preflight_failed" and N.validate_report(rep) == []
     assert "config" in rep["notes"][0]
     assert not (env.sandbox / "nights").exists()
+
+
+def test_an_earlier_hard_killed_night_is_reconciled_under_the_lock(env: SimpleNamespace) -> None:
+    """2026-10-18 review: a watchdog exit 124 or power loss skips _unwind, leaving experiments 'running' and
+    candidates 'selected' (the pool never picks a selected one again). The next night's preflight cleans up."""
+    import psycopg
+    seed_ab(env)
+    run(env)
+    with psycopg.connect(env.url, autocommit=True) as conn:
+        conn.execute("insert into rsi_experiments (id, night, kind, hypothesis, status, meta) values "
+                     "('exp-orphan', '2026-10-01', 'edit_instruction', '{}', 'running', '{}')")
+        conn.execute("update rsi_candidates set status = 'selected' where dedupe_key = "
+                     "(select dedupe_key from rsi_candidates order by dedupe_key limit 1)")
+    rep = run(env, night="2026-10-19")
+    assert rows(env.url, "select status from rsi_experiments where id = 'exp-orphan'") == [("aborted",)]
+    assert any("reconciled an earlier stopped night: experiments aborted=1, candidates deferred=" in n
+               for n in rep["notes"]), rep["notes"]
+    assert rows(env.url, "select count(*) from rsi_candidates where status = 'selected'") == [(0,)]
