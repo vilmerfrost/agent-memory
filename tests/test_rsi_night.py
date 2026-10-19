@@ -20,6 +20,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import psycopg
 import pytest
 
 from agent_memory import config, jev, questions, rsi_approval as AP, rsi_night as N
@@ -237,6 +238,69 @@ def test_already_done_night_is_refused_and_its_report_kept(env: SimpleNamespace)
     assert rep["status"] == "preflight_failed" and "already done" in rep["notes"][-1]
     assert N.report_path(N1).read_bytes() == before
     assert rows(env.url, "select count(*) from rsi_experiments") == [(1,)]
+
+
+# --------------------------------------------------------------------------- the candidate pool
+
+
+def seed_failed_routines(url: str, routines: list[str]) -> None:
+    """One failed run per routine. Their candidate targets (~/.claude/scheduled-tasks/<r>/SKILL.md) are not in the
+    temp HOME, so none is in scope, and routines are sighted after deviations (the newest last_seen_at)."""
+    with psycopg.connect(url) as conn:
+        for r in routines:
+            conn.execute("insert into runs (routine, status) values (%s, 'fail')", (r,))
+
+
+ROUTINES = [f"routine-{i}" for i in range(6)]
+
+
+def test_candidates_without_an_in_scope_target_take_no_pool_slot(env: SimpleNamespace) -> None:
+    """The first live night (2026-10-18): routine failures sighted last filled every pool slot, none had a target
+    in scope, so the night ran 0 experiments while targetable deviation candidates waited."""
+    seed_ab(env)
+    seed_failed_routines(env.url, ROUTINES)
+    rep = run(env, config_path=write_config(env.tmp, candidates={"max_considered": 2}))
+    assert rep["status"] == "ok", rep["notes"]
+    assert {c["key"] for c in rep["candidates"]} == {KEY_A, KEY_B}
+    assert [c["key"] for c in rep["candidates"] if c["selected"]] == [KEY_A]
+    assert rep["experiments"][0]["status"] == "staged"
+    assert "candidates: 6 without an in-scope target, not considered" in rep["notes"]
+    left = rows(env.url, "select dedupe_key, status, target from rsi_candidates where source = 'routine_failures' "
+                         "order by 1")
+    assert left == [(f"routine:{r}", "new", None) for r in ROUTINES]               # sighted and kept, never pooled
+
+
+def test_unranked_candidates_are_pooled_by_recurrence(env: SimpleNamespace) -> None:
+    seed_rule(env.url, RULE_A, "a", sessions=2)
+    seed_rule(env.url, RULE_B, "b", sessions=4)
+    rep = run(env, config_path=write_config(env.tmp, candidates={"max_considered": 1}))
+    assert [c["key"] for c in rep["candidates"]] == [KEY_B]                       # 4 sessions beat 2
+
+
+def test_candidate_under_a_symlink_of_an_allowlisted_file_is_in_scope(env: SimpleNamespace) -> None:
+    """Deviation candidates name ~/.claude/agents/worker.md, a symlink; the allowlist lists the real
+    ~/agent-config/agents/worker.md. The 61-session worker pattern was out of scope for that alone."""
+    (env.home / ".claude" / "agents").mkdir()
+    (env.home / ".claude" / "agents" / "worker.md").symlink_to(env.home / "agent-config" / "agents" / "worker.md")
+    seed_rule(env.url, RULE_A, "a", sessions=1)
+    with psycopg.connect(env.url) as conn:
+        conn.execute("insert into rsi_candidates (dedupe_key, source, kind, target, metrics) values "
+                     "('dev:agent:worker:rules', 'deviations', 'edit_instruction', '~/.claude/agents/worker.md', %s)",
+                     (json.dumps({"sessions": 9}),))
+    rep = run(env, dry_run=True, config_path=write_config(env.tmp, candidates={"max_considered": 1}))
+    assert [c["key"] for c in rep["candidates"]] == ["dev:agent:worker:rules"]
+    assert "candidates:" not in " ".join(rep["notes"])
+    assert candidate(env.url, "dev:agent:worker:rules")["target"] == "~/.claude/agents/worker.md"   # dry: unchanged
+    run(env, config_path=write_config(env.tmp, candidates={"max_considered": 1}))
+    assert candidate(env.url, "dev:agent:worker:rules")["target"] == "~/agent-config/agents/worker.md"
+
+
+def test_dry_run_pool_skips_candidates_without_an_in_scope_target(env: SimpleNamespace) -> None:
+    seed_ab(env)
+    seed_failed_routines(env.url, ROUTINES)
+    rep = run(env, dry_run=True)
+    assert {c["key"] for c in rep["candidates"]} == {KEY_A, KEY_B}
+    assert rows(env.url, "select count(*) from rsi_candidates") == [(0,)]
 
 
 # --------------------------------------------------------------------------- interruption, budgets, lock
