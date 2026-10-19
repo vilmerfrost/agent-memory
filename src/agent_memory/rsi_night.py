@@ -358,6 +358,16 @@ def heuristic_answers(c: Mapping[str, Any], history: Sequence[str], in_scope: bo
     return TriageAnswers("experiment" if go else "wait", 1.0 if go else 0.0, impact, risk, 1.0, "heuristic")
 
 
+def recurrence(c: Mapping[str, Any]) -> int:
+    """How often a candidate recurs: nights it was sighted or sessions it touched, whichever is larger."""
+    return max(int(c.get("seen_count") or 1), int(_num((c.get("metrics") or {}).get("sessions")) or 0))
+
+
+# `recurrence` in SQL, for ordering the pool in the database.
+RECURRENCE_SQL = ("greatest(seen_count, case when jsonb_typeof(metrics->'sessions') = 'number' "
+                  "then floor((metrics->>'sessions')::numeric) else 0 end)")
+
+
 def rank(a: TriageAnswers, recurrence: int, history: Sequence[str], weights: Mapping[str, float]) -> float:
     """The deterministic rank. Jev's answers are inputs; the formula and weights are fixed data."""
     def unit(x: float) -> float:
@@ -1229,7 +1239,20 @@ class Night:
         return max(1, min(cap, math.ceil((datetime.now(UTC) - since).total_seconds() / 86400) + 1))
 
     def _in_scope(self, target: str | None) -> bool:
-        return bool(target) and target in self.allowlist
+        return self._scoped(target) is not None
+
+    def _scoped(self, target: str | None) -> str | None:
+        """The allowlist's spelling of `target`, or None when it is not in scope. The allowlist lists real paths;
+        a candidate may name a symlink to one (~/.claude/agents/worker.md -> ~/agent-config/agents/worker.md)."""
+        if not target:
+            return None
+        if target in self.allowlist:
+            return target
+        try:
+            real = rsi_targets.tilde(rsi_targets.untilde(target).resolve())
+        except (OSError, RuntimeError):       # unreadable path or a symlink loop
+            return None
+        return real if real in self.allowlist else None
 
     def _deviation_sightings(self, delta: Any) -> list[Sighting]:
         new = set(_ids(_dget(delta, "deviations")))
@@ -1244,7 +1267,7 @@ class Night:
                 continue
             rule = g.get("rule_id") or g.get("instruction_ref")
             key = f"dev:{g['instruction_source']}:{rule}"
-            target = next((t for t in g.get("target_paths") or [] if self._in_scope(t)),
+            target = next((s for s in map(self._scoped, g.get("target_paths") or []) if s),
                           (g.get("target_paths") or [None])[0])
             jv = g.get("jev") or {}
             metrics = {"count": g.get("count"), "sessions": g.get("sessions"), "new": len(fresh),
@@ -1274,7 +1297,7 @@ class Night:
         for r in rows:
             target = f"~/.agents/skills/{r['skill']}/SKILL.md"
             out.append(Sighting(f"skill:{r['skill']}", "skill_scores", "edit_skill",
-                                target if self._in_scope(target) else None, f"skill:{r['skill']}",
+                                self._scoped(target), f"skill:{r['skill']}",
                                 [f"amem:skill/{r['skill']}"],
                                 {"score": round(float(r["score"]), 3), "n_scored": r["n_scored"], "sessions": r["n_scored"]},
                                 {"summary": f"skill {_token(r['skill'], 60)} scores {float(r['score']):.2f} over "
@@ -1293,7 +1316,7 @@ class Night:
             target = f"~/.claude/scheduled-tasks/{r}/SKILL.md"
             refs = [str(f.get("ref") or f"amem:run/{f.get('run_id')}") for f in fails][:20]
             out.append(Sighting(f"routine:{r}", "routine_failures", "fix_routine",
-                                target if self._in_scope(target) else None, f"routine:{r}", refs,
+                                self._scoped(target), f"routine:{r}", refs,
                                 {"failures": len(fails), "count": len(fails), "sessions": len(fails)},
                                 {"summary": f"routine {r} failed {len(fails)} time(s)", "n": len(fails),
                                  "sessions": 0, "refs": refs[:5]}))
@@ -1347,23 +1370,43 @@ class Night:
                           (Jsonb({"sighted": (sighted + [self.window_key])[-10:]}), cid))
 
     def _pool(self, sightings: list[Sighting]) -> list[dict[str, Any]]:
+        """Tonight's candidates for triage. Only candidates whose target is in the allowlist: one without can never
+        be selected, so it must not take a slot (the 2026-10-18 night gave all 5 to routine failures and ran 0
+        experiments). Unranked first, the most recurrent first (`recurrence`, the same measure `rank` uses), not
+        the last sighted: sources are sighted in a fixed order, so `last_seen_at` favoured whichever came last."""
         assert self.conn is not None
         if not self.dry_run:
             for s in sightings:
                 self._sight(s)
         limit = int(self.cfg.candidates["max_considered"])
         with self.conn.cursor(row_factory=dict_row) as cur:
-            cur.execute("select * from rsi_candidates where status in ('new', 'deferred') "
-                        "order by rank desc nulls first, last_seen_at desc, dedupe_key limit %s", (limit,))
-            pool = [dict(r) for r in cur.fetchall()]
+            # open candidates stored under a symlink of an allowlisted file get the allowlist's spelling
+            cur.execute("select distinct target from rsi_candidates where status in ('new', 'deferred') "
+                        "and target is not null and not target = any(%s)", (list(self.allowlist),))
+            aliases = {r["target"]: s for r in cur.fetchall() if (s := self._scoped(r["target"]))}
+            if not self.dry_run:
+                for alias, real in aliases.items():
+                    cur.execute("update rsi_candidates set target = %s where target = %s and status in ('new', 'deferred')",
+                                (real, alias))
+            scope = list(self.allowlist) + list(aliases)
+            cur.execute("select * from rsi_candidates where status in ('new', 'deferred') and target = any(%s) "
+                        f"order by rank desc nulls first, {RECURRENCE_SQL} desc, last_seen_at desc, dedupe_key "
+                        "limit %s", (scope, limit))
+            pool = [{**r, "target": aliases.get(r["target"], r["target"])} for r in cur.fetchall()]
+            cur.execute("select count(*) as n from rsi_candidates where status in ('new', 'deferred') "
+                        "and not coalesce(target = any(%s), false)", (scope,))
+            out_of_scope = int(cur.fetchone()["n"])
+        if out_of_scope:
+            self.notes.append(f"candidates: {out_of_scope} without an in-scope target, not considered")
         if self.dry_run:                      # nothing was written: show tonight's sightings as they would be
             known = {c["dedupe_key"]: c for c in pool}
             for s in sightings:
                 c = known.get(s.dedupe_key)
-                if c is None:
+                if c is None and self._in_scope(s.target):
                     pool.append({"id": None, "dedupe_key": s.dedupe_key, "source": s.source, "kind": s.kind,
                                  "target": s.target, "rule_key": s.rule_key, "evidence_refs": s.evidence_refs,
-                                 "metrics": s.metrics, "seen_count": 1, "status": "new", "meta": {}})
+                                 "metrics": s.metrics, "seen_count": 1, "status": "new", "meta": {}, "rank": None})
+            pool.sort(key=lambda c: (c.get("rank") is not None, -(c.get("rank") or 0.0), -recurrence(c)))
         return pool[:limit]
 
     def _history(self, key: str) -> list[str]:
@@ -1384,9 +1427,7 @@ class Night:
                 ans = self.ad.triage.assess(c, state=triage_state(c, hist, in_scope), budget=self.budget)
             if ans is None:
                 ans = heuristic_answers(c, hist, in_scope)
-            m = c.get("metrics") or {}
-            rec = max(int(c.get("seen_count") or 1), int(_num(m.get("sessions")) or 0))
-            r = rank(ans, rec, hist, self.cfg.weights)
+            r = rank(ans, recurrence(c), hist, self.cfg.weights)
             eligible = ans.action == "experiment" and in_scope and r >= self.cfg.min_rank
             why = ("eligible" if eligible else "no in-scope target" if not in_scope
                    else "triage: wait" if ans.action != "experiment" else "rank below the minimum")

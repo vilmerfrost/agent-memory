@@ -77,9 +77,11 @@ def seed_rule(url: str, rule: tuple[str, str, int, float], tag: str, *, sessions
     return ids
 
 
-def write_config(tmp_path: Path, name: str = "night.json", **budget: Any) -> Path:
+def write_config(tmp_path: Path, name: str = "night.json", *, candidates: dict[str, Any] | None = None,
+                 **budget: Any) -> Path:
     d = json.loads(N.CONFIG_PATH.read_text())
     d["budget"].update(budget)
+    d["candidates"].update(candidates or {})
     p = tmp_path / name
     p.write_text(json.dumps(d))
     return p
