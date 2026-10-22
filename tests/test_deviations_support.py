@@ -21,6 +21,11 @@ from agent_memory import deviations, jev
 
 T0 = datetime(2026, 10, 14, 9, 0, tzinfo=UTC)
 NOW = datetime(2026, 10, 15, 12, 0, tzinfo=UTC)
+
+
+def cli_days() -> str:
+    """`--days` for CLI calls: the CLI uses the real clock, the fixtures are dated around NOW."""
+    return str(max(7, (datetime.now(UTC) - NOW).days + 7))
 PAD = "x" * 400  # makes a transcript big enough to pass MIN_BYTES with a few turns
 
 

@@ -19,6 +19,7 @@ from codex_support import Rollout, codex_home, tid
 from conftest import base_env, run_amem
 from test_deviations_support import (  # noqa: F401
     NOW,
+    cli_days,
     T0,
     Home,
     assistant,
@@ -393,7 +394,8 @@ def test_tokens_report_groups_by_category_then_project(db: str) -> None:
     assert doc["top"][0]["title"] == "Title g1" and doc["top"][0]["model"] == "claude-a"
     text_ = "\n".join(tokens_report.lines(doc))
     assert "by category / project" in text_ and "    agent-memory" in text_ and '"Title g1"' in text_
-    res = run_amem("sessions", "tokens", "--by", "outcome", "--by", "effort", env=base_env(AMEM_DB_URL=db))
+    res = run_amem("sessions", "tokens", "--days", cli_days(), "--by", "outcome", "--by", "effort",
+                   env=base_env(AMEM_DB_URL=db))
     assert res.returncode == 0, res.stderr
     assert "by outcome" in res.stdout and "by effort" in res.stdout and "by category" not in res.stdout
 

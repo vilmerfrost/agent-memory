@@ -17,7 +17,7 @@ from codex_support import (
     write_git_config,
 )
 from conftest import base_env, run_amem
-from test_deviations_support import NOW, Home, make_all_kinds, setup_home  # noqa: F401
+from test_deviations_support import NOW, Home, cli_days, make_all_kinds, setup_home  # noqa: F401
 
 
 def _rows(home: Home, tools: tuple[str, ...] = ("codex",)) -> dict[str, sessions_ingest.SessionRow]:
@@ -117,7 +117,7 @@ def test_cli_ingest_codex_only(setup_home: Home, pg_url: str) -> None:  # noqa: 
         conn.execute("delete from sessions")
     env = base_env(AMEM_DB_URL=pg_url, AMEM_CLAUDE_HOME=str(setup_home.claude),
                    AMEM_AGENT_CONFIG_DIR=str(setup_home.agent_config))
-    res = run_amem("sessions", "ingest", "--tool", "codex", "--codex-home", str(codex_home(setup_home)),
+    res = run_amem("sessions", "ingest", "--days", cli_days(), "--tool", "codex", "--codex-home", str(codex_home(setup_home)),
                    "--projects-dir", str(setup_home.root / "nowhere"), env=env)
     assert res.returncode == 0, res.stderr
     assert res.stdout.startswith("sessions: 5 files, 5 new, 0 updated, 0 skipped (chat=1 parent=1 worker=1 ")
