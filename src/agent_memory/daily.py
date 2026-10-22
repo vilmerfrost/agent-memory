@@ -17,7 +17,8 @@ Steps, in order. A failed step is recorded and the next step still runs:
    An id is marked pushed only after ntfy answered 200.
 3b. deviations (daily): `sessions ingest` + `deviations scan --limit 40` (docs/deviations.md) when
    the last scan in the state file is >= 20 hours old (AMEM_DEVIATIONS_EVERY_HOURS). Off unless AMEM_DEVIATIONS_LIVE=1 (then not
-   a failure, and the log line has no deviation fields). Any session error fails the step. A
+   a failure, and the log line has no deviation fields). A session error is a warning (an
+   amem-daily-warn line); it fails the step only when systemic (2+ errors, at least half the sessions). A
    malformed writer item next to valid ones is a counted warning (`deviation_skipped=N`, one
    stderr line per item), not a failure. A lost database before the scan loop is retried once,
    after `wait_for_db`.
@@ -82,6 +83,7 @@ class DailyResult:
     edits: Any = None  # edits.Report; None: the edits step was off or failed early
     rsi_push: list[str] | None = None  # one result per pushed proposal; None: not stage mode, or failed early
     failures: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)  # logged as <name>-warn lines; the verdict stays PASS
     lines: list[str] = field(default_factory=list)  # what was appended to the routines log
 
     @property
@@ -89,10 +91,15 @@ class DailyResult:
         return "FAIL" if self.failures else "PASS"
 
     def fail(self, reason: str) -> None:
-        text = _WS_RE.sub(" ", reason).strip()
-        if len(text) > _REASON_MAX:
-            text = text[: _REASON_MAX - 3] + "..."
-        self.failures.append(text)
+        self.failures.append(_reason(reason))
+
+    def warn(self, reason: str) -> None:
+        self.warnings.append(_reason(reason))
+
+
+def _reason(reason: str) -> str:
+    text = _WS_RE.sub(" ", reason).strip()
+    return text[: _REASON_MAX - 3] + "..." if len(text) > _REASON_MAX else text
 
 
 def _err(msg: str) -> None:
@@ -405,8 +412,9 @@ def deviations_every() -> timedelta:
 def step_deviations(result: DailyResult, *, state_file: Path, now: datetime) -> None:
     """Daily: `sessions ingest` + `deviations scan` (docs/deviations.md). Off (not a failure)
     unless AMEM_DEVIATIONS_LIVE=1. Runs when the last scan in the state file is at least
-    `deviations_every()` old (or missing). The timestamp moves only when the scan finished; per-session errors
-    fail the step but still count as a finished scan (those sessions are retried on the next run)."""
+    `deviations_every()` old (or missing). The timestamp moves only when the scan finished; those sessions
+    are retried on the next run. Per-session errors are a warning (one bad transcript or model reply must not
+    block amem-rsi-night); they fail the step only when systemic: 2+ errors and at least half the sessions."""
     if not deviations.live():
         _err(f"deviations: off ({deviations.LIVE_ENV} is not 1)")
         return
@@ -449,8 +457,13 @@ def step_deviations(result: DailyResult, *, state_file: Path, now: datetime) -> 
     if report.errors:
         first = next(o for o in report.outcomes if o.status == "error")
         n = report.errors
-        result.fail(f"deviations: {n} error{'s' if n != 1 else ''}; first: session {first.session_id}: "
-                    f"{first.reason}")
+        reason = (f"deviations: {n} error{'s' if n != 1 else ''} in {len(report.outcomes)} sessions; "
+                  f"first: session {first.session_id}: {first.reason}")
+        if n >= 2 and 2 * n >= len(report.outcomes):
+            result.fail(reason)
+        else:
+            _err(f"warning: {reason}")
+            result.warn(reason)
     data = _state_dict(state_file)
     data[DEVIATIONS_KEY] = now.strftime(TS_FORMAT)
     data.setdefault("pushed_run_ids", [])
@@ -549,7 +562,8 @@ def log_lines(ts: str, result: DailyResult, secs: int) -> list[str]:
         staged = result.edits.count("staged") if result.edits is not None else 0
         head += f"edits_staged={staged} rsi_push={len(result.rsi_push)} "
     head += f"{secs}s"
-    return [head, *(f"{ts} {NAME}-fail {reason}" for reason in result.failures)]
+    return [head, *(f"{ts} {NAME}-fail {reason}" for reason in result.failures),
+            *(f"{ts} {NAME}-warn {reason}" for reason in result.warnings)]
 
 
 def run_daily(

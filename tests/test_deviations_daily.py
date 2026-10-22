@@ -84,16 +84,34 @@ def test_daily_gating(live: ScoringDb, daily_io: DailyIO, setup_home: Home,  # n
     assert _state(daily_io)[daily.DEVIATIONS_KEY] == "2026-10-16T09:20:00+0200"
 
 
-def test_session_errors_fail_the_step_only(live: ScoringDb, daily_io: DailyIO, setup_home: Home,  # noqa: F811
-                                           writer: Writer, fake_jev: FakeJev) -> None:  # noqa: F811
+def test_one_session_error_is_a_warning_not_a_fail(live: ScoringDb, daily_io: DailyIO, setup_home: Home,  # noqa: F811
+                                                   writer: Writer, fake_jev: FakeJev) -> None:  # noqa: F811
+    # 2026-10-19..22: one bad session (missing transcript, non-JSON reply) failed amem-daily every
+    # morning and so skipped amem-rsi-night. One error is now a warning; the run still PASSes.
     ids = make_all_kinds(setup_home)
     writer(distill.WriterError("timed out after 300s"), default=envelope({"deviations": []}))
     r = daily.run_daily(push=False, now=NOW)
-    assert r.verdict == "FAIL"
-    assert r.failures == [f"deviations: 1 error; first: session {ids['chat']}: writer: timed out after 300s"]
-    head, fail = daily_io.log_lines()
-    assert " deviation_errors=1 " in head and fail.endswith("amem-daily-fail " + r.failures[0])
+    assert r.verdict == "PASS", r.failures
+    assert r.warnings == [f"deviations: 1 error in {len(r.deviations.outcomes)} sessions; "
+                          f"first: session {ids['chat']}: writer: timed out after 300s"]
+    head, warn = daily_io.log_lines()
+    assert " amem-daily PASS " in head and " deviation_errors=1 " in head
+    assert warn.endswith("amem-daily-warn " + r.warnings[0])
     assert daily.DEVIATIONS_KEY in _state(daily_io)  # the scan finished; the failed session is retried later
+
+
+def test_systemic_session_errors_fail_the_step(live: ScoringDb, daily_io: DailyIO, setup_home: Home,  # noqa: F811
+                                               writer: Writer, fake_jev: FakeJev) -> None:  # noqa: F811
+    # Every session failing (writer down) is systemic: that still FAILs.
+    make_all_kinds(setup_home)
+    writer(default=distill.WriterError("exit 1: overloaded"))
+    r = daily.run_daily(push=False, now=NOW)
+    n = len(r.deviations.outcomes)
+    assert n >= 2 and r.deviations.errors == n
+    assert r.verdict == "FAIL" and r.warnings == []
+    assert r.failures[0].startswith(f"deviations: {n} errors in {n} sessions; first: session ")
+    head, fail = daily_io.log_lines()
+    assert " amem-daily FAIL " in head and fail.endswith("amem-daily-fail " + r.failures[0])
 
 
 def test_skipped_item_is_a_counted_warning_not_a_fail(live: ScoringDb, daily_io: DailyIO,  # noqa: F811
@@ -123,7 +141,7 @@ def test_deviation_errors_do_not_stop_the_edits_step(live: ScoringDb, daily_io: 
                                                      setup_home: Home, writer: Writer,  # noqa: F811
                                                      fake_jev: FakeJev,  # noqa: F811
                                                      monkeypatch: pytest.MonkeyPatch) -> None:
-    # Scope of a deviations failure: that session only; the step fails, later steps still run.
+    # Scope of a deviations error: that session only; a warning, later steps still run.
     from agent_memory import edits
 
     ids = make_all_kinds(setup_home)
@@ -132,7 +150,9 @@ def test_deviation_errors_do_not_stop_the_edits_step(live: ScoringDb, daily_io: 
     monkeypatch.setattr(edits, "run", lambda **kw: runs.append(kw) or edits.Report())
     writer(envelope({"deviations": [finding(followed=None)]}), default=envelope({"deviations": [finding()]}))
     r = daily.run_daily(push=False, now=NOW)
-    assert r.failures == [f"deviations: 1 error; first: session {ids['chat']}: writer output: "
+    assert r.failures == []
+    assert r.warnings == [f"deviations: 1 error in {len(r.deviations.outcomes)} sessions; "
+                          f"first: session {ids['chat']}: writer output: "
                           "deviation 0: followed_grade must be a number in 0..1, got None"]
     assert r.deviations is not None and (r.deviations.found, r.deviations.errors) == (4, 1)
     assert len(runs) == 1 and r.edits is not None

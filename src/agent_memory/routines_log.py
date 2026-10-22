@@ -48,13 +48,14 @@ from typing import Any
 LOG_SOURCE = "routines.log"
 STATUS_MAP = {"PASS": "pass", "FAIL": "fail", "SKIP": "skip", "ERROR": "error"}
 DETAIL_SUFFIX = "-fail"
+WARN_SUFFIX = "-warn"  # <routine>-warn: a warning under a PASS line (meta.warnings)
 
 _STATUS_RE = re.compile(r"[A-Z][A-Z_]*")
 _KV_RE = re.compile(r"([A-Za-z_][\w.-]*)=(\S*)")
 _DURATION_RE = re.compile(r"(\d+)s")
 _INT_RE = re.compile(r"-?\d+")
 _FLOAT_RE = re.compile(r"-?\d+\.\d+")
-_RESERVED = {"log_source", "failures", "duration_s", "raw_status", "orphan_detail"}
+_RESERVED = {"log_source", "failures", "warnings", "duration_s", "raw_status", "orphan_detail"}
 
 
 @dataclass
@@ -176,6 +177,10 @@ def parse_lines(lines: list[str]) -> ParseResult:
         third, _, text = rest.partition(" ")
         is_status = bool(_STATUS_RE.fullmatch(third))
 
+        if token.endswith(WARN_SUFFIX) and (ts_raw, token[: -len(WARN_SUFFIX)]) in summaries and not is_status:
+            summaries[(ts_raw, token[: -len(WARN_SUFFIX)])].meta.setdefault("warnings", []).append(rest)
+            result.details += 1
+            continue
         if token.endswith(DETAIL_SUFFIX) and len(token) > len(DETAIL_SUFFIX):
             parent = token[: -len(DETAIL_SUFFIX)]
             group = (ts_raw, parent)

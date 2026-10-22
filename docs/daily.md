@@ -43,7 +43,7 @@ every step failed on that). The steps run either way.
    - `--no-push` never pushes and never marks; it still prunes.
    Then **deviations** (daily, docs/deviations.md): `sessions ingest` + `deviations scan --limit 40`
    when `deviations_last_scan` in the state file is missing or at least 20 hours old (`AMEM_DEVIATIONS_EVERY_HOURS`). Off (not a
-   failure) unless `AMEM_DEVIATIONS_LIVE=1`; the launchd job sets it. A session error fails the step.
+   failure) unless `AMEM_DEVIATIONS_LIVE=1`; the launchd job sets it. A session error is a warning (an `amem-daily-warn` line); it fails the step only when systemic: 2+ errors and at least half the scanned sessions.
    A database connection error before the scan loop waits for the database again and retries once.
    Then **edits** (docs/edits.md): `edits run` after the deviations step. Off (not a failure)
    unless `AMEM_EDITS_LIVE=1`; the launchd job sets it. Kept edits are pushed with an Undo

@@ -304,3 +304,19 @@ def test_ingest_missing_file(db_env: dict[str, str], tmp_path: Path) -> None:
     result = run_amem("ingest", "routines-log", str(tmp_path / "nope.log"), env=db_env)
     assert result.returncode == 1
     assert "no such file" in result.stderr
+
+
+def test_warn_lines_attach_to_their_pass_run() -> None:
+    result = parse_lines([
+        "2026-10-22T09:20:04+0200 amem-daily PASS scored=2 deviation_errors=1 90s",
+        "2026-10-22T09:20:04+0200 amem-daily-warn deviations: 1 error in 4 sessions; first: session x: boom",
+    ])
+    (run,) = result.runs
+    assert (run.routine, run.status, run.meta["failures"]) == ("amem-daily", "pass", [])
+    assert run.meta["warnings"] == ["deviations: 1 error in 4 sessions; first: session x: boom"]
+    assert result.unparsed == []
+
+
+def test_routine_ending_in_warn_with_status_is_a_summary() -> None:
+    result = parse_lines(["2026-10-12T10:00:00+0200 early-warn PASS ok=1"])
+    assert [(r.routine, r.status) for r in result.runs] == [("early-warn", "pass")]
