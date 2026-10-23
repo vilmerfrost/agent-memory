@@ -53,6 +53,7 @@ from agent_memory import config, edits_push, redact, rsi_artifact as RA, store
 REPORT_FORMAT = "rsi-night/1"
 BRIEF_FORMAT = "rsi-brief/1"
 NIGHT_STATUSES = ("ok", "partial", "aborted", "budget_exhausted", "preflight_failed")
+SKIP_REASONS = ("prerequisites", "credentials")                       # rsi_night.SKIP_REASONS
 EXPERIMENT_STATUSES = ("staged", "not_promotable", "failed", "interrupted", "skipped_budget")
 VERDICTS = ("IMPROVES", "NO_EFFECT", "WORSE", "INCONCLUSIVE")        # rsi_verdict.VERDICTS (plan 2.1)
 RISKS = ("low", "medium", "high")
@@ -221,6 +222,13 @@ def validate_report(rep: Any) -> list[str]:
         p.append(f"status {rep['status']!r} is not one of {', '.join(NIGHT_STATUSES)}")
     if "notes" in rep and not (isinstance(rep["notes"], list) and all(isinstance(n, str) for n in rep["notes"])):
         p.append("notes: not a list of strings")
+    sk = rep.get("skipped")                               # optional: the night job did not start the night
+    if sk is not None and not (isinstance(sk, dict) and sk.get("reason") in SKIP_REASONS
+                               and isinstance(sk.get("summary", ""), str) and isinstance(sk.get("items", []), list)):
+        p.append(f"skipped: not an object with reason {' or '.join(SKIP_REASONS)}, a summary and items")
+    pw = rep.get("prerequisite_warnings")
+    if pw is not None and not (isinstance(pw, list) and all(isinstance(w, str) for w in pw)):
+        p.append("prerequisite_warnings: not a list of strings")
     _check_map(rep["delta"], "delta", COUNTS, p)
     for name in ("patterns", "candidates"):
         p += [f"{name}[{i}]: not a JSON object" for i, x in enumerate(rep[name]) if not isinstance(x, dict)]
@@ -671,6 +679,24 @@ HEADLINES = {
     "budget_exhausted": "The night stopped early: the budget ran out, and the remaining work was skipped.",
     "preflight_failed": "The night did not run: preflight failed (see Service health).",
 }
+SKIP_FALLBACK = {"prerequisites": "a prerequisite routine did not complete",
+                 "credentials": "the credentials and budget check failed"}
+
+
+def skip_info(rep: Mapping[str, Any]) -> dict[str, Any] | None:
+    """The night job's skip (report["skipped"]): it never started the night, so nothing was read or checked."""
+    sk = rep.get("skipped")
+    if rep.get("status") != "preflight_failed" or not isinstance(sk, dict) or sk.get("reason") not in SKIP_REASONS:
+        return None
+    return {"reason": sk["reason"], "summary": text(sk.get("summary"), 300) or SKIP_FALLBACK[sk["reason"]],
+            "items": [text(i, 260) for i in (sk.get("items") or [])[:MAX_NOTES] if isinstance(i, str)]}
+
+
+def headline(rep: Mapping[str, Any]) -> str:
+    sk = skip_info(rep)
+    if sk:
+        return _sentence(f"The night did not run: {sk['summary']}")
+    return HEADLINES[rep["status"]]
 
 
 def build_brief(rep: Mapping[str, Any], db: Db, *, artifacts_root: Path, report: dict[str, str] | None = None,
@@ -680,6 +706,7 @@ def build_brief(rep: Mapping[str, Any], db: Db, *, artifacts_root: Path, report:
     passed = [proposal_block(e, db, artifacts_root, suites) for e in exps if e["status"] == "staged"]
     failed = [failed_item(e) for e in exps if e["status"] != "staged"]
     d = rep["delta"]
+    skipped = skip_info(rep)
     sessions = {"since": text(d.get("since"), 40) or None, **{k: d.get(k) or 0 for k in COUNTS}}
     patterns = [{"key": text(x.get("key"), 80), "summary": text(x.get("summary"), 240),
                  "n": x.get("n") if _count(x.get("n")) else None,
@@ -727,7 +754,8 @@ def build_brief(rep: Mapping[str, Any], db: Db, *, artifacts_root: Path, report:
         "started_at": text(rep.get("started_at"), 40) or None, "finished_at": text(rep.get("finished_at"), 40) or None,
         "checkpoint": {"before": text(ck.get("before"), 40) or None, "after": text(ck.get("after"), 40) or None,
                        "advanced": ck.get("advanced") is True},
-        "headline": HEADLINES[rep["status"]],
+        "headline": headline(rep), "skipped": skipped,
+        "prerequisite_warnings": [text(w, 300) for w in (rep.get("prerequisite_warnings") or [])[:MAX_NOTES]],
         "summary": (f"{_plural(sum(1 for x in passed if x['actions']['apply']), 'improvement')} ready to apply"
                     + (f" ({len(passed) - sum(1 for x in passed if x['actions']['apply'])} more staged but not "
                        "ready)" if any(not x["actions"]["apply"] for x in passed) else "")
@@ -881,22 +909,34 @@ def usd4(v: Any) -> str:
 def render_markdown(b: dict[str, Any]) -> str:
     out = [f"# RSI morning brief: night {b['night']}", "", f"{b['headline']} {b['summary']}"]
     ck = b["checkpoint"]
-    run = f"Run {b['started_at'] or '?'} to {b['finished_at'] or '?'}. "
-    run += (f"Checkpoint advanced: {ck['before'] or 'start'} -> {ck['after']}." if ck["advanced"]
-            else f"Checkpoint not advanced (stays at {ck['before'] or 'start'}): the next night reads this window again.")
+    sk = b.get("skipped")
+    not_run = "not analyzed: the night did not run" if sk else ""
+    if sk:
+        run = (f"Skipped at {b['started_at'] or '?'} by the night job ({sk['reason']}). Checkpoint not read or "
+               "advanced: the next night starts from the last advanced checkpoint.")
+    else:
+        run = f"Run {b['started_at'] or '?'} to {b['finished_at'] or '?'}. "
+        run += (f"Checkpoint advanced: {ck['before'] or 'start'} -> {ck['after']}." if ck["advanced"]
+                else f"Checkpoint not advanced (stays at {ck['before'] or 'start'}): the next night reads this window "
+                     "again.")
     out.append(run)
     for n in b["notes"]:
         out.append(f"- Note: {n}")
+    for w in b.get("prerequisite_warnings") or []:
+        out.append(f"- Warning: {w}")
     for w in b["health"]["warnings"]:
         out.append(f"- Warning: {w}")
 
     s = b["sessions"]
     out += ["", "## Sessions analyzed", ""]
     since = f" since {s['since']}" if s["since"] else ""
-    out.append(f"- {_plural(s['sessions'], 'new or changed session')}{since}." if s["sessions"]
-               else f"- No new sessions{since}.")
-    out.append(f"- {_plural(s['deviations'], 'deviation')}, {_plural(s['eval_failures'], 'eval failure')}, "
-               f"{_plural(s['routine_failures'], 'routine failure')}.")
+    if sk:
+        out.append(f"- Sessions, deviations, eval failures and routine failures: {not_run}.")
+    else:
+        out.append(f"- {_plural(s['sessions'], 'new or changed session')}{since}." if s["sessions"]
+                   else f"- No new sessions{since}.")
+        out.append(f"- {_plural(s['deviations'], 'deviation')}, {_plural(s['eval_failures'], 'eval failure')}, "
+                   f"{_plural(s['routine_failures'], 'routine failure')}.")
 
     out += ["", "## Important patterns", ""]
     pats = b["patterns"]
@@ -907,14 +947,15 @@ def render_markdown(b: dict[str, Any]) -> str:
         out.append(f"- **{p['key'] or 'pattern'}**" + (f" ({size})" if size else "") + f": {_sentence(p['summary']) or '-'}"
                    + (f" Evidence: {refs}." if refs else ""))
     if not pats["items"]:
-        out.append("- None found.")
+        out.append(f"- {not_run[:1].upper()}{not_run[1:]}." if sk else "- None found.")
     elif pats["total"] > len(pats["items"]):
         out.append(f"- And {pats['total'] - len(pats['items'])} more (see the report).")
 
     out += ["", "## Candidates considered", ""]
     cd = b["candidates"]
     backlog = f" Backlog: {_plural(cd['backlog'], 'candidate')} kept for future nights." if cd["backlog"] is not None else ""
-    out.append(f"{cd['total']} considered, {cd['selected']} selected for an experiment.{backlog}")
+    out.append(f"None considered: the night did not run.{backlog}" if sk
+               else f"{cd['total']} considered, {cd['selected']} selected for an experiment.{backlog}")
     if cd["items"]:
         out += ["", *_table(["rank", "candidate", "source", "selected", "status", "reason"],
                             [[_fmt(x["rank"]), x["key"], x["source"], "yes" if x["selected"] else "no",
@@ -936,7 +977,7 @@ def render_markdown(b: dict[str, Any]) -> str:
             elif x["experiment_id"] and x["verdict"]:
                 out.append(f"- {x['experiment_id']}: judge and Jev results not in the report.")
     else:
-        out.append("- None ran.")
+        out.append("- None ran: the night did not run." if sk else "- None ran.")
 
     out += ["", "## Improvements that passed", ""]
     for i, blk in enumerate(b["passed"], 1):
@@ -975,15 +1016,20 @@ def render_markdown(b: dict[str, Any]) -> str:
         if co["by_basis"]:
             out.append("- By basis: " + ", ".join(f"{x['basis']} ({x['kind']}) {_plural(x['records'], 'record')} "
                                                   f"{usd4(x['usd'])}" for x in co["by_basis"]) + ".")
+    elif sk:
+        out.append("- Cost basis: none needed: the night did not run, so it made no model or provider call.")
     else:
         out.append("- Cost basis: not recorded in this report (reported vs estimated unknown).")
 
     out += ["", "## Service health", ""]
     h = b["health"]
-    for k, v in h["services"].items():
-        out.append(f"- {k}: {v}" + (" (DEGRADED)" if k in h["degraded"] else ""))
-    if not h["services"]:
-        out.append("- The report lists no services.")
+    if sk:
+        out.append("- Services: not checked: the night did not run.")
+    else:
+        for k, v in h["services"].items():
+            out.append(f"- {k}: {v}" + (" (DEGRADED)" if k in h["degraded"] else ""))
+        if not h["services"]:
+            out.append("- The report lists no services.")
     db = h["database"]
     out.append(f"- Database rows for this brief: {db['status']}" + (f" ({db['detail']})" if db["detail"] else "") + ".")
 
@@ -1037,8 +1083,11 @@ def notification(b: Mapping[str, Any]) -> tuple[str, str]:
     pd = b["pending_decisions"]
     s = b["sessions"]
     ready = sum(1 for x in b["passed"] if x["actions"].get("apply"))
+    sk = b.get("skipped")
     lines = [f"Night {b['status']}. Ready to apply {ready}, staged not ready {len(b['passed']) - ready}, "
              f"failed or inconclusive {len(b['failed'])}.",
+             f"Not run: skipped by the night job ({sk['reason']}); nothing analyzed. Cost {usd(b['costs']['total_usd'])}."
+             if sk and sk.get("reason") in SKIP_REASONS else
              f"Sessions {int(s['sessions'])}, candidates {int(b['candidates']['total'])}, "
              f"experiments {int(b['experiments']['total'])}. Cost {usd(b['costs']['total_usd'])}."]
     deg = [f"{k} {_word(b['health']['services'][k])}" for k in b["health"]["degraded"] if NAME_RE.fullmatch(k)]

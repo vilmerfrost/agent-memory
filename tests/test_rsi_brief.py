@@ -29,7 +29,7 @@ BEFORE = b"# Global\n\n## Closing line\n\n- End with a short summary.\n"
 AFTER = b"# Global\n\n## Closing line\n\n- End with a section that lists the tools you used.\n"
 TOP_KEYS = {"format", "night", "status", "generated_at", "report", "started_at", "finished_at", "checkpoint", "headline",
             "summary", "notes", "sessions", "patterns", "candidates", "experiments", "passed", "failed", "costs", "health",
-            "pending_decisions", "sections"}
+            "pending_decisions", "sections", "skipped", "prerequisite_warnings"}
 BLOCK_KEYS = {"experiment_id", "candidate_key", "proposal_id", "title", "what", "target", "change", "why", "evidence_refs",
               "baseline_vs_candidate", "evaluation", "risk", "confidence", "artifact_hash", "proposal_status", "expires_at",
               "cost_usd", "actions", "apply_blocked", "warnings"}

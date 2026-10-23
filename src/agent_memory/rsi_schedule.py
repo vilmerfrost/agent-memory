@@ -8,7 +8,10 @@ Night job, in order:
 1. Completion checkpoints, not the clock: every prerequisite routine must have a PASS line in routines.log
    (`schedule.prerequisites` in the night config, default DEFAULT_PREREQS): amem-daily and amem-archive passed on
    the night's own date (the night key: 00:00-11:59 counts as the previous day), amem-ingest's latest line is a PASS
-   younger than 25 h. Otherwise the night is skipped (`SKIP`, one `-fail` line per reason).
+   younger than 25 h. Otherwise the night is skipped (`SKIP`, one `-fail` line per reason). A FAIL whose every
+   `<routine>-fail <step>` line names a step in the prerequisite's `nonblocking_steps` (amem-daily default:
+   DAILY_NONBLOCKING_STEPS, the steps the night does not read) counts as completed: the night runs and carries one
+   warning per failed step (`-warn` lines, the report's `prerequisite_warnings`, the brief).
 2. Credentials, checked for presence only, never read and never prompted for: the database URL (remote under
    AMEM_REQUIRE_REMOTE=1), live Jev (AMEM_JEV_LIVE=1 and TYPESAFE_API_KEY), the sandbox Keychain items the live
    stages name (`security find-generic-password` without -w reads attributes only: no dialog), the `claude` CLI
@@ -21,8 +24,9 @@ Night job, in order:
 4. One routines.log summary line `amem-rsi-night PASS|FAIL|SKIP night=... status=... report=...` plus one
    `amem-rsi-night-fail <item>: <detail>` line per problem: the format routine-audit reads.
 
-A skipped night writes a `preflight_failed` rsi-night/1 report (unless that night already has one), so the morning
-brief says why nothing ran. Nothing here writes outside routines.log, the RSI sandbox and the brief's report dir.
+A skipped night writes a `preflight_failed` rsi-night/1 report with a `skipped` object (reason prerequisites or
+credentials, a summary, the items) unless that night already has one, so the morning brief names the real cause and
+says "not analyzed" instead of zero counts. Nothing here writes outside routines.log, the RSI sandbox and the brief's report dir.
 """
 
 from __future__ import annotations
@@ -70,10 +74,23 @@ class Prereq:
     routine: str
     same_night: bool = True             # a PASS dated on the night key's date
     max_age_h: float | None = None      # a PASS younger than this many hours
+    # Steps whose failure does not block the night: a FAIL run whose every `<routine>-fail <step>...` line names one
+    # of these counts as completed, and each failed step becomes a warning in the night report. Any other step, a
+    # step name not listed here, or a FAIL with no step line still blocks (fail closed).
+    nonblocking_steps: tuple[str, ...] = ()
 
 
-DEFAULT_PREREQS = (Prereq("amem-daily", same_night=True), Prereq("amem-archive", same_night=True),
-                   Prereq("amem-ingest", same_night=False, max_age_h=25))
+# amem-daily steps (daily.py) the night does not read. The night's S1 delta (rsi_evidence_pack.DELTA_SQL) reads
+# sessions + deviations (the `deviations` step) and runs (the `ingest` step: cloud routines; the `tasks` step:
+# dispatch runs), so those three block. `score` (scores) and `edits` (edits) only enrich S4 evidence packs, which
+# are re-read live every night; distill (lessons), escalations (a phone push), rsi-push (a phone push) and state
+# (the daily state file) feed nothing the night reads. docs/rsi/night-ops.md has the table.
+DAILY_NONBLOCKING_STEPS = ("score", "distill", "escalations", "edits", "rsi-push", "state")
+DEFAULT_NONBLOCKING = {"amem-daily": DAILY_NONBLOCKING_STEPS}
+DEFAULT_PREREQS = (Prereq("amem-daily", same_night=True, nonblocking_steps=DAILY_NONBLOCKING_STEPS),
+                   Prereq("amem-archive", same_night=True), Prereq("amem-ingest", same_night=False, max_age_h=25))
+_STEP_RE = re.compile(r"[a-z][a-z0-9_-]{0,31}")
+_STEP_AT = re.compile(r"([a-z][a-z0-9_-]{0,31})(?::|\s|$)")
 
 
 @dataclass
@@ -82,6 +99,7 @@ class JobResult:
     status: str                          # PASS | FAIL | SKIP
     night: str
     items: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)   # `<routine>-warn` lines; they never change the status
     fields: dict[str, Any] = field(default_factory=dict)
     report: str | None = None
     lines: list[str] = field(default_factory=list)
@@ -120,8 +138,13 @@ def prerequisites(sched: Mapping[str, Any]) -> tuple[Prereq, ...]:
         if isinstance(p, dict) and isinstance(p.get("routine"), str) and re.fullmatch(r"[a-z0-9][a-z0-9_.-]{0,63}",
                                                                                       p["routine"]):
             age = p.get("max_age_h")
+            steps = p.get("nonblocking_steps", DEFAULT_NONBLOCKING.get(p["routine"], ()))
+            if not isinstance(steps, (list, tuple)) or not all(isinstance(s, str) and _STEP_RE.fullmatch(s)
+                                                                for s in steps):
+                raise ValueError(f"schedule.prerequisites: bad nonblocking_steps in {p!r}")
             out.append(Prereq(p["routine"], bool(p.get("same_night", True)),
-                              float(age) if isinstance(age, (int, float)) and not isinstance(age, bool) else None))
+                              float(age) if isinstance(age, (int, float)) and not isinstance(age, bool) else None,
+                              tuple(steps)))
         else:
             raise ValueError(f"schedule.prerequisites: bad entry {p!r}")
     return tuple(out)
@@ -131,29 +154,80 @@ def _night_date(night: str) -> date:
     return date.fromisoformat(night)
 
 
-def check_prerequisites(log: Path, night: str, now: datetime, prereqs: Sequence[Prereq]) -> list[str]:
-    """Reasons the night must not run yet (empty: every prerequisite completed). Reads routines.log only."""
+def failed_step(detail: str) -> str | None:
+    """The step a `<routine>-fail` detail names: the word before the first `:` or space (`score dispatch: ...` is
+    the score step). None when the detail does not start with a step-shaped word."""
+    m = _STEP_AT.match(detail)
+    return m.group(1) if m else None
+
+
+@dataclass
+class Gate:
+    """The prerequisite check. `reasons` block the night (one routines.log item each, `prerequisite <routine>: ...`),
+    `causes` say the same in headline words (one per reason), `warnings` are failed steps the night does not read."""
+    reasons: list[str] = field(default_factory=list)
+    causes: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+
+    def block(self, reason: str, cause: str) -> None:
+        self.reasons.append(reason)
+        self.causes.append(cause)
+
+    def summary(self) -> str:
+        if not self.causes:
+            return ""
+        more = len(self.causes) - 1
+        return self.causes[0] + (f"; and {more} more prerequisite problem{'s' if more != 1 else ''} (see the notes)"
+                                 if more else "")
+
+
+def evaluate_prerequisites(log: Path, night: str, now: datetime, prereqs: Sequence[Prereq]) -> Gate:
+    """Whether the night may run (no reasons) and which tolerated step failures it carries as warnings. Reads
+    routines.log only. A FAIL run of a prerequisite blocks unless every failed step it names is in that prerequisite's
+    `nonblocking_steps`; then the run counts as completed (its date and age rules still apply)."""
+    g = Gate()
     try:
         runs = RL.parse_file(log).runs
     except OSError as exc:
-        return [f"routines.log: cannot read {log.name} ({type(exc).__name__})"]
-    reasons = []
+        g.block(f"routines.log: cannot read {log.name} ({type(exc).__name__})",
+                f"routines.log could not be read ({type(exc).__name__})")
+        return g
     for p in prereqs:
-        mine = [r for r in runs if r.routine == p.routine and r.started_at <= now]
+        r = p.routine
+        mine = [x for x in runs if x.routine == r and x.started_at <= now]
         if not mine:
-            reasons.append(f"prerequisite {p.routine}: no run in routines.log")
+            g.block(f"prerequisite {r}: no run in routines.log", f"prerequisite {r} has no run in routines.log")
             continue
-        last = max(mine, key=lambda r: (r.started_at, r.line_no))
+        last = max(mine, key=lambda x: (x.started_at, x.line_no))
         ts = last.started_at.strftime(TS_FORMAT)
+        word = last.meta.get("raw_status") or last.status.upper()
+        tolerated = False
         if last.status != "pass":
-            reasons.append(f"prerequisite {p.routine}: last run {last.meta.get('raw_status') or last.status.upper()} "
-                           f"at {ts}")
-            continue
+            fails = [_one_line(f, 260) for f in last.meta.get("failures") or []]
+            blocking = [f for f in fails if failed_step(f) not in p.nonblocking_steps]
+            g.warnings += [f"prerequisite {r}: step {failed_step(f)} failed at {ts}; the night does not read it: {f}"
+                           for f in fails if f not in blocking]
+            tolerated = (last.status == "fail" and bool(fails) and not blocking
+                         and not last.meta.get("orphan_detail"))
+            if not tolerated:
+                shown = blocking or fails
+                g.block(f"prerequisite {r}: last run {word} at {ts}" + (f" ({'; '.join(shown)})" if shown else ""),
+                        f"prerequisite {r} failed (" + ("; ".join(shown) if shown
+                                                        else f"last run {word} at {ts}, no failed step named") + ")")
+                continue
+        done = "PASS" if not tolerated else "completed run"
         if p.same_night and last.started_at.date() != _night_date(night):
-            reasons.append(f"prerequisite {p.routine}: no PASS on {night} (last PASS {ts})")
+            g.block(f"prerequisite {r}: no PASS on {night} (last {done} {ts})",
+                    f"prerequisite {r} did not complete on {night} (last {done} {ts})")
         if p.max_age_h is not None and now - last.started_at > timedelta(hours=p.max_age_h):
-            reasons.append(f"prerequisite {p.routine}: last PASS {ts} is older than {p.max_age_h:g}h")
-    return reasons
+            g.block(f"prerequisite {r}: last {done} {ts} is older than {p.max_age_h:g}h",
+                    f"prerequisite {r} last completed at {ts}, more than {p.max_age_h:g}h ago")
+    return g
+
+
+def check_prerequisites(log: Path, night: str, now: datetime, prereqs: Sequence[Prereq]) -> list[str]:
+    """Reasons the night must not run yet (empty: every prerequisite completed). Reads routines.log only."""
+    return evaluate_prerequisites(log, night, now, prereqs).reasons
 
 
 _WS = re.compile(r"\s+")
@@ -171,7 +245,8 @@ def _kv(v: Any) -> str:
 
 
 def log_lines(res: JobResult, *, now: datetime, secs: int) -> list[str]:
-    """The house format (routines_log.py): one summary line, one `<routine>-fail <item>: <detail>` per item."""
+    """The house format (routines_log.py): one summary line, one `<routine>-fail <item>: <detail>` per item, then
+    one `<routine>-warn <item>: <detail>` per warning."""
     ts = now.strftime(TS_FORMAT)
     head = f"{ts} {res.routine} {res.status}"
     for k, v in res.fields.items():
@@ -179,7 +254,8 @@ def log_lines(res: JobResult, *, now: datetime, secs: int) -> list[str]:
     head += f" {secs}s"
     if res.report:
         head += f" report={res.report.replace(' ', '%20')}"
-    return [head, *(f"{ts} {res.routine}-fail {_one_line(i)}" for i in res.items[:MAX_ITEMS])]
+    return [head, *(f"{ts} {res.routine}-fail {_one_line(i)}" for i in res.items[:MAX_ITEMS]),
+            *(f"{ts} {res.routine}-warn {_one_line(w)}" for w in res.warnings[:MAX_ITEMS])]
 
 
 def append_log(path: Path, lines: Sequence[str]) -> None:
@@ -351,26 +427,53 @@ def render_plan(plan: Mapping[str, Any]) -> str:
 # =========================================================================== the night job
 
 
-def skip_report(night: str, reasons: Sequence[str], *, now: datetime) -> dict[str, Any]:
-    """A valid rsi-night/1 report for a night that did not run: status preflight_failed, the reasons as notes."""
+SKIP_KINDS = ("prerequisites", "credentials")
+
+
+def credentials_summary(problems: Sequence[str]) -> str:
+    """The credentials skip in headline words: the first problem, and how many more."""
+    if not problems:
+        return ""
+    more = len(problems) - 1
+    return (f"the credentials and budget check failed ({_one_line(problems[0], 200)}"
+            + (f"; and {more} more" if more else "") + ")")
+
+
+def skip_report(night: str, reasons: Sequence[str], *, now: datetime, kind: str = "prerequisites",
+                summary: str | None = None, warnings: Sequence[str] = ()) -> dict[str, Any]:
+    """A valid rsi-night/1 report for a night that did not run: status preflight_failed, the reasons as notes, and
+    `skipped` ({by, reason: prerequisites | credentials, summary, items}) so a reader can tell a skip (nothing was
+    read: the zero counts and the `skipped` health mean "not analyzed", not "nothing found") from a night whose own
+    preflight failed. `prerequisite_warnings`: failed prerequisite steps the night does not read."""
     from agent_memory import rsi_night as N
+    if kind not in SKIP_KINDS:
+        raise ValueError(f"skip kind {kind!r} not in {SKIP_KINDS}")
     iso = now.isoformat(timespec="seconds")
-    return {"format": N.FORMAT, "night": night, "started_at": iso, "finished_at": iso, "status": "preflight_failed",
-            "checkpoint": {"before": None, "after": None, "advanced": False},
-            "delta": {"since": None, "sessions": 0, "deviations": 0, "eval_failures": 0, "routine_failures": 0},
-            "patterns": [], "candidates": [], "experiments": [],
-            "costs": {"by_model": {}, "sandbox_runs": 0, "providers": {}, "total_usd": 0.0},
-            "health": {k: "skipped" for k in N.HEALTH_KEYS}, "pending_decisions": [],
-            "notes": [f"skipped by {NIGHT_ROUTINE}: {_one_line(r, 260)}" for r in reasons][:30]}
+    items = [_one_line(r, 260) for r in reasons][:30]
+    if summary is None:
+        summary = credentials_summary(reasons) if kind == "credentials" else (items[0] if items else "")
+    rep: dict[str, Any] = {
+        "format": N.FORMAT, "night": night, "started_at": iso, "finished_at": iso, "status": "preflight_failed",
+        "checkpoint": {"before": None, "after": None, "advanced": False},
+        "delta": {"since": None, "sessions": 0, "deviations": 0, "eval_failures": 0, "routine_failures": 0},
+        "patterns": [], "candidates": [], "experiments": [],
+        "costs": {"by_model": {}, "sandbox_runs": 0, "providers": {}, "total_usd": 0.0},
+        "health": {k: "skipped" for k in N.HEALTH_KEYS}, "pending_decisions": [],
+        "notes": [f"skipped by {NIGHT_ROUTINE}: {r}" for r in items],
+        "skipped": {"by": NIGHT_ROUTINE, "reason": kind, "summary": _one_line(summary, 300), "items": items}}
+    if warnings:
+        rep["prerequisite_warnings"] = [_one_line(w, 300) for w in warnings][:N.MAX_PREREQ_WARNINGS]
+    return rep
 
 
-def _write_skip_report(night: str, reasons: Sequence[str], now: datetime) -> str | None:
+def _write_skip_report(night: str, reasons: Sequence[str], now: datetime, *, kind: str = "prerequisites",
+                       summary: str | None = None, warnings: Sequence[str] = ()) -> str | None:
     from agent_memory import rsi_night as N
     path = N.report_path(night)
     if path.exists():                    # a night that already ran keeps its own report
         return None
     try:
-        N._write_json(path, skip_report(night, reasons, now=now))
+        N._write_json(path, skip_report(night, reasons, now=now, kind=kind, summary=summary, warnings=warnings))
     except (OSError, RuntimeError):
         return None
     return str(path)
@@ -482,17 +585,19 @@ def run_night_job(*, config_path: Path | None = None, night: str | None = None, 
         res.status, res.items = "FAIL", [f"config: {_one_line(exc, 200)}"]
         return finish()
     res.fields["config"] = cfg.sha256[:12]
-    gate = check_prerequisites(log, night, now, prereqs)
-    if gate:
-        res.status, res.items = "SKIP", gate
+    gate = evaluate_prerequisites(log, night, now, prereqs)
+    res.warnings = list(gate.warnings)
+    if gate.reasons:
+        res.status, res.items = "SKIP", gate.reasons
         res.fields["skipped"] = "prerequisites"
-        res.report = _write_skip_report(night, gate, now)
+        res.report = _write_skip_report(night, gate.reasons, now, kind="prerequisites", summary=gate.summary(),
+                                        warnings=gate.warnings)
         return finish()
     creds = credential_problems(cfg, runner=runner)
     if creds:
         res.status, res.items = "FAIL", creds
         res.fields["skipped"] = "credentials"
-        res.report = _write_skip_report(night, creds, now)
+        res.report = _write_skip_report(night, creds, now, kind="credentials", warnings=gate.warnings)
         return finish()
 
     def killed() -> None:
@@ -505,7 +610,8 @@ def run_night_job(*, config_path: Path | None = None, night: str | None = None, 
         if guard:
             guard.__enter__()
         try:
-            rep = N.run_night(night=night, config_path=config_path, db_url=db_url, adapters=adapters)
+            rep = N.run_night(night=night, config_path=config_path, db_url=db_url, adapters=adapters,
+                              prerequisite_warnings=gate.warnings)
         finally:
             if guard:
                 guard.__exit__(None, None, None)
