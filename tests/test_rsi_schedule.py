@@ -45,6 +45,8 @@ DAILY_FAIL = """\
 2026-10-18T09:20:04+0200 amem-daily FAIL scored=16 escalations=14 new=0 push=none tasks=10 deviations=68 deviation_errors=1 707s
 2026-10-18T09:20:04+0200 amem-daily-fail deviations: 1 error; first: session b1b2011c/agent-a079: writer output: deviation 0: followed_grade must be a number in 0..1, got None
 """
+DEV_FAIL = ("deviations: 1 error; first: session b1b2011c/agent-a079: writer output: deviation 0: followed_grade must "
+            "be a number in 0..1, got None")
 
 
 def write_log(tmp: Path, text: str) -> Path:
@@ -62,7 +64,7 @@ def test_gate_passes_only_on_completion_checkpoints(tmp_path: Path) -> None:
     # amem-daily ran but failed (the real 10-17 line): the night waits for a successful run
     reasons = S.check_prerequisites(write_log(tmp_path, GOOD_LOG.replace(
         GOOD_LOG.splitlines()[3] + "\n", DAILY_FAIL)), NIGHT, NOW, pre)
-    assert reasons == ["prerequisite amem-daily: last run FAIL at 2026-10-18T09:20:04+0200"]
+    assert reasons == [f"prerequisite amem-daily: last run FAIL at 2026-10-18T09:20:04+0200 ({DEV_FAIL})"]
     # only yesterday's PASS: completion today is missing (the clock alone would have let it run)
     yday = GOOD_LOG.replace("2026-10-18T09:20:04+0200 amem-daily", "2026-10-17T09:20:04+0200 amem-daily")
     assert S.check_prerequisites(write_log(tmp_path, yday), NIGHT, NOW, pre) == [
@@ -89,6 +91,140 @@ def test_first_config_names_the_prerequisites() -> None:
     assert S.prerequisites({}) == S.DEFAULT_PREREQS
     with pytest.raises(ValueError):
         S.prerequisites({"prerequisites": [{"routine": "../evil"}]})
+
+
+DAILY_PASS_LINE = GOOD_LOG.splitlines()[3] + "\n"
+SCORE_FAIL = "score dispatch: 1 Jev error; first: run 4f1c: ReadTimeout"
+EDITS_FAIL = "edits: 1 error; first: claude rule-7: writer timed out"
+
+
+def daily_fail(*details: str, ts: str = "2026-10-18T09:20:04+0200") -> str:
+    return (f"{ts} amem-daily FAIL scored=16 escalations=14 new=0 push=none tasks=10 707s\n"
+            + "".join(f"{ts} amem-daily-fail {d}\n" for d in details))
+
+
+def test_gate_runs_the_night_when_only_steps_it_does_not_read_failed(tmp_path: Path) -> None:
+    pre = S.DEFAULT_PREREQS
+    g = S.evaluate_prerequisites(write_log(tmp_path, GOOD_LOG.replace(DAILY_PASS_LINE, daily_fail(SCORE_FAIL, EDITS_FAIL))),
+                                 NIGHT, NOW, pre)
+    assert g.reasons == [] and g.summary() == ""
+    assert g.warnings == [
+        f"prerequisite amem-daily: step score failed at 2026-10-18T09:20:04+0200; the night does not read it: {SCORE_FAIL}",
+        f"prerequisite amem-daily: step edits failed at 2026-10-18T09:20:04+0200; the night does not read it: {EDITS_FAIL}"]
+    for step in ("distill: 1 error; first: run 9: x", "escalations: OperationalError: x", "rsi-push: OSError: x",
+                 "state: cannot write amem-daily-state.json: OSError: x"):
+        assert S.check_prerequisites(write_log(tmp_path, GOOD_LOG.replace(DAILY_PASS_LINE, daily_fail(step))),
+                                     NIGHT, NOW, pre) == [], step
+
+
+def test_gate_skips_when_a_step_the_night_reads_failed(tmp_path: Path) -> None:
+    pre = S.DEFAULT_PREREQS
+    ts = "2026-10-18T09:20:04+0200"
+    # a needed step next to a tolerated one: the needed one blocks and names itself, the other is a warning
+    g = S.evaluate_prerequisites(write_log(tmp_path, GOOD_LOG.replace(DAILY_PASS_LINE, daily_fail(SCORE_FAIL, DEV_FAIL))),
+                                 NIGHT, NOW, pre)
+    assert g.reasons == [f"prerequisite amem-daily: last run FAIL at {ts} ({DEV_FAIL})"]
+    assert g.summary() == f"prerequisite amem-daily failed ({DEV_FAIL})"
+    assert [w.split(";")[0] for w in g.warnings] == [f"prerequisite amem-daily: step score failed at {ts}"]
+    for needed in ("ingest: FetchError: gh api failed", "tasks: OperationalError: x", DEV_FAIL,
+                   "newstep: a step the gate does not know", "Traceback (most recent call last)"):
+        got = S.check_prerequisites(write_log(tmp_path, GOOD_LOG.replace(DAILY_PASS_LINE, daily_fail(needed))),
+                                    NIGHT, NOW, pre)
+        assert got == [f"prerequisite amem-daily: last run FAIL at {ts} ({needed})"], needed
+    # a FAIL that names no step blocks (fail closed)
+    g = S.evaluate_prerequisites(write_log(tmp_path, GOOD_LOG.replace(DAILY_PASS_LINE, daily_fail())), NIGHT, NOW, pre)
+    assert g.reasons == [f"prerequisite amem-daily: last run FAIL at {ts}"]
+    assert g.causes == [f"prerequisite amem-daily failed (last run FAIL at {ts}, no failed step named)"]
+    # a tolerated FAIL still has to be the night's own run
+    old = daily_fail(SCORE_FAIL, ts="2026-10-17T09:20:04+0200")
+    assert S.check_prerequisites(write_log(tmp_path, GOOD_LOG.replace(DAILY_PASS_LINE, old)), NIGHT, NOW, pre) == [
+        "prerequisite amem-daily: no PASS on 2026-10-18 (last completed run 2026-10-17T09:20:04+0200)"]
+    # amem-archive and amem-ingest keep the strict rule: any FAIL blocks
+    arch = GOOD_LOG.replace("2026-10-18T08:45:09+0200 amem-archive PASS heartbeat 5s\n",
+                            "2026-10-18T08:45:09+0200 amem-archive FAIL 5s\n"
+                            "2026-10-18T08:45:09+0200 amem-archive-fail score: not a daily step here\n")
+    assert S.check_prerequisites(write_log(tmp_path, arch), NIGHT, NOW, pre) == [
+        "prerequisite amem-archive: last run FAIL at 2026-10-18T08:45:09+0200 (score: not a daily step here)"]
+
+
+def test_nonblocking_steps_are_configurable_and_backward_compatible() -> None:
+    old_shape = {"prerequisites": [{"routine": "amem-daily", "same_night": True}, {"routine": "amem-archive"}]}
+    daily_p, arch = S.prerequisites(old_shape)
+    assert daily_p.nonblocking_steps == S.DAILY_NONBLOCKING_STEPS and arch.nonblocking_steps == ()
+    strict = S.prerequisites({"prerequisites": [{"routine": "amem-daily", "nonblocking_steps": []}]})
+    assert strict == (S.Prereq("amem-daily", True, None, ()),)
+    custom = S.prerequisites({"prerequisites": [{"routine": "amem-archive", "nonblocking_steps": ["verify"]}]})
+    assert custom[0].nonblocking_steps == ("verify",)
+    for bad in ("score", ["Score"], [1], ["../x"]):
+        with pytest.raises(ValueError):
+            S.prerequisites({"prerequisites": [{"routine": "amem-daily", "nonblocking_steps": bad}]})
+
+
+def test_strict_config_restores_the_old_gate(tmp_path: Path) -> None:
+    strict = S.prerequisites({"prerequisites": [{"routine": "amem-daily", "nonblocking_steps": []}]})
+    log = write_log(tmp_path, GOOD_LOG.replace(DAILY_PASS_LINE, daily_fail(SCORE_FAIL)))
+    assert S.check_prerequisites(log, NIGHT, NOW, strict) == [
+        f"prerequisite amem-daily: last run FAIL at 2026-10-18T09:20:04+0200 ({SCORE_FAIL})"]
+
+
+def test_skip_reports_say_why_and_stay_valid_for_every_reader() -> None:
+    from agent_memory import rsi_brief as BR
+    pre = S.skip_report(NIGHT, ["prerequisite amem-daily: last run FAIL at x (deviations: 2 errors)"], now=NOW,
+                        summary="prerequisite amem-daily failed (deviations: 2 errors)", warnings=["w1"])
+    creds = S.skip_report(NIGHT, ["credentials jev: TYPESAFE_API_KEY is not set", "budget max_usd: 0"], now=NOW,
+                          kind="credentials")
+    for rep in (pre, creds):
+        assert N.validate_report(rep) == [] and BR.validate_report(rep) == [] and rep["status"] == "preflight_failed"
+    assert pre["skipped"]["reason"] == "prerequisites" and pre["prerequisite_warnings"] == ["w1"]
+    assert creds["skipped"] == {"by": "amem-rsi-night", "reason": "credentials",
+                                "summary": "the credentials and budget check failed (credentials jev: "
+                                           "TYPESAFE_API_KEY is not set; and 1 more)",
+                                "items": ["credentials jev: TYPESAFE_API_KEY is not set", "budget max_usd: 0"]}
+    assert "prerequisite_warnings" not in creds
+    bad = {**creds, "skipped": {**creds["skipped"], "reason": "tired"}}
+    assert any("skipped.reason" in e for e in N.validate_report(bad)) and BR.validate_report(bad)
+    assert any("only valid with status preflight_failed" in e for e in N.validate_report({**creds, "status": "ok"}))
+    with pytest.raises(ValueError):
+        S.skip_report(NIGHT, ["x"], now=NOW, kind="tired")
+
+
+def render_skip_brief(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, rep: dict[str, Any]) -> str:
+    from agent_memory import rsi_brief as BR
+    root = tmp_path / "sandbox"
+    monkeypatch.setenv("RSI_SANDBOX_DIR", str(root))
+    monkeypatch.setenv("AMEM_AGENT_CONFIG_DIR", str(tmp_path / "no-agent-config"))
+    N._write_json(N.report_path(NIGHT), rep)
+    return BR.render_markdown(BR.make_brief(root=root, night=NIGHT, db_url="postgresql://postgres:postgres@127.0.0.1:1/x"))
+
+
+def test_prerequisite_skip_brief_names_the_cause_and_claims_nothing(tmp_path: Path,
+                                                                    monkeypatch: pytest.MonkeyPatch) -> None:
+    g = S.evaluate_prerequisites(write_log(tmp_path, GOOD_LOG.replace(DAILY_PASS_LINE, daily_fail(SCORE_FAIL, DEV_FAIL))),
+                                 NIGHT, NOW, S.DEFAULT_PREREQS)
+    md = render_skip_brief(tmp_path, monkeypatch, S.skip_report(NIGHT, g.reasons, now=NOW, summary=g.summary(),
+                                                                warnings=g.warnings))
+    assert f"The night did not run: prerequisite amem-daily failed ({DEV_FAIL}). " in md
+    assert "Checkpoint not read or advanced" in md and "- Warning: prerequisite amem-daily: step score failed" in md
+    assert "- Sessions, deviations, eval failures and routine failures: not analyzed: the night did not run." in md
+    assert "- Not analyzed: the night did not run." in md and "None considered: the night did not run." in md
+    assert "- Services: not checked: the night did not run." in md
+    assert "- Cost basis: none needed: the night did not run, so it made no model or provider call." in md
+    for claim in ("No new sessions", "0 deviations", "see Service health", "- clickhouse: skipped", "- None found.",
+                  "not recorded in this report", "stays at start"):
+        assert claim not in md, claim
+
+
+def test_credentials_skip_brief_names_the_missing_credential(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from agent_memory import rsi_brief as BR
+    rep = S.skip_report(NIGHT, ["credentials judge (replay.judge_credentials): keychain item not found"], now=NOW,
+                        kind="credentials")
+    md = render_skip_brief(tmp_path, monkeypatch, rep)
+    assert ("The night did not run: the credentials and budget check failed (credentials judge "
+            "(replay.judge_credentials): keychain item not found).") in md
+    assert "No new sessions" not in md and "see Service health" not in md and "not analyzed" in md
+    title, body = BR.notification(BR.make_brief(root=tmp_path / "sandbox", night=NIGHT,
+                                                db_url="postgresql://postgres:postgres@127.0.0.1:1/x"))
+    assert "Not run: skipped by the night job (credentials); nothing analyzed." in body and "Sessions 0" not in body
 
 
 def test_log_lines_are_what_routine_audit_and_ingest_read() -> None:
@@ -454,10 +590,13 @@ def test_night_skips_with_a_recorded_reason_until_amem_daily_completed(env: Simp
     assert res.status == "SKIP" and res.exit_code == 0 and ev.since_calls == []          # the night never started
     (run,) = log_runs(env, "amem-rsi-night")
     assert run.status == "skip" and run.meta["skipped"] == "prerequisites"
-    assert run.meta["failures"] == ["prerequisite amem-daily: last run FAIL at 2026-10-18T09:20:04+0200"]
+    reason = f"prerequisite amem-daily: last run FAIL at 2026-10-18T09:20:04+0200 ({DEV_FAIL})"
+    assert run.meta["failures"] == [reason]
     rep = json.loads(N.report_path(NIGHT).read_text())                                   # the brief will say why
     assert N.validate_report(rep) == [] and rep["status"] == "preflight_failed"
-    assert rep["notes"] == ["skipped by amem-rsi-night: prerequisite amem-daily: last run FAIL at 2026-10-18T09:20:04+0200"]
+    assert rep["notes"] == [f"skipped by amem-rsi-night: {reason}"]
+    assert rep["skipped"] == {"by": "amem-rsi-night", "reason": "prerequisites", "items": [reason],
+                              "summary": f"prerequisite amem-daily failed ({DEV_FAIL})"}
     assert run.report_path == str(N.report_path(NIGHT))
     for t in ("rsi_checkpoints", "rsi_candidates", "rsi_experiments"):
         assert rows(env.url, f"select count(*) from {t}") == [(0,)], t
@@ -467,6 +606,25 @@ def test_night_skips_with_a_recorded_reason_until_amem_daily_completed(env: Simp
     res2 = night_job(env)
     assert res2.status == "PASS" and res2.fields["status"] == "ok" and res2.fields["staged"] == 1
     assert json.loads(N.report_path(NIGHT).read_text())["status"] == "ok"                 # the real report replaced it
+
+
+def test_night_runs_with_a_warning_when_only_a_step_it_does_not_read_failed(env: SimpleNamespace) -> None:
+    seed_rule(env.url, RULE_A, "a")
+    env.log.write_text(GOOD_LOG.replace(DAILY_PASS_LINE, daily_fail(SCORE_FAIL)))
+    res = night_job(env)
+    assert res.status == "PASS" and res.fields["status"] == "ok" and res.fields["staged"] == 1, res.items
+    warning = (f"prerequisite amem-daily: step score failed at 2026-10-18T09:20:04+0200; the night does not read it: "
+               f"{SCORE_FAIL}")
+    assert res.warnings == [warning]
+    (run,) = log_runs(env, "amem-rsi-night")
+    assert run.status == "pass" and run.meta["warnings"] == [warning] and run.meta["failures"] == []
+    rep = json.loads(N.report_path(NIGHT).read_text())
+    assert N.validate_report(rep) == [] and rep["prerequisite_warnings"] == [warning] and "skipped" not in rep
+    b = S.run_brief_job(night=NIGHT, now=NOW + timedelta(hours=6), routines_log=env.log, out_dir=env.reports,
+                        db_url=env.url)
+    md = b.detail["markdown"]
+    assert b.status == "PASS" and md.split("\n")[2].startswith("The night finished.")
+    assert f"- Warning: {warning}" in md and "not analyzed" not in md
 
 
 def test_overlapping_start_is_refused_and_logged_as_skip(env: SimpleNamespace) -> None:
@@ -503,7 +661,9 @@ def test_missing_credential_skips_cleanly_without_a_prompt(env: SimpleNamespace,
     assert calls == ["find-generic-password -s rsi-sandbox -a openai"]                    # presence only, never -w
     (run,) = log_runs(env, "amem-rsi-night")
     assert run.status == "fail" and run.meta["failures"] == res.items                     # routine-audit raises it
-    assert json.loads(N.report_path(NIGHT).read_text())["notes"][0].startswith("skipped by amem-rsi-night: credentials")
+    rep = json.loads(N.report_path(NIGHT).read_text())
+    assert rep["notes"][0].startswith("skipped by amem-rsi-night: credentials")
+    assert rep["skipped"]["reason"] == "credentials" and N.validate_report(rep) == []
 
 
 def test_cli_night_job_gates_without_running_anything(env: SimpleNamespace) -> None:

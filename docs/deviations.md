@@ -219,9 +219,16 @@ Per session:
    helper plus a few more key shapes) before the cap. Cap: 60k characters, 40% head + 60% tail.
 2. **Writer**: `claude -p --model sonnet --output-format json --tools "" --disable-slash-commands
    --strict-mcp-config --no-session-persistence` (the `lessons distill` flags; `--bare` breaks
-   OAuth). Prompt on stdin: the numbered rule list per source (`N. <id> — <title>`), the
-   instructions, the digest. `instruction_ref` must be an id from that list. It answers
-   `{"deviations": [...]}`, at most 8.
+   OAuth) plus `--json-schema <REPLY_SCHEMA>`. Prompt on stdin: the numbered rule list per source
+   (`N. <id> — <title>`), the instructions, the digest. `instruction_ref` must be an id from that
+   list. It answers `{"deviations": [...]}`, at most 8. The schema makes the CLI enforce that
+   shape (both grades required numbers in 0..1, never null): the CLI re-prompts the model on a
+   mismatch and returns the validated object in the envelope's `structured_output` field (the
+   scan falls back to the `result` text when that field is missing). If the CLI gives up
+   (`error_max_structured_output_retries`, exit 1 with the envelope on stdout) or the reply is
+   still malformed after validation (no valid item, not JSON), the scan retries once, in the
+   same run, with the parse error appended to the prompt. At most one extra writer call per
+   session; a reply with at least one valid item is not retried.
 3. **Validation**: the reply must be JSON with a `deviations` list. Every item needs an offered
    `instruction_source`, a ref, a turn (positive integer or null), `what`/`why`/`how` strings
    and both grades as numbers in 0..1. A reply that is not JSON, has no list or has more than
@@ -231,7 +238,8 @@ Per session:
    in the summary) and stores `sessions.meta.scan_skipped` (the count) and
    `scan_skipped_reasons` (redacted, one line each, e.g. `deviation 0: followed_grade must be a
    number in 0..1, got None`). A grade is never filled in. A reply whose items are all
-   malformed is a session error (retried). The prompt says grades are never null and a
+   malformed is retried once in the call; malformed again, it is a session error (retried on
+   the next scan, reason ends with `(after 1 retry)`). The prompt says grades are never null and a
    deviation that cannot be graded is left out. Text fields
    are cleaned: quoted spans become `[quote]`, backtick code `[code]`, paths `[path]`, file
    names `[file]`, secrets `[redacted]`; a code block makes that item malformed. Max 300 characters each
@@ -259,6 +267,15 @@ it, and the scan goes on. The session is retried on the next scan. A missing Jev
 the writer could not grade it) is not an error either: only that deviation is skipped, the
 session's other findings are stored, and it shows as `skipped=N` in the scan line and
 `sessions.meta.scan_skipped` / `scan_skipped_reasons` (see Validation).
+
+Released transcripts: when the Claude Desktop app deletes a session it removes `<id>.jsonl`
+(and the `<id>/` folder with its subagents) and leaves `<id>.desktop-released.json`, e.g.
+`{"v": 1, "releasedAt": "2026-10-15T14:14:15.516Z", "reason": "delete"}`. Such a session (or a
+subagent of it) is `skipped`, not an error: the scan line reads `skipped <id> ...: transcript
+released by Claude Desktop (reason delete at ...)`, the summary adds `skipped_sessions=N`, and
+`sessions.meta.scan_status = skipped` (with `scan_skip_reason`) keeps it from being picked
+again. `scanned_at` stays null, so the scoreboard does not count it as a clean session. A
+missing transcript without that marker is still an error (`transcript file not found`).
 
 ## Incident scans
 

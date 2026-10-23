@@ -4,6 +4,7 @@ Jev state, dry runs, the CLI gate and the candidates JSON."""
 from __future__ import annotations
 
 import json
+import shutil
 from collections.abc import Callable, Iterator
 from dataclasses import replace
 from pathlib import Path
@@ -127,12 +128,16 @@ def test_recurrence_counts_other_sessions(setup_home: Home, db: str, writer: Wri
 def test_one_session_error_does_not_stop_the_scan(setup_home: Home, db: str, writer: Writer,  # noqa: F811
                                                   fake_jev: FakeJev) -> None:  # noqa: F811
     ids = _ingest(setup_home, db)
-    writer(distill.WriterError("timed out after 300s"), "not an envelope",
-           envelope({"deviations": [finding(source="skill:nope")]}), default=_reply_for)
+    # A failed run is not retried in the call; a malformed reply is retried once (twice here).
+    nope = envelope({"deviations": [finding(source="skill:nope")]})
+    w = writer(distill.WriterError("timed out after 300s"), "not an envelope", "not an envelope", nope, nope,
+               default=_reply_for)
     report = deviations.scan(now=NOW)
     assert [o.status for o in report.outcomes] == ["error", "error", "error", "ok", "ok"]
-    assert report.errors == 3 and report.found == 2
+    assert report.errors == 3 and report.found == 2 and len(w.prompts) == 7
     assert report.outcomes[0].reason == "writer: timed out after 300s"
+    assert report.outcomes[1].reason.startswith("writer output: CLI output is not a JSON envelope")
+    assert report.outcomes[1].reason.endswith(" (after 1 retry)")
     assert "instruction_source 'skill:nope' was not offered" in report.outcomes[2].reason
     chat = _q(db, "select scanned_at, meta ->> 'scan_error', meta ->> 'scan_errors' from sessions "
                   "where session_id = %s", ids["chat"])
@@ -192,16 +197,19 @@ def test_any_malformed_item_skips_only_that_item(setup_home: Home, db: str, writ
 
 def test_reply_with_only_malformed_items_is_a_session_error(setup_home: Home, db: str, writer: Writer,  # noqa: F811
                                                             fake_jev: FakeJev) -> None:  # noqa: F811
-    # Nothing usable: a writer failure, retried on the next scan (never stored as "found nothing").
+    # Nothing usable, also after the one in-call retry: a writer failure, retried on the next scan
+    # (never stored as "found nothing").
     ids = _ingest(setup_home, db)
-    writer(envelope({"deviations": [finding(followed=None)]}),
-           envelope({"deviations": [finding(followed=None), finding(turn=2, result_=2)]}),
-           default=envelope({"deviations": [finding()]}))
+    one_bad = envelope({"deviations": [finding(followed=None)]})
+    two_bad = envelope({"deviations": [finding(followed=None), finding(turn=2, result_=2)]})
+    w = writer(one_bad, one_bad, two_bad, two_bad, default=envelope({"deviations": [finding()]}))
     one = deviations.scan(session_id=ids["chat"], now=NOW)
     two = deviations.scan(session_id=ids["parent"], now=NOW)
-    assert one.outcomes[0].reason == "writer output: deviation 0: followed_grade must be a number in 0..1, got None"
+    assert len(w.prompts) == 4
+    assert one.outcomes[0].reason == ("writer output: deviation 0: followed_grade must be a number in 0..1, "
+                                      "got None (after 1 retry)")
     assert two.outcomes[0].reason == ("writer output: deviation 0: followed_grade must be a number in 0..1, "
-                                      "got None (+1 more skipped)")
+                                      "got None (+1 more skipped) (after 1 retry)")
     assert (one.errors, two.errors, one.skipped, two.skipped) == (1, 1, 0, 0)
     assert _q(db, "select count(*) from deviations") == [(0,)]
     assert _q(db, "select scanned_at, meta ->> 'scan_errors' from sessions where session_id = %s", ids["chat"]) == \
@@ -227,6 +235,106 @@ def test_sessions_failing_too_often_are_not_picked(setup_home: Home, db: str, wr
     for _ in range(deviations.MAX_SCAN_ERRORS):
         deviations.scan(now=NOW)
     assert deviations.scan(now=NOW).outcomes == []
+
+
+RELEASED = {"v": 1, "releasedAt": "2026-10-15T14:14:15.516Z", "reason": "delete"}
+
+
+def _release(home: Home, session: str) -> None:
+    """What the Desktop app leaves when it deletes a session: the marker, no transcript, no folder."""
+    proj = home.projects / "-work-demo-repo"
+    (proj / f"{session}.jsonl").unlink()
+    shutil.rmtree(proj / session, ignore_errors=True)
+    (proj / f"{session}{deviations.RELEASED_SUFFIX}").write_text(json.dumps(RELEASED, indent=2))
+
+
+def test_released_transcript_is_skipped_not_an_error(setup_home: Home, db: str, writer: Writer,  # noqa: F811
+                                                     fake_jev: FakeJev) -> None:  # noqa: F811
+    # 2026-10-15: session 57434622... was deleted in the Desktop app; only its
+    # .desktop-released.json was left, and every scan counted "transcript file not found".
+    ids = _ingest(setup_home, db)
+    _release(setup_home, ids["chat"])
+    w = writer(default=_reply_for)
+    report = deviations.scan(now=NOW)
+    by = {o.session_id: o for o in report.outcomes}
+    chat = by[ids["chat"]]
+    assert chat.status == "skipped"
+    assert chat.reason == "transcript released by Claude Desktop (reason delete at 2026-10-15T14:14:15.516Z)"
+    assert chat.line() == f"skipped {ids['chat']} kind=chat: {chat.reason}"
+    assert report.errors == 0 and report.skipped_sessions == 1
+    assert report.summary() == ("deviations: sessions=5 found=5 edit=5 enforce=0 leave=0 errors=0 "
+                                "skipped_sessions=1")
+    assert len(w.prompts) == 4  # no writer call for it
+    assert _q(db, "select scanned_at, meta ->> 'scan_status', meta ->> 'scan_skip_reason', meta ? 'scan_error', "
+                  "meta ? 'scan_errors' from sessions where session_id = %s", ids["chat"]) == \
+        [(None, "skipped", chat.reason, False, False)]
+    # Never picked again (not retried like an error), and it stays out of the scanned count.
+    assert deviations.scan(now=NOW).outcomes == []
+
+
+def test_released_after_errors_clears_the_error(setup_home: Home, db: str, writer: Writer,  # noqa: F811
+                                                fake_jev: FakeJev) -> None:  # noqa: F811
+    ids = _ingest(setup_home, db)
+    proj = setup_home.projects / "-work-demo-repo"
+    (proj / f"{ids['chat']}.jsonl").rename(proj / "elsewhere.bak")
+    writer(default=_reply_for)
+    deviations.scan(session_id=ids["chat"], now=NOW)
+    assert _q(db, "select meta ->> 'scan_error' from sessions where session_id = %s", ids["chat"]) == \
+        [("transcript file not found",)]
+    (proj / f"{ids['chat']}{deviations.RELEASED_SUFFIX}").write_text(json.dumps(RELEASED))
+    again = deviations.scan(session_id=ids["chat"], now=NOW)
+    assert again.outcomes[0].status == "skipped" and again.errors == 0
+    assert _q(db, "select meta ? 'scan_error', meta ->> 'scan_status' from sessions where session_id = %s",
+              ids["chat"]) == [(False, "skipped")]
+
+
+def test_missing_transcript_without_marker_stays_an_error(setup_home: Home, db: str, writer: Writer,  # noqa: F811
+                                                          fake_jev: FakeJev) -> None:  # noqa: F811
+    ids = _ingest(setup_home, db)
+    proj = setup_home.projects / "-work-demo-repo"
+    (proj / f"{ids['chat']}.jsonl").unlink()
+    (proj / f"{ids['parent']}{deviations.RELEASED_SUFFIX}").write_text(json.dumps(RELEASED))  # another id's marker
+    writer(default=_reply_for)
+    report = deviations.scan(session_id=ids["chat"], now=NOW)
+    (o,) = report.outcomes
+    assert (o.status, o.reason, report.errors, report.skipped_sessions) == \
+        ("error", "transcript file not found", 1, 0)
+    assert _q(db, "select meta ->> 'scan_errors', meta ? 'scan_status' from sessions where session_id = %s",
+              ids["chat"]) == [("1", False)]
+    assert ids["chat"] in {r.session_id for r in deviations.pick_sessions(since=NOW.replace(day=1), limit=50)}
+
+
+def test_subagent_of_a_released_session_is_skipped(setup_home: Home, db: str, writer: Writer,  # noqa: F811
+                                                   fake_jev: FakeJev) -> None:  # noqa: F811
+    ids = _ingest(setup_home, db)
+    _release(setup_home, ids["parent"])  # its subagents/ folder goes with it
+    writer(default=_reply_for)
+    report = deviations.scan(now=NOW)
+    by = {o.session_id: o.status for o in report.outcomes}
+    assert by[ids["parent"]] == "skipped" and by[ids["worker"]] == "skipped"
+    assert report.errors == 0 and report.skipped_sessions == 2
+
+
+def test_released_marker_lookup(setup_home: Home, db: str) -> None:  # noqa: F811
+    ids = _ingest(setup_home, db)
+    rows = {r.session_id: r for r in deviations.pick_sessions(since=NOW.replace(day=1), limit=50)}
+    assert deviations.released_marker(rows[ids["chat"]]) is None  # transcript there, no marker
+    _release(setup_home, ids["parent"])
+    marker = setup_home.projects / "-work-demo-repo" / f"{ids['parent']}{deviations.RELEASED_SUFFIX}"
+    assert deviations.released_marker(rows[ids["parent"]]) == marker
+    assert deviations.released_marker(rows[ids["worker"]]) == marker  # the parent's marker
+    assert deviations.released_marker(replace(rows[ids["parent"]], tool="codex")) is None
+    assert deviations.released_marker(replace(rows[ids["parent"]], project_dir="../x")) is None
+    marker.write_text("not json")
+    assert deviations.released_reason(marker) == "transcript released by Claude Desktop"
+
+
+def test_dry_run_reports_a_released_transcript_without_writing(setup_home: Home, db: str) -> None:  # noqa: F811
+    ids = _ingest(setup_home, db)
+    _release(setup_home, ids["chat"])
+    report = deviations.scan(session_id=ids["chat"], now=NOW, dry_run=True)
+    assert report.outcomes[0].status == "skipped" and report.errors == 0
+    assert _q(db, "select meta ? 'scan_status' from sessions where session_id = %s", ids["chat"]) == [(False,)]
 
 
 def test_rescan_is_idempotent(setup_home: Home, db: str, writer: Writer, fake_jev: FakeJev) -> None:  # noqa: F811
