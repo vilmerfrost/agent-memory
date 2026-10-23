@@ -148,12 +148,13 @@ def test_deviation_errors_do_not_stop_the_edits_step(live: ScoringDb, daily_io: 
     monkeypatch.setenv(edits.LIVE_ENV, "1")
     runs: list[object] = []
     monkeypatch.setattr(edits, "run", lambda **kw: runs.append(kw) or edits.Report())
-    writer(envelope({"deviations": [finding(followed=None)]}), default=envelope({"deviations": [finding()]}))
+    bad = envelope({"deviations": [finding(followed=None)]})
+    writer(bad, bad, default=envelope({"deviations": [finding()]}))  # malformed, and again on the retry
     r = daily.run_daily(push=False, now=NOW)
     assert r.failures == []
     assert r.warnings == [f"deviations: 1 error in {len(r.deviations.outcomes)} sessions; "
                           f"first: session {ids['chat']}: writer output: "
-                          "deviation 0: followed_grade must be a number in 0..1, got None"]
+                          "deviation 0: followed_grade must be a number in 0..1, got None (after 1 retry)"]
     assert r.deviations is not None and (r.deviations.found, r.deviations.errors) == (4, 1)
     assert len(runs) == 1 and r.edits is not None
     head, _fail = daily_io.log_lines()
