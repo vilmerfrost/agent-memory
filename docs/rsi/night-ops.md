@@ -99,10 +99,11 @@ own preflight failed (no `skipped`) keeps the old headline.
 
 Since 2026-10-23 (verify run of night 2026-10-23, partial, $0.14):
 
-- **Pinned and fenced targets leave the pool.** Allowlisted targets that improve refuses (a file in
-  `improve/pins.json`, or a path under `improve/fence.txt`, read through `edits_targets` like the edits step) are
-  removed from the night's allowlist, so their candidates are never triaged or hypothesized. The report notes
-  `candidates: N on a target improve refuses (pinned or fenced: ...), not considered`.
+- **Targets improve refuses leave the pool.** Allowlisted targets that improve refuses (a file in
+  `improve/pins.json`, or a path outside `criteria.json` `allowed_targets` with the `fence.txt` nuance, read through
+  `edits_targets.pinned_file` / `is_allowed` like the edits step) are removed from the night's allowlist, so their
+  candidates are never triaged or hypothesized. The report notes
+  `candidates: N on a target improve refuses (pinned or out of scope: ...), not considered`.
 - **A failed experiment or hypothesizer still advances the checkpoint.** The sightings are stored before S3 and the
   candidate stays `deferred` (or `retired` after repeated failures) in `rsi_candidates`, so the pool retries it;
   rereading the window added nothing and kept the checkpoint at 2026-10-14 for every failing night. The status is
