@@ -62,6 +62,8 @@ TRIAGE_FILE = "rsi-triage"
 HYPOTHESES_FIXTURES = config.REPO_ROOT / "tests" / "fixtures" / "rsi-night" / "hypotheses"
 
 STATUSES = ("ok", "partial", "aborted", "budget_exhausted", "preflight_failed")
+SKIP_REASONS = ("prerequisites", "credentials")     # report["skipped"]["reason"]: the night job did not start it
+MAX_PREREQ_WARNINGS = 10
 EXP_STATUSES = ("staged", "not_promotable", "failed", "interrupted", "skipped_budget")
 VERDICTS = ("IMPROVES", "NO_EFFECT", "WORSE", "INCONCLUSIVE")
 RISKS = ("low", "medium", "high")
@@ -1023,7 +1025,7 @@ def _now_iso() -> str:
 class Night:
     def __init__(self, cfg: NightConfig, adapters: Adapters, *, night: str, db_url: str | None = None,
                  dry_run: bool = False, clock: Callable[[], float] = time.monotonic,
-                 install_signals: bool = True) -> None:
+                 install_signals: bool = True, prerequisite_warnings: Sequence[str] = ()) -> None:
         self.cfg, self.ad, self.night, self.db_url, self.dry_run = cfg, adapters, night, db_url, dry_run
         self.budget = Budget(cfg.budget, clock=clock)
         self.install_signals = install_signals
@@ -1045,6 +1047,8 @@ class Night:
             "delta": {"since": None, "sessions": 0, "deviations": 0, "eval_failures": 0, "routine_failures": 0},
             "patterns": [], "candidates": [], "experiments": [], "costs": {}, "health": {},
             "pending_decisions": [], "notes": []}
+        if prerequisite_warnings:      # failed prerequisite steps the night does not read (rsi_schedule's gate)
+            self.report["prerequisite_warnings"] = _prereq_warnings(prerequisite_warnings)
         self.allowlist: list[str] = []
         self.window_key = "first"
         self.since: str | None = None
@@ -1769,11 +1773,17 @@ class Night:
             self.conn = None
 
 
+def _prereq_warnings(warnings: Sequence[str]) -> list[str]:
+    return [" ".join(str(w).split())[:300] for w in warnings][:MAX_PREREQ_WARNINGS]
+
+
 def run_night(*, night: str | None = None, config_path: Path | None = None, dry_run: bool = False,
               db_url: str | None = None, adapters: Adapters | None = None,
-              clock: Callable[[], float] = time.monotonic, install_signals: bool = True) -> dict[str, Any]:
+              clock: Callable[[], float] = time.monotonic, install_signals: bool = True,
+              prerequisite_warnings: Sequence[str] = ()) -> dict[str, Any]:
     """One night. Returns the report (rsi-night/1); writes it to $RSI_SANDBOX_DIR/nights/<night>/report.json
-    unless dry_run (then nothing is written: no lock, no rows, no report file)."""
+    unless dry_run (then nothing is written: no lock, no rows, no report file). `prerequisite_warnings` (the night
+    job's gate: failed prerequisite steps the night does not read) go into the report as they are."""
     night = night or AP.night_key()
     try:
         cfg = load_config(config_path)
@@ -1784,9 +1794,11 @@ def run_night(*, night: str | None = None, config_path: Path | None = None, dry_
                "patterns": [], "candidates": [], "experiments": [],
                "costs": {"by_model": {}, "sandbox_runs": 0, "providers": {}, "total_usd": 0.0},
                "health": {k: "skipped" for k in HEALTH_KEYS}, "pending_decisions": [], "notes": [f"config: {exc}"[:300]]}
+        if prerequisite_warnings:
+            rep["prerequisite_warnings"] = _prereq_warnings(prerequisite_warnings)
         return rep
     return Night(cfg, adapters or default_adapters(cfg, db_url), night=night, db_url=db_url, dry_run=dry_run,
-                 clock=clock, install_signals=install_signals).run()
+                 clock=clock, install_signals=install_signals, prerequisite_warnings=prerequisite_warnings).run()
 
 
 # =========================================================================== the contract check
@@ -1815,7 +1827,8 @@ def validate_report(obj: Any) -> list[str]:
     if not isinstance(obj, dict):
         return ["report is not an object"]
     allowed = {"format", "night", "started_at", "finished_at", "status", "checkpoint", "delta", "patterns",
-               "candidates", "experiments", "costs", "health", "pending_decisions", "notes"}
+               "candidates", "experiments", "costs", "health", "pending_decisions", "notes",
+               "skipped", "prerequisite_warnings"}           # both optional (rsi_schedule's night job)
     errs += [f"unknown key {k}" for k in sorted(set(obj) - allowed)]
     if obj.get("format") != FORMAT:
         errs.append("format is not rsi-night/1")
@@ -1921,6 +1934,23 @@ def validate_report(obj: Any) -> list[str]:
             errs.append("pending_decisions holds something that is not a lowercase uuid")
     if "notes" in obj and not (isinstance(obj["notes"], list) and all(isinstance(n, str) for n in obj["notes"])):
         errs.append("notes must be a list of strings")
+    if "skipped" in obj:
+        sk = obj["skipped"]
+        if not isinstance(sk, dict):
+            errs.append("skipped must be an object")
+        else:
+            if obj.get("status") != "preflight_failed":
+                errs.append("skipped is only valid with status preflight_failed")
+            if sk.get("reason") not in SKIP_REASONS:
+                errs.append(f"skipped.reason {sk.get('reason')!r} not in {SKIP_REASONS}")
+            need(sk, "by", str, "skipped")
+            need(sk, "summary", str, "skipped")
+            items = need(sk, "items", list, "skipped")
+            if isinstance(items, list) and not all(isinstance(i, str) for i in items):
+                errs.append("skipped.items must be a list of strings")
+    if "prerequisite_warnings" in obj and not (isinstance(obj["prerequisite_warnings"], list) and all(
+            isinstance(w, str) for w in obj["prerequisite_warnings"])):
+        errs.append("prerequisite_warnings must be a list of strings")
     return errs
 
 

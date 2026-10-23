@@ -38,13 +38,38 @@ The night key is the date the night belongs to: a run between 00:00 and 11:59 co
 
 | Routine | Rule | Why |
 |---|---|---|
-| `amem-daily` | its latest line is `PASS` and is dated on the night's date | the night reads the deviations and edits amem-daily wrote that day |
+| `amem-daily` | its latest line is `PASS`, or a `FAIL` whose failed steps are all ones the night does not read (below), and is dated on the night's date | the night reads the sessions, deviations and runs amem-daily wrote that day |
 | `amem-archive` | its latest line is `PASS` and is dated on the night's date | transcripts are archived before anything else reads them |
 | `amem-ingest` | its latest line is `PASS` and younger than 25 h | routine results reached the database |
 
-A routine that ran but failed blocks the night: on 2026-10-17 amem-daily logged `FAIL` (one malformed grade), so
-that night would have been skipped. A missed 01:30 start (Mac asleep) runs at wake; the gate still applies.
-The rules live in `schedule.prerequisites` of the night config.
+A routine that ran but failed blocks the night, unless every step it names in its `<routine>-fail <step>: ...` lines
+is in that prerequisite's `nonblocking_steps`. Then the run counts as completed and the night runs with one warning
+per failed step: an `amem-rsi-night-warn` line, the report's `prerequisite_warnings`, and a `- Warning:` line in the
+brief. A FAIL with no step line, or with a step name the gate does not list, still blocks (fail closed).
+
+Which amem-daily steps the night reads (`DAILY_NONBLOCKING_STEPS` in `rsi_schedule.py`):
+
+| Step (`amem-daily-fail <step>`) | Writes | The night | A failure |
+|---|---|---|---|
+| `ingest` | `runs` (cloud routines) | S1 delta: `routine_failures` | blocks |
+| `tasks` | `runs` (dispatch tasks) | S1 delta: `routine_failures` | blocks |
+| `deviations` | `sessions`, `deviations` | S1 delta: `sessions`, `deviations`; S2 deviation candidates | blocks. Since 1ac4a74 only a systemic failure (2+ errors and at least half the sessions) is a FAIL; one bad session is an `amem-daily-warn` line and the day is a PASS |
+| `score` | `scores` | S4 evidence packs only (`sb.jev_for`), re-read live every night | warning |
+| `edits` | `edits` | S4 evidence packs only (`sb.attempts_for`) | warning |
+| `distill` | `lessons` | nothing | warning |
+| `escalations` | a phone push, the state file | nothing | warning |
+| `rsi-push` | a phone push | nothing | warning |
+| `state` | `amem-daily-state.json` | nothing (the scan data is already in the database) | warning |
+
+The 2026-10-19..2026-10-22 nights were skipped because amem-daily logged `FAIL` for one or two deviation-session
+errors. Those old lines name the `deviations` step, so the gate still skips them (the step is needed); today's
+amem-daily writes the same situation as `PASS` plus an `amem-daily-warn` line, and the night runs. A missed 01:30
+start (Mac asleep) runs at wake; the gate still applies.
+
+The rules live in `schedule.prerequisites` of the night config. Each entry: `routine`, `same_night` (default true),
+`max_age_h` (optional), `nonblocking_steps` (optional list of step names; omitted means the built-in default for that
+routine: `DAILY_NONBLOCKING_STEPS` for amem-daily, none for the others; `[]` restores the strict rule "any FAIL
+blocks"). Configs without the key keep working unchanged.
 
 ## What the night job guarantees
 
@@ -65,7 +90,12 @@ The rules live in `schedule.prerequisites` of the night config.
 Mapping of night statuses to the log line: `ok` → `PASS`; `partial`, `budget_exhausted`, `aborted`, other
 preflight failures → `FAIL` with items (`health langfuse: unavailable`, `budget: usd`, `experiment <id>: ...`);
 lock held or night already done → `SKIP`. A skipped night (gate or credentials) writes a `preflight_failed`
-report with the reasons as notes, so the brief says why nothing ran.
+report with the reasons as notes and an optional `skipped` object (`by`, `reason`: `prerequisites` or
+`credentials`, `summary`, `items`). The night never read anything, so the zero counts and `skipped` health in that
+report mean "not analyzed", not "nothing found". The brief's headline names the cause ("The night did not run:
+prerequisite amem-daily failed (deviations: ...)", "The night did not run: the credentials and budget check failed
+(...)"), its sections say "not analyzed" / "not checked", and its cost basis says no call was made. A night whose
+own preflight failed (no `skipped`) keeps the old headline.
 
 ## First-night limits (`config/rsi-night.first.json`)
 
