@@ -744,7 +744,9 @@ def build_brief(rep: Mapping[str, Any], db: Db, *, artifacts_root: Path, report:
     services = {text(k, 32): text(v, 80) for k, v in rep["health"].items()}
     health = {"services": services,
               "degraded": sorted(k for k, v in services.items() if v not in HEALTHY + NEUTRAL),
-              "database": {"status": db.status, "detail": db.detail}, "warnings": list(warnings or [])}
+              "database": {"status": db.status, "detail": db.detail}, "warnings": list(warnings or []),
+              "reasons": {text(k, 32): [text(x, 160) for x in v[:3]]
+                          for k, v in _obj(rep.get("health_reasons")).items() if isinstance(v, list)}}
     pending = pending_items(rep, db, artifacts_root=artifacts_root, suites=suites)
     n_pending = len(pending["items"])
     ck = rep["checkpoint"]
@@ -1027,7 +1029,8 @@ def render_markdown(b: dict[str, Any]) -> str:
         out.append("- Services: not checked: the night did not run.")
     else:
         for k, v in h["services"].items():
-            out.append(f"- {k}: {v}" + (" (DEGRADED)" if k in h["degraded"] else ""))
+            why = "; ".join(h.get("reasons", {}).get(k) or [])
+            out.append(f"- {k}: {v}" + (" (DEGRADED)" if k in h["degraded"] else "") + (f": {why}" if why else ""))
         if not h["services"]:
             out.append("- The report lists no services.")
     db = h["database"]
