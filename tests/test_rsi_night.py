@@ -26,7 +26,7 @@ import pytest
 from agent_memory import config, jev, questions, rsi_approval as AP, rsi_night as N
 from agent_memory.rsi_budget import Budget, Usage
 from conftest import AMEM, base_env
-from rsi_night_support import (KEY_A, KEY_B, RULE_A, RULE_B, FakeEvidence, FakeReplayer, FakeSandboxOps, FakeStager,
+from rsi_night_support import (KEY_A, KEY_B, LIVE_ALLOWED, RULE_A, RULE_B, FakeEvidence, FakeReplayer, FakeSandboxOps, FakeStager,
                                adapters, candidate, clean_db, make_home, read_report, rows, seed_rule, strip_agent_env,
                                write_config)
 
@@ -510,7 +510,7 @@ def test_injected_evidence_and_hostile_replies_drive_nothing(env: SimpleNamespac
     rep = run(env, evidence=ev, stager=st)
     assert rep["experiments"] == [] and st.calls == []                            # nothing implemented or staged
     assert any(INJECT[:30] in t for t in ev.rendered)                             # the hostile text was retrieved...
-    assert tree(env.home) == before and json.loads(crit.read_text()) == {"allowed_targets": []}   # ...and did nothing
+    assert tree(env.home) == before and json.loads(crit.read_text()) == {"allowed_targets": LIVE_ALLOWED}   # ...and did nothing
     a = candidate(env.url, KEY_A)
     assert a["status"] == "deferred" and a["decided_reason"] == "no valid hypothesis"
     reasons = " | ".join(r["reason"] for r in a["meta"]["hypotheses_rejected"])
@@ -841,3 +841,14 @@ def test_provider_error_records_its_reason() -> None:
     assert night.health["clickhouse"] == "error"
     assert night.health_reasons == {"clickhouse": ["ch.routine_streaks: error (timeout after 8s)"],
                                     "langfuse": ["lf.traces: unavailable (not configured)"]}
+
+
+def test_target_outside_improves_allowed_targets_is_dropped(env: SimpleNamespace) -> None:
+    # The verify rerun of night 2026-10-23 picked parent/skills/dispatch/SKILL.md: allowlisted for the night, but not
+    # in improve's criteria.json allowed_targets, so improve refused it after the paid triage and hypothesis.
+    seed_ab(env)
+    crit = env.home / "agent-config" / "improve" / "criteria.json"
+    crit.write_text(json.dumps({"allowed_targets": [t for t in LIVE_ALLOWED if t != "~/.claude/CLAUDE.md"]}))
+    rep = run(env)
+    assert rep["candidates"] == [] and rep["experiments"] == []
+    assert any("on a target improve refuses" in n and "CLAUDE.md" in n for n in rep["notes"]), rep["notes"]
