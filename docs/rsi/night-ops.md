@@ -97,6 +97,23 @@ prerequisite amem-daily failed (deviations: ...)", "The night did not run: the c
 (...)"), its sections say "not analyzed" / "not checked", and its cost basis says no call was made. A night whose
 own preflight failed (no `skipped`) keeps the old headline.
 
+Since 2026-10-23 (verify run of night 2026-10-23, partial, $0.14):
+
+- **Pinned and fenced targets leave the pool.** Allowlisted targets that improve refuses (a file in
+  `improve/pins.json`, or a path under `improve/fence.txt`, read through `edits_targets` like the edits step) are
+  removed from the night's allowlist, so their candidates are never triaged or hypothesized. The report notes
+  `candidates: N on a target improve refuses (pinned or fenced: ...), not considered`.
+- **A failed experiment or hypothesizer still advances the checkpoint.** The sightings are stored before S3 and the
+  candidate stays `deferred` (or `retired` after repeated failures) in `rsi_candidates`, so the pool retries it;
+  rereading the window added nothing and kept the checkpoint at 2026-10-14 for every failing night. The status is
+  `partial`. The checkpoint still does not advance after an unexpected error in the night itself (`error:` note),
+  a preflight failure, an abort or a budget stop.
+- **Provider health carries its reason.** The failing evidence steps' detail (`ch.<query>: error (timeout ...)`)
+  goes to the report's optional `health_reasons` map, the brief's Service health lines and the `-fail health` line.
+- **Quiet skips.** A lock overlap or a night that is already `done` logs `SKIP` with `-warn` lines, not `-fail`,
+  so routine-audit (which flags a SKIP with `-fail` lines) stays green. A night whose run failed is retried by the
+  next start (the 01:30 job after a failed manual run), as before.
+
 ## First-night limits (`config/rsi-night.first.json`)
 
 | Limit | Value | Why |

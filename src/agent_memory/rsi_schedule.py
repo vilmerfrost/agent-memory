@@ -496,9 +496,11 @@ def classify(rep: Mapping[str, Any]) -> tuple[str, list[str]]:
         items += [f"budget: {n.split('budget exhausted: ', 1)[1]}" for n in notes if n.startswith("budget exhausted: ")]
     if status == "aborted":
         items += [f"aborted: {n}" for n in notes if n.startswith("interrupted by")] or ["aborted: interrupted"]
+    reasons = rep.get("health_reasons") or {}
     for k, v in sorted((rep.get("health") or {}).items()):
         if v in ("error", "unavailable", "fixture-missing", "stale", "truncated"):
-            items.append(f"health {k}: {v}")
+            why = "; ".join(str(x) for x in (reasons.get(k) or [])[:2])
+            items.append(f"health {k}: {v}" + (f" ({why})" if why else ""))
     for e in rep.get("experiments") or []:
         if e.get("status") in ("failed", "interrupted"):
             why = (e.get("verdict_reasons") or [e.get("status")])[0]
@@ -616,6 +618,8 @@ def run_night_job(*, config_path: Path | None = None, night: str | None = None, 
             if guard:
                 guard.__exit__(None, None, None)
     res.status, res.items = classify(rep)
+    if res.status == "SKIP":       # overlap / already done: nothing went wrong, so -warn lines, not -fail (routine-audit)
+        res.warnings, res.items = res.warnings + res.items, []
     if terms["term"] and rep.get("status") != "aborted":
         res.items.append(f"signal: {terms['term']} SIGTERM outside the night's stages (noted, not obeyed)")
         res.status = "FAIL"
