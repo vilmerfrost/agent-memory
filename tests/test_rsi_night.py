@@ -196,20 +196,23 @@ def test_second_night_reads_only_the_delta(env: SimpleNamespace) -> None:
     assert ev.since_calls[2] == r2["checkpoint"]["after"]
 
 
-def test_failed_experiment_does_not_advance_the_checkpoint(env: SimpleNamespace) -> None:
+def test_failed_experiment_still_advances_the_checkpoint(env: SimpleNamespace) -> None:
+    # The sightings are stored before any experiment, and the failed candidate stays deferred in the database, so
+    # a failed experiment need not reread the window: before 2026-10-23 every failing night kept the checkpoint at
+    # 2026-10-14 and reread a growing window (500 sessions). The candidate is retried from the pool instead.
     seed_ab(env)
     ev = FakeEvidence()
     r1 = run(env, evidence=ev, stager=FakeStager(refuse="content guard: code block"))
-    assert r1["status"] == "partial" and not r1["checkpoint"]["advanced"] and r1["checkpoint"]["after"] is None
+    assert r1["status"] == "partial" and r1["checkpoint"]["advanced"] and r1["checkpoint"]["after"] is not None
     e = r1["experiments"][0]
     assert e["status"] == "failed" and "content guard" in e["verdict_reasons"][0]
-    assert rows(env.url, "select status, run_key from rsi_checkpoints") == [("failed", N1)]
+    assert rows(env.url, "select status, run_key from rsi_checkpoints") == [("done", N1)]
     assert rows(env.url, "select status from rsi_experiments") == [("failed",)]
     a = candidate(env.url, KEY_A)
     assert a["status"] == "deferred" and a["meta"]["attempts"] == 1 and a["seen_count"] == 1
-    r2 = run(env, N2, evidence=ev)                                                 # the same delta again
-    assert ev.since_calls == [None, None] and r2["checkpoint"]["before"] is None
-    assert candidate(env.url, KEY_A)["seen_count"] == 1                            # the re-read did not double count
+    r2 = run(env, N2, evidence=ev)
+    assert ev.since_calls == [None, r1["checkpoint"]["after"]] and r2["checkpoint"]["before"] == r1["checkpoint"]["after"]
+    assert [c["key"] for c in r2["candidates"] if c["selected"]] == [KEY_A]       # retried from the pool
     assert r2["status"] == "ok" and r2["checkpoint"]["advanced"]
 
 
@@ -709,7 +712,7 @@ def test_claude_cli_hypothesizer_retries_are_bounded(env: SimpleNamespace, fake_
     rep = run(env, ad=ad, config_path=cfgp)
     calls = [x for x in fake_claude.read_text().splitlines() if x.startswith("[")]
     assert len(calls) == 2                                                        # one call + one retry (model_retries 1)
-    assert rep["status"] == "partial" and not rep["checkpoint"]["advanced"]
+    assert rep["status"] == "partial" and rep["checkpoint"]["advanced"]          # deferred in the db, no reread
     assert rep["costs"]["by_model"]["opus"]["calls"] == 2
     assert candidate(env.url, KEY_A)["status"] == "deferred"
 
@@ -799,3 +802,42 @@ def test_docker_unavailable_fails_closed_with_the_real_sandbox_check(env: Simple
     assert not list((env.sandbox / "run").glob("*.lock"))
     status, items = S.classify(rep)
     assert status == "FAIL" and any("sandbox unavailable" in i for i in items), items
+
+
+# --------------------------------------------------------------------------- verify-run fixes (2026-10-23)
+
+
+def test_candidate_on_a_pinned_target_is_dropped_before_triage(env: SimpleNamespace) -> None:
+    # Night 2026-10-23 picked a candidate on agents/worker.md, which improve/pins.json pins: Jev triage and the
+    # Sonnet hypothesis were paid for, then "improve stage refused: file pinned". Pinned targets leave the pool.
+    seed_ab(env)                                            # both rules target ~/.claude/CLAUDE.md
+    (env.home / "agent-config" / "improve" / "pins.json").write_text(json.dumps(
+        {"files": {"~/.claude/CLAUDE.md": {"reason": "auto-pin: edited by hand"}}, "rules": {}}))
+    rep = run(env)
+    assert rep["candidates"] == [] and rep["experiments"] == []
+    assert any("on a target improve refuses" in n and "CLAUDE.md" in n for n in rep["notes"]), rep["notes"]
+    assert not any("without an in-scope target" in n for n in rep["notes"])
+    assert rep["checkpoint"]["advanced"]
+
+
+def test_unpinned_target_still_runs(env: SimpleNamespace) -> None:
+    seed_ab(env)
+    (env.home / "agent-config" / "improve" / "pins.json").write_text(json.dumps(
+        {"files": {"~/agent-config/agents/worker.md": {"reason": "pinned"}}, "rules": {}}))
+    rep = run(env)
+    assert [c["key"] for c in rep["candidates"] if c["selected"]] == [KEY_A]
+    assert not any("improve refuses" in n for n in rep["notes"])
+
+
+def test_provider_error_records_its_reason() -> None:
+    night = N.Night.__new__(N.Night)
+    night.health = {k: "skipped" for k in N.PROVIDERS}
+    night.health_reasons = {}
+    night._merge_health({"supabase": "ok", "clickhouse": "error"},
+                        [{"step": "sb.delta", "status": "ok", "detail": ""},
+                         {"step": "ch.routine_streaks", "status": "error", "detail": "timeout after 8s"},
+                         {"step": "ch.routine_streaks", "status": "error", "detail": "timeout after 8s"},
+                         {"step": "lf.traces", "status": "unavailable", "detail": "not configured"}])
+    assert night.health["clickhouse"] == "error"
+    assert night.health_reasons == {"clickhouse": ["ch.routine_streaks: error (timeout after 8s)"],
+                                    "langfuse": ["lf.traces: unavailable (not configured)"]}

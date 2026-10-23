@@ -633,7 +633,9 @@ def test_overlapping_start_is_refused_and_logged_as_skip(env: SimpleNamespace) -
     held = box.lock(60)                                                                  # another night is running
     try:
         res = night_job(env, adapters=adapters(sandbox=box))
-        assert res.status == "SKIP" and res.items == ["overlap: another night holds the rsi-night lock"]
+        assert res.status == "SKIP" and res.items == []                               # nothing went wrong: no -fail
+        assert res.warnings == ["overlap: another night holds the rsi-night lock"]
+        assert not any("-fail" in ln for ln in res.lines) and any("amem-rsi-night-warn overlap" in ln for ln in res.lines)
         assert held.exists() and not N.report_path(NIGHT).exists()                        # its lock and report untouched
         assert rows(env.url, "select count(*) from rsi_checkpoints") == [(0,)]
         (run,) = log_runs(env, "amem-rsi-night")
@@ -736,3 +738,22 @@ def test_keychain_present_searches_the_named_keychain_file(monkeypatch, tmp_path
     monkeypatch.delenv("AMEM_RSI_KEYCHAIN")
     S.keychain_present("keychain:rsi-sandbox/openai", runner=lambda argv, **k: seen.append(argv) or SimpleNamespace(returncode=0))
     assert seen[-1][-1] == "openai"
+
+
+def test_health_reason_reaches_the_fail_line() -> None:
+    rep = {"status": "partial", "night": NIGHT, "notes": [], "experiments": [],
+           "health": {"supabase": "ok", "clickhouse": "error"},
+           "health_reasons": {"clickhouse": ["ch.routine_streaks: error (timeout after 8s)"]}}
+    assert S.classify(rep) == ("FAIL", ["health clickhouse: error (ch.routine_streaks: error (timeout after 8s))"])
+
+
+def test_already_done_night_is_a_quiet_skip(env: SimpleNamespace) -> None:
+    # 01:30 on 10-24 has night_key 10-23; a night that a manual run already finished must not run (or spend) again,
+    # and the skip is not a problem: -warn, no -fail, so routine-audit stays green.
+    seed_rule(env.url, RULE_A, "a")
+    first = night_job(env)
+    assert first.status in ("PASS", "FAIL") and N.report_path(NIGHT).exists()
+    again = night_job(env)
+    assert again.status == "SKIP" and again.items == []
+    assert again.warnings and "already done" in again.warnings[0]
+    assert not any("amem-rsi-night-fail" in ln for ln in again.lines)

@@ -50,7 +50,7 @@ import psycopg
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
-from agent_memory import config, rsi_approval as AP, rsi_artifact as RA, rsi_targets
+from agent_memory import config, edits_targets as ET, rsi_approval as AP, rsi_artifact as RA, rsi_targets
 from agent_memory.rsi_budget import Budget, BudgetConfig, BudgetConfigError, BudgetExhausted, Usage
 
 FORMAT = "rsi-night/1"
@@ -506,6 +506,25 @@ def _dget(obj: Any, name: str, default: Any = None) -> Any:
     if isinstance(obj, Mapping):
         return obj.get(name, default)
     return getattr(obj, name, default)
+
+
+_RETRIEVER = {"sb": "supabase", "ch": "clickhouse", "lf": "langfuse", "pd": "pastdev"}   # evidence step prefix
+
+
+def _one_line(x: Any, n: int) -> str:
+    s = " ".join(str(x).split())
+    return s if len(s) <= n else s[: n - 3] + "..."
+
+
+def _refused_by_improve(target: str) -> bool:
+    """True when improve would refuse an edit to `target`: a pinned file (improve/pins.json) or a fenced path
+    (improve/fence.txt), read the way the edits step reads them (edits_targets). An experiment on it always ends
+    "improve stage refused" (night 2026-10-23: agents/worker.md, auto-pinned after a hand edit)."""
+    try:
+        path = rsi_targets.untilde(target)
+        return ET.pinned_file(path) is not None or ET.fenced(path)
+    except (OSError, RuntimeError, ValueError):
+        return False
 
 
 class PackEvidence:
@@ -1036,7 +1055,9 @@ class Night:
         self.owns_night = False        # the night's checkpoint row and report belong to this run
         self.marked_running = False
         self.failed = False            # an experiment or stage failed: the checkpoint is not advanced
-        self.degraded = False          # a provider was down: partial, but S1-S8 finished
+        self.degraded = False          # a provider was down or an experiment failed: partial, but S1-S8 finished
+        self.health_reasons: dict[str, list[str]] = {}   # provider -> why it was not ok (redacted, one line each)
+        self.pinned: list[str] = []    # allowlisted targets improve refuses (pins.json / fence.txt): never selected
         self.notes: list[str] = []
         self.health: dict[str, str] = {k: "skipped" for k in PROVIDERS}
         self.health["jev"] = "fixture" if cfg.stages["triage"] == "fixture" else "live"
@@ -1108,12 +1129,23 @@ class Night:
             self.interruptible = False
 
     # -- health --------------------------------------------------------------------------------------
-    def _merge_health(self, h: Mapping[str, Any] | None) -> None:
+    def _merge_health(self, h: Mapping[str, Any] | None, steps: Any = None) -> None:
         for k, v in (h or {}).items():
             if k not in PROVIDERS or not isinstance(v, str):
                 continue
             if self.health.get(k) == "skipped" or _SEVERITY.get(v, 2) > _SEVERITY.get(self.health[k], 0):
                 self.health[k] = v if v in HEALTH_VALUES else "error"
+        # Why a provider was not ok: the failing steps' own detail (the 2026-10-23 night logged only "error").
+        for st in steps or []:
+            if not isinstance(st, Mapping) or st.get("status") in (None, "ok"):
+                continue
+            prov = _RETRIEVER.get(str(st.get("step") or "").split(".", 1)[0])
+            if prov is None:
+                continue
+            why = _one_line(f"{st.get('step')}: {st.get('status')}" + (f" ({st['detail']})" if st.get("detail") else ""), 160)
+            seen = self.health_reasons.setdefault(prov, [])
+            if why not in seen and len(seen) < 3:
+                seen.append(why)
 
     # -- the run -------------------------------------------------------------------------------------
     def run(self) -> dict[str, Any]:
@@ -1176,6 +1208,9 @@ class Night:
         if self.health["sandbox"] != "ok" and not self.dry_run:      # a dry run never reaches the sandbox
             raise PreflightFailed("sandbox unavailable (docker or the worker image)")
         self.allowlist = list(self.ad.targets())
+        self.pinned = [t for t in self.allowlist if _refused_by_improve(t)]
+        if self.pinned:                # improve refuses these: a candidate on one only burns triage and model money
+            self.allowlist = [t for t in self.allowlist if t not in self.pinned]
         self.budget.check()
         if not self.dry_run:
             self._reconcile_orphans()
@@ -1203,7 +1238,7 @@ class Night:
         except psycopg.Error as exc:
             self.health["supabase"] = "unavailable"
             raise PreflightFailed(f"delta: database unavailable ({type(exc).__name__})") from None
-        self._merge_health(_dget(delta, "health"))
+        self._merge_health(_dget(delta, "health"), _dget(delta, "steps"))
         for src in PROVIDERS[1:]:
             if (_dget(delta, "health") or {}).get(src) in ("ok", "error", "stale", "truncated"):
                 self.budget.record_provider(src)
@@ -1400,8 +1435,16 @@ class Night:
             cur.execute("select count(*) as n from rsi_candidates where status in ('new', 'deferred') "
                         "and not coalesce(target = any(%s), false)", (scope,))
             out_of_scope = int(cur.fetchone()["n"])
-        if out_of_scope:
-            self.notes.append(f"candidates: {out_of_scope} without an in-scope target, not considered")
+            pinned = 0
+            if self.pinned:
+                cur.execute("select count(*) as n from rsi_candidates where status in ('new', 'deferred') "
+                            "and target = any(%s)", (list(self.pinned),))
+                pinned = int(cur.fetchone()["n"])
+        if out_of_scope - pinned:
+            self.notes.append(f"candidates: {out_of_scope - pinned} without an in-scope target, not considered")
+        if pinned:
+            self.notes.append(f"candidates: {pinned} on a target improve refuses (pinned or fenced: "
+                              f"{', '.join(sorted(self.pinned))[:200]}), not considered")
         if self.dry_run:                      # nothing was written: show tonight's sightings as they would be
             known = {c["dedupe_key"]: c for c in pool}
             for s in sightings:
@@ -1476,7 +1519,7 @@ class Night:
             with self._interruptible():
                 pack = self.ad.evidence.pack(cand)
                 evidence_text = self.ad.evidence.render(pack)
-            self._merge_health(_dget(pack, "health"))
+            self._merge_health(_dget(pack, "health"), _dget(pack, "steps"))
             for f in _dget(pack, "findings") or []:
                 if _dget(f, "status") == "ok" and _dget(f, "ref"):
                     refs.append(str(_dget(f, "ref"))[:200])
@@ -1507,7 +1550,7 @@ class Night:
             except (NightAborted, BudgetExhausted):
                 raise
             except Exception as exc:  # noqa: BLE001 - S5 failed for this candidate: it stays for a later night
-                self.failed = True
+                self.degraded = True       # the candidate is deferred in the database; the window need not be reread
                 self.notes.append(f"hypothesizer failed for {c['dedupe_key']}: {type(exc).__name__}: {str(exc)[:150]}")
                 self._update_candidate(c["id"], status="deferred", reason=f"hypothesizer failed: {type(exc).__name__}")
                 return
@@ -1655,7 +1698,7 @@ class Night:
             cand_status, cand_reason = "deferred", f"budget: {exc.kind}"
             raise
         except Exception as exc:  # noqa: BLE001 - this experiment failed; the night records it and goes on
-            self.failed = True
+            self.degraded = True           # recorded on its row; the sightings are stored, so the checkpoint advances
             entry["status"] = "failed"
             msg = f"{type(exc).__name__}: {str(exc)[:240]}"
             row = {"status": "failed", "verdict": row.get("verdict"), "meta": {**row["meta"], "error": msg}}
@@ -1739,6 +1782,9 @@ class Night:
         r["finished_at"] = _now_iso()
         r["costs"] = self.budget.costs()
         r["health"] = {k: self.health.get(k, "skipped") for k in HEALTH_KEYS}
+        reasons = {k: v[:3] for k, v in self.health_reasons.items() if v and r["health"].get(k) not in ("ok", "skipped")}
+        if reasons:
+            r["health_reasons"] = reasons
         r["notes"] = self.notes[-30:]
         if advance:
             r["checkpoint"]["after"] = self.next_checkpoint
@@ -1828,7 +1874,8 @@ def validate_report(obj: Any) -> list[str]:
         return ["report is not an object"]
     allowed = {"format", "night", "started_at", "finished_at", "status", "checkpoint", "delta", "patterns",
                "candidates", "experiments", "costs", "health", "pending_decisions", "notes",
-               "skipped", "prerequisite_warnings"}           # both optional (rsi_schedule's night job)
+               "skipped", "prerequisite_warnings",            # both optional (rsi_schedule's night job)
+               "health_reasons"}                               # optional: provider -> why it was not ok
     errs += [f"unknown key {k}" for k in sorted(set(obj) - allowed)]
     if obj.get("format") != FORMAT:
         errs.append("format is not rsi-night/1")
@@ -1934,6 +1981,11 @@ def validate_report(obj: Any) -> list[str]:
             errs.append("pending_decisions holds something that is not a lowercase uuid")
     if "notes" in obj and not (isinstance(obj["notes"], list) and all(isinstance(n, str) for n in obj["notes"])):
         errs.append("notes must be a list of strings")
+    if "health_reasons" in obj:
+        hr = obj["health_reasons"]
+        if not (isinstance(hr, dict) and all(isinstance(v, list) and all(isinstance(x, str) for x in v)
+                                             for v in hr.values())):
+            errs.append("health_reasons must map a provider to a list of strings")
     if "skipped" in obj:
         sk = obj["skipped"]
         if not isinstance(sk, dict):

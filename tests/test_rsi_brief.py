@@ -266,7 +266,7 @@ def test_json_output_schema_and_cli(rdb: str, sandbox: Path) -> None:
     assert set(out["candidates"]) == {"total", "selected", "backlog", "items"}
     assert set(out["costs"]) == {"by_model", "sandbox_runs", "providers", "total_usd", "budget_exhausted", "by_basis",
                                  "reported_usd", "estimated_usd"}
-    assert set(out["health"]) == {"services", "degraded", "database", "warnings"}
+    assert set(out["health"]) == {"services", "degraded", "database", "warnings", "reasons"}
     assert set(out["pending_decisions"]) == {"total", "items", "no_longer_pending", "with_apply"}
     assert set(out["pending_decisions"]["items"][0]) == {"proposal_id", "title", "night", "this_night", "status", "created_at",
                                                          "expires_at", "artifact_hash", "risk", "confidence", "files", "actions",
