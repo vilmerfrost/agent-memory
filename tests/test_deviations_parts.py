@@ -339,8 +339,9 @@ def test_question_file_loads_and_is_not_a_routine() -> None:
 def test_writer_argv_reuses_distill_flags(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv(deviations.CLAUDE_ENV, raising=False)
     argv = deviations.writer_argv()
-    assert argv == ["claude", "-p", "--model", "sonnet", "--output-format", "json", "--tools", "",
-                    "--disable-slash-commands", "--strict-mcp-config", "--no-session-persistence"]
+    assert argv[:11] == ["claude", "-p", "--model", "sonnet", "--output-format", "json", "--tools", "",
+                         "--disable-slash-commands", "--strict-mcp-config", "--no-session-persistence"]
+    assert argv[11] == "--json-schema" and len(argv) == 13  # the reply schema (test_deviations_writer.py)
     assert "--bare" not in argv
     monkeypatch.setenv(deviations.CLAUDE_ENV, "/opt/fake-claude")
     assert deviations.writer_argv()[0] == "/opt/fake-claude"

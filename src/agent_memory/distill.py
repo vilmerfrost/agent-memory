@@ -189,7 +189,8 @@ def writer_prompt(state: str, repo: str, close: list[dict[str, Any]]) -> str:
 WRITER_MODEL = "sonnet"
 
 
-def writer_argv(exe_env: str = CLAUDE_ENV, model: str = WRITER_MODEL) -> list[str]:
+def writer_argv(exe_env: str = CLAUDE_ENV, model: str = WRITER_MODEL,
+                json_schema: Mapping[str, Any] | None = None) -> list[str]:
     """The headless CLI call. No tools (the prompt holds untrusted run text), no session file.
 
     No skills and no MCP servers either: a plain `claude -p` loads the user's whole setup
@@ -199,11 +200,19 @@ def writer_argv(exe_env: str = CLAUDE_ENV, model: str = WRITER_MODEL) -> list[st
 
     `exe_env` names the env var that may point at another executable (tests, demos):
     `AMEM_DISTILL_CLAUDE` here, `AMEM_DEVIATIONS_CLAUDE` for the deviation writer.
+
+    `json_schema`: adds `--json-schema <schema>`. The CLI then gives the model its own
+    StructuredOutput tool (added after `--tools ""` is applied), validates the reply against
+    the schema, re-prompts on a mismatch, and puts the validated object in the envelope's
+    `structured_output` field (`load_envelope`). Only the deviation writer passes one.
     """
     exe = os.environ.get(exe_env, "").strip() or "claude"
-    return [exe, "-p", "--model", model, "--output-format", "json",
+    argv = [exe, "-p", "--model", model, "--output-format", "json",
             "--tools", "", "--disable-slash-commands", "--strict-mcp-config",
             "--no-session-persistence"]
+    if json_schema is not None:
+        argv += ["--json-schema", json.dumps(json_schema, separators=(",", ":"))]
+    return argv
 
 
 def call_writer(prompt: str, *, timeout: float = DEFAULT_TIMEOUT) -> str:
@@ -216,12 +225,17 @@ def call_writer(prompt: str, *, timeout: float = DEFAULT_TIMEOUT) -> str:
 
 
 def run_cli(argv: list[str], prompt: str, *, timeout: float = DEFAULT_TIMEOUT,
-            env: Mapping[str, str] | None = None) -> str:
+            env: Mapping[str, str] | None = None, keep_error_envelope: bool = False) -> str:
     """Run a headless CLI argv with the prompt on stdin; return stdout. Raises WriterError.
 
     The child gets `AMEM_HOOK_OFF=1`: the user's session hook (deploy/hooks/amem-session-hook.sh)
     would otherwise record every model call as its own empty `sessions` row. `env`: the child's
     environment (default: this process's).
+
+    `keep_error_envelope`: `claude -p --output-format json` exits 1 when its result has
+    `is_error` (for example `error_max_structured_output_retries`) and still prints the result
+    envelope on stdout. With this flag such a stdout is returned, so the caller can tell a
+    malformed reply from a failed run; a non-zero exit without a result envelope still raises.
     """
     env = {**(os.environ if env is None else env), "AMEM_HOOK_OFF": "1"}
     try:
@@ -231,12 +245,23 @@ def run_cli(argv: list[str], prompt: str, *, timeout: float = DEFAULT_TIMEOUT,
     except OSError as exc:
         raise WriterError(f"cannot run {argv[0]}: {type(exc).__name__}: {exc}") from None
     if proc.returncode != 0:
+        if keep_error_envelope and _is_result_envelope(proc.stdout):
+            return proc.stdout
         raise WriterError(f"exit {proc.returncode}: {_one_line(proc.stderr or proc.stdout, 200)}")
     return proc.stdout
 
 
-def parse_envelope(stdout: str) -> str:
-    """The model's text from the CLI's `--output-format json` envelope."""
+def _is_result_envelope(stdout: str) -> bool:
+    try:
+        env = json.loads(stdout)
+    except ValueError:
+        return False
+    return isinstance(env, dict) and env.get("type") == "result"
+
+
+def load_envelope(stdout: str) -> dict[str, Any]:
+    """The CLI's `--output-format json` envelope as a dict. Raises DraftError for output that
+    is not one, and for a `type` other than `result`; the caller checks `is_error` / `subtype`."""
     try:
         env = json.loads(stdout)
     except ValueError:
@@ -245,9 +270,24 @@ def parse_envelope(stdout: str) -> str:
         raise DraftError("CLI envelope is not a JSON object")
     if env.get("type") not in (None, "result"):
         raise DraftError(f"CLI envelope has type {env.get('type')!r}, expected 'result'")
+    return env
+
+
+def envelope_error(env: dict[str, Any]) -> str | None:
+    """Why the envelope reports a failed run (`is_error` or a subtype other than success), or None."""
     if env.get("is_error") is True or env.get("subtype") not in (None, "success"):
-        detail = env.get("result") or env.get("subtype") or "is_error"
-        raise DraftError(f"CLI reported an error: {_one_line(detail, 200)}")
+        errors = env.get("errors")
+        first = errors[0] if isinstance(errors, list) and errors else None
+        return _one_line(env.get("result") or first or env.get("subtype") or "is_error", 200)
+    return None
+
+
+def parse_envelope(stdout: str) -> str:
+    """The model's text from the CLI's `--output-format json` envelope."""
+    env = load_envelope(stdout)
+    error = envelope_error(env)
+    if error is not None:
+        raise DraftError(f"CLI reported an error: {error}")
     result = env.get("result")
     if not isinstance(result, str) or not result.strip():
         raise DraftError("CLI envelope has no result text")

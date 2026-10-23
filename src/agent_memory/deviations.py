@@ -13,8 +13,10 @@ Per session (`scan`):
    PARENT.md for parents, the agent definition for subagents, the routine prompt, the
    repo's CLAUDE.md / CLAUDE.local.md / AGENTS.md; for Codex the global and the repo's
    AGENTS.md and the skills). `.env*` files are never read.
-3. writer: headless `claude -p` (distill.writer_argv flags) gets the numbered rule list per
-   source (rule_catalog.py) and returns JSON deviations naming a rule id. `parse_findings`
+3. writer: headless `claude -p` (distill.writer_argv flags plus `--json-schema REPLY_SCHEMA`,
+   so the CLI enforces the reply shape) gets the numbered rule list per source
+   (rule_catalog.py) and returns JSON deviations naming a rule id. A malformed reply is
+   retried once in the same scan with the parse error in the prompt (`write`). `parse_findings`
    validates them and strips quotes, paths, code and secrets; in the scan (`parse_reply`) a
    malformed item (e.g. a null grade) is skipped and counted (`Outcome.skipped`,
    `sessions.meta.scan_skipped` / `scan_skipped_reasons`), the valid ones are kept; a reply with
@@ -34,6 +36,8 @@ instruction texts the routine sent (`cloud_digests`) as `routine:<name>` (the pr
 
 A writer or Jev error on one session is recorded (`sessions.meta.scan_error`) and the
 scan goes on; the session stays unscanned and is retried (at most MAX_SCAN_ERRORS times).
+A transcript the Claude Desktop app released (`<id>.desktop-released.json` in its place,
+`released_marker`) is `skipped`: not an error, never picked again (`meta.scan_status`).
 `call_writer` is a module attribute so tests replace it. Every writer call needs
 AMEM_DEVIATIONS_LIVE=1; the caller checks `live()`.
 """
@@ -650,17 +654,91 @@ def writer_prompt(row: SessionRow, instructions: list[LoadedSource], digest: str
                          repo=row.repo or "-", digest=digest)
 
 
+_GRADE_SCHEMA = {"type": "number", "minimum": 0, "maximum": 1}
+_TEXT_SCHEMA = {"type": "string", "minLength": 1}
+
+# The reply shape PROMPT describes, enforced by the CLI (`--json-schema`). Both grades are
+# required numbers, never null. Draft-07 (the CLI's validator). `_parse` still validates every
+# item: the schema cannot name the offered sources, and a reply without `structured_output`
+# falls back to the text in `result`.
+REPLY_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "deviations": {
+            "type": "array",
+            "maxItems": MAX_FINDINGS,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "instruction_source": _TEXT_SCHEMA,
+                    "instruction_ref": _TEXT_SCHEMA,
+                    "turn": {"type": ["integer", "null"], "minimum": 1},
+                    "what": _TEXT_SCHEMA,
+                    "why": _TEXT_SCHEMA,
+                    "how": _TEXT_SCHEMA,
+                    "followed_grade": _GRADE_SCHEMA,
+                    "result_grade": _GRADE_SCHEMA,
+                },
+                "required": ["instruction_source", "instruction_ref", "turn", "what", "why", "how",
+                             "followed_grade", "result_grade"],
+            },
+        },
+    },
+    "required": ["deviations"],
+}
+
+RETRY_NOTE = """
+
+=== Note from the scanner (not part of the session) ===
+Your previous reply was rejected: {error}
+Reply again with ONLY the JSON object in the shape given above. Every deviation needs both
+grades as numbers from 0 to 1; leave out a deviation you cannot grade.
+"""
+
+
 def writer_argv() -> list[str]:
-    return distill.writer_argv(CLAUDE_ENV)
+    return distill.writer_argv(CLAUDE_ENV, json_schema=REPLY_SCHEMA)
 
 
 def call_writer(prompt: str, *, timeout: float = DEFAULT_TIMEOUT) -> str:
-    """The headless writer. Raises distill.WriterError. Tests replace this function."""
-    return distill.run_cli(writer_argv(), prompt, timeout=timeout)
+    """The headless writer: stdout, the CLI's JSON envelope (also when the CLI exited 1 with a
+    result envelope, e.g. `error_max_structured_output_retries`; `reply_text` sorts it out).
+    Raises distill.WriterError. Tests replace this function."""
+    return distill.run_cli(writer_argv(), prompt, timeout=timeout, keep_error_envelope=True)
+
+
+def retry_prompt(prompt: str, error: str) -> str:
+    """The prompt for the one in-call retry: the same prompt plus why the reply was rejected."""
+    return prompt + RETRY_NOTE.format(error=_one_line(redact(error), SKIPPED_REASON_MAX))
 
 
 class FindingError(ValueError):
     """The writer's JSON is not a valid deviation list."""
+
+
+def reply_text(stdout: str) -> str:
+    """The model's reply from the CLI envelope, as JSON text for `parse_reply`.
+
+    `structured_output` (the schema-validated object) wins; without it the text in `result`
+    is used. Raises FindingError for a malformed reply (no envelope, the CLI gave up on the
+    schema, no output at all): the scan retries those once. Raises distill.WriterError for
+    any other failed run (an API or auth error, a refusal to run): not retried in the call."""
+    try:
+        env = distill.load_envelope(stdout)
+    except distill.DraftError as exc:
+        raise FindingError(str(exc)) from None
+    error = distill.envelope_error(env)
+    if env.get("subtype") == "error_max_structured_output_retries":
+        raise FindingError(f"no reply matched the schema: {error}")
+    if error is not None:
+        raise distill.WriterError(f"CLI reported an error: {error}")
+    structured = env.get("structured_output")
+    if structured is not None:
+        return json.dumps(structured)
+    result = env.get("result")
+    if not isinstance(result, str) or not result.strip():
+        raise FindingError("CLI envelope has neither structured_output nor result text")
+    return result
 
 
 @dataclass
@@ -940,7 +1018,7 @@ def judge(f: Finding, kind: str, recurrence: int, qset: questions.QuestionSet, o
 class Outcome:
     session_id: str
     kind: str
-    status: str                  # ok | error | dry-run
+    status: str                  # ok | error | skipped (nothing to scan, never retried) | dry-run
     reason: str = ""
     digest_chars: int = 0
     instructions: list[str] = field(default_factory=list)
@@ -975,7 +1053,7 @@ class Outcome:
             miss = f" missing={','.join(self.missing)}" if self.missing else ""
             return (f"{head} digest_chars={self.digest_chars} "
                     f"instructions={','.join(self.instructions) or '-'}{miss}")
-        if self.status == "error":
+        if self.status in ("error", "skipped"):
             return f"{head}: {self.reason}"
         c = self.counts()
         unmatched = sum(j.finding.rule_id == rule_catalog.UNMATCHED for j in self.judged)
@@ -1003,6 +1081,11 @@ class ScanReport:
         """Writer items skipped as malformed in sessions that were otherwise scanned (a warning)."""
         return sum(o.skipped for o in self.outcomes)
 
+    @property
+    def skipped_sessions(self) -> int:
+        """Sessions with nothing to scan (a transcript released by Claude Desktop): not errors."""
+        return sum(o.status == "skipped" for o in self.outcomes)
+
     def verdicts(self) -> Counter[str]:
         total: Counter[str] = Counter()
         for o in self.outcomes:
@@ -1013,7 +1096,8 @@ class ScanReport:
         v = self.verdicts()
         text = (f"deviations: sessions={len(self.outcomes)} found={self.found} edit={v['edit_instruction']} "
                 f"enforce={v['enforce']} leave={v['leave']} errors={self.errors}"
-                + (f" skipped={self.skipped}" if self.skipped else ""))
+                + (f" skipped={self.skipped}" if self.skipped else "")
+                + (f" skipped_sessions={self.skipped_sessions}" if self.skipped_sessions else ""))
         return text + (" (dry run, nothing called or written)" if self.dry_run else "")
 
 
@@ -1026,6 +1110,7 @@ where s.scanned_at is null
   and coalesce((s.meta ->> 'tool_calls')::int, 0) + coalesce((s.meta ->> 'prompts')::int, 0) >= %(min_activity)s
   and coalesce(s.started_at, s.created_at) >= %(since)s
   and coalesce((s.meta ->> 'scan_errors')::int, 0) < %(max_errors)s
+  and coalesce(s.meta ->> 'scan_status', '') <> 'skipped'
   and not (s.kind = 'worker' and coalesce(s.meta ->> 'agent_type', '') <> 'worker'
            and exists (select 1 from sessions p
                        where p.session_id = s.meta ->> 'parent_session' and p.scanned_at is not null))
@@ -1071,6 +1156,41 @@ def transcript_path(row: SessionRow, root: Path | None = None) -> Path:
         stem = row.session_id.split("/", 1)[1] if "/" in row.session_id else row.session_id
         return root / row.project_dir / str(parent) / "subagents" / f"{stem}.jsonl"
     return root / row.project_dir / f"{row.session_id}.jsonl"
+
+
+RELEASED_SUFFIX = ".desktop-released.json"
+
+
+def released_marker(row: SessionRow, root: Path | None = None) -> Path | None:
+    """The Claude Desktop marker left where a session's transcript was, or None.
+
+    When the Desktop app deletes a session it removes `<id>.jsonl` (and the `<id>/` folder
+    with its subagent transcripts) and writes `<id>.desktop-released.json` next to it, e.g.
+    `{"v": 1, "releasedAt": "2026-10-15T14:14:15.516Z", "reason": "delete"}`. A subagent's
+    transcript went with its parent, so its marker is the parent's. Codex has no such marker."""
+    if row.tool == "codex" or ".." in row.project_dir:
+        return None
+    root = root or projects_dir()
+    top = str(row.meta.get("parent_session") or row.session_id)
+    if "/" in top or ".." in top:
+        return None
+    marker = root / row.project_dir / f"{top}{RELEASED_SUFFIX}"
+    return marker if marker.is_file() else None
+
+
+def released_reason(marker: Path) -> str:
+    """The skip reason for a released transcript, with the marker's reason and date when it parses."""
+    detail = ""
+    try:
+        data = json.loads(marker.read_text(encoding="utf-8")[:4096])
+    except (OSError, ValueError):
+        data = None
+    if isinstance(data, dict):
+        parts = [f"reason {data['reason']}" if isinstance(data.get("reason"), str) else "",
+                 f"at {data['releasedAt']}" if isinstance(data.get("releasedAt"), str) else ""]
+        detail = " ".join(p for p in parts if p)
+    text = "transcript released by Claude Desktop" + (f" ({detail})" if detail else "")
+    return _one_line(redact(text), 200)
 
 
 _RECURRENCE_SQL = f"""
@@ -1146,6 +1266,54 @@ def _record_error(o: Outcome, db_url: str | None) -> None:
         pass  # the session stays unscanned and is tried again next time
 
 
+def _record_skipped(o: Outcome, db_url: str | None) -> None:
+    """A session with nothing to scan: never picked again (`scan_status` = skipped), not counted
+    as an error (its old `scan_error` goes), and `scanned_at` stays null so the scoreboard does not
+    count it as a scanned session with no deviation."""
+    try:
+        with store.connect(db_url) as conn:
+            conn.execute(
+                "update sessions set meta = (meta - 'scan_error') || %s where session_id = %s",
+                (Jsonb({"scan_status": "skipped", "scan_skip_reason": _one_line(redact(o.reason), 300)}),
+                 o.session_id))
+    except psycopg.Error:
+        pass  # tried again next time; skipped again then
+
+
+WRITER_ATTEMPTS = 2   # the call plus one retry on a malformed reply (at most one extra writer call)
+
+
+def _attempt(prompt: str, offered: set[str], timeout: float) -> tuple[list[Finding], list[str]]:
+    """One writer call: the findings and why each skipped item was skipped. Raises
+    distill.WriterError (the run failed) or FindingError (the reply is malformed, or not one
+    of its items is usable)."""
+    reasons: list[str] = []
+    findings, skipped = parse_reply(reply_text(call_writer(prompt, timeout=timeout)), offered, reasons)
+    if skipped and not findings:
+        # Not one usable item: a malformed reply, never stored as "found nothing".
+        more = f" (+{skipped - 1} more skipped)" if skipped > 1 else ""
+        raise FindingError(f"{reasons[0]}{more}")
+    return findings, reasons
+
+
+def write(prompt: str, offered: set[str], *, timeout: float = DEFAULT_TIMEOUT) -> tuple[list[Finding], list[str]]:
+    """The writer with one in-call retry. A malformed reply (not JSON, no schema match, only
+    unusable items) is retried once with the parse error appended to the prompt (`retry_prompt`):
+    the model sees what was wrong instead of sampling the same mistake again, for the same cost
+    as a plain retry. A reply with some valid items is kept (its bad items are skipped, not
+    retried). A failed run (distill.WriterError: timeout, exit, API error) is not retried here;
+    the session is retried on a later scan. Raises FindingError when the retry is malformed too."""
+    attempt_prompt = prompt
+    for attempt in range(1, WRITER_ATTEMPTS + 1):
+        try:
+            return _attempt(attempt_prompt, offered, timeout)
+        except FindingError as exc:
+            if attempt == WRITER_ATTEMPTS:
+                raise FindingError(f"{exc} (after {WRITER_ATTEMPTS - 1} retry)") from None
+            attempt_prompt = retry_prompt(prompt, str(exc))
+    raise AssertionError("unreachable")
+
+
 def _scan_one(row: SessionRow, *, dry_run: bool, timeout: float, qset: questions.QuestionSet | None,
               recurrence: _Recurrence | None, db_url: str | None = None) -> Outcome:
     out = Outcome.of(row, "dry-run" if dry_run else "ok")
@@ -1164,7 +1332,12 @@ def _scan_one(row: SessionRow, *, dry_run: bool, timeout: float, qset: questions
     else:
         path = transcript_path(row)
         if not path.is_file():
-            out.status, out.reason = "error", "transcript file not found"
+            marker = released_marker(row)
+            if marker is not None:
+                # Deleted in the Desktop app on purpose: nothing to scan, ever. Not an error.
+                out.status, out.reason = "skipped", released_reason(marker)
+            else:
+                out.status, out.reason = "error", "transcript file not found"
             return out
         # A resumed transcript's copied lines are the earlier session's (session_resume): its
         # own scan finds them, so they are left out here (no finding twice).
@@ -1180,20 +1353,13 @@ def _scan_one(row: SessionRow, *, dry_run: bool, timeout: float, qset: questions
     if not instructions:
         return out  # nothing in force that we can read: scanned, nothing found
     try:
-        envelope = call_writer(writer_prompt(row, instructions, digest), timeout=timeout)
+        findings, reasons = write(writer_prompt(row, instructions, digest), {s.name for s in instructions},
+                                  timeout=timeout)
     except distill.WriterError as exc:
         out.status, out.reason = "error", f"writer: {exc}"
         return out
-    reasons: list[str] = []
-    try:
-        findings, skipped = parse_reply(distill.parse_envelope(envelope), {s.name for s in instructions}, reasons)
-    except (distill.DraftError, FindingError) as exc:
+    except FindingError as exc:
         out.status, out.reason = "error", _one_line(f"writer output: {exc}", 300)
-        return out
-    if skipped and not findings:
-        # Not one usable item: a writer failure (retried), never stored as "found nothing".
-        more = f" (+{skipped - 1} more skipped)" if skipped > 1 else ""
-        out.status, out.reason = "error", _one_line(f"writer output: {reasons[0]}{more}", 300)
         return out
     findings = resolve(findings, instructions)
     assert qset is not None and recurrence is not None
@@ -1232,6 +1398,8 @@ def scan(*, days: int = DEFAULT_DAYS, limit: int = DEFAULT_LIMIT, session_id: st
         if not dry_run:
             if o.status == "error":
                 _record_error(o, db_url)
+            elif o.status == "skipped":
+                _record_skipped(o, db_url)
             else:
                 try:
                     _store(o, db_url)
