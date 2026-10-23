@@ -103,7 +103,7 @@ def test_real_improve_stage_refusal_fails_the_experiment_only(ienv: SimpleNamesp
     seed_rule(ienv.url, RULE_A, "a")
     rep = N.run_night(night="2026-10-18", db_url=ienv.url, adapters=adapters(
         stager=N.ImproveStager(), implementer=CodeBlockImplementer(), replayer=FakeReplayer("IMPROVES")))
-    assert N.validate_report(rep) == [] and rep["status"] == "partial" and not rep["checkpoint"]["advanced"]
+    assert N.validate_report(rep) == [] and rep["status"] == "partial" and rep["checkpoint"]["advanced"]  # deferred, no reread
     e = rep["experiments"][0]
     assert e["status"] == "failed" and "improve stage refused" in e["verdict_reasons"][0]
     assert "code block" in e["verdict_reasons"][0]
