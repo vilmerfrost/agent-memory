@@ -38,6 +38,12 @@ KEY_A = f"dev:claude-md:global:{RULE_A[0]}"
 KEY_B = f"dev:claude-md:global:{RULE_B[0]}"
 
 
+# improve's live allowed_targets (~/agent-config/improve/criteria.json, 2026-10-23): the night drops any target
+# outside them before triage, the way improve would refuse it.
+LIVE_ALLOWED = ["@/parent/PARENT.md", "@/agents/worker.md", "@/lessons.md", "@/hooks/", "~/.agents/skills/",
+                "~/.claude/CLAUDE.md", "~/.claude/scheduled-tasks/", "@/settings.json", "~/.codex/AGENTS.md"]
+
+
 def make_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     home = tmp_path / "home"
     ac = home / "agent-config"
@@ -47,7 +53,7 @@ def make_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     (ac / "agents" / "worker.md").write_text(WORKER_MD)
     (home / ".agents" / "skills" / "demo" / "SKILL.md").write_text(SKILL_MD)
     (ac / "settings.json").write_text("{}\n")
-    (ac / "improve" / "criteria.json").write_text(json.dumps({"allowed_targets": []}))
+    (ac / "improve" / "criteria.json").write_text(json.dumps({"allowed_targets": LIVE_ALLOWED}))
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("AMEM_AGENT_CONFIG_DIR", str(ac))
     return home

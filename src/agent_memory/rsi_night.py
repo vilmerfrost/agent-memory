@@ -517,12 +517,13 @@ def _one_line(x: Any, n: int) -> str:
 
 
 def _refused_by_improve(target: str) -> bool:
-    """True when improve would refuse an edit to `target`: a pinned file (improve/pins.json) or a fenced path
-    (improve/fence.txt), read the way the edits step reads them (edits_targets). An experiment on it always ends
-    "improve stage refused" (night 2026-10-23: agents/worker.md, auto-pinned after a hand edit)."""
+    """True when improve would refuse an edit to `target`: a pinned file (improve/pins.json) or a path outside
+    improve's scope (criteria.json `allowed_targets`, with the fence.txt nuance), read the way the edits step reads
+    them (edits_targets). An experiment on it always ends "improve stage refused" (night 2026-10-23: agents/worker.md
+    pinned after a hand edit; then parent/skills/dispatch/SKILL.md, not in allowed_targets)."""
     try:
         path = rsi_targets.untilde(target)
-        return ET.pinned_file(path) is not None or ET.fenced(path)
+        return ET.pinned_file(path) is not None or not ET.is_allowed(path)
     except (OSError, RuntimeError, ValueError):
         return False
 
@@ -1443,7 +1444,7 @@ class Night:
         if out_of_scope - pinned:
             self.notes.append(f"candidates: {out_of_scope - pinned} without an in-scope target, not considered")
         if pinned:
-            self.notes.append(f"candidates: {pinned} on a target improve refuses (pinned or fenced: "
+            self.notes.append(f"candidates: {pinned} on a target improve refuses (pinned or out of scope: "
                               f"{', '.join(sorted(self.pinned))[:200]}), not considered")
         if self.dry_run:                      # nothing was written: show tonight's sightings as they would be
             known = {c["dedupe_key"]: c for c in pool}
