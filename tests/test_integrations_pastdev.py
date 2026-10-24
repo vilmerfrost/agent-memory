@@ -1198,3 +1198,22 @@ def test_cli_plan_shows_the_dead_lettered_refs_with_wired_ids(db: Db, pdev: Fake
         print("\n" + json.dumps({"dead_letters": dead, "plan_ids": ids}, indent=1))
     assert sorted(dead) == sorted(ids)
     assert ids == {refs_[k]: PD.wire(refs_[k]) for k in SENT} and all("/" not in i for i in ids.values())
+
+
+def test_a_stale_dead_letter_for_a_record_already_sent_is_dropped(db: Db, pdev: FakePastDev,
+                                                                  monkeypatch: pytest.MonkeyPatch) -> None:
+    """2026-10-24 live: the proposal and the decision were sent on 2026-10-17 (links completed); the night's replay
+    re-sent them under '/' ids, past.dev answered 400 id-invalid, and their dead letters stayed although past.dev
+    holds both. A dead letter whose record has a sent link is dropped on the next run."""
+    refs_ = seed(db)
+    with psycopg.connect(db.app) as conn:
+        assert sync.run(sink(pdev), conn, environ={}).rows == len(SENT)           # sent: links completed
+    monkeypatch.setattr(PD, "wire", lambda ref: ref)                              # the replay before the fix
+    with psycopg.connect(db.app) as conn:
+        assert sync.run(sink(pdev), conn, replay=True, environ={}).dead_letters == len(SENT)
+    monkeypatch.undo()
+    with psycopg.connect(db.app) as conn:
+        rep = sync.run(sink(pdev), conn, environ={})
+        meta = sync.load(conn, "pastdev")
+    assert rep.rows == 0 and meta["dead_letters"] == []                            # nothing re-sent, letters gone
+    assert {ln["metrics"]["status"] for ln in links(db).values()} == {"completed"}

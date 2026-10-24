@@ -745,6 +745,10 @@ class PastDevSink:
                            [e for e in batch.evidence if e.ref == f"past:{unwire(str(item.get('id')))}"], _key([item]))
                 for item in batch.rows]
 
+    def settled_keys(self, conn: psycopg.Connection) -> set[str]:
+        """Refs past.dev holds (a sent, not deleted link): sync drops their stale dead letters."""
+        return {sid for sid, m in _links(conn).items() if m.get("status") in SENT and not m.get("deleted")}
+
     def dead_key(self, row: Mapping[str, Any]) -> str:
         """sync's dead-letter key for one row: the record's ref (an ingest item carries the wired id)."""
         return unwire(str(row.get("id") or ""))
