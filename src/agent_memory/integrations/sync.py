@@ -294,6 +294,12 @@ def run(sink: Sink, conn: psycopg.Connection, *, budget_s: float = 60.0, replay:
         conn.commit()          # the links and the advanced watermark land together
         rep.batches += 1
         rep.rows += sum(len(p.rows) for p in ok)
+    # a dead letter for a record the sink already holds is stale: e.g. the 2026-10-24 past.dev replay re-sent two
+    # records sent on 2026-10-17 under '/' ids, got 400 id-invalid, and left letters for records that were never lost
+    settled = getattr(sink, "settled_keys", None)
+    if callable(settled) and dead_letters:
+        held = settled(conn)
+        dead_letters = [d for d in dead_letters if d.get("key") not in held]
     if rep.failed and rep.status == "ok":
         rep.status = "failed" if not rep.batches else "partial"
     final = {"watermarks": watermarks, "failures": failures, "last_try_at": _iso(now), "usage": usage,
