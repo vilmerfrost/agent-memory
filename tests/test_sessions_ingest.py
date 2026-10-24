@@ -66,6 +66,8 @@ def test_instruction_names_per_kind(setup_home: Home) -> None:  # noqa: F811
 
 @pytest.mark.parametrize(("cwd", "repo"), [
     ("/Users/x/worktrees/agent-memory/agent-af46", "agent-memory"),
+    ("/Users/x/Projects/agent-memory/.claude/worktrees/agent-a0846dac3b03cb2f4", "agent-memory"),   # not the agent id
+    ("/Users/x/Projects/agent-memory/.claude/worktrees/agent-a08/src", "agent-memory"),
     ("/Users/x/Projects/simplitics", "simplitics"),
     ("", None),
 ])

@@ -27,6 +27,15 @@ def test_team_terms_skip_generic_placeholders_and_short_names() -> None:
     assert (d | egress.env_terms({egress.DENY_ENV: "acme"})).terms == ("acme", "pipeline-poc", "x-repo")
 
 
+def test_team_terms_skip_agent_worktree_names() -> None:
+    """2026-10-24: a subagent session stored with repo `agent-<id>` (its .claude/worktrees folder) made that name a
+    term, and the term is inside the session's own id `<parent>/agent-<id>`, so ClickHouse dropped the row."""
+    d = egress.team_terms(["agent-a0846dac3b03cb2f4", "AGENT-A05A5BFB2F142D702", "agent-memory", "agent-tools"])
+    assert d.terms == ("agent-memory", "agent-tools")
+    assert not d.match("7ff5f480-77aa-496c-9b6a-bd96d4d4c395/agent-a0846dac3b03cb2f4")
+    assert egress.env_terms({egress.DENY_ENV: "agent-a0846dac3b03cb2f4"}).match("x/agent-a0846dac3b03cb2f4")
+
+
 def test_email_like() -> None:
     assert egress.email_like("vilmer@example.com") and egress.email_like("a b x.y@corp.io")
     assert not egress.email_like("claude-3@20240229") and not egress.email_like(None) and not egress.email_like("a@b")

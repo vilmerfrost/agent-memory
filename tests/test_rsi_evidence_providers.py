@@ -157,6 +157,18 @@ def open_policy(tmp_path: Path, **pastdev: Any) -> EP.Policy:
     return pol
 
 
+@pytest.fixture
+def closed_policy(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """The committed policy with past.dev closed again (`read: false`), as the default policy file: the owner-closed
+    behavior the night must keep (`skipped`, never asked) whenever the owner closes it."""
+    doc = json.loads(EP.POLICY_PATH.read_text())
+    doc["providers"]["pastdev"].update({"read": False, "approval": "test: closed by the owner"})
+    p = tmp_path / "closed-policy.json"
+    p.write_text(json.dumps(doc))
+    monkeypatch.setattr(EP, "POLICY_PATH", p)
+    return p
+
+
 def cand(db_url: str, key: str = C1_KEY) -> dict[str, Any]:
     with psycopg.connect(db_url) as conn:
         c = P.find_candidate(conn, key)
@@ -167,13 +179,15 @@ def cand(db_url: str, key: str = C1_KEY) -> dict[str, Any]:
 # ---------------------------------------------------------------- the policy file
 
 
-def test_committed_policy_is_valid_and_keeps_pastdev_closed() -> None:
+def test_committed_policy_is_valid_and_opens_pastdev_recall_only() -> None:
     pol = EP.load_policy()
     assert pol.problem == "" and pol.sha256 and set(pol.providers) == set(EP.SERVICES.values())
     assert pol.of("supabase").allows("rule_pattern")
     assert pol.of("clickhouse").allows("rule_gap") and not pol.of("clickhouse").allows("tokens_by_outcome")
     assert pol.of("langfuse").allows("trace") and pol.of("langfuse").allows("experiment_scores")
-    assert not pol.of("pastdev").read and "recall from routines" in pol.of("pastdev").approval
+    pd = pol.of("pastdev")                         # Vilmer, 2026-10-24: "everything should be turned on"
+    assert pd.read and pd.allows("recall") and not pd.allows("ingest")
+    assert "2026-10-24" in pd.approval and "everything should be turned on" in pd.approval
 
 
 @pytest.mark.parametrize("text, why", [
@@ -296,12 +310,12 @@ def test_the_probe_picks_the_deltas_top_rule(db: str, m: Mocks, tmp_path: Path) 
 # ---------------------------------------------------------------- the night uses the real clients
 
 
-def test_build_pack_default_retrievers_are_the_real_gated_clients(db: str, m: Mocks) -> None:
+def test_build_pack_default_retrievers_are_the_real_gated_clients(db: str, m: Mocks, closed_policy: Path) -> None:
     rs = P.default_retrievers(provider_env(db, m), lambda: psycopg.connect(db), subject_rule=R1)
     assert isinstance(rs["sb"], E.SupabaseRetriever)
     assert isinstance(rs["ch"], EP.GatedRetriever) and isinstance(rs["ch"].inner.client, EP.ReadOnlyClickHouseClient)
     assert isinstance(rs["lf"].inner.client, EP.ReadOnlyLangfuseClient)
-    assert rs["pd"].block.startswith("not approved")                  # the committed policy keeps past.dev closed
+    assert rs["pd"].block.startswith("not approved")                  # a policy that closes past.dev
     pack = P.build_pack(cand(db), environ=provider_env(db, m), connect=lambda: psycopg.connect(db))
     assert pack.health["clickhouse"] == "ok" and pack.health["langfuse"] == "ok"
     assert pack.health["pastdev"] == "skipped" and m.pd.requests == []    # closed by the owner: not a fault
@@ -315,7 +329,7 @@ def test_build_pack_default_retrievers_are_the_real_gated_clients(db: str, m: Mo
         assert x.ref and x.source in P.SOURCES
 
 
-def test_delta_with_the_real_providers(db: str, m: Mocks) -> None:
+def test_delta_with_the_real_providers(db: str, m: Mocks, closed_policy: Path) -> None:
     """S1 with providers (the edit listed for rsi_night.PackEvidence.delta): ClickHouse answers inside the delta."""
     rs = P.default_retrievers(provider_env(db, m), lambda: psycopg.connect(db))
     with P._read_only(lambda: psycopg.connect(db))() as conn:
@@ -337,7 +351,8 @@ def night(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pg_url: str) -> Simpl
 
 
 def test_a_provider_http_error_is_error_and_the_night_continues(night: SimpleNamespace, m: Mocks,
-                                                                monkeypatch: pytest.MonkeyPatch) -> None:
+                                                                monkeypatch: pytest.MonkeyPatch,
+                                                                closed_policy: Path) -> None:
     """The real night (S0-S9) with the real PackEvidence: ClickHouse answers HTTP 400 to every query."""
     seed_rule(night.url, RULE_A, "a")
     with psycopg.connect(night.url) as conn:                   # older than the delta's settle time (60 s)
@@ -371,9 +386,10 @@ def test_a_provider_timeout_is_error_and_the_rest_answers(db: str, m: Mocks, tmp
 
 
 def test_a_night_with_pastdev_closed_by_policy_is_ok_not_partial(night: SimpleNamespace, m: Mocks,
-                                                                  monkeypatch: pytest.MonkeyPatch) -> None:
-    """2026-10-18 review: with the committed policy (past.dev read: false) every real night ended `partial`, so the
-    night-job logged FAIL and routine-audit raised it daily. An owner-closed provider is `skipped`; a configured
+                                                                  monkeypatch: pytest.MonkeyPatch,
+                                                                  closed_policy: Path) -> None:
+    """2026-10-18 review: with the policy then committed (past.dev read: false) every real night ended `partial`, so
+    the night-job logged FAIL and routine-audit raised it daily. An owner-closed provider is `skipped`; a configured
     provider that fails still makes the night partial (test above)."""
     seed_rule(night.url, RULE_A, "a")
     with psycopg.connect(night.url) as conn:
@@ -395,12 +411,47 @@ def test_a_night_with_pastdev_closed_by_policy_is_ok_not_partial(night: SimpleNa
 # ---------------------------------------------------------------- not approved for this data: unavailable
 
 
-def test_pastdev_not_approved_is_never_asked(db: str, m: Mocks) -> None:
-    rep = EP.probe(provider_env(db, m), candidate_key=C1_KEY)                    # the committed policy
+def test_pastdev_not_approved_is_never_asked(db: str, m: Mocks, closed_policy: Path) -> None:
+    rep = EP.probe(provider_env(db, m), candidate_key=C1_KEY)                    # the default (closed) policy file
     pd = rep["providers"]["pastdev"]
     assert pd["status"] == "unavailable" and pd["configured"] and not pd["approved"]
     assert pd["reason"].startswith("not approved") and pd["requests"] == 0 and m.pd.requests == []
     assert rep["health"]["clickhouse"] == "ok"
+
+
+def test_the_committed_policy_asks_pastdev_when_keyed_and_switched_on(db: str, m: Mocks) -> None:
+    """2026-10-24: with the committed policy and AMEM_PASTDEV_KEY set, the probe and the night's packs recall from
+    past.dev: one recall per pack (0.1 credit), each answer re-read in Supabase. The switches still close it."""
+    rep = EP.probe(provider_env(db, m), candidate_key=C1_KEY)
+    pd = rep["providers"]["pastdev"]
+    assert (pd["status"], pd["approved"], pd["reason"]) == ("ok", True, "") and rep["health"]["pastdev"] == "ok"
+    assert pd["requests"] == 2 and len(m.pd.requests_to("POST", "/api/v1/recall")) == 1      # health + one recall
+    assert pd["sample_refs"] == [f"past:amem:proposal/{PROPOSAL}"]
+    pack = P.build_pack(cand(db), environ=provider_env(db, m), connect=lambda: psycopg.connect(db))
+    assert pack.health["pastdev"] == "ok" and len(m.pd.requests_to("POST", "/api/v1/recall")) == 2
+    assert any(x.source == "pastdev" and x.status == "ok" for x in pack.findings)
+    for over, why in (({"AMEM_PASTDEV": "off"}, "switched off"), ({"AMEM_RSI_EVIDENCE_PASTDEV": "off"}, "switched off"),
+                      ({"AMEM_PASTDEV_KEY": None}, "not configured")):
+        n = len(m.pd.requests)
+        rep = EP.probe(provider_env(db, m, **over), candidate_key=C1_KEY)
+        assert rep["providers"]["pastdev"]["reason"].startswith(why) and len(m.pd.requests) == n, over
+
+
+def test_a_night_with_the_committed_policy_recalls_once_per_pack(night: SimpleNamespace, m: Mocks,
+                                                                 monkeypatch: pytest.MonkeyPatch) -> None:
+    seed_rule(night.url, RULE_A, "a")
+    with psycopg.connect(night.url) as conn:
+        conn.execute("update sessions set created_at = now() - interval '2 hours'")
+        conn.execute("update deviations set created_at = now() - interval '2 hours'")
+    for k, v in provider_env(None, m).items():
+        monkeypatch.setenv(k, v)
+    rep = N.run_night(night="2026-10-18", db_url=night.url,
+                      adapters=adapters(evidence=N.PackEvidence(night.url), replayer=FakeReplayer("IMPROVES")))
+    assert N.validate_report(rep) == []
+    assert rep["health"]["pastdev"] == "ok" and rep["status"] == "ok" and rep["experiments"]
+    recalls = m.pd.requests_to("POST", "/api/v1/recall")
+    assert 1 <= len(recalls) <= len(rep["experiments"]) <= 3                  # bounded: <= 0.3 credit a night
+    assert all(json.loads(r.body)["limit"] <= PD.RECALL_MAX for r in recalls)
 
 
 @pytest.mark.parametrize("repo, why", [

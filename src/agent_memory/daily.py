@@ -25,6 +25,10 @@ Steps, in order. A failed step is recorded and the next step still runs:
 3c. edits: `edits run` (docs/edits.md) after the deviations step. Off unless AMEM_EDITS_LIVE=1
    (then not a failure, and the log line has no edit fields). Kept edits are pushed with an
    Undo button (not with --no-push). Any candidate error fails the step; the others still run.
+3d. sync (daily, last): `sync run` for each sink (clickhouse, langfuse, pastdev) that has its settings and whose
+   kill switch is on, SYNC_BUDGET_S each, at most once per local day (state file `sync_last_day`). An unconfigured
+   or switched-off sink is a skip. A sink that fails is a warning (an amem-daily-warn line), never a failure, so
+   the night's prerequisite check is never blocked by it.
 4. log: one summary line plus one `amem-daily-fail <reason>` line per failed
    step, appended to the routines log in the house format.
 
@@ -82,6 +86,7 @@ class DailyResult:
     deviations: deviations.ScanReport | None = None  # None: off, not due this week, or failed early
     edits: Any = None  # edits.Report; None: the edits step was off or failed early
     rsi_push: list[str] | None = None  # one result per pushed proposal; None: not stage mode, or failed early
+    synced: list[Any] | None = None  # sync.SyncReport per sink run today; None: no sink due, configured and on
     failures: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)  # logged as <name>-warn lines; the verdict stays PASS
     lines: list[str] = field(default_factory=list)  # what was appended to the routines log
@@ -541,6 +546,80 @@ def step_escalations(
         result.fail(f"state: cannot write {state_file.name}: {_exc(exc)}")
 
 
+SYNC_KEY = "sync_last_day"
+SYNC_BUDGET_S = 120.0  # per sink and day; sync.run stops between batches, and its client-side daily limits apply
+SYNC_STOP = ("failed", "unavailable")  # a sink that is configured and switched on but did not sync: a warning
+
+
+def sync_configured(name: str, environ: Mapping[str, str] | None = None) -> bool:
+    """The sink has its settings (URL and keys). Reads env only: no network, no database."""
+    env = os.environ if environ is None else environ
+    if name == "clickhouse":
+        from agent_memory.integrations import clickhouse
+        return not clickhouse.config(env).problem
+    if name == "langfuse":
+        from agent_memory.integrations import langfuse
+        return not langfuse.LangfuseClient.from_env(env).problem
+    if name == "pastdev":
+        from agent_memory.integrations import pastdev
+        return pastdev.config(env) is not None
+    return False
+
+
+def step_sync(result: DailyResult, *, state_file: Path, now: datetime) -> None:
+    """Daily: `amem sync run --sink <sink>` (incremental, SYNC_BUDGET_S each) for every sink that is configured and
+    switched on (docs/daily.md; docs/integrations/cloud-activation.md: daily, so ClickHouse can idle), at most once
+    per local day (the state file's sync_last_day). A sink without its settings or with its switch off is a skip.
+    Never a failure: a sink that fails, is unreachable or hits the provider's cap is a warning, so the night's
+    prerequisite check never sees a `sync` step fail (rsi_schedule: ingest, tasks and deviations block)."""
+    from agent_memory import cli_integrations
+    from agent_memory.integrations import sync
+
+    day = now.date().isoformat()
+    if _state_dict(state_file).get(SYNC_KEY) == day:
+        _err(f"sync: not due (ran on {day})")
+        return
+    todo = []
+    for name in sync.SINKS:
+        if sync.switched_off(name):
+            _err(f"sync {name}: off (kill switch)")
+        elif not sync_configured(name):
+            _err(f"sync {name}: not configured")
+        else:
+            todo.append(name)
+    if not todo:
+        return
+    try:
+        backend = config.backend()
+        refused = config.remote_write_error(for_backend="postgres") if backend == "postgres" else None
+    except config.BackendError as exc:
+        backend, refused = "?", str(exc)
+    if backend != "postgres" or refused is not None:
+        result.warn(f"sync: needs the Postgres backend ({refused or f'backend={backend}'}); not run")
+        return
+    reports: list[Any] = []
+    for name in todo:
+        try:
+            sink = cli_integrations.sink_for(name)
+            with store.connect() as conn:
+                rep = sync.run(sink, conn, budget_s=SYNC_BUDGET_S)
+        except Exception as exc:  # adapter, database or provider error: this sink only, never the day
+            result.warn(f"sync {name}: {_exc(exc)}")
+            continue
+        reports.append(rep)
+        _err(rep.line())
+        if rep.status in SYNC_STOP or (rep.status == "capped" and rep.detail.startswith("provider cap")):
+            result.warn(f"sync {name}: {rep.status} ({rep.detail})")
+    result.synced = reports
+    data = _state_dict(state_file)
+    data[SYNC_KEY] = day
+    data.setdefault("pushed_run_ids", [])
+    try:
+        _write_state(state_file, data)
+    except OSError as exc:
+        result.warn(f"sync: cannot write {state_file.name}: {_exc(exc)}")
+
+
 def log_lines(ts: str, result: DailyResult, secs: int) -> list[str]:
     head = (f"{ts} {NAME} {result.verdict} scored={result.scored} escalations={result.escalations} "
             f"new={result.new} push={result.push} tasks={result.tasks} ")
@@ -561,6 +640,9 @@ def log_lines(ts: str, result: DailyResult, secs: int) -> list[str]:
     if result.rsi_push is not None:  # stage mode only, so legacy lines stay the same
         staged = result.edits.count("staged") if result.edits is not None else 0
         head += f"edits_staged={staged} rsi_push={len(result.rsi_push)} "
+    if result.synced is not None:  # only when the sync step ran a sink, so other runs keep the same line
+        head += (f"sync={','.join(f'{r.sink}:{r.status}' for r in result.synced) or 'none'} "
+                 f"sync_rows={sum(r.rows for r in result.synced)} ")
     head += f"{secs}s"
     return [head, *(f"{ts} {NAME}-fail {reason}" for reason in result.failures),
             *(f"{ts} {NAME}-warn {reason}" for reason in result.warnings)]
@@ -593,6 +675,7 @@ def run_daily(
     step_deviations(result, state_file=state_path(state), now=now)
     step_edits(result, push=push, notify=notify)
     step_rsi_push(result, push=push, notify=notify)
+    step_sync(result, state_file=state_path(state), now=now)  # last: it feeds nothing the steps above read
     secs = int(time.monotonic() - start)
     result.lines = log_lines(now.strftime(TS_FORMAT), result, secs)
     log_file.parent.mkdir(parents=True, exist_ok=True)
