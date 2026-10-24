@@ -178,6 +178,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     ingest = sub.add_parser("ingest", help="ingest external logs into runs (idempotent)")
     ingest_sub = ingest.add_subparsers(dest="ingest_command", required=True)
+    from agent_memory import dashboard
+    dashboard.register(ingest_sub)
     p = ingest_sub.add_parser("routines-log", help="ingest ~/.claude/parent/routines.log lines into runs")
     p.add_argument("path", type=Path, help="path to routines.log")
     p.set_defaults(func=cmd_ingest_routines_log)
