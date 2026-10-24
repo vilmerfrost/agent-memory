@@ -9,8 +9,14 @@ declare
   tok constant text := 'verify-token-0123456789abcdef';
 begin
   -- 1. Objects
-  select count(*) into n from pg_tables where schemaname = 'public' and tablename like 'rsi\_%';
-  if n <> 10 then raise exception 'expected 10 rsi_* tables, found %', n; end if;
+  -- Check this migration's ten objects explicitly. Later migrations may add
+  -- independent RSI tables (Night Desk adds rsi_nights).
+  foreach t in array array['rsi_experiments','rsi_candidates','rsi_evidence','rsi_artifacts',
+    'rsi_eval_results','rsi_proposals','rsi_decision_tokens','rsi_decisions','rsi_decision_results','rsi_checkpoints'] loop
+    if not exists (select 1 from pg_tables where schemaname='public' and tablename=t) then
+      raise exception 'missing core RSI table %', t;
+    end if;
+  end loop;
   select count(*) into n from information_schema.columns
    where table_schema = 'public' and table_name = 'sessions' and column_name in ('env', 'experiment_id');
   if n <> 2 then raise exception 'sessions.env / experiment_id missing'; end if;

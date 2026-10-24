@@ -48,6 +48,8 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+import psycopg
+
 from agent_memory import config, redact, routines_log as RL, rsi_approval as AP, rsi_artifact as RA
 
 NIGHT_ROUTINE = "amem-rsi-night"
@@ -668,7 +670,7 @@ def run_brief_job(*, root: Path | None = None, night: str | None = None, now: da
                   sleep: Callable[[float], None] = time.sleep) -> JobResult:
     """The morning brief for the night key (default: the night that just ended) as markdown + JSON files in
     `out_dir` (default ~/.claude/parent/reports). Waits up to `wait_s` for the night to finish (its lock released
-    and its report written). Read-only towards the sandbox and the database. Never pushes."""
+    and its report written). Stores the completed snapshot for Night Desk. Never pushes."""
     from agent_memory import rsi_brief as BR
     t0 = time.monotonic()
     fixed = now is not None
@@ -699,6 +701,16 @@ def run_brief_job(*, root: Path | None = None, night: str | None = None, now: da
     mdp, jsp = out / f"rsi-brief-{night}.md", out / f"rsi-brief-{night}.json"
     mdp.write_text(md, encoding="utf-8")
     jsp.write_text(json.dumps(b, sort_keys=True, default=str, indent=1) + "\n", encoding="utf-8")
+    # Publish only after both local files exist. A failed upload is visible to the
+    # routine monitor; ingest --backfill can retry without rerunning the night.
+    from agent_memory import dashboard
+    try:
+        report_path, _ = BR.find_report(root or RA.sandbox_dir(), night)
+        report, _ = BR.load_report(report_path)
+        dashboard.upsert_night(b, report, db_url=db_url)
+    except (OSError, ValueError, BR.ReportError, psycopg.Error):
+        res.status = "FAIL"
+        res.items.append("dashboard: night snapshot upload failed; local brief retained")
     ready = sum(1 for x in b["passed"] if x["actions"].get("apply"))
     res.fields.update(night_status=b["status"], ready=ready, staged_not_ready=len(b["passed"]) - ready,
                       failed=len(b["failed"]), pending=b["pending_decisions"]["total"],
