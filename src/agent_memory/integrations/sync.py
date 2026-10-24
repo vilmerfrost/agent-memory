@@ -158,17 +158,24 @@ def provider_cap(exc: BaseException) -> bool:
     return status == 402 or (status == 429 and "cap-reached" in str(exc))
 
 
-def _dead(batch: Batch, rows: list[dict[str, Any]], exc: BaseException, now: datetime) -> list[dict[str, Any]]:
+def _row_key(sink: Sink | None, batch: Batch, r: Mapping[str, Any]) -> str:
+    """A dead letter's key: the sink's own (`dead_key`, e.g. past.dev's ref for a wired id), else the row's id."""
+    key = getattr(sink, "dead_key", None)
+    k = key(r) if key is not None else None
+    return str(k or r.get("id") or r.get("trace_id") or r.get("source_id") or batch.key or "?")[:200]
+
+
+def _dead(batch: Batch, rows: list[dict[str, Any]], exc: BaseException, now: datetime,
+          sink: Sink | None = None) -> list[dict[str, Any]]:
     err = f"{type(exc).__name__}: {exc}"[:200]
-    return [{"table": batch.table, "key": str(r.get("id") or r.get("trace_id") or r.get("source_id") or batch.key or "?")[:200],
-             "error": err,
-             "at": _iso(now)} for r in rows]
+    return [{"table": batch.table, "key": _row_key(sink, batch, r), "error": err, "at": _iso(now)} for r in rows]
 
 
-def _refused(batch: Batch, exc: Refused, usage: dict[str, Any], now: datetime) -> tuple[Batch, list[dict[str, Any]]]:
+def _refused(batch: Batch, exc: Refused, usage: dict[str, Any], now: datetime,
+             sink: Sink | None = None) -> tuple[Batch, list[dict[str, Any]]]:
     """A Refused push: the rows did go out (they count), nothing is delivered, the evidence is recorded."""
     usage["rows"] += len(batch.rows)
-    return Batch(batch.table, [], batch.watermark, exc.evidence), _dead(batch, exc.rows or batch.rows, exc, now)
+    return Batch(batch.table, [], batch.watermark, exc.evidence), _dead(batch, exc.rows or batch.rows, exc, now, sink)
 
 
 def _deliver(sink: Sink, batch: Batch, usage: dict[str, Any],
@@ -180,7 +187,7 @@ def _deliver(sink: Sink, batch: Batch, usage: dict[str, Any],
         usage["rows"] += len(batch.rows)
         return [batch], [], None
     except Refused as exc:
-        part, dead = _refused(batch, exc, usage, now)
+        part, dead = _refused(batch, exc, usage, now, sink)
         return [part], dead, None
     except Exception as exc:  # noqa: BLE001
         if not _record_error(exc):
@@ -188,7 +195,7 @@ def _deliver(sink: Sink, batch: Batch, usage: dict[str, Any],
         split = getattr(sink, "split", None)
         parts = split(batch) if split and len(batch.rows) > 1 else [batch]
         if len(parts) <= 1:
-            return [], _dead(batch, batch.rows, exc, now), None
+            return [], _dead(batch, batch.rows, exc, now, sink), None
     ok: list[Batch] = []
     dead: list[dict[str, Any]] = []
     for part in parts:
@@ -198,13 +205,13 @@ def _deliver(sink: Sink, batch: Batch, usage: dict[str, Any],
             usage["rows"] += len(part.rows)
             ok.append(part)
         except Refused as exc:
-            done, refused = _refused(part, exc, usage, now)
+            done, refused = _refused(part, exc, usage, now, sink)
             ok.append(done)
             dead += refused
         except Exception as exc:  # noqa: BLE001
             if not _record_error(exc):
                 return ok, dead, exc
-            dead += _dead(part, part.rows, exc, now)
+            dead += _dead(part, part.rows, exc, now, sink)
     return ok, dead, None
 
 
@@ -274,6 +281,10 @@ def run(sink: Sink, conn: psycopg.Connection, *, budget_s: float = 60.0, replay:
             _save(conn, sink.name, "running", {"failures": failures, "usage": usage})
             conn.commit()
             continue
+        # a row delivered now is no longer dead: e.g. past.dev's id-invalid letters of 2026-10-24, re-sent once ids
+        # were wired (its record had no link, so the next run sent it again)
+        landed = {(batch.table, _row_key(sink, batch, r)) for p in ok for r in p.rows}
+        dead_letters = [d for d in dead_letters if (d.get("table"), d.get("key")) not in landed]
         dead_letters = (dead_letters + dead)[-MAX_DEAD_LETTERS:]
         rep.dead_letters += len(dead)
         watermarks[batch.table] = batch.watermark

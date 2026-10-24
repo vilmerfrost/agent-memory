@@ -18,7 +18,8 @@ the network before step 4):
                    kill switch AMEM_PASTDEV=off. A sink switch (AMEM_SYNC_<SINK>=off) stops writes only, not reads.
     3 approved     config/rsi-evidence-providers.json (owner-approved; the investigator never writes it): `read`
                    is true and the query is listed. A missing or broken file fails closed for every external
-                   provider. past.dev ships with `read: false` (see the file for why).
+                   provider. past.dev recall was opened on 2026-10-24 (owner approval in the file); each
+                   recall costs 0.1 credit, one per evidence pack, so at most max_experiments (<= 3) a night.
     4 health       the provider's own health check (one request).
     per query      a parameter that leaves the Mac must not name a withheld term (egress.py: AMEM_EGRESS_DENY plus
                    every team or private repo and project name in Supabase) or look like an email; a repo-scoped

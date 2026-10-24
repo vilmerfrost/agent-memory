@@ -348,6 +348,7 @@ def _source_ids(call: Call | None) -> list[str]:
     for r in (res.get("results") if isinstance(res, Mapping) else None) or []:
         for s in (r.get("sources") if isinstance(r, Mapping) else None) or []:
             sid = s.get("sourceId") if isinstance(s, Mapping) else None
+            sid = PD.unwire(sid) if isinstance(sid, str) else sid     # wired ids (2026-10-24) back to refs
             if isinstance(sid, str) and sid not in out:
                 out.append(sid)
     return out
@@ -642,7 +643,7 @@ def run_c3(db_url: str, gold: Mapping[str, Any], *, environ: Mapping[str, str] |
             refused = {ref: list(reasons) for ref, reasons in s.refused}
             want = {**{r: ["team"] for r in team}, **{r: ["private"] for r in private}}
             items = _planned(s, conn)
-            ids = sorted(it["id"] for it in items)
+            ids = sorted(PD.unwire(it["id"]) for it in items)
             local = PD.local_credits(items)
             masked = out.get("masked") or {}
             problems = []
@@ -695,7 +696,7 @@ def run_c3(db_url: str, gold: Mapping[str, Any], *, environ: Mapping[str, str] |
                     got = (by_ord.get(i) or {}).get("sourceId")
                     if not (isinstance(got, str) and got.encode("utf-8") == it["id"].encode("utf-8")):
                         mism.append(f"{it['id']} -> {got!r}")
-                    receipts[it["id"]] = str(res.get("ingestionId") or "")
+                    receipts[PD.unwire(it["id"])] = str(res.get("ingestionId") or "")
             iids = {i for i in receipts.values() if i}
             state["iids"] = iids
             secs = {i: client.completed[i] - client.accepted[i] for i in iids
@@ -794,8 +795,8 @@ def run_c3(db_url: str, gold: Mapping[str, Any], *, environ: Mapping[str, str] |
             conn.execute("update edits set summary = %s where id = %s", (CHANGED_SUMMARY, eid))
             conn.commit()
             items = _planned(sink(), conn)
-            change: dict[str, Any] = {"ref": ref, "planned": [it["id"] for it in items]}
-            if [it["id"] for it in items] != [ref]:
+            change: dict[str, Any] = {"ref": ref, "planned": [PD.unwire(it["id"]) for it in items]}
+            if change["planned"] != [ref]:
                 problems.append(f"changed record: planned {change['planned']}, expected [{ref}]; not sent")
             else:
                 local = PD.local_credits(items)

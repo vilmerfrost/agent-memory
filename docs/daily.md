@@ -49,6 +49,15 @@ every step failed on that). The steps run either way.
    unless `AMEM_EDITS_LIVE=1`; the launchd job sets it. Kept edits are pushed with an Undo
    button (not with `--no-push`). Any candidate error fails the step; the others still run.
    (The `lessons distill` step after scoring is frozen: off unless `AMEM_DISTILL_LIVE=1`.)
+   Then, last, **sync** (daily, since 2026-10-24; docs/integrations/activation.md): `sync run --sink <sink>`
+   (incremental, a 120 s budget each, plus the sink's client-side daily limits) for every sink that has its
+   settings and is switched on: clickhouse (`AMEM_CLICKHOUSE_URL`/`_USER`/`_KEY`), langfuse (`AMEM_LANGFUSE_HOST`/
+   `_PUBLIC_KEY`/`_SECRET_KEY`), pastdev (`AMEM_PASTDEV_KEY`). At most once per local day (`sync_last_day` in the
+   state file), so ClickHouse Cloud can idle between runs. A sink without settings, or switched off
+   (`AMEM_SYNC_<SINK>=off`; past.dev also `AMEM_PASTDEV=off`), is a skip. A sink that fails, is unreachable or hits
+   its provider's credit cap is a **warning** (`amem-daily-warn sync <sink>: ...`), never a failed step: the
+   night's prerequisite check (docs/rsi/night-ops.md) blocks only on `ingest`, `tasks` and `deviations`, and the
+   night does not read what sync writes.
 4. **log**: one line appended to the routines log.
 
 Scoring and escalations need the Postgres backend (V1). `AMEM_REQUIRE_REMOTE=1`
@@ -87,7 +96,9 @@ overrides it. House format (`%Y-%m-%dT%H:%M:%S%z`):
   deviation_errors=X deviation_skipped=S` follows (docs/deviations.md). `deviation_skipped` counts
   writer items skipped as malformed (e.g. a null grade) in sessions whose valid items were stored:
   a warning, not a failed step (each is named on stderr). When the edits step ran, `edits=N edits_kept=K
-  edits_reverted=R edits_suggested=S edit_errors=E` follows (docs/edits.md). One `amem-daily-fail <reason>` line per failed step.
+  edits_reverted=R edits_suggested=S edit_errors=E` follows (docs/edits.md). When the sync step ran a sink,
+  `sync=clickhouse:ok,langfuse:ok,pastdev:partial sync_rows=N` follows (each sink's `sync run` status).
+  One `amem-daily-fail <reason>` line per failed step, one `amem-daily-warn <reason>` line per warning.
 - `amem ingest routines-log` reads these back as routine `amem-daily`
   (`meta.scored`, `meta.escalations`, `meta.new`, `meta.push`, `meta.tasks`, `meta.duration_s`,
   `meta.failures`).
@@ -100,7 +111,7 @@ overrides it. Written atomically, mode 600:
 
 ```json
 {"pushed_run_ids": ["<uuid>", "..."], "updated_at": "2026-10-13T09:20:04+0200",
- "deviations_last_scan": "2026-10-13T09:20:04+0200"}
+ "deviations_last_scan": "2026-10-13T09:20:04+0200", "sync_last_day": "2026-10-13"}
 ```
 
 Each step keeps the other keys when it writes.
