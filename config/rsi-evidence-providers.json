@@ -21,10 +21,10 @@
       "approval": "Mission 005.5 brief section 5 (read-only retrieval); C2 accepted (m004c-report section 3)"
     },
     "pastdev": {
-      "read": false,
+      "read": true,
       "queries": ["recall"],
-      "data": "the reviewed own decision records only (backfill-export-plan section 5.7: 2 records)",
-      "approval": "not approved for investigator recall: the backfill approval (backfill-export-plan 5.8) excludes recall from routines, and each recall spends 0.1 credit"
+      "data": "the sanitized own decision records the past.dev sink sent (proposals, decisions, experiments, edits, lessons); recall answers are amem: refs, each re-read in Supabase",
+      "approval": "Vilmer, 2026-10-24: \"everything should be turned on\" (the ClickHouse, Langfuse and past.dev evidence sources and sinks). Investigator recall approved; this replaces the earlier exclusion of recall from routines (backfill-export-plan 5.8). Bounded: one recall per evidence pack (limit <= 20 results), at most max_experiments packs a night (hard cap 3), 0.1 credit each"
     }
   }
 }

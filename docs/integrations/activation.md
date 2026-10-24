@@ -10,6 +10,24 @@ Test evidence: [test-report.md](test-report.md). The NCM track is separate: [ncm
 past.dev and NCM on Modal: see [cloud-readiness.md](cloud-readiness.md) (findings, costs, backfill counts,
 risks) and [cloud-activation.md](cloud-activation.md) (the per-provider approval steps).
 
+## Status 2026-10-24: everything on
+
+Vilmer: "everything should be turned on". The sinks' kill switches are on, ClickHouse and Langfuse were backfilled,
+and these replace the incremental steps CH7, LF6 and PD6 below:
+
+- **Daily sync.** `amem daily` ends with a sync step (docs/daily.md, step "sync"): `amem sync run --sink <sink>`,
+  incremental, 120 s budget each, for every sink that has its settings and is switched on (clickhouse, langfuse,
+  pastdev), at most once per local day, so ClickHouse Cloud can idle (cloud-activation.md: daily, not every 15
+  min). An unconfigured or switched-off sink is a skip; a failure is an `amem-daily-warn sync ...` line, never a
+  failed step, so it can never block the night. Stop one sink with its kill switch; there is no other schedule.
+- **past.dev source ids.** Since 2026-10-24 past.dev refuses a source id with `/` (HTTP 400 `id-invalid`), so
+  refs leave as `amem:<kind>:<id>` (`pastdev.wire`; `unwire` restores the ref). Links, dead letters and reviewed
+  sets keep the ref. The records the first `--replay` dead-lettered for `id-invalid` had no link, so the next run
+  sends them under the new ids and drops their dead letters. A reviewed set made before the change has other
+  payload hashes (the id is in the payload): make it again with `amem sync plan --sink pastdev --contents --json`.
+- **past.dev recall** is open for the investigator (config/rsi-evidence-providers.json, docs/rsi/evidence-providers.md):
+  one recall per evidence pack, at most 3 packs a night, 0.1 credit each.
+
 ## Ground rules (all steps)
 
 - **Supabase stays the only hub.** Sinks only read Supabase rows (as `amem_app`) and write their own links to
@@ -88,7 +106,7 @@ Behaviour to confirm at PD0 (the adapter's choices):
 
 | Integration | Stop | Remove data |
 |---|---|---|
-| ClickHouse | `AMEM_SYNC_CLICKHOUSE=off`, or remove the amem-ingest step | `docker compose down -v`; `delete from rsi_checkpoints where job = 'sync:clickhouse'` |
+| ClickHouse | `AMEM_SYNC_CLICKHOUSE=off` (the daily sync step then skips it) | `docker compose down -v`; `delete from rsi_checkpoints where job = 'sync:clickhouse'` |
 | Langfuse | `AMEM_SYNC_LANGFUSE=off` | `docker compose down -v`; delete the `rsi_evidence` rows with system `langfuse` and the cursor row |
 | past.dev | `AMEM_PASTDEV=off` | `pastdev.delete_all()` (deletes every recorded point), then delete the `rsi_evidence` rows with system `pastdev` and the cursor row |
 | NCM | nothing runs | delete the `rsi_evidence` rows with system `ncm` |

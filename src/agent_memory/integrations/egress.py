@@ -48,7 +48,10 @@ What a match does:
 A withheld name shorter than MIN_TEAM_TERM characters, and a generic placeholder that sessions_ingest.project_of
 gives to work outside a repo (`unknown`, `evals`, `scratch`, `home`, and `routine:*`) or a mask label (`team`,
 `private`), never becomes a term: those are not employer names, and as substrings they would null nearly every
-label. An explicit AMEM_EGRESS_DENY term is always used as given.
+label. Nor does an agent worktree's generated name (`agent-<hex id>`, AGENT_WORKTREE_RE): a subagent session that
+ran in `<repo>/.claude/worktrees/agent-<id>` was stored with that folder as its repo (sessions_ingest.repo_of, fixed
+2026-10-24), and as a term it is a substring of the session's own id `<parent>/agent-<id>`, so ClickHouse dropped
+the row (sessions parity off by 8). An explicit AMEM_EGRESS_DENY term is always used as given.
 
 Langfuse's `sensitive(text)` has no connection, so the Langfuse sink stores the names it read for this
 process with `use_team_names` (replaced on every run); `current()` joins them with the env terms.
@@ -69,6 +72,7 @@ from agent_memory import config as amem_config
 DENY_ENV = "AMEM_EGRESS_DENY"
 MIN_TEAM_TERM = 3
 GENERIC_NAMES = frozenset({"unknown", "evals", "scratch", "home", "team", "private", "global"})
+AGENT_WORKTREE_RE = re.compile(r"agent-[0-9a-f]{8,40}")      # a Claude Code agent's worktree folder: generated
 EMAIL_RE = re.compile(r"[^@\s/]+@[^@\s/]+\.[A-Za-z]{2,}")
 
 # ---------------------------------------------------------------- ownership (F8)
@@ -175,7 +179,8 @@ def team_terms(names: Iterable[Any]) -> Deny:
     out = set()
     for n in names:
         t = str(n or "").strip().lower()
-        if len(t) >= MIN_TEAM_TERM and t not in GENERIC_NAMES and not t.startswith("routine:"):
+        if len(t) >= MIN_TEAM_TERM and t not in GENERIC_NAMES and not t.startswith("routine:") \
+                and not AGENT_WORKTREE_RE.fullmatch(t):
             out.add(t)
     return Deny(tuple(sorted(out)))
 

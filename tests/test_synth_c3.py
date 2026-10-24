@@ -173,9 +173,11 @@ def test_c3_passes_every_step_against_a_correct_fake(fresh: tuple[str, dict[str,
     assert plan["send"] == len(send) == 8 and plan["plan"]["refused"] == 4 == len(pd["refuse_team"] + pd["refuse_private"])
     assert plan["estimate"]["credits"] == plan["local_credits"] >= len(send)
     (est, est_change) = pdev.svc.requests_to("POST", "/api/v1/ingest/estimate")
-    assert sorted(it["id"] for it in est.json["items"]) == send                    # only the planned sanitized set
+    assert sorted(PD.unwire(it["id"]) for it in est.json["items"]) == send         # only the planned sanitized set
+    assert all("/" not in it["id"] for it in est.json["items"])                      # wired ids (2026-10-24)
     first = pdev.ingest_requests()[:8]
-    assert sorted(it["id"] for r in first for it in r.json["items"]) == send and all(len(r.json["items"]) == 1 for r in first)
+    assert sorted(PD.unwire(it["id"]) for r in first for it in r.json["items"]) == send and \
+        all(len(r.json["items"]) == 1 for r in first)
     assert est.json["items"] == [it for r in first for it in r.json["items"]]       # the estimate priced what was sent
     sr = steps["sync_run"]["data"]
     assert sr["ingestions"] == 8 and sr["receipts"] == {"202": 8} and sr["links"] == 8 and sr["settled"] is True
@@ -184,7 +186,7 @@ def test_c3_passes_every_step_against_a_correct_fake(fresh: tuple[str, dict[str,
     assert dup["second_run"] == {"rows": 0, "sends": 0}
     assert dup["replay"] == {"requests": 8, "new_ingestions": 0, "credits": 0.0}
     assert dup["change"]["credits"] == dup["change"]["local_credits"] == dup["change"]["estimate"] >= 1
-    assert est_change.json["items"][0]["id"] == dup["change"]["ref"] and "C3 duplicate check" in \
+    assert est_change.json["items"][0]["id"] == PD.wire(dup["change"]["ref"]) and "C3 duplicate check" in \
         est_change.json["items"][0]["content"]
     fp = steps["failure_path"]["data"]
     assert fp["bad_host"]["status"] == "unavailable"

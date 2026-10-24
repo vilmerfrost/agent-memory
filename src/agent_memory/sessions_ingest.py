@@ -339,12 +339,15 @@ def work_cwd(cwds: list[str], project: str = "") -> tuple[str, bool]:
 
 
 def repo_of(cwd: str) -> str | None:
-    """The repo a cwd belongs to: `<...>/worktrees/<repo>/<name>` -> repo, else the basename.
-    None for no cwd or the home folder."""
+    """The repo a cwd belongs to: `<repo>/.claude/worktrees/<name>` (Claude Code's own worktrees) -> repo,
+    `<...>/worktrees/<repo>/<name>` -> repo, else the basename. None for no cwd or the home folder."""
     if not cwd:
         return None
     path = Path(cwd)
     parts = path.parts
+    for i in range(len(parts) - 2, 1, -1):          # as project_of: before 2026-10-24 this gave `agent-<id>`
+        if parts[i] == "worktrees" and parts[i - 1] == ".claude":
+            return parts[i - 2]
     if "worktrees" in parts:
         i = len(parts) - 1 - parts[::-1].index("worktrees")
         if i + 1 < len(parts):

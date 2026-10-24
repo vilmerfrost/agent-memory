@@ -23,6 +23,7 @@ import pytest
 from psycopg import sql
 from psycopg.types.json import Jsonb
 
+from agent_memory import sessions_ingest
 from agent_memory.integrations import clickhouse as CH, egress, evidence as E, sync
 from integrations_mock import MockService, Request
 
@@ -795,6 +796,32 @@ def test_unknown_ownership_ships_private_everywhere(seed: Seed, pg_url: str, app
                                      "deviations": {"own": 10, "team": 0, "private": 6},
                                      "skill_calls": {"own": 1, "team": 0, "private": 4}}
     assert (sink.masked["team"], sink.masked["private"], sink.masked["owner_accounts"]) == (0, 15, ["vilmerfrost"])
+
+
+def test_a_subagent_session_named_after_its_own_worktree_is_sent(seed: Seed, pg_url: str, app: str,
+                                                                  fake: FakeClickHouse) -> None:
+    """2026-10-24: sessions parity was off by 8. Subagent sessions that ran in Claude Code's own worktrees
+    (`<repo>/.claude/worktrees/agent-<id>`) were stored with repo = `agent-<id>` (sessions_ingest.repo_of took the
+    folder after `worktrees`) and no known remote (the worktree is gone), so private. Their repo name became a
+    withheld term, which is a substring of the session's own id `<parent>/agent-<id>`: map_row dropped the row
+    while `amem sync verify` counted it. A sibling in another worktree (repo `agent-memory`) was sent."""
+    parent = "7ff5f480-77aa-496c-9b6a-bd96d4d4c395"
+    lost, sibling = f"{parent}/agent-a0846dac3b03cb2f4", f"{parent}/agent-a831fa63c89294d84"
+    created = seed.now - timedelta(hours=2)
+    with psycopg.connect(pg_url) as conn:
+        seed.session(conn, lost, repo="agent-a0846dac3b03cb2f4", project="agent-memory", meta=Jsonb({}),
+                     created=created)
+        seed.session(conn, sibling, created=created)
+    sink = CH.ClickHouseSink(client_for(fake.svc.url))
+    with psycopg.connect(app) as conn:
+        assert sync.run(sink, conn, replay=True, environ={}).status == "ok"
+        rep = CH.verify(conn, 3, client=client_for(fake.svc.url))
+    sessions = fake.by_id("sessions")
+    assert {lost, sibling} <= set(sessions) and sink.dropped.get("sessions", 0) == 0
+    assert (sessions[lost]["project"], sessions[lost]["repo"]) == ("private", "private")      # still masked
+    assert rep.parity and rep.mismatches() == []
+    assert sessions_ingest.repo_of("/Users/x/Projects/agent-memory/.claude/worktrees/agent-a0846dac3b03cb2f4") == \
+        "agent-memory"
 
 
 def test_plan_contents_previews_the_exact_rows_read_only(seed: Seed, pg_url: str, app: str, fake: FakeClickHouse,

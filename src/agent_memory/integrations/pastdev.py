@@ -45,8 +45,17 @@ Not verified (assumed): that `sourceId` echoes our `id` byte for byte (the docs 
 mismatch fails the batch); that GET /ingest/<nil uuid> answers 404 with a valid key and 401/403 without
 (the health check); that a recall `source.label` is the label we sent.
 
-Mapping (blueprint): id = the amem: ref, timestamp = the record time, label = the kind, identity = "rsi",
-no metadata (past.dev feeds metadata to memory extraction). The batch idempotencyKey is sha256 over the
+Mapping (blueprint): id = the record's amem: ref on the wire (`wire`: `amem:<kind>:<id>`, below), timestamp = the
+record time, label = the kind, identity = "rsi", no metadata (past.dev feeds metadata to memory extraction).
+
+Source ids on the wire (2026-10-24). past.dev now refuses a source id that holds '/' (HTTP 400 id-invalid: "Use
+another separator, such as ':' or '-'"), so a ref `amem:<kind>/<id>` leaves as `amem:<kind>:<id>` (`wire`) and comes
+back through `unwire` (ref ids never hold ':', sanitize.SAFE_REF_ID). Only the wire uses that form: the ingest item
+(`_item`, so `amem sync plan --contents` shows the exact payload), recall answers (map_recall unwires) and deletes.
+Links (rsi_evidence `past:<ref>`), dead letters and reviewed sets keep the ref. A link stores the id its data point
+has at past.dev (metrics.source_id); a link written before the change has none, and its data point (if any) holds the
+ref itself, so a delete sends that id, a --replay of the unchanged record sends nothing (a new id would duplicate it),
+and a changed record goes out under the new id with the old one kept as metrics.legacy_id, deleted with it. The batch idempotencyKey is sha256 over the
 canonical items only (so the 409 rule can never fire). It is content-based (Mission 004C, F5): a --replay of
 unchanged records sends the same key, so past.dev answers the stored receipt and ingests nothing new, and a
 re-send after a lost response is the same request. Each record's own sha256(content) is kept in its
@@ -119,6 +128,22 @@ DEAD = frozenset({FAILED, REJECTED})
 MAX_FREE_RETRIES = 3
 CAP_CODES = ("project-cap-reached", "spend-cap-reached")
 NOT_LIVE = "data-point-not-found"
+AMEM = "amem:"
+
+
+def wire(ref: str) -> str:
+    """The source id past.dev gets for an amem ref: `amem:<kind>/<id>` -> `amem:<kind>:<id>` (past.dev refuses '/'
+    since 2026-10-24). Anything else is returned as is."""
+    return AMEM + ref[len(AMEM):].replace("/", ":", 1) if ref.startswith(AMEM) else ref
+
+
+def unwire(sid: str) -> str:
+    """The amem ref for a past.dev source id (`amem:<kind>:<id>` -> `amem:<kind>/<id>`). An id that already holds
+    '/' (sent before 2026-10-24) or is not ours comes back unchanged."""
+    if not sid.startswith(AMEM) or "/" in sid:
+        return sid
+    kind, sep, rest = sid[len(AMEM):].partition(":")
+    return f"{AMEM}{kind}/{rest}" if sep and kind and rest else sid
 
 
 # ---------------------------------------------------------------- config and HTTP
@@ -176,6 +201,8 @@ class Client:
         return _obj(self._call("POST", "/recall", body).json())
 
     def delete(self, ids: list[str]) -> dict[str, Any]:
+        """`ids` are past.dev source ids as stored (live_ids: the wired id, or the ref for a link written before
+        2026-10-24), not refs: a ref alone does not say which id its data point has."""
         return _obj(self._call("POST", "/data-points/delete", {"ids": ids}).json())
 
     def estimate(self, items: list[dict[str, Any]]) -> dict[str, Any]:
@@ -432,7 +459,19 @@ def _evidence(sid: str, metrics: dict[str, Any], summary: str | None = None) -> 
         return None
 
 
-LINK_KEYS = ("sha256", "kind", "status", "ingestion_id", "retries", "unchanged", "failure")
+LINK_KEYS = ("sha256", "kind", "status", "ingestion_id", "retries", "unchanged", "failure", "source_id", "legacy_id")
+
+
+def live_ids(ref: str, metrics: Mapping[str, Any]) -> list[str]:
+    """The past.dev source ids a link's data point may have: metrics.source_id (the wired id), else the ref itself
+    (a link written before 2026-10-24, when the ref was the id), plus metrics.legacy_id (that older point, still live
+    after the record was re-sent under the wired id)."""
+    sid = metrics.get("source_id")
+    out = [sid if isinstance(sid, str) and sid else ref]
+    old = metrics.get("legacy_id")
+    if isinstance(old, str) and old and old not in out:
+        out.append(old)
+    return out
 
 
 def _link(ref: str, content: str, metrics: Mapping[str, Any]) -> EvidenceRef:
@@ -452,8 +491,8 @@ def _key(items: list[dict[str, Any]]) -> str:
 
 
 def _item(rec: Record, content: str) -> dict[str, Any]:
-    """The exact ingest item for one record (the only shape that leaves; no metadata)."""
-    return {"id": rec.ref, "content": content, "timestamp": _ts(rec.at), "label": rec.fields["kind"],
+    """The exact ingest item for one record (the only shape that leaves; no metadata). The id is the wired ref."""
+    return {"id": wire(rec.ref), "content": content, "timestamp": _ts(rec.at), "label": rec.fields["kind"],
             "identity": IDENTITY}
 
 
@@ -630,7 +669,8 @@ class PastDevSink:
         for i in range(0, len(gone), DELETE_MAX):
             part = gone[i:i + DELETE_MAX]
             evs = [ev for sid in part if (ev := _evidence(sid, {"deleted": True, "deleted_at": now})) is not None]
-            yield sync.Batch(RETRACT, [{"id": sid} for sid in part], f"{now}|{part[-1]}", evs)
+            yield sync.Batch(RETRACT, [{"id": sid, "ids": live_ids(sid, links[sid])} for sid in part],
+                             f"{now}|{part[-1]}", evs)
         # 2. send: a record whose link is missing or holds another hash; a deleted id is retired for good.
         #    Same hash: a running ingestion is checked by its id (3), a dead-lettered one waits for new content,
         #    a sent one goes again only on --replay (same key: past.dev answers the stored receipt).
@@ -646,23 +686,28 @@ class PastDevSink:
                     states[ref] = "retired"
                     continue
                 sha = _sha(content)
+                # a link from before 2026-10-24 (no source_id): its data point, if any, has the ref as its id
+                legacy = bool(link) and not link.get("source_id")
                 if link.get("sha256") == sha:
                     iid = _ingestion_id(link.get("ingestion_id"))
                     if link.get("status") == QUEUED and iid:
                         pending.setdefault(iid, []).append(_link(rec.ref, content, link))
                         states[ref] = "check"
                         continue
-                    if link.get("status") in DEAD or (link.get("status") in SENT and not replay):
+                    # a replay re-sends a sent record under the same key, except one sent under the old id: under
+                    # the wired id it would be a second data point, so it stays as it is
+                    if link.get("status") in DEAD or (link.get("status") in SENT and (not replay or legacy)):
                         states[ref] = "dead-lettered" if link.get("status") in DEAD else "already-sent"
                         continue
                 if table not in self.tables or (self.since is not None and rec.at < self.since):
                     continue                                    # out of this run's scope (F4)
-                todo.append((rec, content, sha))
+                old = link.get("legacy_id") or (ref if legacy else None)
+                todo.append((rec, content, {"sha256": sha, "status": QUEUED, "source_id": wire(ref), "legacy_id": old}))
                 states[ref] = "send"
             for i in range(0, len(todo), self.batch_max):
                 part = todo[i:i + self.batch_max]
                 items = [_item(rec, content) for rec, content, _ in part]
-                evs = [_link(rec.ref, content, {"sha256": sha, "status": QUEUED}) for rec, content, sha in part]
+                evs = [_link(rec.ref, content, m) for rec, content, m in part]
                 last = part[-1][0]
                 yield sync.Batch(table, items, f"{_ts(last.at)}|{last.ref}", evs, _key(items))
         # 3. check: one batch per still-running ingestion; no rows, no content, one free GET (and maybe a retry)
@@ -678,12 +723,12 @@ class PastDevSink:
         that would leave, its sha256 (payload_sha256), its class and its local credit and size estimate. A
         retraction or an ingestion check carries no content: only the refs and the action."""
         if batch.table == RETRACT:
-            return [{"action": "delete", "ref": r["id"]} for r in batch.rows]
+            return [{"action": "delete", "ref": r["id"], "ids": list(r.get("ids") or [r["id"]])} for r in batch.rows]
         if batch.table == CHECK:
             return [{"action": "check", "ref": ev.subject_refs[0], "ingestion_id": batch.key}
                     for ev in batch.evidence if ev.subject_refs]
-        return [{"ref": it["id"], "table": batch.table, "class": self.classes.get(it["id"], ("", egress.PRIVATE))[1],
-                 "payload": dict(it), "sha256": payload_sha256(it), "bytes": len(str(it["content"]).encode("utf-8")),
+        return [{"ref": unwire(it["id"]), "table": batch.table,
+                 "class": self.classes.get(unwire(it["id"]), ("", egress.PRIVATE))[1], "payload": dict(it), "sha256": payload_sha256(it), "bytes": len(str(it["content"]).encode("utf-8")),
                  "credits": local_credits([it])} for it in batch.rows]
 
     def refused_records(self) -> list[dict[str, Any]]:
@@ -697,8 +742,12 @@ class PastDevSink:
         if batch.table in (RETRACT, CHECK):
             return [batch]
         return [sync.Batch(batch.table, [item], batch.watermark,
-                           [e for e in batch.evidence if e.ref == f"past:{item.get('id')}"], _key([item]))
+                           [e for e in batch.evidence if e.ref == f"past:{unwire(str(item.get('id')))}"], _key([item]))
                 for item in batch.rows]
+
+    def dead_key(self, row: Mapping[str, Any]) -> str:
+        """sync's dead-letter key for one row: the record's ref (an ingest item carries the wired id)."""
+        return unwire(str(row.get("id") or ""))
 
     def push(self, batch: sync.Batch) -> None:
         if switched_off(self._environ):
@@ -706,7 +755,7 @@ class PastDevSink:
         if self.client is None:
             raise RuntimeError("not configured")
         if batch.table == RETRACT:
-            delete_ids(self.client, [r["id"] for r in batch.rows])
+            delete_ids(self.client, [i for r in batch.rows for i in (r.get("ids") or [r["id"]])])
             return
         if batch.table == CHECK:                        # a running ingestion: one free GET, never a re-send
             retries = max((int(ev.metrics.get("retries") or 0) for ev in batch.evidence), default=0)
@@ -789,14 +838,18 @@ def delete_all(conn: psycopg.Connection, client: Client | None = None, *,
     client = client or _client(config(environ), None, time.sleep)
     if client is None:
         raise RuntimeError(f"past.dev is not configured ({KEY_ENV})")
-    live = {sid for sid, m in _links(conn).items() if not m.get("deleted")}
+    links = {sid: m for sid, m in _links(conn).items() if not m.get("deleted")}
+    live = set(links)
     wanted = None if refs is None else set(refs)
-    ids = sorted(live if wanted is None else live & wanted)
+    # each link's data point ids (live_ids: the wired id, or the ref for a link written before 2026-10-24)
+    owner = {pid: ref for ref in sorted(live if wanted is None else live & wanted) for pid in live_ids(ref, links[ref])}
+    ids = sorted(owner)
 
     def mark(part: list[str]) -> None:
         conn.execute("update rsi_evidence set metrics = metrics || %s, observed_at = now() "
                      "where system = 'pastdev' and external_ref = any(%s)",
-                     (Jsonb({"deleted": True, "deleted_at": _ts(datetime.now(UTC))}), [f"past:{s}" for s in part]))
+                     (Jsonb({"deleted": True, "deleted_at": _ts(datetime.now(UTC))}),
+                      sorted({f"past:{owner[s]}" for s in part})))
         conn.commit()
 
     deleted, gone, calls = delete_ids(client, ids, done=mark)
@@ -845,6 +898,7 @@ def map_recall(res: Mapping[str, Any]) -> list[EvidenceRef]:
     for r in rows:
         for s in r.get("sources") or []:
             sid = s.get("sourceId") if isinstance(s, Mapping) else None
+            sid = unwire(sid) if isinstance(sid, str) else sid       # the wired id back to its ref
             if not _ours(sid) or sid in seen:
                 continue
             seen.add(sid)
