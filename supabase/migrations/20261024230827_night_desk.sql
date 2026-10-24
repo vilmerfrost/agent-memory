@@ -32,6 +32,7 @@ create index if not exists ledger_events_time_idx on public.ledger_events (occur
 
 create or replace view public.dashboard_sessions with (security_invoker = true) as
  select session_id, kind, repo, started_at, ended_at, scanned_at, created_at from public.sessions;
+grant select on public.dashboard_sessions to amem_app;
 
 create or replace function public.amem_request_undo_owner(edit_id uuid) returns text
 language plpgsql security definer set search_path = '' as $$
