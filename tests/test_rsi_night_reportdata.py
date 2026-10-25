@@ -6,6 +6,7 @@ task (experiments[].judge_pairs). Same disposable Postgres, temp HOME and fakes 
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -18,7 +19,7 @@ from rsi_night_support import (KEY_A, KEY_B, RULE_A, RULE_B, FakeReplayer, adapt
                                rows, seed_rule, strip_agent_env)
 
 NIGHT = "2026-10-18"
-REAL_NIGHTS = Path.home() / "sandbox" / "nights"
+REAL_NIGHTS = Path(os.environ.get("AMEM_REAL_NIGHTS") or Path.home() / "sandbox" / "nights")   # real reports, read only
 
 
 @pytest.fixture
