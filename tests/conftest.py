@@ -15,6 +15,8 @@
 - The SDK client is replaced by a tripwire, so no test can make a live Jev call.
 - `pg_url` starts one throwaway Postgres container per session on an OS-assigned
   port (never a fixed port: other worktrees run in parallel) and removes it after.
+  Its data dir is tmpfs (no Docker volume), and each session first removes the
+  containers of earlier runs that were killed before their teardown.
 """
 
 from __future__ import annotations
@@ -117,12 +119,42 @@ def _docker(*args: str) -> str:
     return subprocess.run(["docker", *args], check=True, capture_output=True, text=True, timeout=300).stdout.strip()
 
 
+# Every test container carries the pid of the pytest process that started it.
+OWNER_LABEL = "agent-memory.test-owner-pid"
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _sweep_orphan_containers() -> None:
+    """Remove test containers whose pytest process is gone (killed before its teardown ran).
+
+    Containers of live runs in other worktrees keep their owner pid, so they stay.
+    """
+    rows = _docker("ps", "-a", "--filter", f"label={OWNER_LABEL}",
+                   "--format", f'{{{{.ID}}}} {{{{.Label "{OWNER_LABEL}"}}}}').splitlines()
+    for row in rows:
+        container, _, owner = row.partition(" ")
+        if not owner.isdigit() or not _pid_alive(int(owner)):
+            subprocess.run(["docker", "rm", "-f", "-v", container], capture_output=True, timeout=60)
+
+
 @pytest.fixture(scope="session")
 def pg_url() -> Iterator[str]:
     if shutil.which("docker") is None:
         pytest.skip("docker not installed")
+    _sweep_orphan_containers()
+    # The data dir is tmpfs, so Docker creates no volume for it: a killed run cannot leak one.
     container = _docker(
-        "run", "-d", "--rm", "-p", "127.0.0.1::5432", "-e", "POSTGRES_PASSWORD=postgres", PG_IMAGE
+        "run", "-d", "--rm", "-p", "127.0.0.1::5432", "-e", "POSTGRES_PASSWORD=postgres",
+        "--tmpfs", "/var/lib/postgresql/data", "--label", f"{OWNER_LABEL}={os.getpid()}", PG_IMAGE
     )
     try:
         mapping = _docker("port", container, "5432/tcp").splitlines()[0]  # e.g. 127.0.0.1:55012
@@ -142,7 +174,8 @@ def pg_url() -> Iterator[str]:
         assert result.returncode == 0, result.stderr
         yield url
     finally:
-        subprocess.run(["docker", "rm", "-f", container], capture_output=True, timeout=60)
+        # -v: `rm -f` on a running container skips --rm, so the image's anonymous data volume would stay.
+        subprocess.run(["docker", "rm", "-f", "-v", container], capture_output=True, timeout=60)
 
 
 @pytest.fixture
