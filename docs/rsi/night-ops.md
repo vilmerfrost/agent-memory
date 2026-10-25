@@ -178,7 +178,10 @@ verifies (and matches the database copy); every required evaluation passes; the 
 the hash says `improves` from an independent judge (Codex or Claude, at least one pair judged) and live Jev that
 answered; and the database holds a pending proposal for exactly that hash. Otherwise the brief prints
 "Apply: not offered: <reasons>" and the block says "staged, NOT ready to apply". NO_EFFECT, WORSE and INCONCLUSIVE
-experiments are never staged and never show Apply. Reject and Details always stay. The brief job never pushes.
+experiments are never staged and never show Apply. Reject and Details always stay. The scheduled brief job sends
+one short phone push of the night's result (`alerts.push_night`, since 2026-10-25) when there is something to say:
+the night was skipped or partly ran, an idea was tested, or a decision waits. A quiet night sends nothing.
+`--no-push` and direct `run_brief_job` calls send nothing. A failed push is a note on the line, not a failed brief.
 
 ## Rehearsals
 

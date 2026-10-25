@@ -49,6 +49,11 @@ every step failed on that). The steps run either way.
    unless `AMEM_EDITS_LIVE=1`; the launchd job sets it. Kept edits are pushed with an Undo
    button (not with `--no-push`). Any candidate error fails the step; the others still run.
    (The `lessons distill` step after scoring is frozen: off unless `AMEM_DISTILL_LIVE=1`.)
+   Then **alerts** (`alerts.py`, since 2026-10-25): one phone reminder for each staged proposal that expires within
+   30 hours (its Reject / Review tokens are re-armed, so the reminder's buttons work), and one push for slips of the
+   safety rules (approval without handing work back, safety guards, push and merge policy) from the last 3 days.
+   Each is sent once (`rsi_proposals.meta.reminded`, `deviations.meta.alert`). Not with `--no-push`. A failure is a
+   **warning**, never a failed step: an alert must not block the night.
    Then, last, **sync** (daily, since 2026-10-24; docs/integrations/activation.md): `sync run --sink <sink>`
    (incremental, a 120 s budget each, plus the sink's client-side daily limits) for every sink that has its
    settings and is switched on: clickhouse (`AMEM_CLICKHOUSE_URL`/`_USER`/`_KEY`), langfuse (`AMEM_LANGFUSE_HOST`/
