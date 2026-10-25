@@ -2,19 +2,20 @@
   "format": "rsi-night-config/1",
   "_note": "Subscription qualification profile. Inactive until dedicated login, client isolation and live qualification pass. No API fallback. Promotion freeze unchanged.",
   "budget": {
+    "_limits_note": "3 experiments per night (Vilmer, 2026-10-25). Per night: model_calls, max_sandbox_runs, wall_clock_s, max_usd, max_subscription_tokens. Per candidate: max_hypotheses. Per replay: max_ab_pairs. One shared-skill experiment at most: Opus 7, Sol 12, Jev 2, 108 sandbox runs, 5460 s; the night adds 5 Jev triage calls and 600 s. `amem rsi night-job --plan` prints the room check.",
     "max_hypotheses": 2,
-    "max_experiments": 1,
+    "max_experiments": 3,
     "max_ab_pairs": 6,
-    "max_sandbox_runs": 128,
-    "wall_clock_s": 2700,
+    "max_sandbox_runs": 360,
+    "wall_clock_s": 17100,
     "max_usd": 1.0,
     "model_retries": 0,
     "default_model_calls": 0,
     "free_model_calls": 200,
     "model_calls": {
-      "jev-1.14.0": 7,
-      "claude-opus-5-5": 7,
-      "gpt-6.1-sol": 12
+      "jev-1.14.0": 12,
+      "claude-opus-5-5": 23,
+      "gpt-6.1-sol": 40
     },
     "cost_estimate_usd": {
       "jev-1.14.0": 0.01,
@@ -25,7 +26,7 @@
       "claude-opus-5-5",
       "gpt-6.1-sol"
     ],
-    "max_subscription_tokens": 2000000
+    "max_subscription_tokens": 6000000
   },
   "stages": {
     "triage": "live",

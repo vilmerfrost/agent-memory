@@ -70,6 +70,16 @@ G2B_MEASURED_USD = {"claude-haiku-5-5": round(0.008122 / 6, 6),     # 6 agent ru
                     "gpt-6-luna": round(0.005275 / 3, 6),           # 3 Codex judge calls, tokens x price table
                     "jev-1.14.0": 0.01}                             # 1 Jev call, flat table price
 
+# The paid plan's `room`: what one experiment can take at most, from the code's own limits. Model stages count at
+# their full timeout (hypothesizer and staging timeout_s, each case's timeout_s capped by rsi_replay's container
+# limit, rsi_replay.JUDGE_TIMEOUT_S). The allowances below cover the steps that wait on no model.
+CHECK_RUN_S = 10            # a hidden check is a deterministic script: < 1 s per run on night 2026-10-24 (cap 300 s)
+JEV_CALL_S = 30             # one Jev call: the TypeSafe SDK's 10 s per HTTP operation, a few operations
+NIGHT_OVERHEAD_S = 600      # once per night: delta, pool, triage, evidence packs (all of it took 37 s on 2026-10-24)
+# Observed subscription tokens one experiment may use: the stop approved for one experiment (2026-10-25). The
+# qualification replays used about 163k for both providers together (docs/rsi/subscription-migration.md).
+SUBSCRIPTION_TOKENS_PER_EXPERIMENT = 2_000_000
+
 
 @dataclass(frozen=True)
 class Prereq:
@@ -386,12 +396,21 @@ def paid_plan(cfg: Any, *, cases: int | None = None) -> dict[str, Any]:
     pairs = n_cases * reps
     exps = b.max_experiments
     rows: list[dict[str, Any]] = []
+    per_exp: dict[str, int] = {}       # model -> the calls one experiment can make
+    per_night: dict[str, int] = {}     # model -> the calls made once per night (triage)
 
     def per_call_cap(model: str) -> float:
         est = b.estimate(model)
         return est if est > 0 else prices.estimate(model)
 
-    def add(stage: str, model: str, count: int, *, cap: float | None = None, note: str = "") -> None:
+    def add(stage: str, model: str, each: int, *, cap: float | None = None, note: str = "",
+            once: bool = False) -> None:
+        """`each`: calls per experiment (once=True: per night)."""
+        if each <= 0:
+            return
+        book = per_night if once else per_exp
+        book[model] = book.get(model, 0) + each
+        count = each if once else each * exps
         if count <= 0:
             return
         call_cap = b.call_cap(model) if stage not in ("replay-agent",) else None
@@ -411,23 +430,25 @@ def paid_plan(cfg: Any, *, cases: int | None = None) -> dict[str, Any]:
 
     jev_model = "jev-1.14.0"
     if st["triage"] == "live":
-        add("triage", jev_model, int(cfg.candidates["max_considered"]), note="one Jev call per candidate considered")
+        add("triage", jev_model, int(cfg.candidates["max_considered"]), once=True,
+            note="one Jev call per candidate considered")
     if st["hypothesizer"] == "claude-cli":
         from agent_memory import edits_writer
-        add("hypothesize", str(cfg.hypothesizer.get("model") or edits_writer.writer_model()), exps,
+        add("hypothesize", str(cfg.hypothesizer.get("model") or edits_writer.writer_model()), 1,
             note="host `claude -p`, no tools, hooks off; pending hypotheses from an earlier night need no call")
     if st["implementer"] in ("claude", "codex"):
-        add("implement", str(cfg.implementer.get("model") or st["implementer"]), exps, note="sandbox arm I")
+        add("implement", str(cfg.implementer.get("model") or st["implementer"]), 1, note="sandbox arm I")
     if st["replay_agent"] in ("claude", "codex"):
         for provider, settings in (profiles or {st["replay_agent"]: rp}).items():
             model = str(settings.get("model") or provider)
             cap = float(settings.get("max_budget_usd")) if provider == "claude" and settings.get("max_budget_usd") else None
-            add("replay-agent", model, 2 * pairs * exps, cap=cap,
+            add("replay-agent", model, 2 * pairs, cap=cap,
                 note=f"{provider}: {pairs} A/B pairs; providers are compared separately, depending on target")
     if st["judge"] in ("codex", "claude"):
-        add("replay-judge", str(rp.get("judge_model") or st["judge"]), pairs * exps * provider_count, note="one blind judge call per pair")
+        add("replay-judge", str(rp.get("judge_model") or st["judge"]), pairs * provider_count, note="one blind judge call per pair")
     if st["replay_jev"] == "live":
-        add("replay-jev", jev_model, exps * provider_count, note="one Jev call per provider replay")
+        add("replay-jev", jev_model, provider_count, note="one Jev call per provider replay")
+    room = night_room(cfg, pairs=pairs, per_exp=per_exp, per_night=per_night)
     expected = [r["expected_usd"] for r in rows]
     exp_total = round(sum(x for x in expected if x is not None), 6)
     worst_total = round(sum(r["worst_usd"] for r in rows), 6)
@@ -439,7 +460,7 @@ def paid_plan(cfg: Any, *, cases: int | None = None) -> dict[str, Any]:
             "worst_case_usd": worst_total, "budget_stops_at_usd": b.max_usd,
             "within_cap": worst_total <= b.max_usd + 1e-9, "prices": prices.describe(),
             "max_subscription_tokens": b.max_subscription_tokens,
-            "subscription_models": list(b.subscription_models),
+            "subscription_models": list(b.subscription_models), "room": room,
             "basis_note": "expected = G2b measured per call (Haiku CLI-reported, Codex tokens x price table, Jev flat); "
                           "worst = the budget's pre-call estimate or the per-run CLI cap. The budget refuses a call "
                           "whose estimate would pass max_usd and stops after any call that crossed it, so a night can "
@@ -447,9 +468,71 @@ def paid_plan(cfg: Any, *, cases: int | None = None) -> dict[str, Any]:
                           "--max-budget-usd; the Codex judge has no per-call cap: its sandbox key is spend-capped)."}
 
 
+def night_room(cfg: Any, *, pairs: int, per_exp: Mapping[str, int], per_night: Mapping[str, int]) -> dict[str, Any]:
+    """Whether the night's caps leave room for `max_experiments` experiments, each at its worst case.
+
+    `pairs`: A/B pairs per provider replay. `per_exp` / `per_night`: model calls per experiment / once per night
+    (paid stages only; free stand-ins have `free_model_calls`). Per-night caps (calls, sandbox runs, wall clock,
+    subscription tokens) must cover max_experiments x one experiment; `max_ab_pairs` is per replay and must cover
+    one. The night itself stops at the experiment cap (rsi_night runs at most one experiment per candidate)."""
+    from agent_memory import rsi_replay
+    b, st, rp = cfg.budget, cfg.stages, cfg.replay
+    exps = b.max_experiments
+    base = {k: v for k, v in rp.items() if k != "provider_profiles"}
+    profiles = rp.get("provider_profiles") or {st["replay_agent"]: {}}
+    limit = int(rsi_replay.DEFAULT_LIMITS["timeout_s"])
+    case_s = min(max((int(c.timeout_s) for c in rsi_replay.load_cases(rp.get("cases"))), default=limit), limit)
+    live_agent, live_judge = st["replay_agent"] in ("claude", "codex"), st["judge"] in ("codex", "claude")
+    # one experiment: wall clock (each model stage at its timeout) and container runs
+    secs = {"hypothesize": float(cfg.hypothesizer.get("timeout_s") or 600) if st["hypothesizer"] == "claude-cli" else 0.0,
+            "implement": float(cfg.implementer.get("timeout_s") or 900) if st["implementer"] in ("claude", "codex") else 0.0,
+            "stage": float(cfg.staging.get("timeout_s") or 600), "replay": 0.0}
+    runs = 0
+    for settings in profiles.values():
+        s = {**base, **settings}
+        subscription = live_agent and s.get("auth_mode") == "subscription"
+        per_run = (int(s.get("max_tool_calls") or 8) if subscription else 1) + 1     # agent (tool) containers + check
+        runs += 2 * pairs * per_run + (pairs if live_judge and s.get("judge_auth_mode") != "subscription" else 0)
+        secs["replay"] += (2 * pairs * (case_s + CHECK_RUN_S) + (pairs * rsi_replay.JUDGE_TIMEOUT_S if live_judge else 0)
+                           + (JEV_CALL_S if st["replay_jev"] == "live" else 0))
+    one_s = sum(secs.values())
+    checks: list[dict[str, Any]] = []
+
+    def check(limit_name: str, need: float, cap: float, unit: str = "") -> None:
+        checks.append({"limit": limit_name, "need": need, "cap": cap, "unit": unit, "fits": need <= cap + 1e-9})
+
+    for model in sorted(set(per_exp) | set(per_night)):
+        check(f"calls {model}", per_night.get(model, 0) + exps * per_exp.get(model, 0), b.call_cap(model))
+    check("A/B pairs per experiment", pairs * len(profiles), b.max_ab_pairs)
+    check("sandbox runs", exps * runs, b.max_sandbox_runs)
+    check("wall clock", NIGHT_OVERHEAD_S + exps * one_s, b.wall_clock_s, "s")
+    if b.subscription_models:
+        check("subscription tokens", exps * SUBSCRIPTION_TOKENS_PER_EXPERIMENT, b.max_subscription_tokens)
+    return {"experiments": exps, "fits": all(c["fits"] for c in checks), "checks": checks,
+            "per_experiment": {"calls": dict(sorted(per_exp.items())), "ab_pairs": pairs * len(profiles),
+                               "sandbox_runs": runs, "wall_clock_s": one_s,
+                               "wall_clock_parts_s": secs, "case_timeout_s": case_s,
+                               **({"subscription_tokens": SUBSCRIPTION_TOKENS_PER_EXPERIMENT}
+                                  if b.subscription_models else {})},
+            "per_night": {"calls": dict(sorted(per_night.items())), "overhead_s": NIGHT_OVERHEAD_S}}
+
+
+def render_room(room: Mapping[str, Any]) -> list[str]:
+    one = room["per_experiment"]
+    out = [f"Room for {room['experiments']} experiment(s) "
+           + ("(every limit fits):" if room["fits"] else "(NOT every limit fits; the night stops at the first):"),
+           f"  one experiment at most: {one['sandbox_runs']} sandbox runs, {one['ab_pairs']} A/B pairs, "
+           f"{one['wall_clock_s']:g} s (model stages at their timeouts, case timeout {one['case_timeout_s']} s), calls "
+           + (", ".join(f"{m} {n}" for m, n in one["calls"].items()) or "none paid")]
+    for c in room["checks"]:
+        out.append(f"  - {c['limit']}: need {c['need']:g}{c['unit']} of {c['cap']:g}{c['unit']} "
+                   + ("fits" if c["fits"] else "DOES NOT FIT"))
+    return out
+
+
 def render_plan(plan: Mapping[str, Any]) -> str:
     out = [f"Paid plan for config {plan['config_sha256'][:12]} (prices {plan['prices']['version']}): "
-           f"{plan['max_experiments']} experiment(s), <= {plan['max_hypotheses']} hypotheses, "
+           f"{plan['max_experiments']} experiment(s), <= {plan['max_hypotheses']} hypotheses per candidate, "
            f"{plan['ab_pairs_per_experiment']} A/B pair(s) ({plan['cases']} case(s) x {plan['reps']} rep(s), cap "
            f"{plan['max_ab_pairs']}), retries {plan['model_retries']}, wall clock {plan['wall_clock_s']:g}s."]
     if not plan["calls"]:
@@ -467,6 +550,8 @@ def render_plan(plan: Mapping[str, Any]) -> str:
     out.append(plan["basis_note"])
     if plan.get("subscription_models"):
         out.append(f"Subscription token stop: {plan['max_subscription_tokens']} observed tokens. API totals exclude subscription usage. No API fallback.")
+    if plan.get("room"):
+        out += render_room(plan["room"])
     return "\n".join(out)
 
 

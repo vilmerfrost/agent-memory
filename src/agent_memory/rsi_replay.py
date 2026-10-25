@@ -73,6 +73,7 @@ JEV_MODES = ("fixture", "live", "none")
 CASE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
 DEFAULT_LIMITS = {"memory": "1g", "cpus": "1", "pids": 256, "timeout_s": 300}
 CHECK_LIMITS = {"memory": "512m", "cpus": "1", "pids": 128}
+JUDGE_TIMEOUT_S = 300        # one live judge call (rsi_schedule's paid plan budgets the wall clock with it)
 JUDGE_MODEL_DEFAULT = {"claude": "claude-sonnet-5-5", "codex": "gpt-6-luna"}
 MAX_PROMPT_ATTEMPT = 6000
 # Docker Desktop's file sharing caches each path's entry for about a second. A container that starts within
@@ -1105,7 +1106,7 @@ class _Replay:
             try:
                 result = sub.run(self.cfg.judge, prompt, model=model, effort=self.cfg.judge_effort,
                                  workspace=workspace.resolve(), arm_home=arm_home.resolve(),
-                                 timeout_s=self._timeout(300), auth=auth_for(self.cfg.judge, self.cfg.judge_auth, tools=False),
+                                 timeout_s=self._timeout(JUDGE_TIMEOUT_S), auth=auth_for(self.cfg.judge, self.cfg.judge_auth, tools=False),
                                  tools_allowed=False)
                 usage = usage_fields(result.usage)
                 answer = parse_judge_answer(result.text)
@@ -1131,7 +1132,7 @@ class _Replay:
             if self.cfg.judge_effort:
                 cmd += ["-c", f"model_reasoning_effort={self.cfg.judge_effort}"]
         rid = run_id_for(self.run_prefix, case, "J", rep)
-        res = self.container(rid, "J", entry + cmd, timeout_s=self._timeout(300), network=self.rs.NET_INTERNAL,
+        res = self.container(rid, "J", entry + cmd, timeout_s=self._timeout(JUDGE_TIMEOUT_S), network=self.rs.NET_INTERNAL,
                              ro_mounts=[(str(self.stage_dir / "agent"), "/mnt/agent"), (str(jdir), "/mnt/case")],
                              limits={"memory": "1g", "cpus": "1", "pids": 256},
                              credentials=self.cfg.judge_credentials, credential_name=self.cfg.judge_credential_name)

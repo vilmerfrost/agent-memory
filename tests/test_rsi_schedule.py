@@ -473,6 +473,68 @@ def test_cli_plan_runs_nothing(tmp_path: Path) -> None:
     assert not (tmp_path / "sandbox").exists() and not (tmp_path / ".claude").exists()
 
 
+SUBSCRIPTION = config.REPO_ROOT / "config" / "rsi-night.subscription.json"
+
+
+def room_needs(plan: dict[str, Any]) -> dict[str, tuple[float, float]]:
+    return {c["limit"]: (c["need"], c["cap"]) for c in plan["room"]["checks"]}
+
+
+def test_subscription_plan_has_room_for_three_experiments() -> None:
+    plan = S.paid_plan(N.load_config(SUBSCRIPTION))
+    one = plan["room"]["per_experiment"]
+    # one shared-skill experiment: 3 pairs per provider, each agent run 8 tool + 1 check containers, judge on subscription
+    assert one["calls"] == {"claude-opus-5-5": 7, "gpt-6.1-sol": 12, "jev-1.14.0": 2}
+    assert (one["ab_pairs"], one["sandbox_runs"], one["case_timeout_s"]) == (6, 108, 240)
+    assert one["wall_clock_parts_s"] == {"hypothesize": 300, "implement": 0, "stage": 300,
+                                         "replay": 2 * (6 * (240 + S.CHECK_RUN_S) + 3 * 300 + S.JEV_CALL_S)}
+    assert one["wall_clock_s"] == 5460
+    assert room_needs(plan) == {
+        "calls claude-opus-5-5": (21, 23), "calls gpt-6.1-sol": (36, 40), "calls jev-1.14.0": (5 + 6, 12),
+        "A/B pairs per experiment": (6, 6), "sandbox runs": (324, 360), "wall clock": (600 + 3 * 5460, 17100),
+        "subscription tokens": (6_000_000, 6_000_000)}
+    assert plan["room"]["fits"] and plan["max_experiments"] == 3 and plan["within_cap"]
+    text = S.render_plan(plan)
+    assert "Room for 3 experiment(s) (every limit fits):" in text and "- wall clock: need 16980s of 17100s fits" in text
+
+
+def test_room_flags_caps_sized_for_one_experiment(tmp_path: Path) -> None:
+    d = json.loads(SUBSCRIPTION.read_text())
+    d["budget"].update(max_sandbox_runs=128, wall_clock_s=2700, max_subscription_tokens=2_000_000,
+                       model_calls={"jev-1.14.0": 7, "claude-opus-5-5": 7, "gpt-6.1-sol": 12})
+    p = tmp_path / "old.json"
+    p.write_text(json.dumps(d))
+    plan = S.paid_plan(N.load_config(p))
+    failing = sorted(c["limit"] for c in plan["room"]["checks"] if not c["fits"])
+    assert failing == ["calls claude-opus-5-5", "calls gpt-6.1-sol", "calls jev-1.14.0", "sandbox runs",
+                       "subscription tokens", "wall clock"]
+    assert not plan["room"]["fits"] and "DOES NOT FIT" in S.render_plan(plan)
+    d["budget"]["max_experiments"] = 1                   # the same caps did fit one experiment, except the wall clock
+    p.write_text(json.dumps(d))
+    one = S.paid_plan(N.load_config(p))
+    assert [c["limit"] for c in one["room"]["checks"] if not c["fits"]] == ["wall clock"]
+
+
+def test_three_experiment_night_ends_an_hour_before_the_brief() -> None:
+    night, brief = load_plist("com.vilmerfrost.amem-rsi-night.plist"), load_plist("com.vilmerfrost.amem-rsi-brief.plist")
+    a = night["ProgramArguments"]
+    assert Path(a[a.index("--config") + 1]).name == SUBSCRIPTION.name
+    w = N.load_config(SUBSCRIPTION).budget.wall_clock_s
+    start = night["StartCalendarInterval"]["Hour"] * 60 + night["StartCalendarInterval"]["Minute"]
+    end = start + (w + S.HARD_GRACE_S + S.KILL_GRACE_S) / 60               # the watchdog's hard exit, at the latest
+    assert end <= brief["StartCalendarInterval"]["Hour"] * 60 + brief["StartCalendarInterval"]["Minute"] - 60
+
+
+def test_cli_plan_prints_the_room(tmp_path: Path) -> None:
+    e = base_env(HOME=str(tmp_path), RSI_SANDBOX_DIR=str(tmp_path / "sandbox"))
+    r = subprocess.run([AMEM, "rsi", "night-job", "--plan", "--config", str(SUBSCRIPTION), "--json"], env=e,
+                       capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, r.stderr
+    room = json.loads(r.stdout)["room"]
+    assert room["fits"] and room["experiments"] == 3
+    assert not (tmp_path / "sandbox").exists()
+
+
 # --------------------------------------------------------------------------- the launchd plists (files only)
 
 

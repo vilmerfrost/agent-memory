@@ -8,7 +8,8 @@ A deterministic Python orchestrator. Models are called only at fixed stages, thr
                     provider findings -> durable rsi_candidates rows (upsert by dedupe_key)
     S3 triage       Jev (fixture by default) answers typed questions; deterministic code ranks and selects
     S4 evidence     a bounded evidence pack for each selected candidate (untrusted-data envelope)
-    S5 hypotheses   at most two typed hypotheses (what / why / target from the allowlist); anything else rejected
+    S5 hypotheses   at most two typed hypotheses per candidate (what / why / target from the allowlist); anything
+                    else rejected. One experiment per candidate per night; the other hypothesis waits, pending
     S6 implement    the candidate file content (stub by default; Claude / Codex inside the sandbox)
                     staged with agent-config `improve stage` into $RSI_SANDBOX_DIR
     S7 replay       baseline vs candidate in the sandbox (rsi_replay.run_replay); the verdict is deterministic code
@@ -1713,7 +1714,10 @@ class Night:
             return
         for i, h in enumerate(hyps):
             later = hyps[i + 1:]
-            if self.budget.experiments_left() <= 0:
+            # One experiment per candidate per night. Triage gave each selected candidate one of tonight's slots, so
+            # a candidate's second hypothesis never takes another candidate's slot; it stays pending (stored by
+            # _experiment) and runs on a later night without a new model call.
+            if i > 0 or self.budget.experiments_left() <= 0:
                 self.report["experiments"].append(self._entry(None, c, h, refs, status="skipped_budget"))
                 continue
             try:
