@@ -495,7 +495,8 @@ def test_subscription_plan_has_room_for_three_experiments() -> None:
         "subscription tokens": (6_000_000, 6_000_000)}
     assert plan["room"]["fits"] and plan["max_experiments"] == 3 and plan["within_cap"]
     text = S.render_plan(plan)
-    assert "Room for 3 experiment(s) (every limit fits):" in text and "- wall clock: need 16980s of 17100s fits" in text
+    assert "Room for 3 experiment(s) (every limit fits):" in text and "- wall clock: need 16,980s of 17,100s fits" in text
+    assert "- subscription tokens: need 6,000,000 of 6,000,000 fits" in text
 
 
 def test_room_flags_caps_sized_for_one_experiment(tmp_path: Path) -> None:

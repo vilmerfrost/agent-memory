@@ -524,8 +524,11 @@ def render_room(room: Mapping[str, Any]) -> list[str]:
            f"  one experiment at most: {one['sandbox_runs']} sandbox runs, {one['ab_pairs']} A/B pairs, "
            f"{one['wall_clock_s']:g} s (model stages at their timeouts, case timeout {one['case_timeout_s']} s), calls "
            + (", ".join(f"{m} {n}" for m, n in one["calls"].items()) or "none paid")]
+    def num(x: float) -> str:
+        return f"{int(x):,}" if float(x).is_integer() else f"{x:,.1f}"
+
     for c in room["checks"]:
-        out.append(f"  - {c['limit']}: need {c['need']:g}{c['unit']} of {c['cap']:g}{c['unit']} "
+        out.append(f"  - {c['limit']}: need {num(c['need'])}{c['unit']} of {num(c['cap'])}{c['unit']} "
                    + ("fits" if c["fits"] else "DOES NOT FIT"))
     return out
 
