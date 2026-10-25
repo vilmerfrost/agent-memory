@@ -351,8 +351,7 @@ def triage_state(c: Mapping[str, Any], history: Sequence[str], in_scope: bool) -
 
 def heuristic_answers(c: Mapping[str, Any], history: Sequence[str], in_scope: bool) -> TriageAnswers:
     """Deterministic stand-in when Jev has no answer (missing fixture, error, or a dry run)."""
-    m = c.get("metrics") or {}
-    rec = max(int(c.get("seen_count") or 1), int(m.get("sessions") or 0), int(m.get("count") or 0))
+    rec = max(recurrence(c), int(_num((c.get("metrics") or {}).get("count")) or 0))
     impact = 2.0 if rec >= 5 else 1.0 if rec >= 2 else 0.0
     target = str(c.get("target") or "")
     risk = 0.0 if "/skills/" not in target and target.endswith(".md") else 1.0 if target.endswith(".md") else 2.0
@@ -360,14 +359,23 @@ def heuristic_answers(c: Mapping[str, Any], history: Sequence[str], in_scope: bo
     return TriageAnswers("experiment" if go else "wait", 1.0 if go else 0.0, impact, risk, 1.0, "heuristic")
 
 
+# Evidence `_attach_history` adds to a candidate: what was tried on it, not another occurrence of it.
+_HISTORY_REFS = ("amem:experiment/", "amem:eval_result/")
+
+
 def recurrence(c: Mapping[str, Any]) -> int:
-    """How often a candidate recurs: nights it was sighted or sessions it touched, whichever is larger."""
-    return max(int(c.get("seen_count") or 1), int(_num((c.get("metrics") or {}).get("sessions")) or 0))
+    """How often a candidate really happened: sessions it touched or distinct occurrences in its evidence (deviations,
+    failed runs), whichever is larger. Not `seen_count`: that counts nights that sighted it, and a night that re-sights
+    the same evidence is a re-check, not a recurrence. Evidence accumulates across nights; `metrics` covers one window."""
+    refs = {str(r) for r in c.get("evidence_refs") or [] if not str(r).startswith(_HISTORY_REFS)}
+    return max(1, int(_num((c.get("metrics") or {}).get("sessions")) or 0), len(refs))
 
 
 # `recurrence` in SQL, for ordering the pool in the database.
-RECURRENCE_SQL = ("greatest(seen_count, case when jsonb_typeof(metrics->'sessions') = 'number' "
-                  "then floor((metrics->>'sessions')::numeric) else 0 end)")
+RECURRENCE_SQL = ("greatest(1, case when jsonb_typeof(metrics->'sessions') = 'number' "
+                  "then floor((metrics->>'sessions')::numeric) else 0 end, "
+                  "(select count(distinct r) from unnest(evidence_refs) r where "
+                  + " and ".join(f"not starts_with(r, '{p}')" for p in _HISTORY_REFS) + "))")
 
 
 def rank(a: TriageAnswers, recurrence: int, history: Sequence[str], weights: Mapping[str, float]) -> float:
@@ -1271,13 +1279,6 @@ class Night:
                 self.notes.append(f"candidates: {fn.__name__.strip('_')} failed: {type(exc).__name__}")
         return out
 
-    def _window_days(self) -> int:
-        since = _parse_ts(self.since)
-        cap = int(self.cfg.candidates["window_days_max"])
-        if since is None:
-            return min(cap, 8)
-        return max(1, min(cap, math.ceil((datetime.now(UTC) - since).total_seconds() / 86400) + 1))
-
     def _in_scope(self, target: str | None) -> bool:
         return self._scoped(target) is not None
 
@@ -1295,16 +1296,20 @@ class Night:
         return real if real in self.allowlist else None
 
     def _deviation_sightings(self, delta: Any) -> list[Sighting]:
+        """A rule is sighted when tonight's delta has a new deviation for it. Its metrics and evidence cover the whole
+        look-back (`window_days_max`, by session start), not just the delta: a deviation is often found days after its
+        session, and an earlier session's deviation outside the delta is still an occurrence (`recurrence`)."""
         new = set(_ids(_dget(delta, "deviations")))
         if not new:
             return []
         from agent_memory import deviations
         out = []
-        for g in deviations.candidates(days=self._window_days(), db_url=self.db_url):
+        for g in deviations.candidates(days=int(self.cfg.candidates["window_days_max"]), db_url=self.db_url):
             ids = [str(i) for i in g.get("deviation_ids") or []]
             fresh = [i for i in ids if i in new]
             if not fresh or g.get("team"):
                 continue
+            known = fresh + [i for i in ids if i not in fresh]
             rule = g.get("rule_id") or g.get("instruction_ref")
             key = f"dev:{g['instruction_source']}:{rule}"
             target = next((s for s in map(self._scoped, g.get("target_paths") or []) if s),
@@ -1317,7 +1322,7 @@ class Night:
             title = _token(g.get("rule_title") or rule, 80)
             out.append(Sighting(
                 key, "deviations", "edit_instruction", target, f"{g['instruction_source']}:{rule}",
-                [f"amem:deviation/{i}" for i in fresh][:20], metrics,
+                [f"amem:deviation/{i}" for i in known][:20], metrics,
                 {"summary": f"{_token(g['instruction_source'], 60)} / {title}: {g.get('count')} deviations in "
                             f"{g.get('sessions')} sessions ({len(fresh)} new)",
                  "n": int(g.get("count") or 0), "sessions": int(g.get("sessions") or 0),
