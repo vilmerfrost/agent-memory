@@ -15,8 +15,10 @@
 -- ---------------------------------------------------------------------------------------------- tables
 create table if not exists public.rsi_passkeys (
     id            uuid primary key default gen_random_uuid(),
-    credential_id text not null unique check (credential_id ~ '^[A-Za-z0-9_-]{16,1400}$'),
-    public_key    text not null check (public_key ~ '^[A-Za-z0-9_-]{16,4000}$'),   -- base64url COSE key
+    credential_id text not null unique
+                  check (credential_id ~ '^[A-Za-z0-9_-]+$' and length(credential_id) between 16 and 1400),
+    public_key    text not null                                                    -- base64url COSE key
+                  check (public_key ~ '^[A-Za-z0-9_-]+$' and length(public_key) between 16 and 4000),
     sign_count    bigint not null default 0 check (sign_count >= 0),
     transports    text[] not null default '{}',
     device_type   text,
@@ -339,8 +341,9 @@ begin
   if e.expires_at <= now() then
     return 'expired';
   end if;
-  if p_credential_id is null or p_credential_id !~ '^[A-Za-z0-9_-]{16,1400}$' or p_public_key is null
-     or p_public_key !~ '^[A-Za-z0-9_-]{16,4000}$' or p_sign_count is null or p_sign_count < 0
+  if p_credential_id is null or p_credential_id !~ '^[A-Za-z0-9_-]+$' or length(p_credential_id) not between 16 and 1400
+     or p_public_key is null or p_public_key !~ '^[A-Za-z0-9_-]+$' or length(p_public_key) not between 16 and 4000
+     or p_sign_count is null or p_sign_count < 0
      or exists (select 1 from public.rsi_passkeys where credential_id = p_credential_id) then
     update public.rsi_web_challenges set used_at = now(), result = 'invalid' where id = c.id;
     return 'invalid';
