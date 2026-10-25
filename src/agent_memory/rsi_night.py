@@ -551,6 +551,39 @@ def _dget(obj: Any, name: str, default: Any = None) -> Any:
 
 
 _RETRIEVER = {"sb": "supabase", "ch": "clickhouse", "lf": "langfuse", "pd": "pastdev"}   # evidence step prefix
+MEASURED_SOURCES = ("clickhouse",)     # ok findings whose numbers the report keeps next to their ref
+EVIDENCE_DETAIL_MAX = 10
+
+
+def evidence_detail(findings: Sequence[Any]) -> dict[str, list[dict[str, Any]]]:
+    """What an experiment entry keeps of its evidence pack besides the supporting refs (evidence_refs):
+        evidence_measurements  per ok ClickHouse finding: ref, source, n, ts and its measurements (numbers and short
+                               labels only, through rsi_evidence_pack.report_measurements: nothing unscrubbed), so a
+                               reader can say "broken in 2 of 5 sessions that week" instead of showing a bare ref
+        unlinked_refs          findings that are context only (status unlinked: e.g. a past.dev record about another
+                               rule): ref, source and why. Never supporting evidence, never in evidence_refs.
+    At most EVIDENCE_DETAIL_MAX of each, in pack order."""
+    measured: list[dict[str, Any]] = []
+    unlinked: list[dict[str, Any]] = []
+    if not findings:
+        return {"evidence_measurements": measured, "unlinked_refs": unlinked}
+    from agent_memory.rsi_evidence_pack import report_measurements as clean   # lazy, as PackEvidence
+
+    for f in findings:
+        ref, src, st = _dget(f, "ref"), _dget(f, "source"), _dget(f, "status")
+        if not (isinstance(ref, str) and ref.strip() and isinstance(src, str)):
+            continue
+        if st == "ok" and src in MEASURED_SOURCES and len(measured) < EVIDENCE_DETAIL_MAX:
+            n, ts = _dget(f, "n"), clean({"ts": _dget(f, "ts")}).get("ts")
+            measured.append({"ref": ref[:200], "source": src,
+                             "n": n if isinstance(n, int) and not isinstance(n, bool) else None,
+                             "ts": ts if isinstance(ts, str) else None,
+                             "measurements": clean(_dget(f, "measurements") or {})})
+        elif st == "unlinked" and len(unlinked) < EVIDENCE_DETAIL_MAX:
+            why = _dget(f, "detail")
+            unlinked.append({"ref": ref[:200], "source": src,
+                             "why": _one_line(why, 120) if isinstance(why, str) and why.strip() else "unlinked"})
+    return {"evidence_measurements": measured, "unlinked_refs": unlinked}
 
 
 def _one_line(x: Any, n: int) -> str:
@@ -1145,6 +1178,7 @@ class Night:
         self.next_checkpoint: str | None = None
         self.selected_ids: list[str] = []
         self._pool_rows: dict[str, dict[str, Any]] = {}
+        self._evidence: dict[str, dict[str, list[dict[str, Any]]]] = {}   # candidate key -> its pack's details
         self._advance = False
 
     # -- signals, interruption ----------------------------------------------------------------------
@@ -1581,14 +1615,16 @@ class Night:
         # S4: a bounded evidence pack (untrusted data; it only reaches the model inside its envelope)
         refs = list(c.get("evidence_refs") or [])[:20]
         evidence_text = ""
+        self._evidence[str(c["dedupe_key"])] = evidence_detail([])
         try:
             with self._interruptible():
                 pack = self.ad.evidence.pack(cand)
                 evidence_text = self.ad.evidence.render(pack)
             self._merge_health(_dget(pack, "health"), _dget(pack, "steps"))
             for f in _dget(pack, "findings") or []:
-                if _dget(f, "status") == "ok" and _dget(f, "ref"):
+                if _dget(f, "status") == "ok" and _dget(f, "ref"):        # supporting evidence: ok findings only
                     refs.append(str(_dget(f, "ref"))[:200])
+            self._evidence[str(c["dedupe_key"])] = evidence_detail(_dget(pack, "findings") or [])
             for src in PROVIDERS[1:]:
                 if (_dget(pack, "health") or {}).get(src) in ("ok", "error", "stale", "truncated"):
                     self.budget.record_provider(src)
@@ -1678,10 +1714,12 @@ class Night:
 
     def _entry(self, exp_id: str | None, c: Mapping[str, Any], h: Hypothesis, refs: list[str], *,
                status: str) -> dict[str, Any]:
+        detail = self._evidence.get(str(c["dedupe_key"])) or evidence_detail([])
         return {"experiment_id": exp_id, "candidate_key": c["dedupe_key"], "hypothesis": {"what": h.what, "why": h.why},
                 "target": h.target, "artifact_hash": None, "baseline_id": None, "verdict": None, "verdict_reasons": [],
                 "arms": {"A": {}, "B": {}}, "risk": h.risk, "confidence": h.confidence, "cost_usd": 0.0,
-                "status": status, "proposal_id": None, "evidence_refs": refs[:20], "judge": None, "jev": None}
+                "status": status, "proposal_id": None, "evidence_refs": refs[:20], "judge": None, "jev": None,
+                **{k: [dict(x) for x in v] for k, v in detail.items()}}
 
     def _experiment(self, c: dict[str, Any], h: Hypothesis, refs: list[str], later: list[Hypothesis]) -> None:
         assert self.conn is not None
@@ -1944,7 +1982,8 @@ def validate_report(obj: Any) -> list[str]:
     allowed = {"format", "night", "started_at", "finished_at", "status", "checkpoint", "delta", "patterns",
                "candidates", "experiments", "costs", "health", "pending_decisions", "notes",
                "skipped", "prerequisite_warnings",            # both optional (rsi_schedule's night job)
-               "health_reasons"}                               # optional: provider -> why it was not ok
+               "health_reasons",                               # optional: provider -> why it was not ok
+               "budget"}                                       # optional: the budget caps (_finish, since 1df19d2)
     errs += [f"unknown key {k}" for k in sorted(set(obj) - allowed)]
     if obj.get("format") != FORMAT:
         errs.append("format is not rsi-night/1")
@@ -2018,6 +2057,15 @@ def validate_report(obj: Any) -> list[str]:
         if isinstance(pid, str) and not _UUID.fullmatch(pid):
             errs.append(f"{w}.proposal_id is not a lowercase uuid")
         need(e, "evidence_refs", list, w)
+        for k in ("evidence_measurements", "unlinked_refs"):   # optional (2026-10-25): older reports lack them
+            items = e.get(k)
+            if items is None:
+                continue
+            if not (isinstance(items, list) and all(isinstance(x, dict) and isinstance(x.get("ref"), str)
+                                                    for x in items)):
+                errs.append(f"{w}.{k} must be a list of objects with a ref")
+            elif k == "evidence_measurements" and not all(isinstance(x.get("measurements"), dict) for x in items):
+                errs.append(f"{w}.{k} items need a measurements object")
         for k in ("judge", "jev"):                    # optional (Mission 005.5): the replay's judge and Jev summaries
             if e.get(k) is not None and not isinstance(e[k], dict):
                 errs.append(f"{w}.{k} must be an object or null")

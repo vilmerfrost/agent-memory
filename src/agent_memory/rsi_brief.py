@@ -256,7 +256,7 @@ def validate_report(rep: Any) -> list[str]:
         if c is not None and not (_num(c) and 0 <= c <= 1):
             p.append(f"{where}.confidence: not a number in [0, 1]")
         for k, typ in (("arms", dict), ("hypothesis", dict), ("verdict_reasons", list), ("evidence_refs", list),
-                       ("judge", dict), ("jev", dict)):
+                       ("judge", dict), ("jev", dict), ("evidence_measurements", list), ("unlinked_refs", list)):
             if e.get(k) is not None and not isinstance(e[k], typ):
                 p.append(f"{where}.{k}: wrong type")
         _check_map(e, where, ("cost_usd",), p)
