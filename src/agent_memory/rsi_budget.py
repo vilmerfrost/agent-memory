@@ -51,7 +51,8 @@ FREE_MODELS = ("stub", "fixture", "none")
 # not reconciled with the provider's invoice. Every other paid basis is a local estimate from config/rsi-prices.json
 # or a cap. Free stand-ins and costs booked on another record cost nothing here.
 COST_KINDS = {"reported": "provider-reported", "table": "estimate", "default": "estimate", "call": "estimate",
-              "unknown-usage": "estimate", "cli-cap": "estimate", "free": "free", "none": "free", "on-call": "free"}
+              "unknown-usage": "estimate", "cli-cap": "estimate", "free": "free", "none": "free", "on-call": "free",
+              "subscription": "subscription"}
 PRICES_FORMAT = "rsi-prices/1"
 PRICES_PATH = config.REPO_ROOT / "config" / "rsi-prices.json"
 _EPS = 1e-9
@@ -267,6 +268,8 @@ class BudgetConfig:
     cost_estimate_usd: Mapping[str, float] = field(default_factory=dict)
     sandbox_run_estimate_usd: float = 0.0
     max_ab_pairs: int = HARD_MAX_AB_PAIRS     # cases x reps of one replay (the night refuses a bigger replay)
+    subscription_models: tuple[str, ...] = ()
+    max_subscription_tokens: int = 0
 
     @classmethod
     def from_dict(cls, d: Mapping[str, Any]) -> BudgetConfig:
@@ -276,6 +279,13 @@ class BudgetConfig:
         extra = sorted(k for k in d if k not in known and not k.startswith("_"))
         if extra:
             raise BudgetConfigError(f"unknown budget keys: {extra}")
+        subscription = d.get("subscription_models", [])
+        if not isinstance(subscription, list) or any(not isinstance(m, str) or not m or is_free_model(m)
+                                                   for m in subscription) or len(set(subscription)) != len(subscription):
+            raise BudgetConfigError("budget.subscription_models must be unique non-free model names")
+        token_cap = _int(d, "max_subscription_tokens", 0, 0, 20_000_000)
+        if subscription and token_cap == 0:
+            raise BudgetConfigError("subscription models require a positive max_subscription_tokens")
         return cls(
             max_hypotheses=_int(d, "max_hypotheses", 2, 1, HARD_MAX_HYPOTHESES),
             max_experiments=_int(d, "max_experiments", 1, 0, HARD_MAX_EXPERIMENTS),
@@ -289,6 +299,7 @@ class BudgetConfig:
             cost_estimate_usd=_caps(d, "cost_estimate_usd", number=True),
             sandbox_run_estimate_usd=_num(d, "sandbox_run_estimate_usd", 0.0, 0.0, 100.0),
             max_ab_pairs=_int(d, "max_ab_pairs", HARD_MAX_AB_PAIRS, 1, HARD_MAX_AB_PAIRS),
+            subscription_models=tuple(subscription), max_subscription_tokens=token_cap,
         )
 
     def call_cap(self, model: str) -> int:
@@ -350,9 +361,18 @@ class Budget:
             raise self._stop("wall_clock", f"{self.cfg.wall_clock_s:g}s")
         if self.spent_usd() > self.cfg.max_usd + _EPS:
             raise self._stop("usd", f"spent {self.spent_usd():.4f} > cap {self.cfg.max_usd:.4f}")
+        if self.cfg.subscription_models:
+            records = [r for r in [*self.calls, *self.runs] if r.get("price_basis") == "subscription"]
+            if any(not r.get("tokens_in") and not r.get("tokens_out") for r in records):
+                raise self._stop("subscription_usage_unknown", "cannot continue without usage accounting")
+            used = sum(r["tokens_in"] + r["tokens_out"] for r in records)
+            if used >= self.cfg.max_subscription_tokens:
+                raise self._stop("subscription_tokens", f"used {used} of {self.cfg.max_subscription_tokens}")
 
     def estimate(self, model: str) -> float:
         """The pre-call USD estimate: the config's, else (a paid model) the price table's. Free stand-ins: 0."""
+        if model in self.cfg.subscription_models:
+            return 0.0
         est = self.cfg.estimate(model)
         if est > 0 or is_free_model(model):
             return est
@@ -362,6 +382,9 @@ class Budget:
              tokens_cached: int = 0, tokens_cache_write: int = 0) -> tuple[float, str]:
         """(USD to book, basis) for one call or run: the reported cost, else the price table (never 0 for a paid
         model). The basis says which (PriceTable.book)."""
+        if model in self.cfg.subscription_models:
+            # Excluded from the API-dollar budget, not a claim that subscription usage is free.
+            return 0.0, "subscription"
         return self.prices.book(model, reported_usd=usd, tokens_in=tokens_in, tokens_out=tokens_out,
                                 tokens_cached=tokens_cached, tokens_cache_write=tokens_cache_write)
 
@@ -496,8 +519,16 @@ class Budget:
                 m["usd"] = round(m["usd"] + r["usd"], 6)
         providers = {k: {"requests": int(v["requests"]), "usd": float(v["usd"])}
                      for k, v in sorted(self.provider_requests.items())}
+        subscriptions = [r for r in [*self.calls, *self.runs] if r.get("price_basis") == "subscription"]
         return {"by_model": dict(sorted(by_model.items())), "sandbox_runs": len(self.runs),
                 "providers": providers, "total_usd": self.spent_usd(), "prices": self.prices.describe(),
+                **({"subscription": {"records": len(subscriptions),
+                                 "tokens_in": sum(r["tokens_in"] for r in subscriptions),
+                                 "tokens_out": sum(r["tokens_out"] for r in subscriptions),
+                                 "billed_usd": None, "allowance_used": None,
+                                 "usage_complete": all(r["tokens_in"] or r["tokens_out"] for r in subscriptions)}}
+                   if self.cfg.subscription_models else {}),
+                "total_usd_scope": "api-only" if self.cfg.subscription_models else "all-recorded",
                 **self.cost_bases()}
 
     def cost_bases(self) -> dict[str, Any]:
@@ -529,4 +560,5 @@ class Budget:
         c = self.cfg
         return {"max_hypotheses": self.hypothesis_cap(), "max_experiments": c.max_experiments,
                 "max_sandbox_runs": c.max_sandbox_runs, "wall_clock_s": c.wall_clock_s, "max_usd": c.max_usd,
-                "model_calls": dict(c.model_calls), "model_retries": c.model_retries, "max_ab_pairs": c.max_ab_pairs}
+                "model_calls": dict(c.model_calls), "model_retries": c.model_retries, "max_ab_pairs": c.max_ab_pairs,
+                "subscription_models": list(c.subscription_models), "max_subscription_tokens": c.max_subscription_tokens}

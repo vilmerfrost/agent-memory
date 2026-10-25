@@ -182,8 +182,8 @@ def test_pack_has_every_source_with_refs_and_measurements(pack_db: str) -> None:
     assert ("trace", {"trace_id": TRACES["B"]["trace_id"]}) in rs["lf"].calls
     assert ("trace", {"trace_id": TRACES["A"]["trace_id"]}) not in rs["lf"].calls        # passed: not followed up
     assert f[f"lf:dataset_run/{EXP}-B"].n == 1
-    # pastdev: recalled by the rule id's words, re-read in Supabase
-    assert rs["pd"].calls[0][1]["query"] == "reproduce before fix"
+    # pastdev: recalled by the rule's source and section words, re-read in Supabase, about the same rule
+    assert rs["pd"].calls[0][1]["query"] == "synth debugging reproduce before fix"
     rec = f[f"past:amem:proposal/{DS.ids['proposal']}"]
     assert rec.status == "ok" and rec.authority == f"amem:proposal/{DS.ids['proposal']}"
     # the candidate's own evidence refs were re-read

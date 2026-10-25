@@ -1,0 +1,10 @@
+{
+  "style": "explainer",
+  "length_s": 30,
+  "voice": {"model_id": "eleven_v3", "voice_id": "choA5fzIKsVFxO1Mg9ZL"},
+  "reviewer": "self",
+  "lines": [
+    "Tidepool keeps a folder of Markdown notes in sync across all of your machines.",
+    "You run tide sync, and it tells you exactly what happened."
+  ]
+}

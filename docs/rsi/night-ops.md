@@ -1,7 +1,10 @@
 # Night operations: the unattended RSI night and the morning brief
 
-Mission 005.5, phases D to G. **Prepared, not installed.** Nothing here is loaded into launchd, copied to
-`~/Library/LaunchAgents` or added to `~/agent-config`. Each gate at the end needs Vilmer's approval.
+Current operation (2026-10-25): the installed 01:30 job uses the qualified
+`config/rsi-night.subscription.json` profile. Claude Opus 5.5 and GPT-6.1 Sol use high
+effort and dedicated subscriptions; automatic rule promotion remains frozen.
+See [Subscription migration](subscription-migration.md). The Mission 005.5 first-night
+limits and rehearsal gates below are retained as historical API-profile documentation.
 
 Code: `src/agent_memory/rsi_schedule.py` (the two jobs), `src/agent_memory/rsi_rehearsal.py` +
 `scripts/m0055_rehearsal.py` (rehearsals), `config/rsi-night.first.json` (first-night limits),
@@ -13,7 +16,7 @@ Tests: `tests/test_rsi_schedule.py`, plus the Apply rule in `tests/test_rsi_brie
 
 | Job | launchd label | When | Command | Writes |
 |---|---|---|---|---|
-| Night | `com.vilmerfrost.amem-rsi-night` | 01:30 | `amem rsi night-job --config config/rsi-night.first.json` | `~/sandbox` (staged artifacts, replays, `nights/<night>/report.json`), RSI rows in the hosted DB (candidates, experiments, a staged proposal, the night's checkpoint), one `routines.log` line |
+| Night | `com.vilmerfrost.amem-rsi-night` | 01:30 | `amem rsi night-job --config config/rsi-night.subscription.json` | `~/sandbox` (staged artifacts, replays, `nights/<night>/report.json`), RSI rows in the hosted DB (candidates, experiments, a staged proposal, the night's checkpoint), one `routines.log` line |
 | Brief | `com.vilmerfrost.amem-rsi-brief` | 07:30 | `amem rsi brief-job --wait-s 5400 --out ~/.claude/parent/reports` | `reports/rsi-brief-<night>.md` and `.json`, one `routines.log` line |
 
 Both plists set `AMEM_HOOK_OFF=1`, `AMEM_REQUIRE_REMOTE=1`, `RSI_SANDBOX_DIR=~/sandbox`, `StandardInPath`
@@ -111,6 +114,27 @@ Since 2026-10-23 (verify run of night 2026-10-23, partial, $0.14):
   a preflight failure, an abort or a budget stop.
 - **Provider health carries its reason.** The failing evidence steps' detail (`ch.<query>: error (timeout ...)`)
   goes to the report's optional `health_reasons` map, the brief's Service health lines and the `-fail health` line.
+- **Evidence is about the rule being tested, and carries its numbers** (2026-10-25). Before this, past.dev was
+  searched with the last part of the rule key only (`skill:meltdown:intro` became `intro`), and unrelated records
+  (two worker experiments and a reject decision) showed as supporting evidence. Now:
+  - The recall words are the rule's source and section: `meltdown intro`, `deviations daily`, `worker rules`,
+    `claude md shell habits` (the last heading of a heading path). A file kind (`claude-md`, `agents-md`,
+    `parent-md`) names the source; its scope (`global` or a repo) is never sent.
+  - The pack reads the rule keys and targets of each recalled record (experiment, proposal, decision, edit). A
+    record that names neither the candidate's rule nor its target is `unlinked`: context only. It is not in the
+    experiment's `evidence_refs` (the supporting evidence Night Desk counts). It is listed in the experiment's
+    optional `unlinked_refs` (`ref`, `source`, `why`).
+  - Each ok ClickHouse finding keeps its numbers in the experiment's optional `evidence_measurements` (`ref`,
+    `source`, `n`, `ts`, `measurements`): for example `sessions_hit` 2 of `sessions_total` 5 for the week of
+    2026-10-12. Only numbers, booleans and short labels are kept. Free text and anything the scrubber would change
+    are left out. Older reports have neither field; readers treat them as empty.
+- **Only candidates with a test case take the experiment slot** (2026-10-25). Replay cases now cover the meltdown,
+  pepe and anatomy skills (see [Subscription migration](subscription-migration.md), "Skill coverage"). Now:
+  - Each candidate in report.json carries the additive fields `target`, `test_cases` (the case ids that use its
+    file) and `skip_reason` (null, or "no test case uses this file"). Night Desk can show `skip_reason` per candidate.
+  - A candidate whose file no case uses gets no Jev triage call and never takes the experiment slot.
+  - With `replay.cases` null, an experiment replays only its target's cases, repeated up to `min_pairs`. A change to
+    the global CLAUDE.md still runs the generic cases once each.
 - **Quiet skips.** A lock overlap or a night that is already `done` logs `SKIP` with `-warn` lines, not `-fail`,
   so routine-audit (which flags a SKIP with `-fail` lines) stays green. A night whose run failed is retried by the
   next start (the 01:30 job after a failed manual run), as before.

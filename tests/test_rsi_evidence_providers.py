@@ -276,11 +276,12 @@ def test_probe_against_mocks_reports_counts_timestamps_and_n(db: str, m: Mocks, 
     lf = p["langfuse"]
     assert {q["step"] for q in lf["queries"]} >= {"lf.experiment_scores", "lf.trace"}
     assert lf["rows"] >= 2 and lf["newest_ts"] == "2026-10-16T10:00:00+00:00" and lf["n"]["sum"] >= 1
-    # past.dev: recall by the rule id's words, re-read in Supabase
+    # past.dev: recall by the rule's source and section words, re-read in Supabase
     pd = p["pastdev"]
     assert pd["rows"] == 1 and pd["sample_refs"] == [f"past:amem:proposal/{PROPOSAL}"]
     assert pd["newest_ts"] == "2026-10-14T08:00:00+00:00" and pd["requests"] == 2      # health + one recall
-    assert json.loads(m.pd.requests_to("POST", "/api/v1/recall")[0].body)["query"] == "reproduce before fix"
+    assert json.loads(m.pd.requests_to("POST", "/api/v1/recall")[0].body)["query"] == \
+        "synth debugging reproduce before fix"
     assert all(p[s]["writes_refused"] == 0 for s in EP.SERVICES.values())
     assert counts(db) == before                               # no row and no checkpoint written
 

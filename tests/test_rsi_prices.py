@@ -191,8 +191,15 @@ def test_a_price_basis_from_the_caller_is_kept_only_for_a_priced_run() -> None:
 # ---------------------------------------------------------------- the replay books them (HostSandbox)
 
 
-CLAUDE_OUT = json.dumps({"type": "result", "subtype": "success", "is_error": False, "num_turns": 2, "result": "ok",
-                         "modelUsage": {"claude-haiku-5-5": {"inputTokens": 10, "outputTokens": 5, "costUSD": 0.001}}})
+# The agent reads its changed target (the global CLAUDE.md) first: without that exposure the relevance gate ends
+# the replay INCONCLUSIVE before any judge or Jev call, and nothing here would be booked.
+CLAUDE_OUT = "\n".join([
+    json.dumps({"type": "assistant", "message": {"content": [
+        {"type": "tool_use", "id": "read-global", "name": "Read", "input": {"file_path": "/home/rsi/.claude/CLAUDE.md"}}]}}),
+    json.dumps({"type": "user", "message": {"content": [
+        {"type": "tool_result", "tool_use_id": "read-global", "is_error": False, "content": "instructions"}]}}),
+    json.dumps({"type": "result", "subtype": "success", "is_error": False, "num_turns": 2, "result": "ok",
+                "modelUsage": {"claude-haiku-5-5": {"inputTokens": 10, "outputTokens": 5, "costUSD": 0.001}}})])
 
 
 def judge_out(usage: dict) -> str:

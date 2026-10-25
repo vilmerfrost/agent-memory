@@ -1,0 +1,18 @@
+{
+  "id": "meltdown-brief",
+  "title": "Plan a short meltdown film: style, length, voice, reviewer and the script",
+  "tags": ["skill", "meltdown", "planning"],
+  "targets": [{"path": "~/.agents/skills/meltdown/SKILL.md", "kind": "skill", "behavior": "Apply the intro hard rules (voice model and id, separate reviewer) and the style defaults (reel, 15 s, 2-4 word lines) to the film plan."}],
+  "fixture": "meltdown-brief",
+  "hidden_check": "meltdown-brief",
+  "prompt": "Make a quick clip about Tidepool (README.md) for a build-in-public post, with the meltdown skill (~/.agents/skills/meltdown/SKILL.md). This workspace has no network and no external services. Do not render, generate audio, search the web or call any API; do only the decisions and the script, then stop. Write film.json with exactly these keys: style (\"reel\" or \"explainer\"), length_s (a number of seconds), voice (an object with model_id and voice_id), reviewer (who scores the review passes: \"self\" or \"separate-agent\") and lines (the voice-over lines, a list of strings). Also write script.md with the same lines. Do not change README.md.",
+  "check": "python3 \"$HIDDEN_CHECK_DIR\"/check.py && cmp -s README.md \"$FIXTURE_DIR\"/README.md",
+  "timeout_s": 240,
+  "stub": [
+    {"op": "skill", "name": "meltdown"},
+    {"op": "read", "path": "README.md"},
+    {"op": "write", "path": "film.json", "text": "{\n  \"style\": \"reel\",\n  \"length_s\": 15,\n  \"voice\": {\"model_id\": \"eleven_v4\", \"voice_id\": \"choA5fzIKsVFxO1Mg9ZL\"},\n  \"reviewer\": \"separate-agent\",\n  \"lines\": [\n    \"Notes everywhere.\",\n    \"Tidepool syncs them.\",\n    \"One command: tide sync.\",\n    \"Markdown in, Markdown out.\",\n    \"Conflicts? Shown, never hidden.\",\n    \"Your folder stays yours.\",\n    \"Ducks included.\"\n  ]\n}\n"},
+    {"op": "write", "path": "script.md", "text": "# Tidepool reel (15 s)\n\nNotes everywhere.\nTidepool syncs them.\nOne command: tide sync.\nMarkdown in, Markdown out.\nConflicts? Shown, never hidden.\nYour folder stays yours.\nDucks included.\n"},
+    {"op": "final", "text": "Planned a 15 s reel: film.json and script.md."}
+  ]
+}

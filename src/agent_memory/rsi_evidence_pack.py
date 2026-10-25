@@ -16,12 +16,14 @@ The pack (build_pack). For one candidate (an rsi_candidates row: dedupe_key, rul
              experiments  sb.experiments_for    earlier experiments on the rule, with eval verdict counts
                           sb.attempts_for       earlier proposals and improve edits for the rule
              clickhouse   ch.rule_gap, ch.rule_weekly_rate (and ch.routine_streaks for a routine rule)
-             pastdev      pd.recall             similar past decisions (the rule id's words)
+             pastdev      pd.recall             similar past decisions (the rule's source and section words)
     phase 1  per earlier experiment (at most max_experiments): sb.decisions_for, sb.evidence_for (the stored
              Langfuse trace links), lf.experiment_scores
     phase 2  lf.trace for the failing stored traces (at most max_traces), read live
     then     one read-only Supabase connection re-reads every amem: subject of an external finding and the
-             candidate's own evidence refs (blueprint C1: external evidence counts only when its subjects resolve).
+             candidate's own evidence refs (blueprint C1: external evidence counts only when its subjects resolve),
+             and reads the rule keys and targets of each recalled past.dev record (subject_scopes): a recalled
+             record counts only when it is about the candidate's rule or its target.
 
 Each Finding carries: source (supabase | clickhouse | langfuse | pastdev | jev | experiments), ref (the record in
 its own system: amem:, ch:, lf:, past:, ncm:; `query:<step>` / `health:<retriever>` / `dropped:pack` for the
@@ -30,7 +32,8 @@ one), status, plus kind, authority (the amem: ref it rests on, re-read now), via
 scrubbed text from Supabase rows only). Status:
     ok           a Supabase row, or an external finding whose every amem: subject resolves
     stale        an external finding (or a candidate evidence ref) whose subject no longer resolves
-    unlinked     an external finding with no amem: subject, or whose subjects could not be re-read (context only)
+    unlinked     an external finding with no amem: subject, or whose subjects could not be re-read, or a past.dev
+                 record about another rule and another target (context only: never supporting evidence)
     unavailable  a step whose retriever is unconfigured, switched off or down (one finding per step)
     error        a step that raised, had bad params, or ran past its retriever's time budget
     truncated    `dropped:pack`: n findings were left out by the caps (measurements: how many per source)
@@ -274,13 +277,38 @@ class _Cand:
     routine: str | None
     evidence_refs: tuple[str, ...]
     recall: str | None
+    target: str | None = None
+
+
+_VAGUE = frozenset({"global", "whole", "unknown", "dev"})     # words that name no source and no section
 
 
 def _recall_query(rule: str | None) -> str | None:
-    """A rule key as a past.dev recall query: its rule id's words (`...:zsh-quote-globs` -> `zsh quote globs`)."""
-    if not rule:
+    """A rule key as a past.dev recall query: the words of its source and of its section, so a hit is about this
+    rule and not any rule with a common section name (`intro` alone matched other skills' records).
+        skill:meltdown:intro                                    -> `meltdown intro`
+        routine:deviations-daily:whole                          -> `deviations daily`
+        agent:worker:rules                                      -> `worker rules`
+        agents-md:global:computer-use                           -> `agents md computer use`
+        claude-md:global:global-claude-code-context/shell-habits -> `claude md shell habits` (the last heading)
+        parent-md:repo-profile                                  -> `parent md repo profile`
+    A `dev:` prefix (a candidate key) is dropped. A file kind (`*-md`) names the source itself; its scope (`global`
+    or a repo) is never sent. None for an empty or malformed key, or when the words do not fit QUERY_RE."""
+    if not isinstance(rule, str):
         return None
-    q = " ".join(re.split(r"[-_.]+", rule.rpartition(":")[2])).strip()
+    parts = rule.strip().split(":")
+    if parts and parts[0].lower() == "dev":
+        parts = parts[1:]
+    if len(parts) < 2 or not all(parts):
+        return None
+    kind, scope, section = parts[0], parts[1:-1], parts[-1]
+    source = kind if kind.lower().endswith("-md") or not scope else scope[0]
+    section = section.rstrip("/").rpartition("/")[2]
+    words: list[str] = []
+    for w in re.split(r"[-_./@+\s]+", f"{source} {section}"):
+        if w and w.lower() not in _VAGUE and w.lower() not in (x.lower() for x in words):
+            words.append(w)
+    q = " ".join(words)
     return q if q and re.fullmatch(QUERY_RE, q) else None
 
 
@@ -297,7 +325,9 @@ def _candidate(c: Mapping[str, Any]) -> _Cand:
     raw = c.get("evidence_refs") or []
     ev = tuple(dict.fromkeys(r for r in (raw if isinstance(raw, list | tuple) else [])[:200]
                              if isinstance(r, str) and refs.is_ref(r) and r.startswith("amem:")))
-    return _Cand(_one_line(key, 200), rule, routine, ev, _recall_query(rule))
+    target = c.get("target")
+    target = _one_line(target, 300) if isinstance(target, str) and target.strip() else None
+    return _Cand(_one_line(key, 200), rule, routine, ev, _recall_query(rule), target)
 
 
 @dataclass(frozen=True)
@@ -542,6 +572,84 @@ def existing(conn: psycopg.Connection, amem_refs: Sequence[str]) -> set[str]:
     return found
 
 
+# What a past.dev record is about: the rule keys and targets of the row an amem: subject names (one indexed
+# lookup per entity). An experiment: its hypothesis/meta rule and target, its candidate's, its proposals'. A
+# proposal or decision: its candidate's rule and target and the proposal's targets. An edit: its rule and file.
+_SCOPE_SQL = {
+    "experiment": ("text", """
+        select e.id, array[e.hypothesis ->> 'rule', e.meta ->> 'rule', e.meta ->> 'rule_key', c.rule_key, k.rule_key],
+               array[e.hypothesis ->> 'target', c.target, k.target]
+          from rsi_experiments e
+          left join rsi_candidates c on c.id::text = e.meta ->> 'candidate_id'
+          left join rsi_candidates k on k.dedupe_key = e.meta ->> 'candidate_key'
+         where e.id = any(%(ids)s::text[])
+        union all
+        select p.experiment_id, array[c.rule_key], p.targets || array[c.target]
+          from rsi_proposals p left join rsi_candidates c on c.id = p.candidate_id
+         where p.experiment_id = any(%(ids)s::text[])"""),
+    "proposal": ("uuid", """
+        select p.id::text, array[c.rule_key], p.targets || array[c.target]
+          from rsi_proposals p left join rsi_candidates c on c.id = p.candidate_id
+         where p.id = any(%(ids)s::uuid[])"""),
+    "decision": ("uuid", """
+        select d.id::text, array[c.rule_key], p.targets || array[c.target]
+          from rsi_decisions d join rsi_proposals p on p.id = d.proposal_id
+          left join rsi_candidates c on c.id = p.candidate_id
+         where d.id = any(%(ids)s::uuid[])"""),
+    "edit": ("uuid", """
+        select id::text, array[instruction_source || ':' || rule_id], array[target_path]
+          from edits where id = any(%(ids)s::uuid[])"""),
+}
+_HOME = re.compile(r"^/(?:Users|home)/[^/]+/")
+
+
+def _norm_rule(v: Any) -> str | None:
+    if not isinstance(v, str) or not v.strip():
+        return None
+    r = v.strip().lower()
+    return r[4:] if r.startswith("dev:") else r
+
+
+def _norm_target(v: Any) -> str | None:
+    if not isinstance(v, str) or not v.strip():
+        return None
+    return _HOME.sub("~/", v.strip()).lower()
+
+
+def subject_scopes(conn: psycopg.Connection, amem_refs: Sequence[str]) -> dict[str, tuple[set[str], set[str]]]:
+    """For each amem: ref of an experiment, proposal, decision or edit: (rule keys, targets) it is about,
+    normalized (lowercase, no `dev:` prefix, home directory as `~/`). Other kinds and missing rows: absent."""
+    by_entity: dict[str, list[str]] = defaultdict(list)
+    for s in dict.fromkeys(amem_refs):
+        try:
+            r = refs.parse(s)
+        except refs.RefError:
+            continue
+        if r.scheme == "amem" and r.kind in _SCOPE_SQL:
+            by_entity[r.kind].append(r.id)
+    out: dict[str, tuple[set[str], set[str]]] = {}
+    for entity, ids in sorted(by_entity.items()):
+        typ, q = _SCOPE_SQL[entity]
+        vals = ids if typ == "text" else [i for i in ids if _UUID.fullmatch(i)]
+        if not vals:
+            continue
+        for k, rules, targets in conn.execute(q, {"ids": vals}).fetchall():
+            rs, ts = out.setdefault(refs.amem(entity, str(k)), (set(), set()))
+            rs.update(x for x in map(_norm_rule, rules or []) if x)
+            ts.update(x for x in map(_norm_target, targets or []) if x)
+    return out
+
+
+def _about(c: _Cand, subjects: Sequence[str], scopes: Mapping[str, tuple[set[str], set[str]]]) -> bool:
+    """True when a subject's record names the candidate's rule or its target."""
+    rule, target = _norm_rule(c.rule), _norm_target(c.target)
+    for s in subjects:
+        rs, ts = scopes.get(s, (set(), set()))
+        if (rule and rule in rs) or (target and target in ts):
+            return True
+    return False
+
+
 # ---------------------------------------------------------------- build_pack
 
 
@@ -598,7 +706,8 @@ def _raws(done: Sequence[tuple[_Step, QueryResult]], per: int) -> list[_Raw]:
     return out
 
 
-def _finding(raw: _Raw, found: set[str] | None, lim: PackLimits) -> Finding:
+def _finding(raw: _Raw, found: set[str] | None, lim: PackLimits, c: _Cand | None = None,
+             scopes: Mapping[str, tuple[set[str], set[str]]] | None = None) -> Finding:
     ev = raw.ev
     subjects = [s for s in ev.subject_refs if s.startswith("amem:")]
     if ev.source == "sb":
@@ -613,6 +722,9 @@ def _finding(raw: _Raw, found: set[str] | None, lim: PackLimits) -> Finding:
         status = "ok" if len(resolved) == len(subjects) else "stale"
         authority = resolved[0] if resolved else None
         detail = "" if status == "ok" else f"{len(subjects) - len(resolved)} subject(s) no longer resolve"
+    if raw.source == "pastdev" and status == "ok" and c is not None and not _about(c, subjects, scopes or {}):
+        # a similar past record that is about another rule and another file: context, never support
+        status, authority, detail = "unlinked", None, "about another rule or target: context only"
     m = _measure(ev.metrics)
     return Finding(raw.source, ev.ref, ev.observed_at, m, _n(ev.metrics), status, ev.kind, authority, raw.step.name,
                    _free(ev.summary, lim.text_max), detail)
@@ -703,14 +815,16 @@ def build_pack(candidate: Mapping[str, Any], *, retrievers: Mapping[str, Retriev
     raws = _raws(done, limits.per_source)
     wanted = [s for raw in raws if raw.ev.source != "sb" for s in raw.ev.subject_refs if s.startswith("amem:")]
     wanted += list(c.evidence_refs[: limits.per_source])
+    recalled = [s for raw in raws if raw.source == "pastdev" for s in raw.ev.subject_refs if s.startswith("amem:")]
     found: set[str] | None = None
+    scopes: dict[str, tuple[set[str], set[str]]] = {}
     sb_read = "skipped"
     if ro is not None and wanted:
-        def reread() -> set[str]:
+        def reread() -> tuple[set[str], dict[str, tuple[set[str], set[str]]]]:
             with ro() as conn:
-                return existing(conn, wanted)
+                return existing(conn, wanted), (subject_scopes(conn, recalled) if recalled else {})
         state, val = runner.call("sb", reread)
-        found = val if state == "ok" else None
+        found, scopes = val if state == "ok" else (None, {})
         sb_read = "ok" if state == "ok" else ("error" if state == "timeout" else "unavailable")
     elif ro is None and wanted:
         sb_read = "unavailable"
@@ -719,7 +833,7 @@ def build_pack(candidate: Mapping[str, Any], *, retrievers: Mapping[str, Retriev
     # unique); a live provider answer wins over the same link read back from Supabase
     by_key: dict[tuple[str, str, str], Finding] = {}
     for raw in raws:
-        f = _finding(raw, found, limits)
+        f = _finding(raw, found, limits, c, scopes)
         old = by_key.get((f.source, f.kind, f.ref))
         if old is None or (raw.live and old.via.startswith("sb.")):
             by_key[(f.source, f.kind, f.ref)] = f
@@ -874,6 +988,39 @@ class _Neutral:
         if isinstance(v, float):
             return round(v, 4) if math.isfinite(v) else None
         return None
+
+
+def _report_value(v: Any) -> Any:
+    if v is None or isinstance(v, bool | int):
+        return v
+    if isinstance(v, float):
+        return round(v, 4) if math.isfinite(v) else None
+    if isinstance(v, str):
+        t = _one_line(v, 120)
+        shaped = _LABEL.fullmatch(t) or re.fullmatch(r"[0-9T:.+ Z-]{10,40}", t)
+        return t if shaped and not _instruction_like(t) and scrub_text(t)[0] == t else None
+    return None
+
+
+def report_measurements(measurements: Mapping[str, Any], *, cap: int = 20) -> dict[str, Any]:
+    """A finding's measurements as a night report keeps them next to its ref: numbers, booleans and short labels
+    (or lists of at most 10 of them). A key or value that is free text, instruction-like or that the scrubber would
+    change is left out, so the report holds nothing unscrubbed. At most `cap` keys."""
+    out: dict[str, Any] = {}
+    for k, v in measurements.items() if isinstance(measurements, Mapping) else ():
+        if len(out) >= cap:
+            break
+        if not (isinstance(k, str) and _MKEY.fullmatch(k)) or _instruction_like(k):
+            continue
+        if isinstance(v, list | tuple):
+            vals = [x for x in map(_report_value, v[:10]) if x is not None]
+            if vals:
+                out[k] = vals
+            continue
+        x = _report_value(v)
+        if x is not None:
+            out[k] = x
+    return out
 
 
 def _line(obj: Mapping[str, Any]) -> str:

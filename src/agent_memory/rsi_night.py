@@ -76,6 +76,7 @@ _SEVERITY = {"ok": 0, "fixture": 0, "live": 0, "skipped": 0, "stale": 1, "trunca
 
 # The investigator's own rules: never a hypothesis target, whatever the allowlist says.
 SELF_FILES = ("rsi-night.json", "rsi-night.first.json", "rsi-triage.toml", "rsi-verdict-policy.json", "rsi-prices.json",
+              "rsi-night.subscription-claude.json", "rsi-night.subscription-codex.json", "rsi-night.subscription.json",
               "rsi-evidence-providers.json", "criteria.json", "fence.txt", "pins.json")
 TARGET_KINDS = ("instruction", "lessons", "skill")
 NEW_TEXT_MAX = 200_000
@@ -174,10 +175,39 @@ def load_config(path: Path | None = None) -> NightConfig:
             raise ConfigError(f"{p}: {name} must be an object")
         return {k: x for k, x in v.items() if not k.startswith("_")}
 
-    return NightConfig(budget=budget, stages=stages, candidates=cands, weights=weights, min_rank=float(min_rank),
-                       hypothesizer=section("hypothesizer"), implementer=section("implementer"),
-                       replay=section("replay"), staging=section("staging"), path=str(p),
-                       sha256=hashlib.sha256(raw).hexdigest())
+    result = NightConfig(budget=budget, stages=stages, candidates=cands, weights=weights, min_rank=float(min_rank),
+                         hypothesizer=section("hypothesizer"), implementer=section("implementer"),
+                         replay=section("replay"), staging=section("staging"), path=str(p),
+                         sha256=hashlib.sha256(raw).hexdigest())
+    from agent_memory.rsi_subscription_config import validate_role
+    roles = [("claude", result.hypothesizer, "") ] if stages["hypothesizer"] == "claude-cli" else []
+    roles += [(stages["replay_agent"], result.replay, ""), (stages["judge"], result.replay, "judge_")]
+    profiles = result.replay.get("provider_profiles")
+    if profiles is not None:
+        if not isinstance(profiles, dict) or set(profiles) != {"claude", "codex"}:
+            raise ConfigError("provider_profiles must include claude and codex")
+        for provider, settings in profiles.items():
+            if not isinstance(settings, dict) or settings.get("auth_mode") != "subscription":
+                raise ConfigError("provider profiles require subscription authentication")
+            roles.append((provider, settings, ""))
+    subscribed = set()
+    for provider, settings, prefix in roles:
+        mode = settings.get(prefix + "auth_mode", "api")
+        model = settings.get(prefix + "model")
+        try:
+            validate_role(provider, model, settings.get(prefix + "effort"), mode,
+                          settings.get(prefix + "auth"), credentials=settings.get(prefix + "credentials") or "none")
+        except ValueError as exc:
+            raise ConfigError(str(exc)) from None
+        if mode == "subscription":
+            subscribed.add(model)
+        elif model in budget.subscription_models:
+            raise ConfigError("API role cannot be charged to a subscription budget")
+    if subscribed != set(budget.subscription_models):
+        raise ConfigError("budget.subscription_models must exactly match subscription roles")
+    if subscribed and stages["implementer"] != "stub":
+        raise ConfigError("subscription migration keeps the deterministic implementer")
+    return result
 
 
 # =========================================================================== targets and typed hypotheses
@@ -376,6 +406,11 @@ RECURRENCE_SQL = ("greatest(1, case when jsonb_typeof(metrics->'sessions') = 'nu
                   "then floor((metrics->>'sessions')::numeric) else 0 end, "
                   "(select count(distinct r) from unnest(evidence_refs) r where "
                   + " and ".join(f"not starts_with(r, '{p}')" for p in _HISTORY_REFS) + "))")
+# The pool reads this many times `max_considered` rows, so candidates with a replay case can move ahead of
+# uncovered ones that rank higher (Night._pool).
+POOL_FETCH = 10
+# Why a candidate cannot run: no replay case declares its file, so any experiment would end INCONCLUSIVE.
+NO_TEST_CASE = "no test case uses this file"
 
 
 def rank(a: TriageAnswers, recurrence: int, history: Sequence[str], weights: Mapping[str, float]) -> float:
@@ -482,6 +517,10 @@ class ReplayOutcome:
     runs: int = 0
     judge: dict[str, Any] | None = None      # rsi_verdict.JudgeResult.summary(): mode, judged, wins, b_winrate
     jev: dict[str, Any] | None = None        # rsi_verdict.JevResult.summary(): mode, status, effect, confidence
+    setup: dict[str, Any] = field(default_factory=dict)
+    relevance: dict[str, Any] = field(default_factory=dict)
+    judge_pairs: list[dict[str, Any]] = field(default_factory=list)
+    provider_results: list[dict[str, Any]] = field(default_factory=list)
 
 
 JUDGE_KEYS = ("mode", "judged", "wins_a", "wins_b", "ties", "unfired_b", "errors", "b_winrate")
@@ -517,6 +556,39 @@ def _dget(obj: Any, name: str, default: Any = None) -> Any:
 
 
 _RETRIEVER = {"sb": "supabase", "ch": "clickhouse", "lf": "langfuse", "pd": "pastdev"}   # evidence step prefix
+MEASURED_SOURCES = ("clickhouse",)     # ok findings whose numbers the report keeps next to their ref
+EVIDENCE_DETAIL_MAX = 10
+
+
+def evidence_detail(findings: Sequence[Any]) -> dict[str, list[dict[str, Any]]]:
+    """What an experiment entry keeps of its evidence pack besides the supporting refs (evidence_refs):
+        evidence_measurements  per ok ClickHouse finding: ref, source, n, ts and its measurements (numbers and short
+                               labels only, through rsi_evidence_pack.report_measurements: nothing unscrubbed), so a
+                               reader can say "broken in 2 of 5 sessions that week" instead of showing a bare ref
+        unlinked_refs          findings that are context only (status unlinked: e.g. a past.dev record about another
+                               rule): ref, source and why. Never supporting evidence, never in evidence_refs.
+    At most EVIDENCE_DETAIL_MAX of each, in pack order."""
+    measured: list[dict[str, Any]] = []
+    unlinked: list[dict[str, Any]] = []
+    if not findings:
+        return {"evidence_measurements": measured, "unlinked_refs": unlinked}
+    from agent_memory.rsi_evidence_pack import report_measurements as clean   # lazy, as PackEvidence
+
+    for f in findings:
+        ref, src, st = _dget(f, "ref"), _dget(f, "source"), _dget(f, "status")
+        if not (isinstance(ref, str) and ref.strip() and isinstance(src, str)):
+            continue
+        if st == "ok" and src in MEASURED_SOURCES and len(measured) < EVIDENCE_DETAIL_MAX:
+            n, ts = _dget(f, "n"), clean({"ts": _dget(f, "ts")}).get("ts")
+            measured.append({"ref": ref[:200], "source": src,
+                             "n": n if isinstance(n, int) and not isinstance(n, bool) else None,
+                             "ts": ts if isinstance(ts, str) else None,
+                             "measurements": clean(_dget(f, "measurements") or {})})
+        elif st == "unlinked" and len(unlinked) < EVIDENCE_DETAIL_MAX:
+            why = _dget(f, "detail")
+            unlinked.append({"ref": ref[:200], "source": src,
+                             "why": _one_line(why, 120) if isinstance(why, str) and why.strip() else "unlinked"})
+    return {"evidence_measurements": measured, "unlinked_refs": unlinked}
 
 
 def _one_line(x: Any, n: int) -> str:
@@ -701,6 +773,8 @@ class ClaudeCliHypothesizer:
         from agent_memory import distill, edits_writer
         model = str(self.cfg.get("model") or edits_writer.writer_model())
         argv = [*distill.writer_argv(edits_writer.CLAUDE_ENV, model=model), *UNATTENDED_CLAUDE_FLAGS]
+        if self.cfg.get("effort"):
+            argv += ["--effort", str(self.cfg["effort"])]
         cand = {k: candidate.get(k) for k in ("dedupe_key", "source", "kind", "target", "rule_key", "seen_count")}
         cand["metrics"] = {k: v for k, v in (candidate.get("metrics") or {}).items() if isinstance(v, (int, float))}
         limit = int(self.cfg.get("max_prompt_chars") or 24_000)
@@ -713,6 +787,17 @@ class ClaudeCliHypothesizer:
         timeout = float(self.cfg.get("timeout_s") or 600)
 
         def run() -> tuple[str, Usage]:
+            if self.cfg.get("auth_mode") == "subscription":
+                from agent_memory import rsi_subscription as sub
+                from agent_memory.rsi_subscription_config import auth_for, usage_fields
+                with tempfile.TemporaryDirectory(prefix="rsi-hypothesis-") as tmp:
+                    work, arm = Path(tmp) / "work", Path(tmp) / "arm"
+                    work.mkdir(); arm.mkdir()
+                    result = sub.run("claude", prompt, model=model, effort=self.cfg["effort"],
+                                     workspace=work.resolve(), arm_home=arm.resolve(),
+                                     timeout_s=max(1, int(min(timeout, budget.remaining_s()))),
+                                     auth=auth_for("claude", self.cfg["auth"], tools=False), tools_allowed=False)
+                return result.text, Usage(**usage_fields(result.usage))
             out = distill.run_cli(argv, prompt, timeout=max(1.0, min(timeout, budget.remaining_s())),
                                   env={**model_cli_env(), "AMEM_HOOK_OFF": "1"})
             return distill.parse_envelope(out), _envelope_usage(out)
@@ -861,13 +946,28 @@ class SandboxReplayer:
                   "judge_credential_name": self.cfg.get("judge_credential_name")}
         if self.cfg.get("max_budget_usd") is not None:
             fields["max_budget_usd"] = float(self.cfg["max_budget_usd"])
+        for key in ("auth_mode", "auth", "judge_auth_mode", "judge_auth", "judge_effort", "max_tool_calls", "profile"):
+            if key in self.cfg:
+                fields[key] = self.cfg[key]
         known = getattr(rsi_replay.ReplayConfig, "__dataclass_fields__", fields)
         return rsi_replay.ReplayConfig(**{k: v for k, v in fields.items() if k in known})
 
     def replay(self, *, artifact_hash: str, experiment_id: str, baseline_id: str, budget: Budget) -> ReplayOutcome:
         from agent_memory import rsi_replay
+        if self.cfg.get("provider_profiles"):
+            from agent_memory import rsi_provider_replay
+            return rsi_provider_replay.replay(self.stages, self.cfg, artifact_hash=artifact_hash,
+                experiment_id=experiment_id, baseline_id=baseline_id, budget=budget)
         cases = rsi_replay.load_cases(self.cfg.get("cases"))
         rc = self.replay_config()
+        auto = getattr(rsi_replay, "auto_cases", None)
+        if self.cfg.get("cases") is None and auto is not None:   # the target's own cases, enough pairs for a verdict
+            plan = auto(artifact_hash, cases, root=RA.sandbox_dir(), reps=int(rc.reps),
+                        max_pairs=int(getattr(budget.cfg, "max_ab_pairs", 0) or len(cases)))
+            cases, reps = plan or (cases, rc.reps)
+            if reps != rc.reps:
+                from dataclasses import replace as _replace
+                rc = _replace(rc, reps=reps)
         pairs = len(cases) * int(rc.reps)
         cap = int(getattr(budget.cfg, "max_ab_pairs", pairs))
         if pairs > cap:          # refused before any container: a bigger replay than the night allows
@@ -875,7 +975,7 @@ class SandboxReplayer:
                                    f"the cap of {cap}")
         # A live agent or judge needs rsi-internal + the egress proxy. `replay.ensure_network` (unattended nights)
         # brings them up for this replay and takes them down again if they were not up before.
-        live = rc.agent != "stub" or rc.judge in ("codex", "claude")
+        live = (rc.agent != "stub" and rc.auth_mode == "api") or (rc.judge in ("codex", "claude") and rc.judge_auth_mode == "api")
         ensure = bool(self.cfg.get("ensure_network")) and live
         box = sandbox_module().Sandbox(RA.sandbox_dir()) if ensure else None
         was_up = bool((box.net_status() or {}).get("proxy_running")) if box is not None else True
@@ -893,7 +993,13 @@ class SandboxReplayer:
                              baseline_id=_dget(r, "baseline_id"),
                              eval_path=str(_dget(r, "eval_path")) if _dget(r, "eval_path") else None,
                              budget_stop=_dget(r, "budget_stop"), runs=len(_dget(r, "runs") or []),
-                             judge=_summary(_dget(r, "judge"), JUDGE_KEYS), jev=_summary(_dget(r, "jev"), JEV_KEYS))
+                             judge=_summary(_dget(r, "judge"), JUDGE_KEYS), jev=_summary(_dget(r, "jev"), JEV_KEYS),
+                             setup={"agent": rc.agent, "model": rc.model, "effort": rc.effort,
+                                    "auth_mode": rc.auth_mode, "judge": rc.judge, "judge_model": rc.judge_model,
+                                    "judge_effort": rc.judge_effort, "judge_auth_mode": rc.judge_auth_mode,
+                                    "tasks": [{"id": c.id, "title": c.title or c.id} for c in cases]},
+                             relevance=dict(_dget(r, "relevance") or {}),
+                             judge_pairs=list(getattr(_dget(r, "judge"), "pairs", ()) or ()))
 
 
 class ApprovalProposer:
@@ -1085,6 +1191,7 @@ class Night:
         self.next_checkpoint: str | None = None
         self.selected_ids: list[str] = []
         self._pool_rows: dict[str, dict[str, Any]] = {}
+        self._evidence: dict[str, dict[str, list[dict[str, Any]]]] = {}   # candidate key -> its pack's details
         self._advance = False
 
     # -- signals, interruption ----------------------------------------------------------------------
@@ -1436,7 +1543,7 @@ class Night:
             scope = list(self.allowlist) + list(aliases)
             cur.execute("select * from rsi_candidates where status in ('new', 'deferred') and target = any(%s) "
                         f"order by rank desc nulls first, {RECURRENCE_SQL} desc, last_seen_at desc, dedupe_key "
-                        "limit %s", (scope, limit))
+                        "limit %s", (scope, limit * POOL_FETCH))
             pool = [{**r, "target": aliases.get(r["target"], r["target"])} for r in cur.fetchall()]
             cur.execute("select count(*) as n from rsi_candidates where status in ('new', 'deferred') "
                         "and not coalesce(target = any(%s), false)", (scope,))
@@ -1460,7 +1567,27 @@ class Night:
                                  "target": s.target, "rule_key": s.rule_key, "evidence_refs": s.evidence_refs,
                                  "metrics": s.metrics, "seen_count": 1, "status": "new", "meta": {}, "rank": None})
             pool.sort(key=lambda c: (c.get("rank") is not None, -(c.get("rank") or 0.0), -recurrence(c)))
-        return pool[:limit]
+        # A candidate whose file no replay case uses can only end INCONCLUSIVE: covered candidates take the triage
+        # slots first. Up to `limit` uncovered ones are still listed (no triage call) so the report says why.
+        covered = [c for c in pool if self._test_cases(c.get("target"))]
+        uncovered = [c for c in pool if not self._test_cases(c.get("target"))]
+        return covered[:limit] + uncovered[:limit]
+
+    def _test_cases(self, target: str | None) -> list[str]:
+        """Replay cases (the night's `replay.cases`, default all of bench/rsi-replay) that declare `target`. Path
+        only: the artifact's kind is checked again by the replay. A bench that does not load covers nothing."""
+        cov = getattr(self, "_case_coverage", None)
+        if cov is None:
+            cov = {}
+            try:
+                from agent_memory import rsi_replay
+                for case in rsi_replay.load_cases(self.cfg.replay.get("cases")):
+                    for t in case.targets:
+                        cov.setdefault(t["path"], []).append(case.id)
+            except Exception as exc:  # noqa: BLE001 - fail closed: no experiment without a case
+                self.notes.append(f"test cases unavailable: {type(exc).__name__}: {str(exc)[:150]}")
+            self._case_coverage = cov
+        return sorted(cov.get(target or "", []))
 
     def _history(self, key: str) -> list[str]:
         assert self.conn is not None
@@ -1475,14 +1602,16 @@ class Night:
             self._poll()
             hist = self._history(c["dedupe_key"])
             in_scope = self._in_scope(c.get("target"))
+            tests = self._test_cases(c.get("target"))
             ans = None
-            if not self.dry_run or self.cfg.stages["triage"] == "fixture":
+            # No replay case uses the file: no paid triage call, the deterministic heuristic ranks it for the report.
+            if tests and (not self.dry_run or self.cfg.stages["triage"] == "fixture"):
                 ans = self.ad.triage.assess(c, state=triage_state(c, hist, in_scope), budget=self.budget)
             if ans is None:
                 ans = heuristic_answers(c, hist, in_scope)
             r = rank(ans, recurrence(c), hist, self.cfg.weights)
-            eligible = ans.action == "experiment" and in_scope and r >= self.cfg.min_rank
-            why = ("eligible" if eligible else "no in-scope target" if not in_scope
+            eligible = ans.action == "experiment" and in_scope and bool(tests) and r >= self.cfg.min_rank
+            why = ("eligible" if eligible else "no in-scope target" if not in_scope else NO_TEST_CASE if not tests
                    else "triage: wait" if ans.action != "experiment" else "rank below the minimum")
             results.append((c, ans, r, eligible, why, hist))
         self.health["jev"] = getattr(self.ad.triage, "health", self.health["jev"])
@@ -1503,8 +1632,12 @@ class Night:
                     "update rsi_candidates set status = %s, rank = %s, jev = %s, decided_reason = %s, "
                     "last_considered_at = now() where id = %s",
                     ("selected" if selected else "deferred", r, Jsonb(c["jev"]), reason[:300], c["id"]))
+            tests = self._test_cases(c.get("target"))
             self.report["candidates"].append({"id": str(c.get("id")) if c.get("id") else None, "key": c["dedupe_key"],
-                                              "source": c["source"], "rank": r, "selected": selected, "reason": reason})
+                                              "source": c["source"], "rank": r, "selected": selected, "reason": reason,
+                                              # additive (Night Desk): the file, the cases that use it, or why not
+                                              "target": c.get("target"), "test_cases": tests,
+                                              "skip_reason": None if tests else NO_TEST_CASE})
         self._pool_rows = {str(c.get("id") or c["dedupe_key"]): c for c, *_ in results}
 
     # -- S4-S8 -----------------------------------------------------------------------------------------
@@ -1521,14 +1654,16 @@ class Night:
         # S4: a bounded evidence pack (untrusted data; it only reaches the model inside its envelope)
         refs = list(c.get("evidence_refs") or [])[:20]
         evidence_text = ""
+        self._evidence[str(c["dedupe_key"])] = evidence_detail([])
         try:
             with self._interruptible():
                 pack = self.ad.evidence.pack(cand)
                 evidence_text = self.ad.evidence.render(pack)
             self._merge_health(_dget(pack, "health"), _dget(pack, "steps"))
             for f in _dget(pack, "findings") or []:
-                if _dget(f, "status") == "ok" and _dget(f, "ref"):
+                if _dget(f, "status") == "ok" and _dget(f, "ref"):        # supporting evidence: ok findings only
                     refs.append(str(_dget(f, "ref"))[:200])
+            self._evidence[str(c["dedupe_key"])] = evidence_detail(_dget(pack, "findings") or [])
             for src in PROVIDERS[1:]:
                 if (_dget(pack, "health") or {}).get(src) in ("ok", "error", "stale", "truncated"):
                     self.budget.record_provider(src)
@@ -1618,10 +1753,12 @@ class Night:
 
     def _entry(self, exp_id: str | None, c: Mapping[str, Any], h: Hypothesis, refs: list[str], *,
                status: str) -> dict[str, Any]:
+        detail = self._evidence.get(str(c["dedupe_key"])) or evidence_detail([])
         return {"experiment_id": exp_id, "candidate_key": c["dedupe_key"], "hypothesis": {"what": h.what, "why": h.why},
                 "target": h.target, "artifact_hash": None, "baseline_id": None, "verdict": None, "verdict_reasons": [],
                 "arms": {"A": {}, "B": {}}, "risk": h.risk, "confidence": h.confidence, "cost_usd": 0.0,
-                "status": status, "proposal_id": None, "evidence_refs": refs[:20], "judge": None, "jev": None}
+                "status": status, "proposal_id": None, "evidence_refs": refs[:20], "judge": None, "jev": None,
+                **{k: [dict(x) for x in v] for k, v in detail.items()}}
 
     def _experiment(self, c: dict[str, Any], h: Hypothesis, refs: list[str], later: list[Hypothesis]) -> None:
         assert self.conn is not None
@@ -1667,10 +1804,12 @@ class Night:
                          arms={"A": dict(rr.arms.get("A") or {}), "B": dict(rr.arms.get("B") or {})},
                          judge=_summary(getattr(rr, "judge", None), JUDGE_KEYS),
                          jev=_summary(getattr(rr, "jev", None), JEV_KEYS))
+            entry.update(test_setup=rr.setup, relevance=rr.relevance, judge_pairs=rr.judge_pairs, provider_results=rr.provider_results)
             row = {"status": "evaluated", "verdict": verdict,
                    "meta": {"verdict_reasons": rr.reasons[:20], "arms": entry["arms"], "eval_path": rr.eval_path,
                             "replay_runs": rr.runs, "budget_stop": rr.budget_stop, "judge": entry["judge"],
-                            "jev": entry["jev"]}}
+                            "jev": entry["jev"], "test_setup": rr.setup, "relevance": rr.relevance,
+                            "judge_pairs": rr.judge_pairs, "provider_results": rr.provider_results}}
             if rr.budget_stop:
                 entry["status"] = "skipped_budget"
                 cand_status, cand_reason = "deferred", f"replay stopped by the budget ({rr.budget_stop})"
@@ -1787,6 +1926,7 @@ class Night:
         r["status"] = status
         r["finished_at"] = _now_iso()
         r["costs"] = self.budget.costs()
+        r["budget"] = self.budget.caps()
         r["health"] = {k: self.health.get(k, "skipped") for k in HEALTH_KEYS}
         reasons = {k: v[:3] for k, v in self.health_reasons.items() if v and r["health"].get(k) not in ("ok", "skipped")}
         if reasons:
@@ -1881,7 +2021,8 @@ def validate_report(obj: Any) -> list[str]:
     allowed = {"format", "night", "started_at", "finished_at", "status", "checkpoint", "delta", "patterns",
                "candidates", "experiments", "costs", "health", "pending_decisions", "notes",
                "skipped", "prerequisite_warnings",            # both optional (rsi_schedule's night job)
-               "health_reasons"}                               # optional: provider -> why it was not ok
+               "health_reasons",                               # optional: provider -> why it was not ok
+               "budget"}                                       # optional: the budget caps (_finish, since 1df19d2)
     errs += [f"unknown key {k}" for k in sorted(set(obj) - allowed)]
     if obj.get("format") != FORMAT:
         errs.append("format is not rsi-night/1")
@@ -1955,6 +2096,15 @@ def validate_report(obj: Any) -> list[str]:
         if isinstance(pid, str) and not _UUID.fullmatch(pid):
             errs.append(f"{w}.proposal_id is not a lowercase uuid")
         need(e, "evidence_refs", list, w)
+        for k in ("evidence_measurements", "unlinked_refs"):   # optional (2026-10-25): older reports lack them
+            items = e.get(k)
+            if items is None:
+                continue
+            if not (isinstance(items, list) and all(isinstance(x, dict) and isinstance(x.get("ref"), str)
+                                                    for x in items)):
+                errs.append(f"{w}.{k} must be a list of objects with a ref")
+            elif k == "evidence_measurements" and not all(isinstance(x.get("measurements"), dict) for x in items):
+                errs.append(f"{w}.{k} items need a measurements object")
         for k in ("judge", "jev"):                    # optional (Mission 005.5): the replay's judge and Jev summaries
             if e.get(k) is not None and not isinstance(e[k], dict):
                 errs.append(f"{w}.{k} must be an object or null")

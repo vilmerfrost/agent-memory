@@ -53,6 +53,10 @@ class FakeReplayConfig:
     judge: str = "stub"
     jev: str = "fixture"
     credentials: str = "none"
+    auth_mode: str = "api"
+    judge_auth_mode: str = "api"
+    judge_model: str | None = None
+    judge_effort: str | None = None
 
 
 def test_sandbox_replayer_maps_the_replay_result(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -66,7 +70,8 @@ def test_sandbox_replayer_maps_the_replay_result(monkeypatch: pytest.MonkeyPatch
         return SimpleNamespace(verdict=FakeVerdict("NO_EFFECT", ("delta 0.00 below 0.10",)),
                                arms={"A": {"pass": 2}, "B": {"pass": 2}}, runs=[1, 2, 3, 4], artifact_hash=h,
                                baseline_id=baseline_id, eval_path=tmp_path / "e.json", budget_stop=None)
-    fake = SimpleNamespace(load_cases=lambda ids=None: ["case-1", "case-2", "case-3"], ReplayConfig=FakeReplayConfig,
+    cases = [SimpleNamespace(id=f"case-{i}", title=f"Task {i}") for i in range(1, 4)]
+    fake = SimpleNamespace(load_cases=lambda ids=None: cases, ReplayConfig=FakeReplayConfig,
                            run_replay=run_replay)
     monkeypatch.setitem(__import__("sys").modules, "agent_memory.rsi_replay", fake)
     monkeypatch.setattr(agent_memory, "rsi_replay", fake, raising=False)
@@ -75,8 +80,11 @@ def test_sandbox_replayer_maps_the_replay_result(monkeypatch: pytest.MonkeyPatch
     out = N.SandboxReplayer(cfg.stages, cfg.replay).replay(artifact_hash="a" * 64, experiment_id="exp-20261018-1",
                                                           baseline_id="bl-1", budget=b)
     assert out == N.ReplayOutcome("NO_EFFECT", ["delta 0.00 below 0.10"], {"A": {"pass": 2}, "B": {"pass": 2}},
-                                  "a" * 64, "bl-1", str(tmp_path / "e.json"), None, 4)
-    assert calls["cases"] == ["case-1", "case-2", "case-3"] and calls["budget"] is b and calls["root"] == tmp_path
+                                  "a" * 64, "bl-1", str(tmp_path / "e.json"), None, 4,
+                                  setup={"agent": "stub", "model": None, "effort": None, "auth_mode": "api",
+                                         "judge": "stub", "judge_model": None, "judge_effort": None,
+                                         "judge_auth_mode": "api", "tasks": [{"id": c.id, "title": c.title} for c in cases]})
+    assert calls["cases"] == cases and calls["budget"] is b and calls["root"] == tmp_path
     assert calls["cfg"] == FakeReplayConfig()                                      # stub agent, stub judge, fixture Jev
     assert (calls["experiment_id"], calls["baseline_id"]) == ("exp-20261018-1", "bl-1")
 
