@@ -11,6 +11,7 @@ from agent_memory import dashboard as D
 MIGRATION = next((Path(__file__).resolve().parents[1] / 'supabase/migrations').glob('*_night_desk.sql')).read_text()
 EVIDENCE_MIGRATION = next((Path(__file__).resolve().parents[1] / 'supabase/migrations').glob('*_night_desk_evidence_columns.sql')).read_text()
 TITLES_MIGRATION = next((Path(__file__).resolve().parents[1] / 'supabase/migrations').glob('*_night_desk_session_titles.sql')).read_text()
+GOLIVE_MIGRATION = next((Path(__file__).resolve().parents[1] / 'supabase/migrations').glob('*_night_desk_web_golive.sql')).read_text()
 OWNER = str(uuid.UUID(int=6101))
 OTHER = str(uuid.UUID(int=6102))
 TABLES = ('rsi_nights','report_snapshots','ledger_events','runs','edits','undo_requests',
@@ -28,6 +29,7 @@ def owner_db(pg_url):
         c.execute(MIGRATION)
         c.execute(EVIDENCE_MIGRATION)
         c.execute(TITLES_MIGRATION)
+        c.execute(GOLIVE_MIGRATION)                     # re-running the night_desk grants above, then the go-live revoke
         c.execute('insert into amem_private.dashboard_owner values (true,%s) on conflict (singleton) do update set uid=excluded.uid', (OWNER,))
         c.execute("insert into rsi_nights values ('rls-test','partial','Test','{}','{}','{}','{}',now(),now()) on conflict do nothing")
         c.execute("insert into report_snapshots(kind,date,summary,report_path) values ('improve','2026-01-01','{}','local') on conflict do nothing")
@@ -114,21 +116,15 @@ def test_edit_evidence_columns_are_owner_only_and_readonly(owner_db):
             c.execute(query)
 
 
-def test_undo_owner_nonowner_unknown_and_already_undone(owner_db):
+def test_owner_undo_rpc_is_retired_for_signed_in_sessions(owner_db):
+    # Since the web go-live (2026-10-25) an edit Undo goes through amem-decide with Face ID; the old
+    # login-only RPC no longer runs for any signed-in session, the owner included.
     c, eid = owner_db
-    identity(c,OTHER)
-    with pytest.raises(psycopg.errors.InsufficientPrivilege):
-        with c.transaction():
-            c.execute('select amem_request_undo_owner(%s)', (eid,))
-    identity(c,OWNER)
-    assert c.execute('select amem_request_undo_owner(%s)', (uuid.uuid4(),)).fetchone() == ('nothing to undo',)
-    assert c.execute('select amem_request_undo_owner(%s)', (eid,)).fetchone() == ('queued',)
-    assert c.execute('select amem_request_undo_owner(%s)', (eid,)).fetchone() == ('queued',)
-    c.execute('reset role')
-    c.execute("update undo_requests set result='reverted',handled_at=now() where edit_id=%s", (eid,))
-    c.execute("update edits set status='reverted' where id=%s", (eid,))
-    identity(c,OWNER)
-    assert c.execute('select amem_request_undo_owner(%s)', (eid,)).fetchone() == ('already undone',)
+    for who in (OTHER, OWNER):
+        identity(c, who)
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            with c.transaction():
+                c.execute('select amem_request_undo_owner(%s)', (eid,))
 
 
 def test_report_costs_missing_values_secret_counts_and_idempotence(pg_url,tmp_path):
