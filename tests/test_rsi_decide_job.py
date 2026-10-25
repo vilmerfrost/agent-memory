@@ -95,12 +95,9 @@ def stage(w: dict[str, Any], sandbox: Path, name: str, title: str) -> tuple[str,
 
 def record(owner: str, pid: str, h: str, action: str, *, web: bool = True) -> str:
     """A recorded Night Desk decision, inserted as the superuser (the web edge function's SQL is the sibling's)."""
-    with psycopg.connect(owner) as conn:
-        cols = {r[0] for r in conn.execute("select column_name from information_schema.columns "
-                                           "where table_name = 'rsi_decisions'")}
-        extra = {"channel": "web"} if web and "channel" in cols else {}
-        names = ["proposal_id", "action", "artifact_hash", "source", "verified", "reason", *extra]
-        vals = [pid, action, h, "phone", "edge-token", "night desk test", *extra.values()]
+    with psycopg.connect(owner) as conn:                               # channel is generated from source
+        names = ["proposal_id", "action", "artifact_hash", "source", "verified", "reason"]
+        vals = [pid, action, h, "web" if web else "phone", "edge-token", "night desk test"]
         did = conn.execute(f"insert into rsi_decisions ({', '.join(names)}, expires_at) values "
                            f"({', '.join(['%s'] * len(names))}, now() + interval '24 hours') returning id", vals).fetchone()[0]
         new = {"apply": "approved", "reject": "rejected"}.get(action)
