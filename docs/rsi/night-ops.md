@@ -29,7 +29,7 @@ a key or a database URL (the routines read the database URL from the repo's env 
 08:45 amem-archive ──PASS──┐
 09:20 amem-daily ───PASS───┼──▶ 01:30 night-job ──gate──▶ amem rsi night (S0-S9) ──▶ report.json
 every 15 min amem-ingest ──┘        │ not done: SKIP + reason          │ lock: one night at a time
-                                     │ key missing: FAIL + reason       │ wall clock 45 min + watchdog
+                                     │ key missing: FAIL + reason       │ wall clock 4 h 45 min + watchdog
                                      ▼                                  ▼
                               routines.log ◀── amem-rsi-night line   07:30 brief-job (waits for lock + report)
                                      │                                  │
@@ -102,6 +102,7 @@ own preflight failed (no `skipped`) keeps the old headline.
 
 Since 2026-10-23 (verify run of night 2026-10-23, partial, $0.14):
 
+- **Three experiments per night** (2026-10-25): one per candidate; the second hypothesis waits pending. `night-job --plan` prints "Room for N experiment(s)" with each per-night cap's need and cap. The wall clock is 4 h 45 min (see [Subscription migration](subscription-migration.md), "Limits and accounting").
 - **Targets improve refuses leave the pool.** Allowlisted targets that improve refuses (a file in
   `improve/pins.json`, or a path outside `criteria.json` `allowed_targets` with the `fence.txt` nuance, read through
   `edits_targets.pinned_file` / `is_allowed` like the edits step) are removed from the night's allowlist, so their
@@ -282,7 +283,7 @@ fails, the night records "hypothesizer failed" and spends nothing on the replay.
 | Credential missing | `FAIL credentials ...`; routine-audit raises it | store the key (secret popup / Keychain), then wait or run `amem rsi night-job` by hand |
 | Night aborted or over the wall clock | experiment `interrupted`, containers reaped, lock released, checkpoint kept | nothing: the next night resumes the pending hypothesis |
 | Process killed (watchdog exit 124, power loss) | the lock expires (wall clock + 15 min) or is taken over when its pid is dead; experiment rows may stay `running` | `amem rsi night-job` again; `python3 sandbox/rsi_sandbox.py recover` if containers remain |
-| Budget exhausted | `FAIL budget: <kind>`, hypotheses kept pending | raise the cap only with a new approval |
+| Budget exhausted | `FAIL budget: <kind>`, hypotheses kept pending; the 2nd and 3rd candidates stay deferred with their hypotheses | raise the cap only with a new approval |
 | A staged proposal looks wrong | it expires after its TTL | `amem rsi decide <id> reject --hash <H>` |
 | Turn the night off | — | `launchctl bootout gui/$(id -u)/com.vilmerfrost.amem-rsi-night` (and `...-rsi-brief`), remove the plists from `~/Library/LaunchAgents` and `~/agent-config/launchd/`, remove the registry rows |
 
