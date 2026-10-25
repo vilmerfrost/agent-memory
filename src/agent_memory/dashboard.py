@@ -22,7 +22,11 @@ KINDS = {'evals': 'evals-parent', 'evals-parent': 'evals-parent', 'skill-evals':
          'routine-audit': 'routine-audit'}
 FILE = re.compile(r'^(evals-parent|evals|skill-evals|improve|secret-scan|config-check|routine-audit)-(\d{4}-\d{2}-\d{2})(?:-[^.]+)?\.json$')
 CASE_FIELDS = ('id', 'name', 'status', 'verdict', 'seconds', 'attempts', 'cost_usd')
-LEDGER_FIELDS = ('event', 'id', 't', 'target', 'rule', 'reason', 'summary', 'artifact_hash', 'decision_id', 'files', 'commit')
+LEDGER_FIELDS = ('event', 'id', 't', 'target', 'rule', 'rule_id', 'topic', 'why', 'reason',
+                 'revert_reason', 'status', 'kind', 'summary', 'artifact_hash', 'decision_id', 'files', 'commit')
+CHANGE_CONTEXT_FIELDS = ('target', 'rule_id', 'topic', 'why', 'files', 'artifact_hash', 'decision_id')
+USAGE_FIELDS = ('sessions', 'active_seconds', 'api_seconds', 'usd', 'cost_usd')
+TOKEN_FIELDS = ('input', 'output', 'cache_read', 'cache_creation', 'total')
 
 
 def clean(value: Any) -> Any:
@@ -73,20 +77,25 @@ def snapshot(kind: str, documents: list[tuple[Path, dict]]) -> tuple[dict, float
                  for k in ('findings', 'new', 'errors', 'unreadable', 'repos')}, None)
     items = []
     costs = []
+    complete = []
     source_counts = []
     for path, doc in documents:
         rows = cases(doc)
-        items.extend(rows)
+        items.extend({**row, "report": clean(path.name)} for row in rows)
         cost = doc.get('cost_usd')
-        if not number(cost):
+        measured_total = number(cost)
+        if not measured_total:
             values = [x['cost_usd'] for x in rows if number(x.get('cost_usd'))]
             cost = sum(values) if values else None
+            complete.append(bool(rows) and len(values) == len(rows))
+        else:
+            complete.append(True)
         costs.append(cost)
         source_counts.append({'report': path.name, 'cases': len(rows), 'cost_usd': cost,
                               **{k: doc[k] for k in ('pass', 'fail', 'inconclusive') if number(doc.get(k))}})
     known = sum(c for c in costs if c is not None)
     summary = {'cases': items, 'sources': source_counts, 'known_cost_usd': round(known, 6),
-               'cost_complete': all(c is not None for c in costs)}
+               'cost_complete': all(complete)}
     if kind == 'routine-audit':
         summary['cases'] = [clean({'status': row[0], 'name': row[1]})
                             for _, doc in documents for row in doc.get('rows', [])
@@ -123,6 +132,7 @@ def sync_reports(reports: Path, ledger: Path, *, db_url: str | None = None) -> d
         except (ValueError, OSError):
             errors.append(path.name)
     events = []
+    contexts = {}
     if ledger.exists():
         lines = ledger.read_text().splitlines(keepends=True)
         for index, line in enumerate(lines):
@@ -133,7 +143,23 @@ def sync_reports(reports: Path, ledger: Path, *, db_url: str | None = None) -> d
                 if not isinstance(raw, dict) or not isinstance(raw.get('event'), str):
                     raise ValueError('invalid event')
                 digest = hashlib.sha256(json.dumps(raw, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
-                events.append((digest, raw['event'], raw.get('t'), clean({k: raw[k] for k in LEDGER_FIELDS if k in raw})))
+                summary = {k: raw[k] for k in LEDGER_FIELDS if k in raw}
+                change_id = raw.get('id')
+                if isinstance(change_id, str):
+                    previous = contexts.get(change_id, {})
+                    if previous:
+                        # Explicitly label inherited identity; it is not this event's own reason/time.
+                        summary['change_context'] = dict(previous)
+                    contexts[change_id] = {**previous, **{k: raw[k] for k in CHANGE_CONTEXT_FIELDS if k in raw}}
+                usage = raw.get('cost')
+                if isinstance(usage, dict):
+                    summary['cost'] = {k: usage[k] for k in USAGE_FIELDS if number(usage.get(k))}
+                    tokens = usage.get('tokens')
+                    if isinstance(tokens, dict):
+                        summary['cost']['tokens'] = {k: tokens[k] for k in TOKEN_FIELDS if number(tokens.get(k))}
+                if isinstance(raw.get('window'), dict):
+                    summary['window'] = {k: raw['window'][k] for k in ('start', 'end') if isinstance(raw['window'].get(k), str)}
+                events.append((digest, raw['event'], raw.get('t'), clean(summary)))
             except ValueError:
                 errors.append(f'ledger line {index + 1}')
     with store.connect(db_url) as conn:
@@ -145,7 +171,8 @@ def sync_reports(reports: Path, ledger: Path, *, db_url: str | None = None) -> d
              (kind, date, Jsonb(summary), cost, '\n'.join(str(p) for p, _ in docs)))
         for eid, event, at, summary in events:
             conn.execute('''insert into public.ledger_events (id,event,occurred_at,summary)
-             values (%s,%s,%s,%s) on conflict (id) do nothing''', (eid, event, at, Jsonb(summary)))
+             values (%s,%s,%s,%s) on conflict (id) do update set summary=excluded.summary
+             where public.ledger_events.summary is distinct from excluded.summary''', (eid, event, at, Jsonb(summary)))
     return {'reports': len(grouped), 'ledger_events': len(events), 'errors': errors}
 
 

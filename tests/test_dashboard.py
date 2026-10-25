@@ -119,3 +119,49 @@ def test_malformed_and_incomplete_reports_are_reported(tmp_path,pg_url):
     ledger=tmp_path/'ledger'; ledger.write_text('{unfinished')
     result=D.sync_reports(tmp_path,ledger,db_url=pg_url)
     assert result['errors']==['evals-2026-10-24.json'] and result['ledger_events']==0
+
+
+def test_partial_case_cost_is_not_labelled_complete(tmp_path):
+    path = tmp_path / 'evals-2026-10-24.json'
+    summary, cost = D.snapshot('evals-parent', [(path, {'results': [
+        {'id': 'priced', 'cost_usd': 1.25}, {'id': 'unpriced', 'status': 'FAIL'}]})])
+    assert cost == 1.25 and summary['cost_complete'] is False
+    assert all(case['report'] == path.name for case in summary['cases'])
+    summary, cost = D.snapshot('evals-parent', [(path, {'cost_usd': 0, 'results': [{'id': 'skipped', 'status': 'SKIP'}]})])
+    assert cost == 0 and summary['cost_complete'] is True
+
+
+def test_ledger_preserves_change_identity_reason_and_usage_and_upgrades_existing_rows(pg_url, tmp_path):
+    import hashlib
+    change = 'dashboard-context-test'
+    records = [
+        {'event': 'applied', 'id': change, 't': '2026-10-20T12:00:00Z', 'target': '~/example.md',
+         'rule_id': 'example-rule', 'topic': 'Example change', 'why': 'Clarify the task', 'status': 'trial'},
+        {'event': 'eval-cost', 'id': change, 't': '2026-10-20T13:00:00Z',
+         'cost': {'sessions': 2, 'tokens': {'input': 100, 'total': 100, 'secret': 'never-store'}, 'secret': 'never-store'},
+         'window': {'start': '2026-10-20T12:00:00Z', 'end': '2026-10-20T12:10:00Z'}},
+        {'event': 'reverted', 'id': change, 't': '2026-10-21T12:00:00Z', 'status': 'reverted',
+         'revert_reason': 'phone undo', 'secret': 'never-store'},
+    ]
+    ledger = tmp_path / 'ledger.jsonl'
+    ledger.write_text(''.join(json.dumps(r) + '\n' for r in records))
+    digest = hashlib.sha256(json.dumps(records[2], sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+    with psycopg.connect(pg_url) as c:
+        c.execute("insert into ledger_events(id,event,summary) values (%s,'reverted',%s) on conflict do nothing",
+                  (digest, psycopg.types.json.Jsonb({'id': change, 'event': 'reverted'})))
+        created = c.execute('select created_at from ledger_events where id=%s', (digest,)).fetchone()[0]
+    D.sync_reports(tmp_path, ledger, db_url=pg_url)
+    with psycopg.connect(pg_url) as c:
+        rows = dict(c.execute("select event,summary from ledger_events where summary->>'id'=%s", (change,)))
+        assert rows['applied']['why'] == 'Clarify the task'
+        assert rows['reverted']['revert_reason'] == 'phone undo'
+        assert rows['reverted']['change_context']['target'] == '~/example.md'
+        assert rows['eval-cost']['cost'] == {'sessions': 2, 'tokens': {'input': 100, 'total': 100}}
+        assert 'cost_usd' not in rows['eval-cost']['cost']
+        assert 'never-store' not in json.dumps(rows)
+        version = c.execute('select xmin::text,created_at from ledger_events where id=%s', (digest,)).fetchone()
+        assert version[1] == created
+    D.sync_reports(tmp_path, ledger, db_url=pg_url)
+    with psycopg.connect(pg_url) as c:
+        assert c.execute('select xmin::text,created_at from ledger_events where id=%s', (digest,)).fetchone() == version
+        assert c.execute("select count(*) from ledger_events where summary->>'id'=%s", (change,)).fetchone() == (3,)
