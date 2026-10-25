@@ -19,6 +19,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import pwd
 from pathlib import Path
 import re
 import stat
@@ -86,8 +87,11 @@ def _private_home(home: Path) -> Path:
         if child.is_symlink():
             raise SubscriptionError("auth_home_symlink_refused")
     # An entire everyday home cannot be repurposed as an isolated auth home.
-    if home == Path.home().resolve() or any((home / x).exists() for x in
-                                          (".ssh", ".aws", ".config", "Projects", "Library")):
+    # Native macOS clients create Library caches inside an otherwise dedicated
+    # HOME. Compare the real account home explicitly instead of rejecting that cache.
+    real_home = Path(pwd.getpwuid(os.getuid()).pw_dir).resolve()
+    if home in (Path.home().resolve(), real_home) or any((home / x).exists() for x in
+                                                      (".ssh", ".aws", ".config", "Projects")):
         raise SubscriptionError("dedicated_private_auth_home_required")
     return home
 
@@ -137,7 +141,12 @@ def _auth_lock(home: Path, timeout_s: float):
 def claude_command(auth: SubscriptionAuth, *, model: str, effort: str, mcp_config: Path,
                    tools_allowed: bool) -> list[str]:
     settings = {"disableAllHooks": True, "enableAllProjectMcpServers": False,
-                "enabledPlugins": {}, "autoMemoryEnabled": False,
+                # Built-in mods are independent of disableAllHooks/restricted mode.
+                # Explicit IDs are documented plugin enable/disable keys. Keep the
+                # startup guard: any newly enabled plugin still rejects the run.
+                "enabledPlugins": {"cc-plugin-agents-md@builtin": False,
+                                   "cc-plugin-plugin-authoring@builtin": False},
+                "syncClaudeAiPlugins": False, "autoMemoryEnabled": False,
                 "permissions": {"defaultMode": "dontAsk"}}
     argv = [str(auth.client), "--restricted", "--print", "--output-format", "stream-json",
             "--verbose", "--model", model, "--effort", effort,
@@ -343,6 +352,7 @@ def run(provider: str, prompt: str, *, model: str, effort: str, workspace: Path,
 # openai/codex rust-v0.163.0 core/src/tools/spec_plan.rs gates shell, apply_patch,
 # view_image and request_permissions on stable_environment_tools OR an environment.
 CODEX_VERSION = "codex-cli 0.163.0"
+CODEX_PERMISSION_PROFILE = "rsi-no-host"
 # Audited against rust-v0.163.0 spec_plan.rs and ext/{skills,memories,history-notes}.
 # No environments/executor roots => no native shell/file/permission handlers.
 # Skill tools require cloud skills or executor roots; host discovery is confined
@@ -367,6 +377,9 @@ CODEX_OVERRIDES = {
     "agents.enabled": False, "mcp_servers": {}, "web_search": "disabled",
     "project_doc_max_bytes": 0, "model_provider": "openai", "forced_login_method": "chatgpt",
     "cli_auth_credentials_store": "file", "model_reasoning_effort": "high",
+    "default_permissions": CODEX_PERMISSION_PROFILE,
+    f"permissions.{CODEX_PERMISSION_PROFILE}.filesystem": {},
+    f"permissions.{CODEX_PERMISSION_PROFILE}.network.enabled": False,
 }
 
 
@@ -492,6 +505,15 @@ def _check_codex_config(config):
         raise SubscriptionError("codex_native_tool_isolation_unverified")
     if config.get("model_provider") != "openai":
         raise SubscriptionError("subscription_auth_required")
+    profile = (config.get("permissions") or {}).get(CODEX_PERMISSION_PROFILE) or {}
+    filesystem = profile.get("filesystem")
+    # config/read adds its optional scan-depth field even to an empty filesystem table.
+    grants = ({k: v for k, v in filesystem.items() if not (k == "glob_scan_max_depth" and v is None)}
+              if isinstance(filesystem, dict) else None)
+    if (config.get("default_permissions") != CODEX_PERMISSION_PROFILE or grants != {}
+            or profile.get("extends") or profile.get("workspace_roots")
+            or (profile.get("network") or {}).get("enabled") is not False):
+        raise SubscriptionError("codex_native_tool_isolation_unverified")
 
 
 def _codex_session(rpc, *, model, effort, prompt, cwd, bridge_tools):
@@ -500,6 +522,9 @@ def _codex_session(rpc, *, model, effort, prompt, cwd, bridge_tools):
     rpc.send({"method": "initialized", "params": {}})
     # Config and account are verified before creating a thread or generating tokens.
     _check_codex_config(rpc.request("config/read", {"includeLayers": False}).get("config") or {})
+    profiles = rpc.request("permissionProfile/list", {"cwd": str(cwd), "limit": 100}).get("data") or []
+    if not any(p.get("id") == CODEX_PERMISSION_PROFILE and p.get("allowed") is True for p in profiles):
+        raise SubscriptionError("codex_permission_profile_unavailable")
     account = rpc.request("account/read", {"refreshToken": True}).get("account") or {}
     if account.get("type") != "chatgpt":
         raise SubscriptionError("subscription_auth_required")
@@ -522,7 +547,7 @@ def _codex_session(rpc, *, model, effort, prompt, cwd, bridge_tools):
         tools = [{"type": "function", **tool} for tool in (bridge.TOOL, bridge.READ_TOOL)]
     started = rpc.request("thread/start", {"model": model, "modelProvider": "openai",
         "cwd": str(cwd), "ephemeral": True, "environments": [], "runtimeWorkspaceRoots": [],
-        "approvalPolicy": "never", "approvalsReviewer": "user", "sandbox": "read-only",
+        "approvalPolicy": "never", "approvalsReviewer": "user", "permissions": CODEX_PERMISSION_PROFILE,
         "dynamicTools": tools, "config": {"model_reasoning_effort": effort},
         "baseInstructions": "Complete the supplied task. All task file access and command execution "
                             "must use the explicitly supplied task tools. Do not request permissions.",
@@ -536,8 +561,7 @@ def _codex_session(rpc, *, model, effort, prompt, cwd, bridge_tools):
         raise SubscriptionError("client_protocol_invalid")
     turn = rpc.request("turn/start", {"threadId": thread_id, "model": model, "effort": effort,
         "environments": [], "approvalPolicy": "never", "approvalsReviewer": "user",
-        "sandboxPolicy": {"type": "readOnly", "access": {"type": "restricted",
-                          "includePlatformDefaults": False, "readableRoots": []}},
+        "permissions": CODEX_PERMISSION_PROFILE,
         "input": [{"type": "text", "text": prompt, "text_elements": []}]})
     turn_id = (turn.get("turn") or {}).get("id")
     if not turn_id:

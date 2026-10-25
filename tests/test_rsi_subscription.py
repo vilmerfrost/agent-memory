@@ -64,6 +64,10 @@ def test_subscription_run_does_not_forward_parent_secrets_or_config(setup, monke
     assert "--fallback-model" not in argv
     assert argv[argv.index("--setting-sources") + 1] == ""
     assert "--strict-mcp-config" in argv
+    settings = json.loads(argv[argv.index("--settings") + 1])
+    assert settings["enabledPlugins"] == {"cc-plugin-agents-md@builtin": False,
+                                           "cc-plugin-plugin-authoring@builtin": False}
+    assert settings["syncClaudeAiPlugins"] is False
     assert options["cwd"] != str(setup[1])
     assert str(setup[0].home).encode() not in options["input_bytes"]
     assert result.evidence["generated_execution"] == "disabled"
@@ -74,6 +78,17 @@ def test_api_auth_rejected_before_inference(setup):
     with pytest.raises(S.SubscriptionError, match="subscription_auth_required"):
         invoke(setup, fake_client(calls, auth_method="api_key"), tools_allowed=False)
     assert len(calls) == 1
+
+
+def test_dedicated_home_may_contain_native_macos_cache_but_not_real_account_home(setup, monkeypatch):
+    from types import SimpleNamespace
+    auth, _, _ = setup
+    (auth.home / "Library").mkdir()
+    assert S._private_home(auth.home) == auth.home
+    monkeypatch.setenv("HOME", str(auth.home.parent / "spoofed-home"))
+    monkeypatch.setattr(S.pwd, "getpwuid", lambda uid: SimpleNamespace(pw_dir=str(auth.home)))
+    with pytest.raises(S.SubscriptionError, match="dedicated_private_auth_home_required"):
+        S._private_home(auth.home)
 
 
 @pytest.mark.parametrize("model,effort", [("claude-sonnet-5-5", "high"), ("claude-opus-5-5", "medium")])
@@ -234,16 +249,22 @@ class FakeRpc:
                                "cloud": {"skills": {"enabled": False}},
                                "skills": {"include_instructions": False, "bundled": {"enabled": False}},
                                "orchestrator": {"mcp": {"enabled": False}},
+                               "default_permissions": S.CODEX_PERMISSION_PROFILE,
+                               "permissions": {S.CODEX_PERMISSION_PROFILE: {"filesystem": {"glob_scan_max_depth": None}, "network": {"enabled": False}}},
                                "agents": {"enabled": False}, "mcp_servers": {}, "web_search": "disabled",
                                "forced_login_method": "chatgpt", "model_provider": "openai"}}
         if method == "account/read":
             return {"account": {"type": self.auth_type, "planType": "pro"}}
+        if method == "permissionProfile/list":
+            return {"data": [{"id": S.CODEX_PERMISSION_PROFILE, "allowed": True}]}
         if method == "model/list":
             return {"data": [{"model": self.model, "supportedReasoningEfforts": [{"reasoningEffort": self.effort}]}]}
         if method == "thread/start":
+            assert params.get("permissions") == S.CODEX_PERMISSION_PROFILE and "sandbox" not in params
             return {"thread": {"id": "t"}, "model": self.model, "reasoningEffort": self.effort,
                     "modelProvider": "openai", "instructionSources": []}
         if method == "turn/start":
+            assert params.get("permissions") == S.CODEX_PERMISSION_PROFILE and "sandboxPolicy" not in params
             return {"turn": {"id": "u"}}
         raise AssertionError(method)
 
@@ -271,7 +292,7 @@ def test_codex_no_native_environment_and_exact_model_effort(setup, monkeypatch):
     turn = next(p for m, p in rpc.requests if m == "turn/start")
     assert thread["environments"] == [] and turn["environments"] == []
     assert thread["dynamicTools"] == []
-    assert turn["sandboxPolicy"]["access"]["readableRoots"] == []
+    assert turn["permissions"] == S.CODEX_PERMISSION_PROFILE and "sandboxPolicy" not in turn
     assert thread["approvalPolicy"] == turn["approvalPolicy"] == "never"
 
 
@@ -351,3 +372,11 @@ def test_tool_call_budget_is_enforced_before_starting_another_container(setup):
     with pytest.raises(bridge.ToolError, match="tool_call_limit"):
         tool.call("task_shell", {"command": "printf again"})
     assert len(calls) == 2
+
+
+def test_named_codex_profile_must_not_grant_any_host_path():
+    cfg = FakeRpc().request("config/read", {})["config"]
+    S._check_codex_config(cfg)
+    cfg["permissions"][S.CODEX_PERMISSION_PROFILE]["filesystem"]["/"] = "read"
+    with pytest.raises(S.SubscriptionError, match="isolation_unverified"):
+        S._check_codex_config(cfg)

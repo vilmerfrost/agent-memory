@@ -508,7 +508,7 @@ def test_plists_are_stage_only_hooks_off_and_lint_clean(name: str, sub: str) -> 
 def test_night_plist_uses_the_first_night_config_and_brief_waits_for_the_night() -> None:
     night, brief = load_plist("com.vilmerfrost.amem-rsi-night.plist"), load_plist("com.vilmerfrost.amem-rsi-brief.plist")
     a = night["ProgramArguments"]
-    assert a[a.index("--config") + 1] == "/Users/vilmerfrost/Projects/agent-memory/config/rsi-night.first.json"
+    assert a[a.index("--config") + 1] == "/Users/vilmerfrost/Projects/agent-memory/config/rsi-night.subscription.json"
     assert night["EnvironmentVariables"]["AMEM_JEV_LIVE"] == "1"
     b = brief["ProgramArguments"]
     assert float(b[b.index("--wait-s") + 1]) >= first_cfg().budget.wall_clock_s + S.HARD_GRACE_S

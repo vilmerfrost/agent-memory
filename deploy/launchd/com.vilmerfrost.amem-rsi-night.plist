@@ -28,7 +28,7 @@
 		<string>rsi</string>
 		<string>night-job</string>
 		<string>--config</string>
-		<string>/Users/vilmerfrost/Projects/agent-memory/config/rsi-night.first.json</string>
+		<string>/Users/vilmerfrost/Projects/agent-memory/config/rsi-night.subscription.json</string>
 	</array>
 	<key>RunAtLoad</key>
 	<false/>

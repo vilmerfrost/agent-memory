@@ -2,8 +2,8 @@
 
 Approved by Vilmer on 2026-10-25. Claude calls use `claude-opus-5-5`; Codex calls use
 `gpt-6.1-sol`. Both use **high** effort, including hypothesis writing and judging.
-This is implemented behind new profiles. The installed scheduler still selects
-`config/rsi-night.first.json`; activation requires dedicated login and live qualification.
+The deployment template selects `config/rsi-night.subscription.json` after dedicated
+login and live qualification. `rsi-night.first.json` remains the explicit legacy API profile.
 The rule-promotion freeze is unchanged.
 
 ## Execution boundary
@@ -95,12 +95,26 @@ error code. Rollback is an explicit config selection, never a silent switch to A
 
 ## Validation recorded during implementation
 
-202 backend tests passed in a networkless Docker test runner with read-only source,
+204 backend tests passed in a networkless Docker test runner with read-only source,
 empty environment, bounded tmpfs, memory, CPU, processes and wall time. Nine database
 tests were skipped because the runner does not expose a database service. An installed
 Codex metadata-only check accepted every required isolation configuration override;
 no inference was requested. A fresh read-only change review found no actionable defect.
-These checks do not prove live subscription access or production readiness.
+
+Both providers subsequently passed live subscription access and isolated-tool checks.
+Three synthetic tasks were replayed on A and B for each provider: twelve task runs and
+six Sol judgments, with no runtime errors, complete usage records and verified target
+reads. Claude used 70,974 input / 3,189 output tokens; Codex used 86,544 / 1,777.
+These figures include each replay's Sol judge calls, and are usage, not billed dollars.
+The Claude synthetic change was judged WORSE; Codex's change was INCONCLUSIVE because
+Jev was intentionally disabled. Neither qualification promoted a rule or wrote production DB rows.
+
+Live qualification exposed and resolved two client compatibility details: built-in
+Claude mods require explicit plugin disable entries, and Codex 0.163.0 restricted reads
+use a named empty-filesystem permission profile rather than legacy readOnly.access.
+Claude also creates a Library cache inside its private HOME; real account homes are
+rejected explicitly using both environment and OS account identity.
+This qualifies the controlled replay transport, not every real skill or production workload.
 
 ## Official interface references
 
