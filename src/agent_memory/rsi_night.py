@@ -10,7 +10,8 @@ A deterministic Python orchestrator. Models are called only at fixed stages, thr
     S4 evidence     a bounded evidence pack for each selected candidate (untrusted-data envelope)
     S5 hypotheses   at most two typed hypotheses per candidate (what / why / target from the allowlist); anything
                     else rejected. One experiment per candidate per night; the other hypothesis waits, pending
-    S6 implement    the candidate file content (stub by default; Claude / Codex inside the sandbox)
+    S6 implement    the candidate file content (stub by default; the Opus section writer in the subscription
+                    profiles, the stub as its per-experiment fallback; Claude / Codex inside the sandbox)
                     staged with agent-config `improve stage` into $RSI_SANDBOX_DIR
     S7 replay       baseline vs candidate in the sandbox (rsi_replay.run_replay); the verdict is deterministic code
     S8 staging      a proposal row, only for IMPROVES with the exact artifact hash and a bound eval record
