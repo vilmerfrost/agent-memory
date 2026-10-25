@@ -128,6 +128,13 @@ Since 2026-10-23 (verify run of night 2026-10-23, partial, $0.14):
     `source`, `n`, `ts`, `measurements`): for example `sessions_hit` 2 of `sessions_total` 5 for the week of
     2026-10-12. Only numbers, booleans and short labels are kept. Free text and anything the scrubber would change
     are left out. Older reports have neither field; readers treat them as empty.
+- **Only candidates with a test case take the experiment slot** (2026-10-25). Replay cases now cover the meltdown,
+  pepe and anatomy skills (see [Subscription migration](subscription-migration.md), "Skill coverage"). Now:
+  - Each candidate in report.json carries the additive fields `target`, `test_cases` (the case ids that use its
+    file) and `skip_reason` (null, or "no test case uses this file"). Night Desk can show `skip_reason` per candidate.
+  - A candidate whose file no case uses gets no Jev triage call and never takes the experiment slot.
+  - With `replay.cases` null, an experiment replays only its target's cases, repeated up to `min_pairs`. A change to
+    the global CLAUDE.md still runs the generic cases once each.
 - **Quiet skips.** A lock overlap or a night that is already `done` logs `SKIP` with `-warn` lines, not `-fail`,
   so routine-audit (which flags a SKIP with `-fail` lines) stays green. A night whose run failed is retried by the
   next start (the 01:30 job after a failed manual run), as before.
