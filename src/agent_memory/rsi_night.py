@@ -106,6 +106,15 @@ class HypothesisParseError(ValueError):
     """The whole model reply is unusable (not JSON, wrong shape)."""
 
 
+class HypothesisRejected(ValueError):
+    """One hypothesis broke a rule. `code` (REJECT_REASONS) and `field` (a HYP_FIELDS name) are what the night report
+    keeps: fixed words, never the model's own text. `target` only when it is a well-formed ~/ markdown path."""
+
+    def __init__(self, code: str, msg: str, field: str | None = None, target: str | None = None) -> None:
+        super().__init__(msg)
+        self.code, self.field, self.target = code, field, target
+
+
 # =========================================================================== config
 
 
@@ -254,44 +263,88 @@ _TARGET_RE = re.compile(r"~/[A-Za-z0-9._/-]+\.md")
 
 def _clean_text(v: Any, name: str, limit: int) -> str:
     if not isinstance(v, str):
-        raise ValueError(f"{name} must be a string")
+        raise HypothesisRejected("not_text", f"{name} must be a string", name)
     s = v.strip()
     if not s:
-        raise ValueError(f"{name} is empty")
+        raise HypothesisRejected("empty", f"{name} is empty", name)
     if len(s) > limit:
-        raise ValueError(f"{name} is longer than {limit} characters")
+        raise HypothesisRejected("too_long", f"{name} is longer than {limit} characters", name)
     if any(unicodedata.category(ch) in ("Cc", "Cf", "Co", "Cs") for ch in s):
-        raise ValueError(f"{name} holds control or format characters")
+        raise HypothesisRejected("control_chars", f"{name} holds control or format characters", name)
     if _INJECTION.search(s):
-        raise ValueError(f"{name} looks like a command or an injected instruction")
+        raise HypothesisRejected("looks_like_command", f"{name} looks like a command or an injected instruction", name)
     return s
 
 
 def parse_hypothesis(obj: Any, allowlist: Sequence[str]) -> Hypothesis:
-    """One strict hypothesis. Raises ValueError with the reason."""
+    """One strict hypothesis. Raises HypothesisRejected (a ValueError) with the reason and its code."""
     if not isinstance(obj, dict):
-        raise ValueError("a hypothesis must be an object")
+        raise HypothesisRejected("not_an_object", "a hypothesis must be an object")
     extra = sorted(set(obj) - set(HYP_FIELDS))
     if extra:
-        raise ValueError(f"unknown fields {extra}")
+        raise HypothesisRejected("unknown_fields", f"unknown fields {extra}")
     missing = [k for k in HYP_REQUIRED if k not in obj]
     if missing:
-        raise ValueError(f"missing fields {missing}")
+        raise HypothesisRejected("missing_fields", f"missing fields {missing}", missing[0])
     target = obj["target"]
     if not isinstance(target, str) or not _TARGET_RE.fullmatch(target) or ".." in target.split("/"):
-        raise ValueError("target is not a ~/ markdown path")
+        raise HypothesisRejected("bad_target", "target is not a ~/ markdown path", "target")
     if target not in set(allowlist) or Path(target).name in SELF_FILES:
-        raise ValueError(f"target {target} is not in the allowlist of instruction targets")
+        raise HypothesisRejected("not_allowlisted", f"target {target} is not in the allowlist of instruction targets",
+                                 "target", target)
     what = _clean_text(obj["what"], "what", HYP_FIELDS["what"])
     why = _clean_text(obj["why"], "why", HYP_FIELDS["why"])
     expected = _clean_text(obj["expected"], "expected", HYP_FIELDS["expected"]) if obj.get("expected") else ""
     risk = obj.get("risk", "medium")
     if risk not in RISKS:
-        raise ValueError(f"risk must be one of {RISKS}")
+        raise HypothesisRejected("bad_risk", f"risk must be one of {RISKS}", "risk")
     conf = obj.get("confidence", 0.5)
     if isinstance(conf, bool) or not isinstance(conf, (int, float)) or not math.isfinite(conf) or not 0 <= conf <= 1:
-        raise ValueError("confidence must be a number in 0..1")
+        raise HypothesisRejected("bad_confidence", "confidence must be a number in 0..1", "confidence")
     return Hypothesis(what=what, why=why, target=target, expected=expected, risk=risk, confidence=float(conf))
+
+
+# Why a hypothesis was thrown out before any test, in fixed plain words (Night Desk decision 18). The report keeps
+# the code and these words only; the model's own text never reaches it.
+REJECT_REASONS = {
+    "unparseable": "the idea writer's reply was not the required JSON shape",
+    "not_an_object": "the idea was not a structured object",
+    "unknown_fields": "the idea had fields the rules do not allow",
+    "missing_fields": "the idea left out a required field",
+    "bad_target": "the file to change was not a valid instruction file path",
+    "not_allowlisted": "the file to change is not on the list of files the loop may edit",
+    "not_text": "a field was not plain text",
+    "empty": "a field was empty",
+    "too_long": "a field was longer than the rules allow",
+    "control_chars": "a field held hidden control characters",
+    "looks_like_command": "a field looked like a command, a link or an injected instruction",
+    "bad_risk": "the risk was not low, medium or high",
+    "bad_confidence": "the confidence was not a number between 0 and 1",
+    "over_cap": "more ideas than tonight's cap; only the first ones are tested",
+    "duplicate": "the same change was proposed twice",
+    "ignored": "the reply held more than 10 ideas; the rest were not read",
+    "invalid": "the idea broke the hypothesis rules",
+}
+REJECTED_MAX = 10
+
+
+def rejection_entries(rejected: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """parse_hypotheses' `rejected` as the report keeps them: index, code, field, plain reason, and the target only
+    for `not_allowlisted` (a path the strict ~/ markdown regex accepted). At most REJECTED_MAX."""
+    out: list[dict[str, Any]] = []
+    for r in list(rejected)[:REJECTED_MAX]:
+        if not isinstance(r, Mapping):
+            continue
+        code = r.get("code") if r.get("code") in REJECT_REASONS else "invalid"
+        idx = r.get("index")
+        item: dict[str, Any] = {"index": idx if isinstance(idx, int) and not isinstance(idx, bool) else None,
+                                "code": code, "field": r.get("field") if r.get("field") in HYP_FIELDS else None,
+                                "reason": REJECT_REASONS[code]}
+        t = r.get("target")
+        if code == "not_allowlisted" and isinstance(t, str) and _TARGET_RE.fullmatch(t) and ".." not in t.split("/"):
+            item["target"] = t
+        out.append(item)
+    return out
 
 
 _FENCE = re.compile(r"^```(?:json)?\s*\n(.*?)\n?```$", re.S)
@@ -318,17 +371,22 @@ def parse_hypotheses(reply: str, *, allowlist: Sequence[str], cap: int) -> tuple
         try:
             h = parse_hypothesis(item, allowlist)
         except ValueError as exc:
-            rejected.append({"index": i, "reason": str(exc)[:200]})
+            rej = {"index": i, "reason": str(exc)[:200], "code": getattr(exc, "code", "invalid"),
+                   "field": getattr(exc, "field", None)}
+            if getattr(exc, "target", None):
+                rej["target"] = exc.target    # type: ignore[attr-defined]
+            rejected.append(rej)
             continue
         if len(ok) >= cap:
-            rejected.append({"index": i, "reason": f"over the cap of {cap} hypotheses"})
+            rejected.append({"index": i, "reason": f"over the cap of {cap} hypotheses", "code": "over_cap", "field": None})
             continue
         if any(h.target == o.target and h.what == o.what for o in ok):
-            rejected.append({"index": i, "reason": "duplicate"})
+            rejected.append({"index": i, "reason": "duplicate", "code": "duplicate", "field": None})
             continue
         ok.append(h)
     if len(obj["hypotheses"]) > 10:
-        rejected.append({"index": 10, "reason": f"{len(obj['hypotheses']) - 10} more items ignored"})
+        rejected.append({"index": 10, "reason": f"{len(obj['hypotheses']) - 10} more items ignored", "code": "ignored",
+                         "field": None})
     return ok, rejected
 
 
@@ -538,6 +596,41 @@ def _summary(obj: Any, keys: Sequence[str]) -> dict[str, Any] | None:
             if v is None or isinstance(v, (bool, int, float, str))} or None
 
 
+JUDGE_PAIRS_MAX = 40
+
+
+def report_judge_pairs(pairs: Any, setup: Mapping[str, Any] | None = None) -> list[dict[str, Any]]:
+    """The blind judge's verdict per A/B pair as the report keeps it: case id, its task title (from the replay
+    setup's tasks), rep, order, winner, and the judge's reason as one redacted line of at most 200 characters
+    (Night Desk decision 12). Nothing else of the judge's prompt or the runs."""
+    from agent_memory.redact import redact
+    titles = {}
+    for t in (setup or {}).get("tasks") or []:
+        if isinstance(t, Mapping) and isinstance(t.get("id"), str) and isinstance(t.get("title"), str):
+            titles[t["id"]] = t["title"]
+    out: list[dict[str, Any]] = []
+    for p in list(pairs or [])[:JUDGE_PAIRS_MAX]:
+        if not isinstance(p, Mapping):
+            continue
+        item: dict[str, Any] = {k: p[k] for k in ("case", "rep", "order", "winner", "raw_winner")
+                                if k in p and (p[k] is None or isinstance(p[k], (str, int)))}
+        if isinstance(item.get("case"), str):
+            item["case"] = _token(item["case"], 80)
+            if item["case"] in titles:
+                item["title"] = redact(_one_line(titles[item["case"]], 120))
+        for k in ("reason", "error"):
+            if isinstance(p.get(k), str) and p[k].strip():
+                item[k] = redact(_one_line(p[k], 200))
+        out.append(item)
+    return out
+
+
+def report_provider_results(views: Any) -> list[dict[str, Any]]:
+    """rsi_provider_replay's per-provider views with their judge pairs reduced as report_judge_pairs does."""
+    return [{**v, "judge_pairs": report_judge_pairs(v.get("judge_pairs"), v.get("test_setup"))}
+            for v in list(views or []) if isinstance(v, Mapping)]
+
+
 class Replayer(Protocol):
     def preflight(self) -> str: ...
 
@@ -606,6 +699,26 @@ def _refused_by_improve(target: str) -> bool:
         return ET.pinned_file(path) is not None or not ET.is_allowed(path)
     except (OSError, RuntimeError, ValueError):
         return False
+
+
+# Why an idea in the queue cannot be tested (Night Desk decisions 2 and 9), most specific first:
+#   no_target        the idea names no file, so there is nothing to edit
+#   hand_edited      the file is pinned because Vilmer edited it by hand (improve/pins.json auto-pin)
+#   grades_loop      the file is pinned as a judge or eval prompt: the loop never changes its own measuring stick
+#   pinned           pinned for another reason
+#   outside_allowed  not on the loop's target list (instruction_targets) or outside improve's allowed_targets
+BLOCK_REASONS = ("no_target", "hand_edited", "grades_loop", "pinned", "outside_allowed")
+BLOCKED_TARGETS_MAX = 500
+
+
+def pin_kind(reason: str) -> str:
+    """A pins.json reason as a BLOCK_REASONS code. Only the code reaches the report, never the reason text."""
+    r = reason.lower()
+    if "measuring stick" in r or "judge prompt" in r or "eval prompt" in r:
+        return "grades_loop"
+    if "edited by hand" in r or "auto-pin" in r or "hand edit" in r:
+        return "hand_edited"
+    return "pinned"
 
 
 class PackEvidence:
@@ -1095,6 +1208,7 @@ class Sighting:
     evidence_refs: list[str] = field(default_factory=list)
     metrics: dict[str, Any] = field(default_factory=dict)
     pattern: dict[str, Any] | None = None
+    file: str | None = None          # the file the rule lives in, even when it is not in scope (report patterns only)
 
 
 def _iso(v: Any) -> str | None:
@@ -1368,7 +1482,7 @@ class Night:
                                                    for k in ("sessions", "deviations", "eval_failures", "routine_failures")}}
         self._poll()
         sightings = self._sightings(delta)
-        self.report["patterns"] = [{"key": s.dedupe_key, **s.pattern} for s in sightings if s.pattern][:20]
+        self.report["patterns"] = [self._pattern(s) for s in sightings if s.pattern][:20]
         self._attach_history(delta)
         pool = self._pool(sightings)
         self._poll()
@@ -1402,6 +1516,48 @@ class Night:
             return None
         return real if real in self.allowlist else None
 
+    def _block_reason(self, target: str | None) -> str | None:
+        """Why no experiment can run on `target` (BLOCK_REASONS), or None when it is in scope tonight. Pins are read
+        once per target; only the code is kept."""
+        if not target:
+            return "no_target"
+        if self._in_scope(target):
+            return None
+        cache = getattr(self, "_blocks", None)
+        if cache is None:
+            cache = self._blocks = {}
+        if target not in cache:
+            try:
+                pin = ET.pinned_file(rsi_targets.untilde(target))
+            except (OSError, RuntimeError, ValueError):
+                pin = None
+            cache[target] = pin_kind(pin) if pin is not None else "outside_allowed"
+        return cache[target]
+
+    def _pattern(self, s: Sighting) -> dict[str, Any]:
+        """A report pattern (most-broken rules) with its file and, when the loop cannot edit it, why (additive)."""
+        f = s.target or s.file
+        return {"key": s.dedupe_key, **(s.pattern or {}), "target": _token(f, 300) if f else None,
+                "blocked": self._block_reason(f)}
+
+    def _blocked(self, rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+        """report.blocked (additive, Night Desk decisions 2, 8 and 9): the open ideas no experiment can use, from the
+        same database read as the candidates notes. `groups` adds up to `total`; `targets` lists every file with its
+        idea count in full (no 200-character cut); `refused_files` is every allowlisted file improve refuses tonight."""
+        groups = {k: 0 for k in BLOCK_REASONS}
+        targets = []
+        for r in rows:
+            t, n = r.get("target"), int(r.get("n") or 0)
+            why = self._block_reason(t) or "outside_allowed"
+            groups[why] += n
+            if t:
+                targets.append({"target": _token(t, 300), "reason": why, "ideas": n})
+        targets.sort(key=lambda x: (BLOCK_REASONS.index(x["reason"]), -x["ideas"], x["target"]))
+        refused = [{"target": _token(t, 300), "reason": self._block_reason(t) or "outside_allowed"}
+                   for t in sorted(self.pinned)]
+        return {"total": sum(groups.values()), "groups": groups, "targets": targets[:BLOCKED_TARGETS_MAX],
+                "refused_files": refused[:BLOCKED_TARGETS_MAX]}
+
     def _deviation_sightings(self, delta: Any) -> list[Sighting]:
         """A rule is sighted when tonight's delta has a new deviation for it. Its metrics and evidence cover the whole
         look-back (`window_days_max`, by session start), not just the delta: a deviation is often found days after its
@@ -1433,7 +1589,8 @@ class Night:
                 {"summary": f"{_token(g['instruction_source'], 60)} / {title}: {g.get('count')} deviations in "
                             f"{g.get('sessions')} sessions ({len(fresh)} new)",
                  "n": int(g.get("count") or 0), "sessions": int(g.get("sessions") or 0),
-                 "refs": [f"amem:deviation/{i}" for i in fresh][:5]}))
+                 "refs": [f"amem:deviation/{i}" for i in fresh][:5]},
+                file=(g.get("target_paths") or [None])[0]))
         return out
 
     def _skill_sightings(self, _delta: Any) -> list[Sighting]:
@@ -1454,7 +1611,7 @@ class Night:
                                 {"score": round(float(r["score"]), 3), "n_scored": r["n_scored"], "sessions": r["n_scored"]},
                                 {"summary": f"skill {_token(r['skill'], 60)} scores {float(r['score']):.2f} over "
                                             f"{r['n_scored']} scored sessions", "n": int(r["n_calls"]),
-                                 "sessions": int(r["n_scored"]), "refs": [f"amem:skill/{r['skill']}"]}))
+                                 "sessions": int(r["n_scored"]), "refs": [f"amem:skill/{r['skill']}"]}, file=target))
         return out
 
     def _routine_sightings(self, delta: Any) -> list[Sighting]:
@@ -1471,7 +1628,7 @@ class Night:
                                 self._scoped(target), f"routine:{r}", refs,
                                 {"failures": len(fails), "count": len(fails), "sessions": len(fails)},
                                 {"summary": f"routine {r} failed {len(fails)} time(s)", "n": len(fails),
-                                 "sessions": 0, "refs": refs[:5]}))
+                                 "sessions": 0, "refs": refs[:5]}, file=target))
         return out
 
     def _finding_sightings(self, delta: Any) -> list[Sighting]:
@@ -1548,6 +1705,9 @@ class Night:
             cur.execute("select count(*) as n from rsi_candidates where status in ('new', 'deferred') "
                         "and not coalesce(target = any(%s), false)", (scope,))
             out_of_scope = int(cur.fetchone()["n"])
+            cur.execute("select target, count(*) as n from rsi_candidates where status in ('new', 'deferred') "
+                        "and not coalesce(target = any(%s), false) group by target", (scope,))
+            blocked_rows = cur.fetchall()
             pinned = 0
             if self.pinned:
                 cur.execute("select count(*) as n from rsi_candidates where status in ('new', 'deferred') "
@@ -1555,9 +1715,10 @@ class Night:
                 pinned = int(cur.fetchone()["n"])
         if out_of_scope - pinned:
             self.notes.append(f"candidates: {out_of_scope - pinned} without an in-scope target, not considered")
-        if pinned:
+        if pinned:      # the full list (report.blocked has it per file); bounded only as a backstop
             self.notes.append(f"candidates: {pinned} on a target improve refuses (pinned or out of scope: "
-                              f"{', '.join(sorted(self.pinned))[:200]}), not considered")
+                              f"{_one_line(', '.join(sorted(self.pinned)), 2000)}), not considered")
+        self.report["blocked"] = self._blocked(blocked_rows)
         if self.dry_run:                      # nothing was written: show tonight's sightings as they would be
             known = {c["dedupe_key"]: c for c in pool}
             for s in sightings:
@@ -1698,9 +1859,12 @@ class Night:
         try:
             hyps, rejected = parse_hypotheses(reply, allowlist=self.allowlist, cap=cap)
         except HypothesisParseError as exc:
-            hyps, rejected = [], [{"index": None, "reason": str(exc)}]
+            hyps, rejected = [], [{"index": None, "reason": str(exc), "code": "unparseable", "field": None}]
         if rejected:
             self.notes.append(f"{len(rejected)} hypothesis(es) rejected for {c['dedupe_key']}")
+        for ce in self.report["candidates"]:       # additive (Night Desk decision 18): why each idea was thrown out
+            if ce.get("key") == c["dedupe_key"]:
+                ce.update(hypotheses_accepted=len(hyps), hypotheses_rejected=rejection_entries(rejected))
         self._update_candidate(c["id"], meta={"hypotheses_rejected": rejected[-10:]} if rejected else None)
         if not hyps:
             # Counted as an attempt: a candidate that never yields a usable hypothesis retires (it returns as
@@ -1804,12 +1968,14 @@ class Night:
                          arms={"A": dict(rr.arms.get("A") or {}), "B": dict(rr.arms.get("B") or {})},
                          judge=_summary(getattr(rr, "judge", None), JUDGE_KEYS),
                          jev=_summary(getattr(rr, "jev", None), JEV_KEYS))
-            entry.update(test_setup=rr.setup, relevance=rr.relevance, judge_pairs=rr.judge_pairs, provider_results=rr.provider_results)
+            pairs = report_judge_pairs(rr.judge_pairs, rr.setup)     # titled, one redacted short line per reason
+            views = report_provider_results(rr.provider_results)
+            entry.update(test_setup=rr.setup, relevance=rr.relevance, judge_pairs=pairs, provider_results=views)
             row = {"status": "evaluated", "verdict": verdict,
                    "meta": {"verdict_reasons": rr.reasons[:20], "arms": entry["arms"], "eval_path": rr.eval_path,
                             "replay_runs": rr.runs, "budget_stop": rr.budget_stop, "judge": entry["judge"],
                             "jev": entry["jev"], "test_setup": rr.setup, "relevance": rr.relevance,
-                            "judge_pairs": rr.judge_pairs, "provider_results": rr.provider_results}}
+                            "judge_pairs": pairs, "provider_results": views}}
             if rr.budget_stop:
                 entry["status"] = "skipped_budget"
                 cand_status, cand_reason = "deferred", f"replay stopped by the budget ({rr.budget_stop})"
@@ -2022,7 +2188,8 @@ def validate_report(obj: Any) -> list[str]:
                "candidates", "experiments", "costs", "health", "pending_decisions", "notes",
                "skipped", "prerequisite_warnings",            # both optional (rsi_schedule's night job)
                "health_reasons",                               # optional: provider -> why it was not ok
-               "budget"}                                       # optional: the budget caps (_finish, since 1df19d2)
+               "budget",                                       # optional: the budget caps (_finish, since 1df19d2)
+               "blocked"}                                      # optional: ideas no experiment can use (2026-10-25)
     errs += [f"unknown key {k}" for k in sorted(set(obj) - allowed)]
     if obj.get("format") != FORMAT:
         errs.append("format is not rsi-night/1")
@@ -2052,6 +2219,10 @@ def validate_report(obj: Any) -> list[str]:
         for r in need(p, "refs", list, f"patterns[{i}]") or []:
             if not isinstance(r, str):
                 errs.append(f"patterns[{i}].refs holds a non-string")
+        if isinstance(p, dict) and p.get("blocked") is not None and p["blocked"] not in BLOCK_REASONS:   # optional
+            errs.append(f"patterns[{i}].blocked {p['blocked']!r} not in {BLOCK_REASONS}")
+        if isinstance(p, dict) and p.get("target") is not None and not isinstance(p["target"], str):
+            errs.append(f"patterns[{i}].target must be a string or null")
     for i, c in enumerate(need(obj, "candidates", list, "report") or []):
         w = f"candidates[{i}]"
         need(c, "id", str, w, True)
@@ -2060,6 +2231,14 @@ def validate_report(obj: Any) -> list[str]:
         need(c, "rank", (int, float), w, True)
         need(c, "selected", bool, w)
         need(c, "reason", str, w)
+        if isinstance(c, dict) and "hypotheses_rejected" in c:     # optional (2026-10-25): why ideas were dropped
+            hr = c["hypotheses_rejected"]
+            if not (isinstance(hr, list) and all(isinstance(x, dict) and x.get("code") in REJECT_REASONS
+                                                 and isinstance(x.get("reason"), str) for x in hr)):
+                errs.append(f"{w}.hypotheses_rejected must be a list of objects with a known code and a reason")
+        if isinstance(c, dict) and "hypotheses_accepted" in c and (
+                isinstance(c["hypotheses_accepted"], bool) or not isinstance(c["hypotheses_accepted"], int)):
+            errs.append(f"{w}.hypotheses_accepted must be an int")
     for i, e in enumerate(need(obj, "experiments", list, "report") or []):
         w = f"experiments[{i}]"
         xid = need(e, "experiment_id", str, w, True)
@@ -2108,6 +2287,11 @@ def validate_report(obj: Any) -> list[str]:
         for k in ("judge", "jev"):                    # optional (Mission 005.5): the replay's judge and Jev summaries
             if e.get(k) is not None and not isinstance(e[k], dict):
                 errs.append(f"{w}.{k} must be an object or null")
+        jp = e.get("judge_pairs")                     # optional (1df19d2): the judge's verdict per pair
+        if jp is not None and not (isinstance(jp, list) and all(isinstance(x, dict) for x in jp)):
+            errs.append(f"{w}.judge_pairs must be a list of objects")
+        if e.get("test_setup") is not None and not isinstance(e["test_setup"], dict):
+            errs.append(f"{w}.test_setup must be an object or null")
         if e.get("status") == "staged" and not (e.get("proposal_id") and e.get("verdict") == "IMPROVES"
                                                 and e.get("artifact_hash") and e.get("experiment_id")):
             errs.append(f"{w}: staged without an IMPROVES verdict, an experiment id, an artifact hash and a proposal")
@@ -2159,6 +2343,29 @@ def validate_report(obj: Any) -> list[str]:
     if "prerequisite_warnings" in obj and not (isinstance(obj["prerequisite_warnings"], list) and all(
             isinstance(w, str) for w in obj["prerequisite_warnings"])):
         errs.append("prerequisite_warnings must be a list of strings")
+    if "blocked" in obj:
+        errs += _blocked_problems(obj["blocked"])
+    return errs
+
+
+def _blocked_problems(b: Any) -> list[str]:
+    def count(x: Any) -> bool:
+        return isinstance(x, int) and not isinstance(x, bool) and x >= 0
+    if not isinstance(b, dict):
+        return ["blocked must be an object"]
+    errs = []
+    groups = b.get("groups")
+    if not (isinstance(groups, dict) and set(groups) <= set(BLOCK_REASONS) and all(map(count, groups.values()))):
+        errs.append(f"blocked.groups must map {BLOCK_REASONS} to counts")
+    elif not count(b.get("total")) or b["total"] != sum(groups.values()):
+        errs.append("blocked.total must be the sum of blocked.groups")
+    for k, need_ideas in (("targets", True), ("refused_files", False)):
+        items = b.get(k)
+        if not (isinstance(items, list) and all(
+                isinstance(x, dict) and isinstance(x.get("target"), str) and x.get("reason") in BLOCK_REASONS
+                and (not need_ideas or count(x.get("ideas"))) for x in items)):
+            errs.append(f"blocked.{k} must be a list of objects with a target and a known reason"
+                        + (" and an idea count" if need_ideas else ""))
     return errs
 
 
