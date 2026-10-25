@@ -9,6 +9,7 @@ import pytest
 from agent_memory import dashboard as D
 
 MIGRATION = next((Path(__file__).resolve().parents[1] / 'supabase/migrations').glob('*_night_desk.sql')).read_text()
+EVIDENCE_MIGRATION = next((Path(__file__).resolve().parents[1] / 'supabase/migrations').glob('*_night_desk_evidence_columns.sql')).read_text()
 OWNER = str(uuid.UUID(int=6101))
 OTHER = str(uuid.UUID(int=6102))
 TABLES = ('rsi_nights','report_snapshots','ledger_events','runs','edits','undo_requests',
@@ -24,6 +25,7 @@ def owner_db(pg_url):
         c.execute("create or replace function auth.uid() returns uuid language sql stable as $$ select nullif(current_setting('request.jwt.claim.sub',true),'')::uuid $$")
         c.execute('grant usage on schema auth,public to authenticated,anon')
         c.execute(MIGRATION)
+        c.execute(EVIDENCE_MIGRATION)
         c.execute('insert into amem_private.dashboard_owner values (true,%s) on conflict (singleton) do update set uid=excluded.uid', (OWNER,))
         c.execute("insert into rsi_nights values ('rls-test','partial','Test','{}','{}','{}','{}',now(),now()) on conflict do nothing")
         c.execute("insert into report_snapshots(kind,date,summary,report_path) values ('improve','2026-01-01','{}','local') on conflict do nothing")
@@ -76,6 +78,22 @@ def test_owner_cannot_read_sensitive_columns_or_write(owner_db):
         with pytest.raises(psycopg.errors.InsufficientPrivilege):
             with c.transaction():
                 c.execute(query)
+
+
+def test_edit_evidence_columns_are_owner_only_and_readonly(owner_db):
+    c, _ = owner_db
+    query = 'select deviation_ids,instruction_sha_before,instruction_sha_after from edits'
+    identity(c, OWNER)
+    assert c.execute(query).fetchone() is not None
+    with pytest.raises(psycopg.errors.InsufficientPrivilege):
+        with c.transaction():
+            c.execute("update edits set deviation_ids='{}'")
+    identity(c, OTHER)
+    assert c.execute(query).fetchall() == []
+    identity(c, '', 'anon')
+    with pytest.raises(psycopg.errors.InsufficientPrivilege):
+        with c.transaction():
+            c.execute(query)
 
 
 def test_undo_owner_nonowner_unknown_and_already_undone(owner_db):
