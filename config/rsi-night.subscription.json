@@ -1,0 +1,137 @@
+{
+  "format": "rsi-night-config/1",
+  "_note": "Subscription qualification profile. Inactive until dedicated login, client isolation and live qualification pass. No API fallback. Promotion freeze unchanged.",
+  "budget": {
+    "max_hypotheses": 2,
+    "max_experiments": 1,
+    "max_ab_pairs": 6,
+    "max_sandbox_runs": 128,
+    "wall_clock_s": 2700,
+    "max_usd": 1.0,
+    "model_retries": 0,
+    "default_model_calls": 0,
+    "free_model_calls": 200,
+    "model_calls": {
+      "jev-1.14.0": 7,
+      "claude-opus-5-5": 7,
+      "gpt-6.1-sol": 12
+    },
+    "cost_estimate_usd": {
+      "jev-1.14.0": 0.01,
+      "default": 1.0
+    },
+    "sandbox_run_estimate_usd": 0,
+    "subscription_models": [
+      "claude-opus-5-5",
+      "gpt-6.1-sol"
+    ],
+    "max_subscription_tokens": 2000000
+  },
+  "stages": {
+    "triage": "live",
+    "hypothesizer": "claude-cli",
+    "implementer": "stub",
+    "replay_agent": "claude",
+    "judge": "codex",
+    "replay_jev": "live"
+  },
+  "candidates": {
+    "max_considered": 5,
+    "max_attempts": 2,
+    "window_days_max": 7,
+    "skill_score_below": 0.5,
+    "skill_min_scored": 3,
+    "finding_min_n": 5,
+    "max_finding_candidates": 5
+  },
+  "triage": {
+    "weights": {
+      "impact": 0.35,
+      "recurrence": 0.25,
+      "testability": 0.2,
+      "risk": 0.15,
+      "history": 0.25
+    },
+    "min_rank": 0.0
+  },
+  "hypothesizer": {
+    "model": "claude-opus-5-5",
+    "timeout_s": 300,
+    "max_prompt_chars": 24000,
+    "effort": "high",
+    "auth_mode": "subscription",
+    "auth": {
+      "home": "~/Projects/agent-memory/.subscription-auth/claude"
+    }
+  },
+  "implementer": {
+    "model": null,
+    "timeout_s": 600,
+    "credentials": "none"
+  },
+  "replay": {
+    "cases": null,
+    "reps": 1,
+    "model": "claude-opus-5-5",
+    "effort": "high",
+    "credentials": "none",
+    "credential_name": null,
+    "judge_model": "gpt-6.1-sol",
+    "judge_credentials": "none",
+    "judge_credential_name": null,
+    "ensure_network": false,
+    "auth_mode": "subscription",
+    "auth": {
+      "home": "~/Projects/agent-memory/.subscription-auth/claude"
+    },
+    "judge_effort": "high",
+    "judge_auth_mode": "subscription",
+    "judge_auth": {
+      "home": "~/Projects/agent-memory/.subscription-auth/codex"
+    },
+    "max_tool_calls": 8,
+    "provider_profiles": {
+      "claude": {
+        "model": "claude-opus-5-5",
+        "effort": "high",
+        "auth_mode": "subscription",
+        "auth": {
+          "home": "~/Projects/agent-memory/.subscription-auth/claude"
+        },
+        "credentials": "none",
+        "credential_name": null
+      },
+      "codex": {
+        "model": "gpt-6.1-sol",
+        "effort": "high",
+        "auth_mode": "subscription",
+        "auth": {
+          "home": "~/Projects/agent-memory/.subscription-auth/codex"
+        },
+        "credentials": "none",
+        "credential_name": null
+      }
+    }
+  },
+  "staging": {
+    "timeout_s": 300
+  },
+  "schedule": {
+    "_note": "Completion checkpoints for `amem rsi night-job` (rsi_schedule.py): each routine's latest routines.log line must be a PASS; same_night = dated on the night key's date (the 09:20 amem-daily and 08:45 amem-archive of that day); max_age_h = younger than that.",
+    "prerequisites": [
+      {
+        "routine": "amem-daily",
+        "same_night": true
+      },
+      {
+        "routine": "amem-archive",
+        "same_night": true
+      },
+      {
+        "routine": "amem-ingest",
+        "same_night": false,
+        "max_age_h": 25
+      }
+    ]
+  }
+}

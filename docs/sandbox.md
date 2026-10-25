@@ -188,6 +188,12 @@ Note that `disableAllHooks` also disables hooks in skills and agents frontmatter
 
 ## Credentials
 
+This section applies to credentials inside the original API worker. Subscription
+replays use a separate trusted client and credential-free task containers; see
+[Subscription migration](rsi/subscription-migration.md). The worker's API-only
+credential allowlist is unchanged. Personal subscription authentication is never
+copied into an arm or passed into a task container.
+
 A provider supplies named credentials. Names are limited to `ANTHROPIC_API_KEY`,
 `OPENAI_API_KEY` and `CODEX_API_KEY`. There is no OAuth-token name on purpose.
 
