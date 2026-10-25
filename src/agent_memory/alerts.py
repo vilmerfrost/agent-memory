@@ -1,0 +1,201 @@
+"""Phone alerts the existing pushes missed, through the same ntfy channel (`edits_push._publish`, notify.env).
+
+- A staged proposal on its last day: one reminder, with fresh Reject / Review buttons (re-armed tokens).
+- The night's result, from the morning brief, when there is something to say (skipped, partly run, tested,
+  or a decision waits). A quiet night sends nothing.
+- Slips of the safety rules (working around a guard, the push and merge policy, the safety guards).
+
+Each alert goes out once: the row records it (`rsi_proposals.meta.reminded`, `deviations.meta.alert`); the night
+push is sent by the brief job, which runs once per night. Messages carry plain words, rule names and file names
+only, then `redact`, like the other pushes. Raises nothing that should stop a routine: callers log a warning.
+"""
+
+from __future__ import annotations
+
+import re
+from collections.abc import Mapping
+from datetime import UTC, datetime, timedelta
+from typing import Any
+
+from psycopg.rows import dict_row
+from psycopg.types.json import Jsonb
+
+from agent_memory import edits_push, redact, store
+from agent_memory import rsi_approval as AP
+
+REMIND_WITHIN = timedelta(hours=30)   # the daily run (09:20) catches every proposal on its last day
+SAFETY_RULES = ("approval-without-handing-work-back", "safety-guards", "push-and-merge-policy")
+SAFETY_DAYS = 3
+SAFETY_LINES = 5
+
+VERDICT_WORDS = {
+    "WORSE": "made things worse, nothing changed",
+    "NO_EFFECT": "no clear difference, nothing changed",
+    "INCONCLUSIVE": "the test could not tell, nothing changed",
+    "IMPROVES": "it won and waits for your OK",
+}
+
+
+def _cap(s: str) -> str:
+    return s[:1].upper() + s[1:]
+
+
+def _words(s: str) -> str:
+    return re.sub(r"[-_]+", " ", re.sub(r"^\d+\.\s*", "", s)).strip()
+
+
+def file_name(source: str) -> str:
+    """The file a rule lives in, as Night Desk names it ("CLAUDE.md", "Meltdown skill", "worker.md")."""
+    if source == "claude-md:global":
+        return "CLAUDE.md"
+    if source == "agents-md:global":
+        return "AGENTS.md"
+    kind, _, name = source.partition(":")
+    if kind == "parent-md":
+        return "PARENT.md"
+    if kind == "skill":
+        return f"{_cap(_words(name))} skill"
+    if kind == "agent":
+        return f"{name}.md"
+    if kind == "routine":
+        return f"{name} routine"
+    return _cap(_words(source)) or "a rule file"
+
+
+def rule_name(key: str) -> str:
+    """"dev:skill:meltdown:intro" -> "Meltdown skill › Intro"."""
+    k = key.removeprefix("dev:")
+    source, _, rule = k.rpartition(":")
+    section = "whole file" if rule in ("", "whole") else _cap(_words(rule.split("/")[-1]))
+    return f"{file_name(source or k)} › {section}"
+
+
+# --------------------------------------------------------------------------- proposals on their last day
+
+
+def remind_proposals(*, db_url: str | None = None, push: bool = True, notify: dict[str, str] | None = None,
+                     now: datetime | None = None) -> list[str]:
+    """One reminder per staged proposal that expires within REMIND_WITHIN and was not reminded yet. Its tokens
+    are re-armed, so the reminder's buttons work and the first push's buttons stop working."""
+    out: list[str] = []
+    now = now or datetime.now(UTC)
+    url, page = AP.decide_url(), AP.decide_page()
+    with store.connect(db_url) as conn, conn.cursor(row_factory=dict_row) as cur:
+        cur.execute("select * from rsi_proposals where status = 'staged' and expires_at > %s and expires_at <= %s "
+                    "and coalesce(meta->>'reminded', '') = '' order by expires_at", (now, now + REMIND_WITHIN))
+        for p in cur.fetchall():
+            if not push:
+                out.append("off")
+                continue
+            tokens = AP.issue_tokens(conn, str(p["id"]), p["artifact_hash"])
+            hours = max(1, round((p["expires_at"] - now).total_seconds() / 3600))
+
+            def payload(topic: str, p: dict[str, Any] = p, tokens: dict[str, str] = tokens,
+                        hours: int = hours) -> dict[str, Any]:
+                pay = AP.proposal_payload(topic, p, tokens, url, page)
+                pay["title"] = f"Expires in {hours} h · {pay['title']}"[:120]
+                pay["priority"] = 4
+                pay["tags"] = ["hourglass_flowing_sand"]
+                return pay
+
+            res = edits_push._publish(payload, f"Expires in {hours} h: {p['title']}"[:120],
+                                      f"amem rsi show {p['id']}", notify)
+            conn.execute("update rsi_proposals set meta = meta || %s where id = %s",
+                         (Jsonb({"reminded": res}), p["id"]))
+            out.append(res)
+    return out
+
+
+# --------------------------------------------------------------------------- the night's result
+
+
+def _skip_words(b: Mapping[str, Any]) -> str:
+    for n in b.get("notes") or []:
+        m = re.match(r"skipped by amem-rsi-night: prerequisite ([\w-]+): last run (\w+)", str(n))
+        if m:
+            return ("the morning scan (amem-daily) failed" if m.group(1) == "amem-daily"
+                    else f"the routine it depends on ({m.group(1)}) did not pass")
+    sk = b.get("skipped") or {}
+    return str(sk.get("summary") or "a check before the night failed")
+
+
+def night_message(b: Mapping[str, Any]) -> tuple[str, str] | None:
+    """(title, body) for the night, or None for a quiet night (it ran, tested nothing, nothing waits)."""
+    night, status = str(b.get("night") or "?"), str(b.get("status") or "?")
+    pending = int((b.get("pending_decisions") or {}).get("total") or 0)
+    exps = list((b.get("experiments") or {}).get("items") or [])
+    total = (b.get("costs") or {}).get("total_usd")
+    cost = f"Cost ${float(total):.2f}." if total is not None else ""
+    lines: list[str] = []
+    if status == "preflight_failed":
+        title = f"Night {night}: skipped"
+        lines.append(f"Skipped: {_skip_words(b)}. Nothing was read or tested.")
+    else:
+        if not exps and status == "ok" and not pending:
+            return None
+        for x in exps:
+            verdict = str(x.get("verdict") or "")
+            lines.append(f"Tested {rule_name(str(x.get('candidate_key') or '?'))}: "
+                         f"{VERDICT_WORDS.get(verdict, 'the test did not finish')}.")
+        if not exps:
+            lines.append("Nothing was tested.")
+        if status != "ok":
+            lines.append(f"The night only partly ran ({status.replace('_', ' ')}).")
+        title = f"Night {night}: " + (lines[0].rstrip(".") if exps else status.replace("_", " "))
+    degraded = [str(s) for s in ((b.get("health") or {}).get("degraded") or [])]
+    if degraded:
+        lines.append("Not working: " + ", ".join(degraded[:4]) + ".")
+    lines.append(f"Waiting for your OK: {pending}." if pending else "Nothing waits for your OK.")
+    if cost:
+        lines.append(cost)
+    lines.append("Details: Night Desk, Last night.")
+    return redact.redact(title)[:120], redact.redact("\n".join(lines))[:1500]
+
+
+def push_night(b: Mapping[str, Any], *, notify: dict[str, str] | None = None) -> str:
+    """'phone' | 'mac' when sent, 'quiet' when the night has nothing to say."""
+    msg = night_message(b)
+    if msg is None:
+        return "quiet"
+    title, body = msg
+    return edits_push._publish(lambda topic: {"topic": topic, "title": title, "message": body, "priority": 3,
+                                              "tags": ["crescent_moon"]}, title, body, notify)
+
+
+# --------------------------------------------------------------------------- safety-rule slips
+
+
+def safety_message(rows: list[Mapping[str, Any]]) -> tuple[str, str]:
+    n = len(rows)
+    lines = []
+    for r in rows[:SAFETY_LINES]:
+        section = _cap(_words(str(r.get("rule_title") or str(r.get("rule_id") or "").split("/")[-1])))
+        what = re.sub(r"\s+", " ", str(r.get("what") or "")).strip()
+        lines.append(f"- {file_name(str(r.get('instruction_source') or ''))} › {section}: {what[:180]}")
+    if n > SAFETY_LINES:
+        lines.append(f"- and {n - SAFETY_LINES} more")
+    lines.append("Details: Night Desk, Last night, What went wrong this week.")
+    title = f"Safety rule broken: {n} slip{'s' if n != 1 else ''}"
+    return title, redact.redact("\n".join(lines))[:2000]
+
+
+def push_safety_slips(*, db_url: str | None = None, push: bool = True,
+                      notify: dict[str, str] | None = None) -> str | None:
+    """One push for the safety-rule slips of the last SAFETY_DAYS that were not alerted yet.
+    None when there are none, 'off' when push is off (rows stay unmarked)."""
+    with store.connect(db_url) as conn, conn.cursor(row_factory=dict_row) as cur:
+        cur.execute("select id, instruction_source, rule_id, rule_title, what from deviations "
+                    "where created_at > now() - %s and coalesce(meta->>'alert', '') = '' and ("
+                    + " or ".join(["rule_id like %s"] * len(SAFETY_RULES)) + ") order by created_at",
+                    (timedelta(days=SAFETY_DAYS), *[f"%{r}" for r in SAFETY_RULES]))
+        rows = cur.fetchall()
+        if not rows:
+            return None
+        if not push:
+            return "off"
+        title, body = safety_message(rows)
+        res = edits_push._publish(lambda topic: {"topic": topic, "title": title, "message": body, "priority": 4,
+                                                 "tags": ["warning"]}, title, body, notify)
+        conn.execute("update deviations set meta = coalesce(meta, '{}'::jsonb) || %s where id = any(%s)",
+                     (Jsonb({"alert": res}), [r["id"] for r in rows]))
+        return res

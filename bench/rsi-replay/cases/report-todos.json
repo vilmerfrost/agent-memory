@@ -2,6 +2,7 @@
   "id": "report-todos",
   "title": "Report every TODO, ending with the required closing line",
   "tags": ["instruction", "report", "closing-line"],
+  "targets": [{"path": "~/.claude/CLAUDE.md", "kind": "instruction", "behavior": "Apply standing report-format instructions to REPORT.md and preserve notes.txt."}],
   "fixture": "report-todos",
   "hidden_check": "report-todos",
   "prompt": "Read notes.txt and write the report file REPORT.md: a title line, then one bullet per TODO item (without the TODO: prefix). Do not change notes.txt. Follow your standing instructions. Any rule they give for a report applies to the text inside REPORT.md, not only to your chat reply.",

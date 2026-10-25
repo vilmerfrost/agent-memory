@@ -1,7 +1,10 @@
 # Night operations: the unattended RSI night and the morning brief
 
-Mission 005.5, phases D to G. **Prepared, not installed.** Nothing here is loaded into launchd, copied to
-`~/Library/LaunchAgents` or added to `~/agent-config`. Each gate at the end needs Vilmer's approval.
+Current operation (2026-10-25): the installed 01:30 job uses the qualified
+`config/rsi-night.subscription.json` profile. Claude Opus 5.5 and GPT-6.1 Sol use high
+effort and dedicated subscriptions; automatic rule promotion remains frozen.
+See [Subscription migration](subscription-migration.md). The Mission 005.5 first-night
+limits and rehearsal gates below are retained as historical API-profile documentation.
 
 Code: `src/agent_memory/rsi_schedule.py` (the two jobs), `src/agent_memory/rsi_rehearsal.py` +
 `scripts/m0055_rehearsal.py` (rehearsals), `config/rsi-night.first.json` (first-night limits),
@@ -13,7 +16,7 @@ Tests: `tests/test_rsi_schedule.py`, plus the Apply rule in `tests/test_rsi_brie
 
 | Job | launchd label | When | Command | Writes |
 |---|---|---|---|---|
-| Night | `com.vilmerfrost.amem-rsi-night` | 01:30 | `amem rsi night-job --config config/rsi-night.first.json` | `~/sandbox` (staged artifacts, replays, `nights/<night>/report.json`), RSI rows in the hosted DB (candidates, experiments, a staged proposal, the night's checkpoint), one `routines.log` line |
+| Night | `com.vilmerfrost.amem-rsi-night` | 01:30 | `amem rsi night-job --config config/rsi-night.subscription.json` | `~/sandbox` (staged artifacts, replays, `nights/<night>/report.json`), RSI rows in the hosted DB (candidates, experiments, a staged proposal, the night's checkpoint), one `routines.log` line |
 | Brief | `com.vilmerfrost.amem-rsi-brief` | 07:30 | `amem rsi brief-job --wait-s 5400 --out ~/.claude/parent/reports` | `reports/rsi-brief-<night>.md` and `.json`, one `routines.log` line |
 
 Both plists set `AMEM_HOOK_OFF=1`, `AMEM_REQUIRE_REMOTE=1`, `RSI_SANDBOX_DIR=~/sandbox`, `StandardInPath`
@@ -178,7 +181,10 @@ verifies (and matches the database copy); every required evaluation passes; the 
 the hash says `improves` from an independent judge (Codex or Claude, at least one pair judged) and live Jev that
 answered; and the database holds a pending proposal for exactly that hash. Otherwise the brief prints
 "Apply: not offered: <reasons>" and the block says "staged, NOT ready to apply". NO_EFFECT, WORSE and INCONCLUSIVE
-experiments are never staged and never show Apply. Reject and Details always stay. The brief job never pushes.
+experiments are never staged and never show Apply. Reject and Details always stay. The scheduled brief job sends
+one short phone push of the night's result (`alerts.push_night`, since 2026-10-25) when there is something to say:
+the night was skipped or partly ran, an idea was tested, or a decision waits. A quiet night sends nothing.
+`--no-push` and direct `run_brief_job` calls send nothing. A failed push is a note on the line, not a failed brief.
 
 ## Rehearsals
 

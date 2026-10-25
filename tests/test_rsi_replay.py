@@ -83,19 +83,11 @@ def test_judge_prompt_is_blind():
         R.parse_judge_answer('{"winner": "A"}')
 
 
-def test_triggered_win_rule():
-    skill_only = {"files": [{"path": "~/.claude/skills/demo/SKILL.md", "kind": "skill"}]}
-    instr = {"files": [{"path": "~/.claude/CLAUDE.md", "kind": "instruction"}]}
-    assert R.trigger_patterns(instr) == (True, ())
-    always, pats = R.trigger_patterns(skill_only)
-    assert not always and R.triggered([{"name": "Skill", "input": '{"skill": "demo"}'}], pats)
-    assert not R.triggered([{"name": "Read", "input": "x"}], pats)
+def test_tally_counts_only_already_verified_pairs_symmetrically():
     pairs = [{"case": "c", "rep": 0, "winner": "B"}, {"case": "c", "rep": 1, "winner": "B"},
              {"case": "c", "rep": 2, "winner": "A"}, {"case": "c", "rep": 3, "winner": None}]
-    t = R.tally(pairs, "stub", {("c", 0): True, ("c", 1): False}, always_on=False)
-    assert (t.wins_b, t.unfired_b, t.wins_a, t.errors, t.judged) == (1, 1, 1, 1, 3)
-    assert t.b_winrate == 0.5                        # (1 + 0.5 * 1) / 3
-    assert R.tally(pairs, "stub", {}, always_on=True).wins_b == 2
+    t = R.tally(pairs, "stub")
+    assert (t.wins_b, t.unfired_b, t.wins_a, t.errors, t.judged) == (2, 0, 1, 1, 3)
 
 
 def test_replay_jev_fixtures_match_their_states():
@@ -103,14 +95,16 @@ def test_replay_jev_fixtures_match_their_states():
     The key is `_replay_state`, not `_state`: tests/test_tasks_state.py reads `_state` as a routine state."""
     from agent_memory import config, jev
     qs = R.Q.load_file(R.QUESTIONS_FILE, "rsi-replay").jev_questions()
-    found = 0
+    versions: dict[str, int] = {}
     for p in sorted(config.jev_fixtures_dir().glob("*.json")):
         body = json.loads(p.read_text())
         if "_replay_state" in body:
-            found += 1
+            version = body["_replay_state"].splitlines()[0]
+            versions[version] = versions.get(version, 0) + 1
             assert jev.fixture_key(body["_replay_state"], qs) == p.stem and "_state" not in body
             assert set(body["answers"]) == {"effect", "harness_problem", "evidence_strength"}
-    assert found == 6                     # 5 for bench/rsi-replay/scenarios.json + 1 for the M005 demo's no-effect night
+    # Keep the six historical V1 outcomes and six explicit V2 counterparts.
+    assert versions == {"suite: sandbox-replay/1": 6, "suite: sandbox-replay/2": 6}
 
 
 def test_jev_state_is_numbers_only_and_fixture_mode_never_goes_live(monkeypatch):
@@ -214,7 +208,12 @@ def test_non_exact_artifact_is_never_recorded_as_passing(tmp_path, monkeypatch):
     root, _, h = setup_root(tmp_path, monkeypatch, "hooky", bench=bench)
     evals = root / "artifacts" / h / "evals"
     (evals / "sandbox-replay.json").write_text(json.dumps({"format": "rsi-eval/1", "verdict": "improves"}))
-    res, sb = replay(root, h, ["report-todos"])
+    from dataclasses import replace
+    case = R.load_cases(["report-todos"])[0]
+    case = replace(case, targets=(*case.targets, {"path": "~/.claude/settings.json", "kind": "settings",
+                    "behavior": "Exercise the staged settings during the report task."}))
+    sb = HostSandbox(root)
+    res = R.run_replay(h, [case], R.ReplayConfig(), root=root, experiment_id=EXP, sandbox=sb)
     assert res.verdict.verdict == "INCONCLUSIVE" and res.verdict.reasons[0].startswith("artifact-not-exact")
     assert sb.calls == [] and res.eval_path is None
     assert not (evals / "sandbox-replay.json").exists()            # the old passing record was moved aside
@@ -333,7 +332,8 @@ def test_parse_agent_reads_claude_stream_json_and_codex_events():
                                                                        "cacheReadInputTokens": 100,
                                                                        "costUSD": 0.0123}}}])
     p = R.parse_agent(claude, "claude", "claude-haiku-5-5")
-    assert p["tool_calls"] == [{"name": "Edit", "input": '{"file_path": "calc.py"}'}]
+    assert p["tool_calls"] == [{"name": "Edit", "input": '{"file_path": "calc.py"}',
+                                "status": "unknown", "target_reads": []}]
     assert (p["tokens_in"], p["tokens_out"], p["cost_usd"], p["final"], p["is_error"]) == (1000, 120, 0.0123, "fixed",
                                                                                          False)
     codex = "\n".join(json.dumps(e) for e in [
@@ -342,7 +342,8 @@ def test_parse_agent_reads_claude_stream_json_and_codex_events():
         {"type": "item.completed", "item": {"id": "i2", "type": "agent_message", "text": "done"}},
         {"type": "turn.completed", "usage": {"input_tokens": 2000, "cached_input_tokens": 500, "output_tokens": 80}}])
     p = R.parse_agent(codex, "codex", "gpt-6-luna")
-    assert p["tool_calls"] == [{"name": "command_execution", "input": "completed"}] and p["final"] == "done"
+    assert p["tool_calls"] == [{"name": "command_execution", "input": "completed",
+                                "status": "completed", "target_reads": []}] and p["final"] == "done"
     assert (p["tokens_in"], p["tokens_out"]) == (2000, 80)
     assert R.parse_agent("not json at all", "claude", None)["parsed"] is False
 
@@ -356,6 +357,12 @@ def test_live_agent_and_judge_plumbing_without_any_call(tmp_path, monkeypatch):
     claude_out = json.dumps({"type": "result", "subtype": "success", "is_error": False, "num_turns": 2,
                              "result": "ok", "modelUsage": {"claude-haiku-5-5": {"inputTokens": 10, "outputTokens": 5,
                                                                                  "costUSD": 0.001}}})
+    claude_out = "\n".join([json.dumps({"type": "assistant", "message": {"content": [
+        {"type": "tool_use", "id": "read-global", "name": "Read",
+         "input": {"file_path": "/home/rsi/.claude/CLAUDE.md"}}]}}),
+        json.dumps({"type": "user", "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "read-global", "is_error": False, "content": "instructions"}]}}),
+        claude_out])
     judge_out = "\n".join(json.dumps(e) for e in [
         {"type": "item.completed", "item": {"id": "m", "type": "agent_message", "text": '{"winner": "2", "reason": "r"}'}},
         {"type": "turn.completed", "usage": {"input_tokens": 100, "output_tokens": 10}}])

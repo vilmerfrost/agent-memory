@@ -76,6 +76,7 @@ _SEVERITY = {"ok": 0, "fixture": 0, "live": 0, "skipped": 0, "stale": 1, "trunca
 
 # The investigator's own rules: never a hypothesis target, whatever the allowlist says.
 SELF_FILES = ("rsi-night.json", "rsi-night.first.json", "rsi-triage.toml", "rsi-verdict-policy.json", "rsi-prices.json",
+              "rsi-night.subscription-claude.json", "rsi-night.subscription-codex.json", "rsi-night.subscription.json",
               "rsi-evidence-providers.json", "criteria.json", "fence.txt", "pins.json")
 TARGET_KINDS = ("instruction", "lessons", "skill")
 NEW_TEXT_MAX = 200_000
@@ -174,10 +175,39 @@ def load_config(path: Path | None = None) -> NightConfig:
             raise ConfigError(f"{p}: {name} must be an object")
         return {k: x for k, x in v.items() if not k.startswith("_")}
 
-    return NightConfig(budget=budget, stages=stages, candidates=cands, weights=weights, min_rank=float(min_rank),
-                       hypothesizer=section("hypothesizer"), implementer=section("implementer"),
-                       replay=section("replay"), staging=section("staging"), path=str(p),
-                       sha256=hashlib.sha256(raw).hexdigest())
+    result = NightConfig(budget=budget, stages=stages, candidates=cands, weights=weights, min_rank=float(min_rank),
+                         hypothesizer=section("hypothesizer"), implementer=section("implementer"),
+                         replay=section("replay"), staging=section("staging"), path=str(p),
+                         sha256=hashlib.sha256(raw).hexdigest())
+    from agent_memory.rsi_subscription_config import validate_role
+    roles = [("claude", result.hypothesizer, "") ] if stages["hypothesizer"] == "claude-cli" else []
+    roles += [(stages["replay_agent"], result.replay, ""), (stages["judge"], result.replay, "judge_")]
+    profiles = result.replay.get("provider_profiles")
+    if profiles is not None:
+        if not isinstance(profiles, dict) or set(profiles) != {"claude", "codex"}:
+            raise ConfigError("provider_profiles must include claude and codex")
+        for provider, settings in profiles.items():
+            if not isinstance(settings, dict) or settings.get("auth_mode") != "subscription":
+                raise ConfigError("provider profiles require subscription authentication")
+            roles.append((provider, settings, ""))
+    subscribed = set()
+    for provider, settings, prefix in roles:
+        mode = settings.get(prefix + "auth_mode", "api")
+        model = settings.get(prefix + "model")
+        try:
+            validate_role(provider, model, settings.get(prefix + "effort"), mode,
+                          settings.get(prefix + "auth"), credentials=settings.get(prefix + "credentials") or "none")
+        except ValueError as exc:
+            raise ConfigError(str(exc)) from None
+        if mode == "subscription":
+            subscribed.add(model)
+        elif model in budget.subscription_models:
+            raise ConfigError("API role cannot be charged to a subscription budget")
+    if subscribed != set(budget.subscription_models):
+        raise ConfigError("budget.subscription_models must exactly match subscription roles")
+    if subscribed and stages["implementer"] != "stub":
+        raise ConfigError("subscription migration keeps the deterministic implementer")
+    return result
 
 
 # =========================================================================== targets and typed hypotheses
@@ -351,8 +381,7 @@ def triage_state(c: Mapping[str, Any], history: Sequence[str], in_scope: bool) -
 
 def heuristic_answers(c: Mapping[str, Any], history: Sequence[str], in_scope: bool) -> TriageAnswers:
     """Deterministic stand-in when Jev has no answer (missing fixture, error, or a dry run)."""
-    m = c.get("metrics") or {}
-    rec = max(int(c.get("seen_count") or 1), int(m.get("sessions") or 0), int(m.get("count") or 0))
+    rec = max(recurrence(c), int(_num((c.get("metrics") or {}).get("count")) or 0))
     impact = 2.0 if rec >= 5 else 1.0 if rec >= 2 else 0.0
     target = str(c.get("target") or "")
     risk = 0.0 if "/skills/" not in target and target.endswith(".md") else 1.0 if target.endswith(".md") else 2.0
@@ -360,14 +389,23 @@ def heuristic_answers(c: Mapping[str, Any], history: Sequence[str], in_scope: bo
     return TriageAnswers("experiment" if go else "wait", 1.0 if go else 0.0, impact, risk, 1.0, "heuristic")
 
 
+# Evidence `_attach_history` adds to a candidate: what was tried on it, not another occurrence of it.
+_HISTORY_REFS = ("amem:experiment/", "amem:eval_result/")
+
+
 def recurrence(c: Mapping[str, Any]) -> int:
-    """How often a candidate recurs: nights it was sighted or sessions it touched, whichever is larger."""
-    return max(int(c.get("seen_count") or 1), int(_num((c.get("metrics") or {}).get("sessions")) or 0))
+    """How often a candidate really happened: sessions it touched or distinct occurrences in its evidence (deviations,
+    failed runs), whichever is larger. Not `seen_count`: that counts nights that sighted it, and a night that re-sights
+    the same evidence is a re-check, not a recurrence. Evidence accumulates across nights; `metrics` covers one window."""
+    refs = {str(r) for r in c.get("evidence_refs") or [] if not str(r).startswith(_HISTORY_REFS)}
+    return max(1, int(_num((c.get("metrics") or {}).get("sessions")) or 0), len(refs))
 
 
 # `recurrence` in SQL, for ordering the pool in the database.
-RECURRENCE_SQL = ("greatest(seen_count, case when jsonb_typeof(metrics->'sessions') = 'number' "
-                  "then floor((metrics->>'sessions')::numeric) else 0 end)")
+RECURRENCE_SQL = ("greatest(1, case when jsonb_typeof(metrics->'sessions') = 'number' "
+                  "then floor((metrics->>'sessions')::numeric) else 0 end, "
+                  "(select count(distinct r) from unnest(evidence_refs) r where "
+                  + " and ".join(f"not starts_with(r, '{p}')" for p in _HISTORY_REFS) + "))")
 
 
 def rank(a: TriageAnswers, recurrence: int, history: Sequence[str], weights: Mapping[str, float]) -> float:
@@ -474,6 +512,10 @@ class ReplayOutcome:
     runs: int = 0
     judge: dict[str, Any] | None = None      # rsi_verdict.JudgeResult.summary(): mode, judged, wins, b_winrate
     jev: dict[str, Any] | None = None        # rsi_verdict.JevResult.summary(): mode, status, effect, confidence
+    setup: dict[str, Any] = field(default_factory=dict)
+    relevance: dict[str, Any] = field(default_factory=dict)
+    judge_pairs: list[dict[str, Any]] = field(default_factory=list)
+    provider_results: list[dict[str, Any]] = field(default_factory=list)
 
 
 JUDGE_KEYS = ("mode", "judged", "wins_a", "wins_b", "ties", "unfired_b", "errors", "b_winrate")
@@ -693,6 +735,8 @@ class ClaudeCliHypothesizer:
         from agent_memory import distill, edits_writer
         model = str(self.cfg.get("model") or edits_writer.writer_model())
         argv = [*distill.writer_argv(edits_writer.CLAUDE_ENV, model=model), *UNATTENDED_CLAUDE_FLAGS]
+        if self.cfg.get("effort"):
+            argv += ["--effort", str(self.cfg["effort"])]
         cand = {k: candidate.get(k) for k in ("dedupe_key", "source", "kind", "target", "rule_key", "seen_count")}
         cand["metrics"] = {k: v for k, v in (candidate.get("metrics") or {}).items() if isinstance(v, (int, float))}
         limit = int(self.cfg.get("max_prompt_chars") or 24_000)
@@ -705,6 +749,17 @@ class ClaudeCliHypothesizer:
         timeout = float(self.cfg.get("timeout_s") or 600)
 
         def run() -> tuple[str, Usage]:
+            if self.cfg.get("auth_mode") == "subscription":
+                from agent_memory import rsi_subscription as sub
+                from agent_memory.rsi_subscription_config import auth_for, usage_fields
+                with tempfile.TemporaryDirectory(prefix="rsi-hypothesis-") as tmp:
+                    work, arm = Path(tmp) / "work", Path(tmp) / "arm"
+                    work.mkdir(); arm.mkdir()
+                    result = sub.run("claude", prompt, model=model, effort=self.cfg["effort"],
+                                     workspace=work.resolve(), arm_home=arm.resolve(),
+                                     timeout_s=max(1, int(min(timeout, budget.remaining_s()))),
+                                     auth=auth_for("claude", self.cfg["auth"], tools=False), tools_allowed=False)
+                return result.text, Usage(**usage_fields(result.usage))
             out = distill.run_cli(argv, prompt, timeout=max(1.0, min(timeout, budget.remaining_s())),
                                   env={**model_cli_env(), "AMEM_HOOK_OFF": "1"})
             return distill.parse_envelope(out), _envelope_usage(out)
@@ -853,11 +908,18 @@ class SandboxReplayer:
                   "judge_credential_name": self.cfg.get("judge_credential_name")}
         if self.cfg.get("max_budget_usd") is not None:
             fields["max_budget_usd"] = float(self.cfg["max_budget_usd"])
+        for key in ("auth_mode", "auth", "judge_auth_mode", "judge_auth", "judge_effort", "max_tool_calls", "profile"):
+            if key in self.cfg:
+                fields[key] = self.cfg[key]
         known = getattr(rsi_replay.ReplayConfig, "__dataclass_fields__", fields)
         return rsi_replay.ReplayConfig(**{k: v for k, v in fields.items() if k in known})
 
     def replay(self, *, artifact_hash: str, experiment_id: str, baseline_id: str, budget: Budget) -> ReplayOutcome:
         from agent_memory import rsi_replay
+        if self.cfg.get("provider_profiles"):
+            from agent_memory import rsi_provider_replay
+            return rsi_provider_replay.replay(self.stages, self.cfg, artifact_hash=artifact_hash,
+                experiment_id=experiment_id, baseline_id=baseline_id, budget=budget)
         cases = rsi_replay.load_cases(self.cfg.get("cases"))
         rc = self.replay_config()
         pairs = len(cases) * int(rc.reps)
@@ -867,7 +929,7 @@ class SandboxReplayer:
                                    f"the cap of {cap}")
         # A live agent or judge needs rsi-internal + the egress proxy. `replay.ensure_network` (unattended nights)
         # brings them up for this replay and takes them down again if they were not up before.
-        live = rc.agent != "stub" or rc.judge in ("codex", "claude")
+        live = (rc.agent != "stub" and rc.auth_mode == "api") or (rc.judge in ("codex", "claude") and rc.judge_auth_mode == "api")
         ensure = bool(self.cfg.get("ensure_network")) and live
         box = sandbox_module().Sandbox(RA.sandbox_dir()) if ensure else None
         was_up = bool((box.net_status() or {}).get("proxy_running")) if box is not None else True
@@ -885,7 +947,13 @@ class SandboxReplayer:
                              baseline_id=_dget(r, "baseline_id"),
                              eval_path=str(_dget(r, "eval_path")) if _dget(r, "eval_path") else None,
                              budget_stop=_dget(r, "budget_stop"), runs=len(_dget(r, "runs") or []),
-                             judge=_summary(_dget(r, "judge"), JUDGE_KEYS), jev=_summary(_dget(r, "jev"), JEV_KEYS))
+                             judge=_summary(_dget(r, "judge"), JUDGE_KEYS), jev=_summary(_dget(r, "jev"), JEV_KEYS),
+                             setup={"agent": rc.agent, "model": rc.model, "effort": rc.effort,
+                                    "auth_mode": rc.auth_mode, "judge": rc.judge, "judge_model": rc.judge_model,
+                                    "judge_effort": rc.judge_effort, "judge_auth_mode": rc.judge_auth_mode,
+                                    "tasks": [{"id": c.id, "title": c.title or c.id} for c in cases]},
+                             relevance=dict(_dget(r, "relevance") or {}),
+                             judge_pairs=list(getattr(_dget(r, "judge"), "pairs", ()) or ()))
 
 
 class ApprovalProposer:
@@ -1271,13 +1339,6 @@ class Night:
                 self.notes.append(f"candidates: {fn.__name__.strip('_')} failed: {type(exc).__name__}")
         return out
 
-    def _window_days(self) -> int:
-        since = _parse_ts(self.since)
-        cap = int(self.cfg.candidates["window_days_max"])
-        if since is None:
-            return min(cap, 8)
-        return max(1, min(cap, math.ceil((datetime.now(UTC) - since).total_seconds() / 86400) + 1))
-
     def _in_scope(self, target: str | None) -> bool:
         return self._scoped(target) is not None
 
@@ -1295,16 +1356,20 @@ class Night:
         return real if real in self.allowlist else None
 
     def _deviation_sightings(self, delta: Any) -> list[Sighting]:
+        """A rule is sighted when tonight's delta has a new deviation for it. Its metrics and evidence cover the whole
+        look-back (`window_days_max`, by session start), not just the delta: a deviation is often found days after its
+        session, and an earlier session's deviation outside the delta is still an occurrence (`recurrence`)."""
         new = set(_ids(_dget(delta, "deviations")))
         if not new:
             return []
         from agent_memory import deviations
         out = []
-        for g in deviations.candidates(days=self._window_days(), db_url=self.db_url):
+        for g in deviations.candidates(days=int(self.cfg.candidates["window_days_max"]), db_url=self.db_url):
             ids = [str(i) for i in g.get("deviation_ids") or []]
             fresh = [i for i in ids if i in new]
             if not fresh or g.get("team"):
                 continue
+            known = fresh + [i for i in ids if i not in fresh]
             rule = g.get("rule_id") or g.get("instruction_ref")
             key = f"dev:{g['instruction_source']}:{rule}"
             target = next((s for s in map(self._scoped, g.get("target_paths") or []) if s),
@@ -1317,7 +1382,7 @@ class Night:
             title = _token(g.get("rule_title") or rule, 80)
             out.append(Sighting(
                 key, "deviations", "edit_instruction", target, f"{g['instruction_source']}:{rule}",
-                [f"amem:deviation/{i}" for i in fresh][:20], metrics,
+                [f"amem:deviation/{i}" for i in known][:20], metrics,
                 {"summary": f"{_token(g['instruction_source'], 60)} / {title}: {g.get('count')} deviations in "
                             f"{g.get('sessions')} sessions ({len(fresh)} new)",
                  "n": int(g.get("count") or 0), "sessions": int(g.get("sessions") or 0),
@@ -1662,10 +1727,12 @@ class Night:
                          arms={"A": dict(rr.arms.get("A") or {}), "B": dict(rr.arms.get("B") or {})},
                          judge=_summary(getattr(rr, "judge", None), JUDGE_KEYS),
                          jev=_summary(getattr(rr, "jev", None), JEV_KEYS))
+            entry.update(test_setup=rr.setup, relevance=rr.relevance, judge_pairs=rr.judge_pairs, provider_results=rr.provider_results)
             row = {"status": "evaluated", "verdict": verdict,
                    "meta": {"verdict_reasons": rr.reasons[:20], "arms": entry["arms"], "eval_path": rr.eval_path,
                             "replay_runs": rr.runs, "budget_stop": rr.budget_stop, "judge": entry["judge"],
-                            "jev": entry["jev"]}}
+                            "jev": entry["jev"], "test_setup": rr.setup, "relevance": rr.relevance,
+                            "judge_pairs": rr.judge_pairs, "provider_results": rr.provider_results}}
             if rr.budget_stop:
                 entry["status"] = "skipped_budget"
                 cand_status, cand_reason = "deferred", f"replay stopped by the budget ({rr.budget_stop})"
@@ -1782,6 +1849,7 @@ class Night:
         r["status"] = status
         r["finished_at"] = _now_iso()
         r["costs"] = self.budget.costs()
+        r["budget"] = self.budget.caps()
         r["health"] = {k: self.health.get(k, "skipped") for k in HEALTH_KEYS}
         reasons = {k: v[:3] for k, v in self.health_reasons.items() if v and r["health"].get(k) not in ("ok", "skipped")}
         if reasons:

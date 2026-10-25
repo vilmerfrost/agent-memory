@@ -295,7 +295,10 @@ def keychain_present(ref: str, *, runner: Callable[..., Any] | None = None) -> s
 
 
 def paid_stages(cfg: Any) -> list[str]:
-    return sorted(k for k, v in cfg.stages.items() if v in PAID_STAGE_MODES.get(k, ()))
+    settings = {"hypothesizer": (cfg.hypothesizer, "auth_mode"),
+                "replay_agent": (cfg.replay, "auth_mode"), "judge": (cfg.replay, "judge_auth_mode")}
+    return sorted(k for k, v in cfg.stages.items() if v in PAID_STAGE_MODES.get(k, ())
+                  and (k not in settings or settings[k][0].get(settings[k][1], "api") != "subscription"))
 
 
 def credential_problems(cfg: Any, *, runner: Callable[..., Any] | None = None) -> list[str]:
@@ -314,10 +317,20 @@ def credential_problems(cfg: Any, *, runner: Callable[..., Any] | None = None) -
         if not config.typesafe_api_key():
             out.append("credentials jev: TYPESAFE_API_KEY is not set")
     refs = []                    # item names avoid "<name>_credentials: " (redact.py would mask the reason)
+    from agent_memory.rsi_subscription_config import credential_problem
+    subscription_roles = []
+    for provider, settings in (cfg.replay.get("provider_profiles") or {}).items():
+        subscription_roles.append((provider, settings["auth"]))
     if st.get("replay_agent") in ("claude", "codex"):
-        refs.append(("replay agent (replay.credentials)", cfg.replay.get("credentials") or "none"))
+        if cfg.replay.get("auth_mode") == "subscription":
+            subscription_roles.append((st["replay_agent"], cfg.replay["auth"]))
+        else:
+            refs.append(("replay agent (replay.credentials)", cfg.replay.get("credentials") or "none"))
     if st.get("judge") in ("codex", "claude"):
-        refs.append(("judge (replay.judge_credentials)", cfg.replay.get("judge_credentials") or "none"))
+        if cfg.replay.get("judge_auth_mode") == "subscription":
+            subscription_roles.append((st["judge"], cfg.replay["judge_auth"]))
+        else:
+            refs.append(("judge (replay.judge_credentials)", cfg.replay.get("judge_credentials") or "none"))
     if st.get("implementer") in ("claude", "codex"):
         refs.append(("implementer (implementer.credentials)", cfg.implementer.get("credentials") or "none"))
     for name, ref in refs:
@@ -325,9 +338,20 @@ def credential_problems(cfg: Any, *, runner: Callable[..., Any] | None = None) -
         if why:
             out.append(f"credentials {name}: {why}")
     if st.get("hypothesizer") == "claude-cli":
+        if cfg.hypothesizer.get("auth_mode") == "subscription":
+            subscription_roles.append(("claude", cfg.hypothesizer["auth"]))
         exe = os.environ.get("AMEM_EDITS_CLAUDE", "").strip() or "claude"
         if not shutil.which(exe):
             out.append("credentials hypothesizer: the claude CLI is not on PATH")
+    seen = set()
+    for provider, settings in subscription_roles:
+        key = (provider, settings["home"])
+        if key in seen:
+            continue
+        seen.add(key)
+        problem = credential_problem(provider, settings)
+        if problem:
+            out.append(f"credentials {provider}: {problem}")
     paid = paid_stages(cfg)
     if paid and cfg.budget.max_usd <= 0:
         out.append(f"budget max_usd: 0 while paid stages are configured ({', '.join(paid)})")
@@ -349,6 +373,8 @@ def paid_plan(cfg: Any, *, cases: int | None = None) -> dict[str, Any]:
     prices = rsi_budget.load_prices()
     b = cfg.budget
     st, rp = cfg.stages, cfg.replay
+    profiles = rp.get("provider_profiles") or {}
+    provider_count = len(profiles) or 1
     n_cases = cases if cases is not None else len(rsi_replay.load_cases(rp.get("cases")))
     reps = int(rp.get("reps") or 1)
     pairs = n_cases * reps
@@ -365,9 +391,13 @@ def paid_plan(cfg: Any, *, cases: int | None = None) -> dict[str, Any]:
         call_cap = b.call_cap(model) if stage not in ("replay-agent",) else None
         if call_cap is not None:
             count = min(count, call_cap)
-        expected = G2B_MEASURED_USD.get(model)
+        subscription = model in b.subscription_models
+        expected = None if subscription else G2B_MEASURED_USD.get(model)
         worst = cap if cap is not None else per_call_cap(model)
+        if subscription:
+            worst = 0.0  # excluded from API-dollar subtotal; allowance consumption is unknown
         rows.append({"stage": stage, "model": model, "count": count, "budget_call_cap": call_cap,
+                     "billing_source": "subscription" if subscription else "api",
                      "expected_usd_each": expected, "worst_usd_each": round(worst, 6),
                      "expected_basis": "G2b measured" if expected is not None else "no measurement (worst case only)",
                      "expected_usd": round(count * expected, 6) if expected is not None else None,
@@ -383,24 +413,27 @@ def paid_plan(cfg: Any, *, cases: int | None = None) -> dict[str, Any]:
     if st["implementer"] in ("claude", "codex"):
         add("implement", str(cfg.implementer.get("model") or st["implementer"]), exps, note="sandbox arm I")
     if st["replay_agent"] in ("claude", "codex"):
-        model = str(rp.get("model") or st["replay_agent"])
-        cap = float(rp.get("max_budget_usd")) if st["replay_agent"] == "claude" and rp.get("max_budget_usd") else None
-        add("replay-agent", model, 2 * pairs * exps, cap=cap,
-            note=f"{pairs} A/B pair(s) x 2 arms per experiment; checks run free in their own containers")
+        for provider, settings in (profiles or {st["replay_agent"]: rp}).items():
+            model = str(settings.get("model") or provider)
+            cap = float(settings.get("max_budget_usd")) if provider == "claude" and settings.get("max_budget_usd") else None
+            add("replay-agent", model, 2 * pairs * exps, cap=cap,
+                note=f"{provider}: {pairs} A/B pairs; providers are compared separately, depending on target")
     if st["judge"] in ("codex", "claude"):
-        add("replay-judge", str(rp.get("judge_model") or st["judge"]), pairs * exps, note="one blind judge call per pair")
+        add("replay-judge", str(rp.get("judge_model") or st["judge"]), pairs * exps * provider_count, note="one blind judge call per pair")
     if st["replay_jev"] == "live":
-        add("replay-jev", jev_model, exps, note="one Jev call per replay")
+        add("replay-jev", jev_model, exps * provider_count, note="one Jev call per provider replay")
     expected = [r["expected_usd"] for r in rows]
     exp_total = round(sum(x for x in expected if x is not None), 6)
     worst_total = round(sum(r["worst_usd"] for r in rows), 6)
     return {"config_sha256": cfg.sha256, "paid_stages": paid_stages(cfg), "cases": n_cases, "reps": reps,
-            "ab_pairs_per_experiment": pairs, "max_ab_pairs": b.max_ab_pairs, "max_experiments": exps,
+            "ab_pairs_per_experiment": pairs * provider_count, "max_ab_pairs": b.max_ab_pairs, "max_experiments": exps,
             "max_hypotheses": min(b.max_hypotheses, rsi_budget.HARD_MAX_HYPOTHESES), "model_retries": b.model_retries,
             "wall_clock_s": b.wall_clock_s, "max_usd": b.max_usd, "calls": rows,
             "expected_usd": exp_total, "expected_incomplete": any(x is None for x in expected),
             "worst_case_usd": worst_total, "budget_stops_at_usd": b.max_usd,
             "within_cap": worst_total <= b.max_usd + 1e-9, "prices": prices.describe(),
+            "max_subscription_tokens": b.max_subscription_tokens,
+            "subscription_models": list(b.subscription_models),
             "basis_note": "expected = G2b measured per call (Haiku CLI-reported, Codex tokens x price table, Jev flat); "
                           "worst = the budget's pre-call estimate or the per-run CLI cap. The budget refuses a call "
                           "whose estimate would pass max_usd and stops after any call that crossed it, so a night can "
@@ -416,6 +449,9 @@ def render_plan(plan: Mapping[str, Any]) -> str:
     if not plan["calls"]:
         out.append("No paid call: every stage is a stub or a fixture. Expected $0.")
     for r in plan["calls"]:
+        if r.get("billing_source") == "subscription":
+            out.append(f"- {r['stage']}: {r['count']} x {r['model']} -> subscription usage; billed dollars and allowance draw unknown. {r['note']}")
+            continue
         exp = f"${r['expected_usd']:.4f}" if r["expected_usd"] is not None else "unmeasured"
         out.append(f"- {r['stage']}: {r['count']} x {r['model']} -> expected {exp} ({r['expected_basis']}), "
                    f"worst ${r['worst_usd']:.4f}. {r['note']}")
@@ -423,6 +459,8 @@ def render_plan(plan: Mapping[str, Any]) -> str:
                + f", worst case ${plan['worst_case_usd']:.4f}, hard cap max_usd ${plan['max_usd']:.2f} "
                + ("(the worst case fits)" if plan["within_cap"] else "(the budget stops the night at the cap)") + ".")
     out.append(plan["basis_note"])
+    if plan.get("subscription_models"):
+        out.append(f"Subscription token stop: {plan['max_subscription_tokens']} observed tokens. API totals exclude subscription usage. No API fallback.")
     return "\n".join(out)
 
 
@@ -667,10 +705,12 @@ def wait_for_night(night: str, root: Path | None, wait_s: float, *, poll_s: floa
 def run_brief_job(*, root: Path | None = None, night: str | None = None, now: datetime | None = None,
                   routines_log: Path | None = None, out_dir: Path | None = None, db_url: str | None = None,
                   write_log: bool = True, wait_s: float = 0.0, poll_s: float = 60.0,
-                  sleep: Callable[[float], None] = time.sleep) -> JobResult:
+                  sleep: Callable[[float], None] = time.sleep, push: bool = False,
+                  notify: dict[str, str] | None = None) -> JobResult:
     """The morning brief for the night key (default: the night that just ended) as markdown + JSON files in
     `out_dir` (default ~/.claude/parent/reports). Waits up to `wait_s` for the night to finish (its lock released
-    and its report written). Stores the completed snapshot for Night Desk. Never pushes."""
+    and its report written). Stores the completed snapshot for Night Desk. With `push` (the scheduled CLI run),
+    one short phone push of the night's result when there is something to say (alerts.push_night)."""
     from agent_memory import rsi_brief as BR
     t0 = time.monotonic()
     fixed = now is not None
@@ -719,6 +759,13 @@ def run_brief_job(*, root: Path | None = None, night: str | None = None, now: da
     if b["health"]["database"]["status"] != "ok":
         res.items.append(f"database: rows not read ({b['health']['database']['detail'] or 'unavailable'})")
         res.status = "FAIL"
+    if push:
+        from agent_memory import alerts
+        try:
+            res.fields["push"] = alerts.push_night(b, notify=notify)
+        except Exception as exc:  # the brief is written; a failed push is a note, not a failed brief
+            res.fields["push"] = "error"
+            res.items.append(f"push: {_one_line(exc, 160)}")
     res.report = str(mdp)
     res.detail.update(brief=b, markdown=md, json_path=str(jsp))
     return finish()
@@ -757,7 +804,8 @@ def cmd_night_job(args: argparse.Namespace) -> int:
 
 def cmd_brief_job(args: argparse.Namespace) -> int:
     res = run_brief_job(root=args.root.expanduser() if args.root else None, night=args.night, now=_now_arg(args.now),
-                        routines_log=args.routines_log, out_dir=args.out, wait_s=args.wait_s)
+                        routines_log=args.routines_log, out_dir=args.out, wait_s=args.wait_s,
+                        push=not args.no_push)
     if args.json:
         print(json.dumps({"status": res.status, "night": res.night, "items": res.items, "fields": res.fields,
                           "report": res.report, "lines": res.lines}, sort_keys=True, default=str))
@@ -777,7 +825,7 @@ def register(sub: argparse._SubParsersAction) -> None:
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_night_job)
     p = sub.add_parser("brief-job", help="the scheduled morning brief: markdown + JSON in the reports dir, one "
-                                         "routines.log line; never pushes")
+                                         "routines.log line, and a short phone push of the night's result")
     p.add_argument("--root", type=Path, default=None, help="the RSI sandbox root (default RSI_SANDBOX_DIR or ~/sandbox)")
     p.add_argument("--night", default=None)
     p.add_argument("--now", default=None, help=argparse.SUPPRESS)
@@ -785,5 +833,6 @@ def register(sub: argparse._SubParsersAction) -> None:
     p.add_argument("--out", type=Path, default=None, help="report dir (default ~/.claude/parent/reports)")
     p.add_argument("--wait-s", type=float, default=0.0,
                    help="wait up to this long for the night to finish (lock released, report written)")
+    p.add_argument("--no-push", action="store_true", help="write the brief, send no phone push")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_brief_job)

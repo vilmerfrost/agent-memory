@@ -280,6 +280,88 @@ def test_unranked_candidates_are_pooled_by_recurrence(env: SimpleNamespace) -> N
     assert [c["key"] for c in rep["candidates"]] == [KEY_B]                       # 4 sessions beat 2
 
 
+def test_re_sighting_the_same_evidence_does_not_raise_recurrence_or_rank() -> None:
+    """1 deviation in 1 session, sighted on 2 nights: the second night was a re-check of the same deviation, not a
+    second occurrence. seen_count 2 put 0.1145 into the rank where one occurrence is worth 0.0723."""
+    once = {"seen_count": 1, "metrics": {"count": 1, "sessions": 1}, "evidence_refs": ["amem:deviation/d1"],
+            "target": "~/.agents/skills/meltdown/SKILL.md"}
+    twice = {**once, "seen_count": 2}
+    assert N.recurrence(once) == N.recurrence(twice) == 1
+    w = N.load_config().weights
+    for in_scope in (True, False):
+        assert N.heuristic_answers(twice, [], in_scope) == N.heuristic_answers(once, [], in_scope)
+    a = N.heuristic_answers(twice, [], True)
+    assert N.rank(a, N.recurrence(twice), [], w) == N.rank(a, N.recurrence(once), [], w)
+    # the recurrence part alone: 0.1145 with seen_count 2, 0.0723 for the one real occurrence
+    part = {n: N.rank(N.TriageAnswers("wait", 0.0, 0.0, 0.0, 0.0, "t"), n, [], w) for n in (1, 2)}
+    assert (part[2], part[1]) == (0.1145, 0.0723)
+
+
+def test_recurrence_counts_distinct_occurrences_not_history() -> None:
+    """A new deviation on a later night is a real recurrence even when tonight's window has 1 session; the experiments
+    and eval failures `_attach_history` adds are not."""
+    c = {"seen_count": 9, "metrics": {"sessions": 1},
+         "evidence_refs": ["amem:deviation/d1", "amem:deviation/d2", "amem:deviation/d2",
+                           "amem:experiment/x1", "amem:eval_result/e1"]}
+    assert N.recurrence(c) == 2
+    assert N.recurrence({"metrics": {"sessions": 4}, "evidence_refs": ["amem:skill/s"]}) == 4
+    assert N.recurrence({}) == 1
+
+
+def test_recurrence_accumulates_across_sighting_windows(env: SimpleNamespace) -> None:
+    """Two deviations in two sessions, each sighted in its own window. `upsert_candidate` overwrites metrics (sessions
+    1), but the evidence keeps both: recurrence 2. A third sighting of the same deviation adds nothing."""
+    key = "dev:claude-md:global:accumulates"
+
+    def sight(ref: str) -> dict[str, Any]:
+        with psycopg.connect(env.url) as conn:
+            AP.upsert_candidate(conn, dedupe_key=key, source="deviations", kind="edit_instruction",
+                                evidence_refs=[ref], metrics={"count": 1, "sessions": 1})
+        return candidate(env.url, key)
+
+    sight("amem:deviation/d-1015")
+    c = sight("amem:deviation/d-1019")
+    assert (c["metrics"]["sessions"], c["seen_count"], N.recurrence(c)) == (1, 2, 2)
+    c = sight("amem:deviation/d-1019")
+    assert (c["seen_count"], N.recurrence(c)) == (3, 2)
+    assert rows(env.url, f"select {N.RECURRENCE_SQL} from rsi_candidates where dedupe_key = %s", key) == [(2,)]
+
+
+def test_an_earlier_sessions_deviation_outside_the_delta_still_counts(env: SimpleNamespace) -> None:
+    """dev:skill:meltdown:intro: deviations in sessions of 10-15 and 10-19, but the candidate was first sighted on 10-23
+    and only the 10-19 one was attached (1 session, 1 ref; rank 0.381 with recurrence from evidence). The sighting
+    window was the delta (8 days on a first night) by session start; the look-back is now `window_days_max` (14)."""
+    old = seed_rule(env.url, RULE_B, "old", sessions=1)
+    with psycopg.connect(env.url) as conn:            # found long ago (not in tonight's delta), session 10 days back
+        conn.execute("update sessions set started_at = now() - interval '10 days', created_at = now() - interval "
+                     "'10 days' where session_id = any(%s)", (old,))
+        conn.execute("update deviations set created_at = now() - interval '10 days' where session_id = any(%s)", (old,))
+    seed_rule(env.url, RULE_B, "new", sessions=1)
+    rep = run(env, evidence=FakeEvidence(), replayer=FakeReplayer("NO_EFFECT"))
+    assert rep["delta"]["deviations"] == 1
+    c = candidate(env.url, KEY_B)
+    devs = {f"amem:deviation/{r[0]}" for r in rows(env.url, "select id from deviations where rule_id = %s", RULE_B[0])}
+    assert (c["metrics"]["sessions"], c["metrics"]["new"], set(c["evidence_refs"])) == (2, 1, devs)
+    assert (c["seen_count"], N.recurrence(c)) == (1, 2)
+
+
+def test_recurrence_sql_matches_recurrence(env: SimpleNamespace) -> None:
+    """The pool is ordered in SQL; it must agree with the measure `rank` uses."""
+    cands = {"resighted": (7, {"sessions": 1}, ["amem:deviation/d1", "amem:experiment/x1", "amem:eval_result/e1"]),
+             "recurring": (1, {"sessions": 1}, ["amem:deviation/d2", "amem:deviation/d3"]),
+             "sessions": (1, {"sessions": 3.0}, ["amem:skill/s"]),
+             "bare": (1, {"sessions": "n/a"}, [])}
+    with psycopg.connect(env.url) as conn:
+        for key, (seen, metrics, refs) in cands.items():
+            conn.execute("insert into rsi_candidates (dedupe_key, source, kind, seen_count, metrics, evidence_refs) "
+                         "values (%s, 'deviations', 'edit_instruction', %s, %s, %s)", (key, seen, json.dumps(metrics), refs))
+    got = rows(env.url, f"select dedupe_key, {N.RECURRENCE_SQL} from rsi_candidates "
+                        f"order by {N.RECURRENCE_SQL} desc, dedupe_key limit %s", 10)
+    assert got == [("sessions", 3), ("recurring", 2), ("bare", 1), ("resighted", 1)]
+    for key, n in got:
+        assert N.recurrence(candidate(env.url, key)) == n, key
+
+
 def test_candidate_under_a_symlink_of_an_allowlisted_file_is_in_scope(env: SimpleNamespace) -> None:
     """Deviation candidates name ~/.claude/agents/worker.md, a symlink; the allowlist lists the real
     ~/agent-config/agents/worker.md. The 61-session worker pattern was out of scope for that alone."""
