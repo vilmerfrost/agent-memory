@@ -12,8 +12,9 @@ const env = (k: string): string => Deno.env.get(k) ?? "";
 const PG = env("AMEM_E2E_PG_URL");
 const ORIGIN = `https://${RP_ID}`;
 const OWNER = "6f1c2b9e-1d2a-4c3b-8e4f-5a6b7c8d9e0f";
-const TOKEN = "eyJhbGciOiJFUzI1NiJ9." + btoa(JSON.stringify({ sub: OWNER, role: "authenticated", exp: 4102444800 }))
-  .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "") + ".c2ln";
+// A fake JWT built in code (header, claims, dummy signature), so no token-shaped literal sits in the repo.
+const b64url = (o: unknown): string => btoa(JSON.stringify(o)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+const TOKEN = `${b64url({ alg: "ES256" })}.${b64url({ sub: OWNER, role: "authenticated", exp: 4102444800 })}.c2ln`;
 const TYPES: Record<string, string> = { p_challenge: "uuid", p_id: "uuid", p_sign_count: "bigint", p_transports: "text[]",
                                         p_backed_up: "boolean" };
 
