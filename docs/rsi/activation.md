@@ -49,9 +49,17 @@ See [../archive.md](../archive.md).
   Smoke test: a random token returns `denied`.
 
 ### 7. Least-privilege worker (closes the main residual risk)
-- [ ] Create a login role that is a member of `rsi_writer`. It has no insert on `rsi_decisions` and
-  no execute on the CLI decision function.
-- [ ] Give `decide-poll` that DSN only, not the superuser `AMEM_DB_URL`.
+The login is `amem_app` (migration `20261023010000_amem_app_role.sql`): a member of `rsi_writer`, no insert
+on `rsi_decisions`, no execute on any decision function. E3 (2026-10-16) set its password and put its DSN in
+`.env.local`, so every routine, and `decide-poll`, already connect as `amem_app`
+([least-privilege.md](least-privilege.md)). No new login and no new password are needed.
+- [x] Create the login role (`amem_app`, E1) and set its password (`amem admin split-credentials`, E3).
+- [ ] `amem admin credentials-status` exits 0 and says "connects as amem_app". If it does not, run
+  `amem admin split-credentials` in your own terminal: it sets the password itself, so the password never
+  passes through chat or a repo file.
+- [ ] `amem rsi decide-job` checks this on every run: it refuses (a `FAIL` line, nothing handled) under any
+  login that is or can become a superuser or BYPASSRLS role, can insert into `rsi_decisions`, or can run a
+  function that records a decision (also one added later, such as the web path).
 
 Until this is done, any process that runs as your user and can read `.env.local` could insert a
 decision. See [approval.md](approval.md), "Trust boundary".
@@ -75,10 +83,56 @@ In `~/agent-config/improve/criteria.json`:
 ### 10. Re-enable the writers in stage mode
 - [ ] amem-daily plist: `AMEM_EDITS_LIVE=1` **and** `AMEM_EDITS_MODE=stage`. `bootout` and
   `bootstrap` the job.
-- [ ] ~~New launchd job for `amem rsi decide-poll`~~ **Not while R2 is open** (decision 2026-10-16,
-  [least-privilege.md](least-privilege.md)). You run `amem rsi decide-poll` in your own terminal.
+- [ ] The decide job: see step 10b. (The 2026-10-16 decision "no unattended decide-poll while R2 is open" was
+  replaced on 2026-10-25: Vilmer chose "Within 5 minutes" for Night Desk decisions. R2 is still open; see
+  [least-privilege.md](least-privilege.md), "Unattended decide-job".)
 - [ ] New launchd job for `amem rsi push` after the nightly run (the morning brief).
 - [ ] Re-enable `ab-lessons-monthly` only if you want it. Under stage mode it cannot write.
+
+### 10b. The 5-minute decide job (Night Desk Approve / Deny / Undo)
+`amem rsi decide-job` runs `decide-poll` (apply, reject and undo decisions from Night Desk, the phone or your
+terminal) and `amem edits undo-poll` (the older edit loop's Undo) every 300 s. The plist is
+`deploy/launchd/com.vilmerfrost.amem-rsi-decide.plist`. It is prepared, not installed.
+
+```
+Night Desk tap ─▶ amem-decide (edge) ─▶ rsi_decisions row ─┐            ┌─▶ improve promote / revert-change
+Night Desk Undo (edit) ─▶ amem_request_undo_owner ─▶ undo_requests ─┤ decide-job ┤
+                                                           │ every 300 s└─▶ improve revert (edit loop)
+                         rsi_decision_status / edit_undo_status ◀── rsi_decision_results / undo_requests
+```
+
+Each run: refuse agent sessions → job lock (`~/sandbox/run/rsi-decide-job.lock`; an overlap is a `SKIP`) →
+`.env.local` and `AMEM_REQUIRE_REMOTE=1` like every routine → the login check (step 7) → `decide-poll` →
+`edits undo-poll` → one `amem-rsi-decide PASS|FAIL|SKIP login=amem_app decisions=… undo_requests=…` line
+in `~/.claude/parent/routines.log`, with a `-warn` line per refused decision or failed undo.
+
+Each step needs your approval. Do them in order; stop at any failed check.
+- [ ] **Migration.** `20261025213700_rsi_decision_status.sql` (additive: two columns on `rsi_decision_results`,
+  two views, the owner read policy). Verify: as the owner in Night Desk, `select * from rsi_decision_status`
+  returns one row per decision; the advisors show no new warning.
+- [ ] **Login.** Step 7: `amem admin credentials-status` exits 0 ("connects as amem_app").
+- [ ] **Dry run in your terminal.** `uv run amem rsi decide-job --no-push` in `~/Projects/agent-memory`. The
+  line says `PASS login=amem_app`. A `FAIL credentials login: …` line means the DSN can create decisions: stop.
+- [ ] **Install.**
+  `cp deploy/launchd/com.vilmerfrost.amem-rsi-decide.plist ~/Library/LaunchAgents/`, then
+  `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.vilmerfrost.amem-rsi-decide.plist`.
+- [ ] **Check.** Within 5 minutes routines.log has an `amem-rsi-decide PASS` line, and
+  `launchctl print gui/$(id -u)/com.vilmerfrost.amem-rsi-decide` shows `last exit code = 0`.
+- [ ] **First real cycle** (step 11), from Night Desk: Deny, then Apply and Undo on a harmless labelled
+  proposal, then Undo of one edit-loop change. Each card shows `rejected`, `applied`, `undone` within 5 minutes.
+
+What Night Desk reads (owner RLS, read only):
+
+| View | One row per | `state` | `reason` (only when refused or retrying) |
+|------|-------------|---------|------------------------------------------|
+| `rsi_decision_status` | decision | `waiting`, `applied`, `rejected`, `undone`, `refused` | `hash-mismatch`, `decision-expired`, `artifact-changed`, `live-file-changed`, `promotion-refused`, `not-promoted`, `undo-conflict`, `retrying`, `gave-up` |
+| `edit_undo_status` | edit undo request | `waiting`, `undone`, `refused` | `nothing-to-undo`, `gave-up`, `undo-failed`, `retrying` |
+
+Both have `state_at` (when the state was reached, or the last try, or when it was recorded). The owner can also
+read `rsi_decision_results` itself (with `detail`, the redacted worker text).
+
+The edit-loop undo also still runs from amem-ingest every 15 minutes. Both pollers claim each request with a row
+lock (`for update skip locked`), so a request is reverted once. Removing the step from amem-ingest is not needed.
 
 ### 11. First real cycle (watch it)
 - [ ] One proposal arrives on the phone with Apply / Reject.
@@ -94,10 +148,11 @@ Undo the steps in reverse. Each one is independent.
 | Step | Undo |
 |------|------|
 | 11 | Undo each promoted change: phone Undo, `amem rsi decide <id> undo`, or `improve revert-change <prm-id>`. A conflict changes nothing and reports the file. |
-| 10 | Restore the plists from the step-1 backup. `bootout` the decide-poll and push jobs. |
+| 10b | `launchctl bootout gui/$(id -u)/com.vilmerfrost.amem-rsi-decide`, then delete the copied plist. Decisions wait for your next `amem rsi decide-poll`. The migration can stay (Night Desk only reads it); to remove it, see [least-privilege.md](least-privilege.md), "Unattended decide-job". |
+| 10 | Restore the plists from the step-1 backup. `bootout` the push job. |
 | 9 | Remove `apply_mode` (legacy behaviour), or keep `stage` and freeze again. |
 | 8 | `rsi_sandbox.py net-down`. Delete the Keychain item. `~/sandbox` holds no production data. |
-| 7 | Point the worker back to `AMEM_DB_URL`. Drop the login role. |
+| 7 | `amem admin restore-credentials` (the decide job then refuses to run: the login check fails). Drop the login role only with [rollback_least_privilege.sql](rollback_least_privilege.sql). |
 | 6 | `supabase functions delete amem-decide`. |
 | 5 | `inverse.sh <backup dir>`. |
 | 4 | Stop the archive job. The archive never deletes or changes the original transcripts. |

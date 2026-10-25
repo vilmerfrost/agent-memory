@@ -7,7 +7,8 @@ an `http` action "Undo" that POSTs {edit_id, token} to the edge function `amem-u
 (edits.undo_token_hash). No topic, or ntfy fails: a macOS notification naming
 `amem edits undo <id>` instead.
 
-Undo poll (`amem edits undo-poll`, every 15 minutes from agent-config's amem-ingest):
+Undo poll (`amem edits undo-poll`, every 15 minutes from agent-config's amem-ingest, and every 5 minutes from
+`amem rsi decide-job` once that job is installed; each request is claimed with a row lock, so it runs once):
 pending undo_requests -> `improve revert <improve id> --reason "phone undo"` -> request
 handled, edit status `reverted`, a short confirmation push. A failed revert is recorded and
 retried; after MAX_ATTEMPTS it is closed as failed and pushed. A busy revert (improve's write
@@ -193,6 +194,7 @@ from undo_requests u join edits e on e.id = u.edit_id
 where u.handled_at is null {only}
 order by u.requested_at, u.id
 """
+_CLAIM_SQL = "select 1 from undo_requests where id = %s and handled_at is null for update skip locked"
 
 
 def _revert(improve_id: str, reason: str) -> subprocess.CompletedProcess[str]:
@@ -264,8 +266,14 @@ def undo_poll(*, push: bool = True, notify: dict[str, str] | None = None, edit_i
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(_PENDING_SQL.format(only=only), {"edit": edit_id})
             rows = cur.fetchall()
+        conn.commit()
         for r in rows:
             try:
+                # Two pollers (amem-ingest every 15 min, amem-rsi-decide every 5 min) may list the same request. Each
+                # claims it with a row lock held until _handle commits; the other skips it, so a revert runs once.
+                if conn.execute(_CLAIM_SQL, (r["request_id"],)).fetchone() is None:
+                    conn.rollback()
+                    continue
                 report.outcomes.append(_handle(conn, r, push=push, notify=notify))
                 conn.commit()
             except Exception as exc:  # DB hiccup: this request is retried next poll
