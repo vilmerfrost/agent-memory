@@ -29,7 +29,7 @@ a key or a database URL (the routines read the database URL from the repo's env 
 08:45 amem-archive ──PASS──┐
 09:20 amem-daily ───PASS───┼──▶ 01:30 night-job ──gate──▶ amem rsi night (S0-S9) ──▶ report.json
 every 15 min amem-ingest ──┘        │ not done: SKIP + reason          │ lock: one night at a time
-                                     │ key missing: FAIL + reason       │ wall clock 45 min + watchdog
+                                     │ key missing: FAIL + reason       │ wall clock 4 h 45 min + watchdog
                                      ▼                                  ▼
                               routines.log ◀── amem-rsi-night line   07:30 brief-job (waits for lock + report)
                                      │                                  │
@@ -102,6 +102,7 @@ own preflight failed (no `skipped`) keeps the old headline.
 
 Since 2026-10-23 (verify run of night 2026-10-23, partial, $0.14):
 
+- **Three experiments per night** (2026-10-25): one per candidate; the second hypothesis waits pending. `night-job --plan` prints "Room for N experiment(s)" with each per-night cap's need and cap. The wall clock is 4 h 45 min (see [Subscription migration](subscription-migration.md), "Limits and accounting").
 - **Targets improve refuses leave the pool.** Allowlisted targets that improve refuses (a file in
   `improve/pins.json`, or a path outside `criteria.json` `allowed_targets` with the `fence.txt` nuance, read through
   `edits_targets.pinned_file` / `is_allowed` like the edits step) are removed from the night's allowlist, so their
@@ -189,6 +190,48 @@ No cost in the night is verified provider billing. Verification is manual: the m
 Anthropic and OpenAI console usage for the sandbox keys and the TypeSafe usage with `reported_usd` and
 `estimated_usd` (gate 3).
 
+## Night Desk data audit (2026-10-25)
+
+Night Desk's `docs/plain-language-pass.md` ("Build status", "Not built, because the data does not exist yet", plus
+decisions 8, 9, 12 and 21) listed items it could not show. Each one against `report.json`, checked on the real
+2026-10-24 report (written before 1df19d2, so it has none of the newer fields) and on fixture nights
+(`tests/test_rsi_night_reportdata.py`). Every field below is additive and optional: older reports lack it, still
+validate (`rsi_night.validate_report`, `rsi_brief.validate_report`) and still render in `amem rsi brief`, so a reader
+shows "not saved" when a field is missing.
+
+| Item | State | Field(s) |
+|---|---|---|
+| Night budget | covered (1df19d2) | `budget.max_usd` (the whole `budget` object is `Budget.caps()`) |
+| Test task names | covered (1df19d2) | `experiments[].test_setup.tasks[]` `{id, title}`; two-provider runs: `experiments[].provider_results[].test_setup.tasks` |
+| Judge's reason per task | covered (1df19d2), tightened | `experiments[].judge_pairs[]` `{case, title, rep, order, winner, raw_winner, reason, error}`. Now each pair also has the task `title`, and `reason` / `error` are one redacted line of at most 200 characters. The same list is in `provider_results[].judge_pairs` and on the `rsi_experiments.meta` row |
+| Why a dropped idea was thrown out | added | `candidates[].hypotheses_rejected[]` `{index, code, field, reason, target?}` and `candidates[].hypotheses_accepted` (only on a candidate that reached the idea writer) |
+| Full pinned / refused file list | added | `blocked.refused_files[]` `{target, reason}` (every allowlisted file improve refuses tonight) and `blocked.targets[]` (see next row). The `candidates: N on a target improve refuses (...)` note is no longer cut at 200 characters (2000 is a backstop only) |
+| Blocked ideas split by reason | added | `blocked.groups` `{no_target, hand_edited, grades_loop, pinned, outside_allowed}`, `blocked.total` (= the sum, = the two `candidates:` notes added up, from the same database read), `blocked.targets[]` `{target, reason, ideas}` (every file, idea count per file, sorted by group then count) |
+| Per-candidate 🔒 reason on "Most-broken rules" | added | `patterns[].target` (the rule's file, even when out of scope) and `patterns[].blocked` (a group code, or null when the loop may edit it) |
+| ClickHouse measurements | covered (worker-evidence) | `experiments[].evidence_measurements[]` |
+| Past.dev hits not about the rule | covered (worker-evidence) | `experiments[].unlinked_refs[]` |
+| Guard-workaround tagging | not possible here | Deviation rows hold no such tag, only free text (`what`, `why`, `how`). The deviation grading (`questions/deviation.toml`, `deviations` table) must record it first; the night must not parse transcript text for it |
+| Failing routines (decision 21) | not added, by design | Decision 24 settles it on the `runs` table (`runs.meta.failures`) for the window `checkpoint.before` → `checkpoint.after`. The report keeps the count (`delta.routine_failures`) and one pattern per failing routine (`patterns[]`, key `routine:<name>`, `n`). Failure text stays in `runs`: it can name files with possible secrets (secret-scan) |
+| Console links, "Open Claude" | not report data | Night Desk config and UI |
+| Eval test names, suggested-edit text | out of scope | agent-config (`evals/run.py` `TOPICS`, `improve`) |
+
+**Blocked groups** (`rsi_night.BLOCK_REASONS`, most specific first). Night Desk's four plain groups map as shown;
+`pinned` is a fifth code for a pin with any other reason (none on 2026-10-25).
+
+| Code | Night Desk group | Rule |
+|---|---|---|
+| `no_target` | No file to change | the candidate names no file |
+| `hand_edited` | You edited the file yourself | `improve/pins.json` reason says "auto-pin" or "edited by hand" |
+| `grades_loop` | Files that grade the loop | pin reason says "judge prompt", "eval prompt" or "measuring stick" |
+| `pinned` | (pinned, other) | any other pin reason; the reason text itself is never copied |
+| `outside_allowed` | Outside the allowed area | not pinned, and not on the loop's target list or outside improve's `allowed_targets` / fence |
+
+**Rejection codes** (`rsi_night.REJECT_REASONS`; `reason` is that fixed plain sentence, never the model's text;
+`field` is a hypothesis field name or null; `target` appears only for `not_allowlisted` and only when it is a valid
+`~/…/*.md` path): `unparseable`, `not_an_object`, `unknown_fields`, `missing_fields`, `bad_target`,
+`not_allowlisted`, `not_text`, `empty`, `too_long`, `control_chars`, `looks_like_command`, `bad_risk`,
+`bad_confidence`, `over_cap`, `duplicate`, `ignored`, `invalid`.
+
 ## The morning brief
 
 `amem rsi brief` / `brief-job` shows, in fixed sections: new sessions analyzed, candidates considered, experiments
@@ -240,7 +283,7 @@ fails, the night records "hypothesizer failed" and spends nothing on the replay.
 | Credential missing | `FAIL credentials ...`; routine-audit raises it | store the key (secret popup / Keychain), then wait or run `amem rsi night-job` by hand |
 | Night aborted or over the wall clock | experiment `interrupted`, containers reaped, lock released, checkpoint kept | nothing: the next night resumes the pending hypothesis |
 | Process killed (watchdog exit 124, power loss) | the lock expires (wall clock + 15 min) or is taken over when its pid is dead; experiment rows may stay `running` | `amem rsi night-job` again; `python3 sandbox/rsi_sandbox.py recover` if containers remain |
-| Budget exhausted | `FAIL budget: <kind>`, hypotheses kept pending | raise the cap only with a new approval |
+| Budget exhausted | `FAIL budget: <kind>`, hypotheses kept pending; the 2nd and 3rd candidates stay deferred with their hypotheses | raise the cap only with a new approval |
 | A staged proposal looks wrong | it expires after its TTL | `amem rsi decide <id> reject --hash <H>` |
 | Turn the night off | — | `launchctl bootout gui/$(id -u)/com.vilmerfrost.amem-rsi-night` (and `...-rsi-brief`), remove the plists from `~/Library/LaunchAgents` and `~/agent-config/launchd/`, remove the registry rows |
 

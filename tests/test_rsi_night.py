@@ -634,7 +634,8 @@ def test_hypothesis_parser() -> None:
     assert ok == [] and len(rej) == 11 and rej[-1]["reason"] == "6 more items ignored"   # at most 10 are read
     three = [good, {**good, "target": "~/agent-config/agents/worker.md"}, {**good, "what": "A third clear rule"}]
     ok, rej = N.parse_hypotheses(json.dumps({"hypotheses": three}), allowlist=allow, cap=2)
-    assert len(ok) == 2 and rej == [{"index": 2, "reason": "over the cap of 2 hypotheses"}]
+    assert len(ok) == 2 and rej == [{"index": 2, "reason": "over the cap of 2 hypotheses", "code": "over_cap",
+                                     "field": None}]
     for reply in ("not json", "[]", json.dumps({"hypotheses": [], "approve": True}), json.dumps({"hyp": []})):
         with pytest.raises(N.HypothesisParseError):
             N.parse_hypotheses(reply, allowlist=allow, cap=2)

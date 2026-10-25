@@ -232,6 +232,14 @@ def validate_report(rep: Any) -> list[str]:
     _check_map(rep["delta"], "delta", COUNTS, p)
     for name in ("patterns", "candidates"):
         p += [f"{name}[{i}]: not a JSON object" for i, x in enumerate(rep[name]) if not isinstance(x, dict)]
+    for i, c in enumerate(rep["candidates"]):             # optional (2026-10-25): why each idea was thrown out
+        if isinstance(c, dict) and c.get("hypotheses_rejected") is not None and not (
+                isinstance(c["hypotheses_rejected"], list) and all(isinstance(x, dict) for x in c["hypotheses_rejected"])):
+            p.append(f"candidates[{i}].hypotheses_rejected: not a list of objects")
+    bl = rep.get("blocked")                               # optional (2026-10-25): ideas no experiment can use
+    if bl is not None and not (isinstance(bl, dict) and isinstance(bl.get("groups"), dict)
+                               and isinstance(bl.get("targets"), list)):
+        p.append("blocked: not an object with groups and targets")
     for i, e in enumerate(rep["experiments"]):
         where = f"experiments[{i}]"
         if not isinstance(e, dict):
@@ -256,7 +264,8 @@ def validate_report(rep: Any) -> list[str]:
         if c is not None and not (_num(c) and 0 <= c <= 1):
             p.append(f"{where}.confidence: not a number in [0, 1]")
         for k, typ in (("arms", dict), ("hypothesis", dict), ("verdict_reasons", list), ("evidence_refs", list),
-                       ("judge", dict), ("jev", dict), ("evidence_measurements", list), ("unlinked_refs", list)):
+                       ("judge", dict), ("jev", dict), ("evidence_measurements", list), ("unlinked_refs", list),
+                       ("judge_pairs", list), ("test_setup", dict)):
             if e.get(k) is not None and not isinstance(e[k], typ):
                 p.append(f"{where}.{k}: wrong type")
         _check_map(e, where, ("cost_usd",), p)
