@@ -1,18 +1,56 @@
 """Conservative replay relevance evidence, independent of judge preference.
 
 Case declarations establish intended coverage. Completed, exact-path reads establish
-observed exposure, not proof that a model obeyed or understood the contents. Shell
-snippets, arbitrary MCP arguments, name-only skill calls and missing results remain
-unknown. No command or target code is executed by this module.
+observed exposure, not proof that a model obeyed or understood the contents. A
+completed name-only Skill call counts only when the caller passes a staged-skill index
+(`skill_index`) in which exactly one staged SKILL.md has that name. Shell snippets,
+arbitrary MCP arguments, other name-only skill calls and missing results remain
+unknown. No command or target code is executed, and no path is resolved, by this module.
 """
 from __future__ import annotations
 
 import json
+import re
 import shlex
 from collections.abc import Mapping, Sequence
 from typing import Any
 
 FORMAT = "rsi-relevance/1"
+# Where the replay clients discover skills in the sandbox home: Claude Code reads ~/.claude/skills, Codex and the
+# shared skill set live in ~/.agents/skills, older Codex homes use ~/.codex/skills.
+SKILL_DIRS = ("~/.claude/skills/", "~/.agents/skills/", "~/.codex/skills/")
+SKILL_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+SKILL_CALL = "completed-unique-staged-skill-call"
+
+
+def skill_name(path: str) -> str | None:
+    """The skill name of `~/<skill dir>/<name>/SKILL.md`, else None."""
+    for base in SKILL_DIRS:
+        if path.startswith(base) and path.endswith("/SKILL.md"):
+            name = path[len(base):-len("/SKILL.md")]
+            return name if SKILL_NAME.fullmatch(name) else None
+    return None
+
+
+def skill_index(files: Mapping[str, str], mirrors: Mapping[str, str] | None = None) -> dict[str, str]:
+    """name -> the one staged SKILL.md path a name-only Skill call can have loaded.
+
+    files: staged `~/<skill dir>/<name>/SKILL.md` paths -> sha256 (what the arm home holds). mirrors: a copy the
+    runner installed so another client discovers the same skill -> its source path. A mirror with the source's
+    exact bytes is the same skill; any other second file with the same name makes the name ambiguous, and an
+    ambiguous or unknown name maps to nothing.
+    """
+    mirrors = mirrors or {}
+    by_name: dict[str, set[str]] = {}
+    for path, sha in files.items():
+        name = skill_name(path)
+        if name is None:
+            continue
+        src = mirrors.get(path)
+        if src is not None and skill_name(src) == name and files.get(src) == sha:
+            path = src
+        by_name.setdefault(name, set()).add(path)
+    return {name: next(iter(paths)) for name, paths in sorted(by_name.items()) if len(paths) == 1}
 
 
 def target_path(value: Any) -> str | None:
@@ -85,11 +123,13 @@ def _read_command(command: Any) -> list[str]:
     return [target_path(p) for p in paths]
 
 
-def parse_calls(events: Sequence[Mapping[str, Any]], agent: str) -> list[dict[str, Any]]:
+def parse_calls(events: Sequence[Mapping[str, Any]], agent: str,
+                skills: Mapping[str, str] | None = None) -> list[dict[str, Any]]:
     """Keep bounded arguments from raw events; LF's telemetry parser drops them.
 
     Only a matching successful tool_result / completed command yields evidence.
     Unknown schemas and incomplete events retain diagnostics but cannot pass.
+    skills: the arm's `skill_index`; without it a name-only Skill call stays unknown.
     """
     calls: dict[str, dict[str, Any]] = {}
     results: dict[str, bool] = {}
@@ -115,6 +155,12 @@ def parse_calls(events: Sequence[Mapping[str, Any]], agent: str) -> list[dict[st
                             call["target_reads"] = [p]
                     elif call["name"] == "Bash":
                         call["target_reads"] = _read_command(args.get("command"))
+                    elif call["name"] == "Skill" and skills and set(args) <= {"skill", "args"}:
+                        # Claude Code's Skill tool loads the whole SKILL.md of the named skill. Only a name that
+                        # exactly one staged skill carries maps to a path; plugin:name and unknown names do not.
+                        name = args.get("skill")
+                        if isinstance(name, str) and name in skills:
+                            call["target_reads"], call["read_kind"] = [skills[name]], SKILL_CALL
                     calls[str(item.get("id") or f"unknown-{len(calls)}")] = call
                 elif ev.get("type") == "user" and item.get("type") == "tool_result":
                     results[str(item.get("tool_use_id"))] = item.get("is_error", False) is False
@@ -167,6 +213,8 @@ def evidence(run: Any, paths: Sequence[str], files: Mapping[str, Mapping[str, An
         for call in run.tool_calls:
             if call.get("status") == "completed":
                 for path in call.get("target_reads", []):
-                    seen[path] = "completed-exact-path-read"
+                    kind = SKILL_CALL if call.get("read_kind") == SKILL_CALL else "completed-exact-path-read"
+                    if seen.get(path) != "completed-exact-path-read":
+                        seen[path] = kind
     return {"observed": {p: seen[p] for p in paths if p in seen},
             "missing": [p for p in paths if p not in seen]}

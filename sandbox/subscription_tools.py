@@ -35,7 +35,7 @@ TOOL = {
 READ_TOOL_NAME = "task_read_arm"
 READ_TOOL = {
     "name": READ_TOOL_NAME,
-    "description": "Read a complete sanitized arm file (up to 16 KiB) and record verified "
+    "description": "Read a complete sanitized arm file (up to 48 KiB) and record verified "
                    "exposure evidence. Use this tool to read experimental instructions; "
                    "shell reads do not establish verified exposure. Paths are ~/relative or "
                    "/home/rsi/relative or /arm-home/relative.",
@@ -45,8 +45,8 @@ READ_TOOL = {
 READ_SCRIPT = """import hashlib,json,pathlib,sys
 p=pathlib.Path(sys.argv[1]); root=pathlib.Path('/arm-home')
 if not p.resolve().is_relative_to(root): raise SystemExit(2)
-with p.open('rb') as f: data=f.read(16385)
-if len(data)>16384: raise SystemExit(3)
+with p.open('rb') as f: data=f.read(49153)
+if len(data)>49152: raise SystemExit(3)
 print(json.dumps({'content':data.decode('utf-8'),'sha256':hashlib.sha256(data).hexdigest()},ensure_ascii=False))
 """
 

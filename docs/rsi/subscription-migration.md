@@ -51,11 +51,54 @@ establish efficacy; a regression in them still blocks promotion. Old passing rec
 superseded before a new provider comparison. Exact-path read evidence proves exposure,
 not obedience or semantic correctness of the task design.
 
-The supplied synthetic cases cover `~/.claude/CLAUDE.md`. They can qualify the transport,
-but do not establish coverage of arbitrary real skills, Codex-specific files or shared
-targets. Those targets remain inconclusive until appropriate case declarations, task
-fixtures and objective checks exist. In particular, generic typo/add/TODO tasks do not
-qualify a Meltdown change.
+The three generic cases (`docs-typo`, `fix-add`, `report-todos`) cover `~/.claude/CLAUDE.md`.
+They can qualify the transport. They do not qualify a skill change: a typo task never reads
+a skill.
+
+## Skill coverage (2026-10-25)
+
+Three cases now cover real skill files. Each asks for the skill's first planning step and
+writes one file that a hidden check grades. Nothing renders, speaks, searches or calls out.
+
+| Case | Target | What the hidden check grades |
+|---|---|---|
+| `meltdown-brief` | `~/.agents/skills/meltdown/SKILL.md` | Intro hard rules and style defaults: reel, 15 s, `eleven_v4` with Vilmer's voice id, a separate reviewer, 2–4 word lines, about 25 words. |
+| `pepe-lock` | `~/.agents/skills/pepe/SKILL.md` | Phase 3 Lock: after one suggestion the user's two picks stand; every other session idea goes to `docs/ideas/parked.md`, one line each with a revisit trigger; no briefs yet. |
+| `anatomy-plan` | `~/.agents/skills/anatomy/SKILL.md` | Workflow steps 1–4: a Figure of 30–90 min, a real object, 40–80 parts in the five groups, one lit subject part, the request's true numbers, no geometry. |
+
+Crafted compliant and non-compliant outputs live in `tests/data/rsi_skill_cases/`. The tests
+also break each rule alone and check that the hidden check fails.
+
+**Which cases run.** With `replay.cases: null`, an experiment replays only the cases that
+declare its changed file. Only those cases count towards the verdict's `min_pairs` (3), so
+one skill case runs 3 repetitions. That fits each provider's share of the night: 3 pairs for
+Claude and 3 for Codex on a shared skill (6 of 6). A `CLAUDE.md` change still runs the three
+generic cases once. An explicit case list is replayed as given.
+
+**Exposure in both clients.** The arm home holds the skill at its real path. The runner also
+copies it to the place the other client looks (`~/.agents/skills/<n>` ↔ `~/.claude/skills/<n>`),
+with that arm's bytes. It is a copy because the sanitizer strips symlinks. In the subscription
+transport both clients read the listed file with `task_read_arm`; the bridge now returns files up
+to 48 KiB (Anatomy is 31 KB). With native Claude tools, a completed `Skill` call by name counts
+only when exactly one staged skill has that name; two different staged files with one name stay
+unknown.
+
+**Triage.** A candidate whose file no case declares cannot take the experiment slot. It gets no
+paid triage call. The report lists it with `skip_reason: "no test case uses this file"`, and
+covered candidates fill the triage slots first.
+
+**Limits.**
+
+- Coverage is per file, not per section. A Meltdown change outside the intro or style table is
+  still graded by `meltdown-brief`; that is evidence of no regression there, not of the change.
+- Each skill has one task. Three repetitions of one task measure noise in that task, not breadth.
+- The checks grade the plan's decisions, not the quality of the script, ideas or object.
+- Exposure proves the file was returned in full, not that the model followed it. A client may
+  still truncate a long tool result before the model sees it.
+- The hypothesizer may name a different target than its candidate. Such an experiment still ends
+  INCONCLUSIVE when no case declares that file.
+- Other skills (for example `handoff`), `~/.codex/AGENTS.md` and scheduled tasks have no case.
+  Their candidates wait with the reason above.
 
 ## Limits and accounting
 

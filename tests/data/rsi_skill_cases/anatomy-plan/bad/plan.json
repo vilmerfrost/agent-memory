@@ -1,0 +1,15 @@
+{
+  "size": "Hero",
+  "estimate_minutes": [120, 240],
+  "object": "A flowchart of labelled boxes with arrows from inputs to the cache",
+  "motion": "Arrows light up from left to right when the key matches.",
+  "lit_part": "cache box",
+  "numbers": ["90% hit rate"],
+  "parts": [
+    {"name": "inputs box", "group": "boxes"},
+    {"name": "hash box", "group": "boxes"},
+    {"name": "cache box", "group": "boxes"},
+    {"name": "arrow 1", "group": "arrows"},
+    {"name": "arrow 2", "group": "arrows"}
+  ]
+}

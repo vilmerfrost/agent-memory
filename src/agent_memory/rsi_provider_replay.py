@@ -35,6 +35,14 @@ def replay(stages, settings, *, artifact_hash, experiment_id, baseline_id, budge
     profiles = settings["provider_profiles"]
     if not required or any(p not in profiles for p in required):
         raise N.ExperimentFailed("missing required provider profile")
+    if settings.get("cases") is None:
+        # No explicit case list: the target's own cases, repeated up to the verdict's minimum pairs, within each
+        # provider's share of the night's A/B pairs. Every provider runs the same plan.
+        plan = R.auto_cases(artifact_hash, R.load_cases(), root=RA.sandbox_dir(),
+                            reps=int(settings.get("reps") or 1),
+                            max_pairs=max(1, budget.cfg.max_ab_pairs // len(required)))
+        if plan is not None:
+            settings = {**settings, "cases": [c.id for c in plan[0]], "reps": plan[1]}
     pairs = len(R.load_cases(settings.get("cases"))) * int(settings.get("reps") or 1) * len(required)
     if pairs > budget.cfg.max_ab_pairs:
         raise N.BudgetExhausted("ab_pairs", f"{pairs} provider-specific pairs exceed {budget.cfg.max_ab_pairs}")

@@ -351,7 +351,8 @@ def test_first_night_config_is_the_smallest_useful_scope() -> None:
 
 def test_a_replay_over_the_pair_cap_is_refused_before_any_container() -> None:
     cfg = first_cfg()
-    rep = N.SandboxReplayer(cfg.stages, {**cfg.replay, "reps": 2})
+    generic = ["docs-typo", "fix-add", "report-todos"]       # an explicit case list is replayed as given
+    rep = N.SandboxReplayer(cfg.stages, {**cfg.replay, "cases": generic, "reps": 2})
     from agent_memory.rsi_budget import Budget
     with pytest.raises(N.ExperimentFailed, match="6 A/B pairs is over the cap of 3"):
         rep.replay(artifact_hash="a" * 64, experiment_id="exp-20261018-abcd1234", baseline_id="bl-1",
@@ -385,12 +386,13 @@ def test_live_replay_brings_the_network_up_and_down_only_when_asked(monkeypatch:
     monkeypatch.setattr(rsi_replay, "run_replay", fake_run)
     cfg = first_cfg()
     assert cfg.replay["ensure_network"] is True
-    out = N.SandboxReplayer(cfg.stages, cfg.replay).replay(artifact_hash="a" * 64, experiment_id="exp-20261018-ab",
-                                                          baseline_id="bl-1", budget=Budget(cfg.budget))
+    generic = ["docs-typo", "fix-add", "report-todos"]       # the artifact is not staged: an explicit list
+    out = N.SandboxReplayer(cfg.stages, {**cfg.replay, "cases": generic}).replay(
+        artifact_hash="a" * 64, experiment_id="exp-20261018-ab", baseline_id="bl-1", budget=Budget(cfg.budget))
     assert out.verdict == "NO_EFFECT" and events == ["status", ("run", True, "codex", 3), "down"]
     events.clear()
     stub = N.load_config()                                   # stub agent and judge: no network, nothing touched
-    N.SandboxReplayer(stub.stages, {**stub.replay, "ensure_network": True}).replay(
+    N.SandboxReplayer(stub.stages, {**stub.replay, "cases": generic, "ensure_network": True}).replay(
         artifact_hash="a" * 64, experiment_id="exp-20261018-ab", baseline_id="bl-1", budget=Budget(stub.budget))
     assert events == [("run", False, "stub", 3)]
 

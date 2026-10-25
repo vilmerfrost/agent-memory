@@ -406,6 +406,11 @@ RECURRENCE_SQL = ("greatest(1, case when jsonb_typeof(metrics->'sessions') = 'nu
                   "then floor((metrics->>'sessions')::numeric) else 0 end, "
                   "(select count(distinct r) from unnest(evidence_refs) r where "
                   + " and ".join(f"not starts_with(r, '{p}')" for p in _HISTORY_REFS) + "))")
+# The pool reads this many times `max_considered` rows, so candidates with a replay case can move ahead of
+# uncovered ones that rank higher (Night._pool).
+POOL_FETCH = 10
+# Why a candidate cannot run: no replay case declares its file, so any experiment would end INCONCLUSIVE.
+NO_TEST_CASE = "no test case uses this file"
 
 
 def rank(a: TriageAnswers, recurrence: int, history: Sequence[str], weights: Mapping[str, float]) -> float:
@@ -955,6 +960,14 @@ class SandboxReplayer:
                 experiment_id=experiment_id, baseline_id=baseline_id, budget=budget)
         cases = rsi_replay.load_cases(self.cfg.get("cases"))
         rc = self.replay_config()
+        auto = getattr(rsi_replay, "auto_cases", None)
+        if self.cfg.get("cases") is None and auto is not None:   # the target's own cases, enough pairs for a verdict
+            plan = auto(artifact_hash, cases, root=RA.sandbox_dir(), reps=int(rc.reps),
+                        max_pairs=int(getattr(budget.cfg, "max_ab_pairs", 0) or len(cases)))
+            cases, reps = plan or (cases, rc.reps)
+            if reps != rc.reps:
+                from dataclasses import replace as _replace
+                rc = _replace(rc, reps=reps)
         pairs = len(cases) * int(rc.reps)
         cap = int(getattr(budget.cfg, "max_ab_pairs", pairs))
         if pairs > cap:          # refused before any container: a bigger replay than the night allows
@@ -1530,7 +1543,7 @@ class Night:
             scope = list(self.allowlist) + list(aliases)
             cur.execute("select * from rsi_candidates where status in ('new', 'deferred') and target = any(%s) "
                         f"order by rank desc nulls first, {RECURRENCE_SQL} desc, last_seen_at desc, dedupe_key "
-                        "limit %s", (scope, limit))
+                        "limit %s", (scope, limit * POOL_FETCH))
             pool = [{**r, "target": aliases.get(r["target"], r["target"])} for r in cur.fetchall()]
             cur.execute("select count(*) as n from rsi_candidates where status in ('new', 'deferred') "
                         "and not coalesce(target = any(%s), false)", (scope,))
@@ -1554,7 +1567,27 @@ class Night:
                                  "target": s.target, "rule_key": s.rule_key, "evidence_refs": s.evidence_refs,
                                  "metrics": s.metrics, "seen_count": 1, "status": "new", "meta": {}, "rank": None})
             pool.sort(key=lambda c: (c.get("rank") is not None, -(c.get("rank") or 0.0), -recurrence(c)))
-        return pool[:limit]
+        # A candidate whose file no replay case uses can only end INCONCLUSIVE: covered candidates take the triage
+        # slots first. Up to `limit` uncovered ones are still listed (no triage call) so the report says why.
+        covered = [c for c in pool if self._test_cases(c.get("target"))]
+        uncovered = [c for c in pool if not self._test_cases(c.get("target"))]
+        return covered[:limit] + uncovered[:limit]
+
+    def _test_cases(self, target: str | None) -> list[str]:
+        """Replay cases (the night's `replay.cases`, default all of bench/rsi-replay) that declare `target`. Path
+        only: the artifact's kind is checked again by the replay. A bench that does not load covers nothing."""
+        cov = getattr(self, "_case_coverage", None)
+        if cov is None:
+            cov = {}
+            try:
+                from agent_memory import rsi_replay
+                for case in rsi_replay.load_cases(self.cfg.replay.get("cases")):
+                    for t in case.targets:
+                        cov.setdefault(t["path"], []).append(case.id)
+            except Exception as exc:  # noqa: BLE001 - fail closed: no experiment without a case
+                self.notes.append(f"test cases unavailable: {type(exc).__name__}: {str(exc)[:150]}")
+            self._case_coverage = cov
+        return sorted(cov.get(target or "", []))
 
     def _history(self, key: str) -> list[str]:
         assert self.conn is not None
@@ -1569,14 +1602,16 @@ class Night:
             self._poll()
             hist = self._history(c["dedupe_key"])
             in_scope = self._in_scope(c.get("target"))
+            tests = self._test_cases(c.get("target"))
             ans = None
-            if not self.dry_run or self.cfg.stages["triage"] == "fixture":
+            # No replay case uses the file: no paid triage call, the deterministic heuristic ranks it for the report.
+            if tests and (not self.dry_run or self.cfg.stages["triage"] == "fixture"):
                 ans = self.ad.triage.assess(c, state=triage_state(c, hist, in_scope), budget=self.budget)
             if ans is None:
                 ans = heuristic_answers(c, hist, in_scope)
             r = rank(ans, recurrence(c), hist, self.cfg.weights)
-            eligible = ans.action == "experiment" and in_scope and r >= self.cfg.min_rank
-            why = ("eligible" if eligible else "no in-scope target" if not in_scope
+            eligible = ans.action == "experiment" and in_scope and bool(tests) and r >= self.cfg.min_rank
+            why = ("eligible" if eligible else "no in-scope target" if not in_scope else NO_TEST_CASE if not tests
                    else "triage: wait" if ans.action != "experiment" else "rank below the minimum")
             results.append((c, ans, r, eligible, why, hist))
         self.health["jev"] = getattr(self.ad.triage, "health", self.health["jev"])
@@ -1597,8 +1632,12 @@ class Night:
                     "update rsi_candidates set status = %s, rank = %s, jev = %s, decided_reason = %s, "
                     "last_considered_at = now() where id = %s",
                     ("selected" if selected else "deferred", r, Jsonb(c["jev"]), reason[:300], c["id"]))
+            tests = self._test_cases(c.get("target"))
             self.report["candidates"].append({"id": str(c.get("id")) if c.get("id") else None, "key": c["dedupe_key"],
-                                              "source": c["source"], "rank": r, "selected": selected, "reason": reason})
+                                              "source": c["source"], "rank": r, "selected": selected, "reason": reason,
+                                              # additive (Night Desk): the file, the cases that use it, or why not
+                                              "target": c.get("target"), "test_cases": tests,
+                                              "skip_reason": None if tests else NO_TEST_CASE})
         self._pool_rows = {str(c.get("id") or c["dedupe_key"]): c for c, *_ in results}
 
     # -- S4-S8 -----------------------------------------------------------------------------------------
