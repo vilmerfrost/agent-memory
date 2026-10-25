@@ -189,6 +189,48 @@ No cost in the night is verified provider billing. Verification is manual: the m
 Anthropic and OpenAI console usage for the sandbox keys and the TypeSafe usage with `reported_usd` and
 `estimated_usd` (gate 3).
 
+## Night Desk data audit (2026-10-25)
+
+Night Desk's `docs/plain-language-pass.md` ("Build status", "Not built, because the data does not exist yet", plus
+decisions 8, 9, 12 and 21) listed items it could not show. Each one against `report.json`, checked on the real
+2026-10-24 report (written before 1df19d2, so it has none of the newer fields) and on fixture nights
+(`tests/test_rsi_night_reportdata.py`). Every field below is additive and optional: older reports lack it, still
+validate (`rsi_night.validate_report`, `rsi_brief.validate_report`) and still render in `amem rsi brief`, so a reader
+shows "not saved" when a field is missing.
+
+| Item | State | Field(s) |
+|---|---|---|
+| Night budget | covered (1df19d2) | `budget.max_usd` (the whole `budget` object is `Budget.caps()`) |
+| Test task names | covered (1df19d2) | `experiments[].test_setup.tasks[]` `{id, title}`; two-provider runs: `experiments[].provider_results[].test_setup.tasks` |
+| Judge's reason per task | covered (1df19d2), tightened | `experiments[].judge_pairs[]` `{case, title, rep, order, winner, raw_winner, reason, error}`. Now each pair also has the task `title`, and `reason` / `error` are one redacted line of at most 200 characters. The same list is in `provider_results[].judge_pairs` and on the `rsi_experiments.meta` row |
+| Why a dropped idea was thrown out | added | `candidates[].hypotheses_rejected[]` `{index, code, field, reason, target?}` and `candidates[].hypotheses_accepted` (only on a candidate that reached the idea writer) |
+| Full pinned / refused file list | added | `blocked.refused_files[]` `{target, reason}` (every allowlisted file improve refuses tonight) and `blocked.targets[]` (see next row). The `candidates: N on a target improve refuses (...)` note is no longer cut at 200 characters (2000 is a backstop only) |
+| Blocked ideas split by reason | added | `blocked.groups` `{no_target, hand_edited, grades_loop, pinned, outside_allowed}`, `blocked.total` (= the sum, = the two `candidates:` notes added up, from the same database read), `blocked.targets[]` `{target, reason, ideas}` (every file, idea count per file, sorted by group then count) |
+| Per-candidate 🔒 reason on "Most-broken rules" | added | `patterns[].target` (the rule's file, even when out of scope) and `patterns[].blocked` (a group code, or null when the loop may edit it) |
+| ClickHouse measurements | covered (worker-evidence) | `experiments[].evidence_measurements[]` |
+| Past.dev hits not about the rule | covered (worker-evidence) | `experiments[].unlinked_refs[]` |
+| Guard-workaround tagging | not possible here | Deviation rows hold no such tag, only free text (`what`, `why`, `how`). The deviation grading (`questions/deviation.toml`, `deviations` table) must record it first; the night must not parse transcript text for it |
+| Failing routines (decision 21) | not added, by design | Decision 24 settles it on the `runs` table (`runs.meta.failures`) for the window `checkpoint.before` → `checkpoint.after`. The report keeps the count (`delta.routine_failures`) and one pattern per failing routine (`patterns[]`, key `routine:<name>`, `n`). Failure text stays in `runs`: it can name files with possible secrets (secret-scan) |
+| Console links, "Open Claude" | not report data | Night Desk config and UI |
+| Eval test names, suggested-edit text | out of scope | agent-config (`evals/run.py` `TOPICS`, `improve`) |
+
+**Blocked groups** (`rsi_night.BLOCK_REASONS`, most specific first). Night Desk's four plain groups map as shown;
+`pinned` is a fifth code for a pin with any other reason (none on 2026-10-25).
+
+| Code | Night Desk group | Rule |
+|---|---|---|
+| `no_target` | No file to change | the candidate names no file |
+| `hand_edited` | You edited the file yourself | `improve/pins.json` reason says "auto-pin" or "edited by hand" |
+| `grades_loop` | Files that grade the loop | pin reason says "judge prompt", "eval prompt" or "measuring stick" |
+| `pinned` | (pinned, other) | any other pin reason; the reason text itself is never copied |
+| `outside_allowed` | Outside the allowed area | not pinned, and not on the loop's target list or outside improve's `allowed_targets` / fence |
+
+**Rejection codes** (`rsi_night.REJECT_REASONS`; `reason` is that fixed plain sentence, never the model's text;
+`field` is a hypothesis field name or null; `target` appears only for `not_allowlisted` and only when it is a valid
+`~/…/*.md` path): `unparseable`, `not_an_object`, `unknown_fields`, `missing_fields`, `bad_target`,
+`not_allowlisted`, `not_text`, `empty`, `too_long`, `control_chars`, `looks_like_command`, `bad_risk`,
+`bad_confidence`, `over_cap`, `duplicate`, `ignored`, `invalid`.
+
 ## The morning brief
 
 `amem rsi brief` / `brief-job` shows, in fixed sections: new sessions analyzed, candidates considered, experiments
