@@ -11,6 +11,9 @@
 // on the row, and `improve promote` re-checks it. No secret configured -> Apply / Undo are refused.
 //
 // Pure logic, no Deno globals, so it runs under `deno test` and `node --test` alike.
+//
+// Paths with /web/... are Night Desk's routes (web.ts: owner login, Origin, passkey). index.ts passes web.ts in
+// as deps.web, so this file never imports the WebAuthn library and the phone tests still run under node.
 
 import { verify } from "./totp.ts";
 
@@ -18,10 +21,16 @@ export interface Deps {
   supabaseUrl: string;
   serviceKey: string;
   totpSecret: string;          // base32; empty = phone Apply / Undo disabled
-  origin: string;              // the decide page origin allowed by CORS; empty = no browser access
+  origin: string;              // the browser origin allowed by CORS (Night Desk); empty = no browser access
   now: () => number;           // ms since the epoch
   fetch: (input: string, init?: RequestInit) => Promise<Response>;
+  anonKey?: string;            // web: apikey for Supabase Auth /auth/v1/user (falls back to serviceKey)
+  ownerUserId?: string;        // web: RSI_OWNER_USER_ID, the only Supabase user who may decide; empty = nobody
+  rpId?: string;               // web: WebAuthn RP ID (default night-desk-vilmer-frosts-projects.vercel.app)
+  web?: (req: Request, deps: Deps, path: string) => Promise<Response>;   // web.ts serveWeb (index.ts wires it)
 }
+
+const WEB_PATH = /\/web(\/|$)/;
 
 export const TEXT: Record<string, [number, string]> = {
   "recorded:apply": [200, "Approved — the change is applied within minutes"],
@@ -64,6 +73,18 @@ async function rpc(deps: Deps, fn: string, args: Record<string, unknown>): Promi
 }
 
 export async function handle(req: Request, deps: Deps): Promise<Response> {
+  let path = "";
+  try {
+    path = new URL(req.url).pathname;
+  } catch {
+    path = "";
+  }
+  if (WEB_PATH.test(path)) {
+    if (!deps.web) {
+      return new Response(JSON.stringify({ result: "error" }), { status: 501, headers: { "content-type": "application/json" } });
+    }
+    return await deps.web(req, deps, path);
+  }
   const h = cors(deps, req);
   if (req.method === "OPTIONS") {
     return h["Access-Control-Allow-Origin"] ? new Response(null, { status: 204, headers: h }) : text(403, "Not allowed");

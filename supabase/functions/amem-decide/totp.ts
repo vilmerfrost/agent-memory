@@ -9,7 +9,7 @@ export const RFC_VECTOR: [number, string] = [59, "287082"];
 
 const B32 = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
 
-export function base32Decode(s: string): Uint8Array {
+export function base32Decode(s: string): Uint8Array<ArrayBuffer> {
   const clean = s.replace(/=+$/g, "").replace(/\s+/g, "").toUpperCase();
   let bits = 0, value = 0;
   const out: number[] = [];

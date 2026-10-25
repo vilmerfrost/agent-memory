@@ -177,7 +177,8 @@ def test_amem_app_fires_the_cloud_digest_triggers(db: dict[str, str]) -> None:
 
 def test_every_table_is_reachable_by_amem_app_or_deliberately_not(db: dict[str, str]) -> None:
     """Guards later migrations: a new routine table without an amem_app grant and policy fails here."""
-    secret = {"rsi_totp_used", "rsi_totp_failures"}
+    secret = {"rsi_totp_used", "rsi_totp_failures",                       # owner-only (20261025210000_rsi_web_decide)
+              "rsi_passkeys", "rsi_passkey_enroll_codes", "rsi_web_challenges"}
     with psycopg.connect(db["owner"]) as conn:
         tables = [r[0] for r in conn.execute("select tablename from pg_tables where schemaname = 'public'")]
         pol = {r[0] for r in conn.execute("select tablename from pg_policies where schemaname = 'public' and "
