@@ -377,6 +377,12 @@ def paid_plan(cfg: Any, *, cases: int | None = None) -> dict[str, Any]:
     provider_count = len(profiles) or 1
     n_cases = cases if cases is not None else len(rsi_replay.load_cases(rp.get("cases")))
     reps = int(rp.get("reps") or 1)
+    if cases is None and rp.get("cases") is None:
+        # No explicit list: each experiment replays only its target's cases (rsi_replay.plan_cases). Plan for the
+        # biggest such replay within one provider's share of the night's A/B pairs.
+        from agent_memory import rsi_verdict
+        n_cases, reps = rsi_replay.largest_auto_plan(rsi_replay.load_cases(), min_pairs=rsi_verdict.load_policy().min_pairs,
+                                                     max_pairs=max(1, b.max_ab_pairs // provider_count), reps=reps)
     pairs = n_cases * reps
     exps = b.max_experiments
     rows: list[dict[str, Any]] = []

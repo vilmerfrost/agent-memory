@@ -39,10 +39,11 @@ def record(root: Path, h: str) -> dict:
 
 def test_shipped_cases_load_and_are_stable():
     cases = R.load_cases()
-    assert [c.id for c in cases] == ["docs-typo", "fix-add", "report-todos"]
+    assert [c.id for c in cases] == ["anatomy-plan", "docs-typo", "fix-add", "meltdown-brief", "pepe-lock",
+                                     "report-todos"]
     assert all(c.fixture.is_dir() and c.stub and c.check for c in cases)
     assert R.load_cases(["report-todos"])[0].hidden_check.name == "report-todos"
-    assert cases[0].digest() == R.load_cases(["docs-typo"])[0].digest()
+    assert cases[1].digest() == R.load_cases(["docs-typo"])[0].digest()
     with pytest.raises(R.ReplayError, match="unknown case"):
         R.load_cases(["nope"])
     scen = json.loads((R.BENCH_DIR / "scenarios.json").read_text())["scenarios"]
@@ -434,7 +435,7 @@ def test_cli_dry_run_writes_nothing(tmp_path, monkeypatch):
     monkeypatch.delenv("RSI_SANDBOX_DIR")
     assert R.main(["run", "--artifact", h, "--experiment", EXP, "--dry-run"], out=out.append) == 2   # no root
     out.clear()
-    assert R.main(["cases"], out=out.append) == 0 and len(out) == 3
+    assert R.main(["cases"], out=out.append) == 0 and len(out) == len(R.load_cases())
 
 
 def test_cli_run_with_host_double(tmp_path, monkeypatch):

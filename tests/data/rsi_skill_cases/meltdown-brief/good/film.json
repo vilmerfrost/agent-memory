@@ -1,0 +1,15 @@
+{
+  "style": "reel",
+  "length_s": 15,
+  "voice": {"model_id": "eleven_v4", "voice_id": "choA5fzIKsVFxO1Mg9ZL"},
+  "reviewer": "separate-agent",
+  "lines": [
+    "Notes everywhere.",
+    "Tidepool syncs them.",
+    "One command: tide sync.",
+    "Markdown in, Markdown out.",
+    "Conflicts? Shown, never hidden.",
+    "Your folder stays yours.",
+    "Ducks included."
+  ]
+}

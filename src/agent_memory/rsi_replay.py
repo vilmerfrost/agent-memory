@@ -182,6 +182,93 @@ def load_cases(ids: Sequence[str] | None = None, *, bench: Path | None = None) -
     return [out[i] for i in sorted(dict.fromkeys(ids))]
 
 
+def plan_cases(manifest: Mapping[str, Any], cases: Sequence[ReplayCase], *, min_pairs: int, max_pairs: int,
+               reps: int = 1) -> tuple[list[ReplayCase], int]:
+    """The cases and repetitions of an automatic replay (no explicit case list in the night config).
+
+    Only cases whose declared target the artifact changes run: a generic task never reads a changed skill, so it
+    adds cost and noise but no evidence. Only eligible cases count towards the verdict's `min_pairs`, so a target
+    with fewer eligible cases than that gets more repetitions, up to `max_pairs` pairs (one provider's share of the
+    night's A/B pairs). An artifact no case covers keeps one case: run_replay then refuses before any container
+    runs and records the uncovered targets.
+    """
+    eligible_ids = REL.select(manifest, cases)["eligible_cases"]
+    eligible = [c for c in cases if c.id in eligible_ids]
+    if not eligible:
+        return list(cases)[:1], reps
+    want = max(int(reps), -(-int(min_pairs) // len(eligible)))
+    while want > reps and len(eligible) * want > max_pairs:
+        want -= 1
+    return eligible, want
+
+
+def largest_auto_plan(cases: Sequence[ReplayCase], *, min_pairs: int, max_pairs: int,
+                      reps: int = 1) -> tuple[int, int]:
+    """(cases, reps) of the biggest automatic replay any one declared target can get (rsi_schedule's paid plan)."""
+    best = (0, int(reps))
+    for target in sorted({(t["path"], t["kind"]) for c in cases for t in c.targets}):
+        chosen, r = plan_cases({"files": [{"path": target[0], "kind": target[1]}]}, cases,
+                               min_pairs=min_pairs, max_pairs=max_pairs, reps=reps)
+        if len(chosen) * r > best[0] * best[1]:
+            best = (len(chosen), r)
+    return best
+
+
+def staged_skills(home: Path) -> dict[str, str]:
+    """`~/<skill dir>/<name>/SKILL.md` -> sha256 for every regular SKILL.md a client can discover in an arm home.
+    Reads only the staged sandbox home; never a host path, never a symlink."""
+    out = {}
+    for base in REL.SKILL_DIRS:
+        root = home / base[2:]
+        if not root.is_dir() or root.is_symlink():
+            continue
+        for d in sorted(root.iterdir()):
+            f = d / "SKILL.md"
+            if d.is_dir() and not d.is_symlink() and f.is_file() and not f.is_symlink():
+                out[f"{base}{d.name}/SKILL.md"] = hashlib.sha256(f.read_bytes()).hexdigest()
+    return out
+
+
+def install_skill_mirrors(home: Path) -> dict[str, str]:
+    """Copy each staged skill where the other client discovers it: ~/.agents/skills/<n> (Codex, shared skills)
+    to ~/.claude/skills/<n> (Claude Code), and the reverse, when that place is empty. A copy, not a symlink: the
+    sanitizer removes symlinks from a home. The copy holds the arm's own bytes (A: before, B: after). Returns
+    mirror path -> source path."""
+    mirrors = {}
+    pairs = ((".agents/skills", ".claude/skills"), (".claude/skills", ".agents/skills"))
+    for src_base, dst_base in pairs:
+        root = home / src_base
+        if not root.is_dir() or root.is_symlink():
+            continue
+        for d in sorted(root.iterdir()):
+            src = d / "SKILL.md"
+            dst = home / dst_base / d.name / "SKILL.md"
+            if not (d.is_dir() and not d.is_symlink() and src.is_file() and not src.is_symlink()):
+                continue
+            if REL.skill_name(f"~/{dst_base}/{d.name}/SKILL.md") is None or (home / dst_base / d.name).exists():
+                continue
+            dst.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            shutil.copyfile(src, dst)
+            os.chmod(dst, src.stat().st_mode & 0o777)
+            mirrors[f"~/{dst_base}/{d.name}/SKILL.md"] = f"~/{src_base}/{d.name}/SKILL.md"
+    return mirrors
+
+
+def auto_cases(artifact_hash: str, cases: Sequence[ReplayCase], *, root: Path, reps: int,
+               max_pairs: int) -> tuple[list[ReplayCase], int] | None:
+    """plan_cases for a staged artifact under the RSI sandbox `root`. None when the artifact cannot be read: the
+    caller keeps its cases, and run_replay refuses the artifact before anything runs."""
+    rs = sandbox_module()
+    try:
+        manifest, _, _ = rs.load_artifact(rs.Sandbox(root).artifacts / artifact_hash)
+    except (rs.SandboxError, OSError, ValueError):
+        return None
+    if not isinstance(manifest, Mapping) or not all(isinstance(f, Mapping) and "path" in f and "kind" in f
+                                                    for f in manifest.get("files", [])):
+        return None
+    return plan_cases(manifest, cases, min_pairs=V.load_policy().min_pairs, max_pairs=max_pairs, reps=reps)
+
+
 @dataclass(frozen=True)
 class ReplayConfig:
     agent: str = "stub"                  # stub | claude | codex  (claude/codex = live, unverified here)
@@ -471,9 +558,11 @@ def run_jev(state: str, mode: str, budget: Any = None) -> V.JevResult:
 # ---------------------------------------------------------------- agent output
 
 
-def parse_agent(stdout: str, agent: str, model: str | None) -> dict[str, Any]:
+def parse_agent(stdout: str, agent: str, model: str | None,
+                skills: Mapping[str, str] | None = None) -> dict[str, Any]:
     """Tool calls (name + truncated input), tokens, cost, final text and errors from an agent's stdout.
-    The stub and `claude --output-format stream-json` share a format; codex is `exec --json`."""
+    The stub and `claude --output-format stream-json` share a format; codex is `exec --json`. skills: the arm's
+    staged-skill index (rsi_relevance.skill_index), so a name-only Skill call can count as exposure."""
     from agent_memory.integrations import langfuse as LF
     events = []
     stub: dict = {}
@@ -487,7 +576,7 @@ def parse_agent(stdout: str, agent: str, model: str | None) -> dict[str, Any]:
         events.append(ev)
         if ev.get("type") == "result" and isinstance(ev.get("stub"), dict):
             stub = ev["stub"]
-    calls = REL.parse_calls(events, agent)
+    calls = REL.parse_calls(events, agent, skills)
     out = LF.parse_agent_output("codex" if agent == "codex" else "claude", stdout, model)
     tokens_in = sum(g.usage.get("total", 0) - g.usage.get("output", 0) for g in out.generations)
     tokens_out = sum(g.usage.get("output", 0) for g in out.generations)
@@ -572,6 +661,7 @@ class _Replay:
         self.baseline_id: str | None = None
         self.started = _now()
         self.relevance: dict[str, Any] = {}
+        self.skill_indexes: dict[str, dict[str, str]] = {}    # arm -> name -> the one staged SKILL.md path
 
     # ---- log
 
@@ -751,7 +841,7 @@ class _Replay:
         except BaseException as exc:
             rec.error = f"not run: {_budget_kind(exc) and 'budget' or type(exc).__name__}"
             raise
-        parsed = parse_agent(res.stdout, cfg.agent, cfg.model)
+        parsed = parse_agent(res.stdout, cfg.agent, cfg.model, self.skill_indexes.get(arm))
         rec.exit_code, rec.timed_out, rec.duration_s = res.exit_code, res.timed_out, res.duration_s
         rec.tool_calls, rec.final = parsed["tool_calls"], parsed["final"]
         rec.tokens_in, rec.tokens_out = parsed["tokens_in"], parsed["tokens_out"]
@@ -900,6 +990,11 @@ class _Replay:
             bad = [r["path"] for r in rep_b.get("overlay", []) if r.get("after_sha256") != r.get("home_sha256")]
             self.refusals.append(f"artifact-not-exact: the sanitizer changed {', '.join(bad) or 'the overlay'}")
             return False
+        for arm in ("A", "B"):
+            mirrors = install_skill_mirrors(self.sb.arm_home(self.exp, arm))
+            self.skill_indexes[arm] = REL.skill_index(staged_skills(self.sb.arm_home(self.exp, arm)), mirrors)
+            if self.relevance:
+                self.relevance.setdefault("staged_skills", {})[arm] = dict(self.skill_indexes[arm])
         self.home_digests = {arm: tree_digest(self.sb.arm_home(self.exp, arm)) for arm in ("A", "B")}
         return True
 
@@ -1357,7 +1452,8 @@ def main(argv: Sequence[str] | None = None, out: Callable[[str], None] = print) 
     p.add_argument("--artifact", required=True)
     p.add_argument("--experiment", required=True)
     p.add_argument("--baseline-id", default=None, help="the current baseline; another one in the manifest is stale")
-    p.add_argument("--cases", default=None, help="comma-separated case ids (default: all)")
+    p.add_argument("--cases", default=None,
+                   help="comma-separated case ids (default: the cases that declare the artifact's targets)")
     p.add_argument("--agent", default="stub", choices=AGENTS)
     p.add_argument("--model")
     p.add_argument("--effort")
@@ -1384,7 +1480,12 @@ def main(argv: Sequence[str] | None = None, out: Callable[[str], None] = print) 
             out(json.dumps({"baseline_id": bid, "artifact_hash": h}))
             return 0
         cases = load_cases(args.cases.split(",") if args.cases else None)
-        cfg = ReplayConfig(agent=args.agent, model=args.model, effort=args.effort, reps=args.reps, judge=args.judge,
+        reps = args.reps
+        if not args.cases:     # default: the artifact's own cases, repeated up to the verdict's minimum pairs
+            plan = auto_cases(args.artifact, cases, root=_root(args), reps=args.reps,
+                              max_pairs=max(len(cases) * args.reps, V.load_policy().min_pairs))
+            cases, reps = plan or (cases, reps)
+        cfg = ReplayConfig(agent=args.agent, model=args.model, effort=args.effort, reps=reps, judge=args.judge,
                            judge_model=args.judge_model, jev=args.jev, credentials=args.credentials,
                            credential_name=args.credential_name, judge_credentials=args.judge_credentials,
                            judge_credential_name=args.judge_credential_name, max_budget_usd=args.max_budget_usd)
