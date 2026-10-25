@@ -118,15 +118,10 @@ connection string: a safeguard plus the Keychain gate, not a separate boundary.
 **Function secrets** (set at deploy, not here): `RSI_OWNER_USER_ID` (your Supabase Auth user id),
 `RSI_DECIDE_ORIGIN = https://night-desk-vilmer-frosts-projects.vercel.app`. Optional `RSI_WEBAUTHN_RP_ID`.
 
-**Go-live.** `amem_request_undo_owner` (Night Desk's older Undo RPC) lets a signed-in session undo an edit
-without Face ID. Its revoke is a separate file that `amem db migrate` does not read:
-`supabase/migrations-golive/20261025220000_night_desk_web_golive.sql`. Apply it together with the Night Desk
-deploy that uses `/web/*`, not before (the current Night Desk still calls the RPC):
-
-```
-git mv supabase/migrations-golive/20261025220000_night_desk_web_golive.sql supabase/migrations/
-uv run amem db migrate
-```
+**Go-live (done 2026-10-25).** `amem_request_undo_owner` (Night Desk's older Undo RPC) let a signed-in session
+undo an edit without Face ID. Its revoke, `supabase/migrations/20261025220000_night_desk_web_golive.sql`, was
+applied together with the Night Desk deploy that uses `/web/*`. An edit Undo now goes through `amem-decide`
+with Face ID only.
 
 **Tests.** `parent-run -- python3 scripts/edge_test.py amem-decide` runs the Deno tests in the pinned image
 `denoland/deno:2.9.7@sha256:fa335acd…` (a software authenticator; generated keys only). `tests/test_web_decide.py`

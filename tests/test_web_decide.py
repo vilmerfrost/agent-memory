@@ -3,7 +3,7 @@
 SQL: migration 20261025210000_rsi_web_decide.sql on the throwaway Postgres (the edge function's checks of the
 login and the WebAuthn signature are trusted here; supabase/functions/amem-decide/web_test.ts covers them).
 Grants: the Supabase API roles recreated with default privileges, plus the go-live revoke of
-amem_request_undo_owner (supabase/migrations-golive/). CLI: `amem rsi passkey-*`. Deno: the edge tests and an
+amem_request_undo_owner (go-live migration, applied 2026-10-25). CLI: `amem rsi passkey-*`. Deno: the edge tests and an
 end-to-end run (real handler + real SQL + a software passkey) in the pinned Deno image, skipped without it.
 """
 
@@ -27,7 +27,7 @@ REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "scripts"))
 import edge_test  # noqa: E402
 
-GOLIVE = REPO / "supabase" / "migrations-golive" / "20261025220000_night_desk_web_golive.sql"
+GOLIVE = REPO / "supabase" / "migrations" / "20261025220000_night_desk_web_golive.sql"
 WEB_TABLES = ("rsi_passkeys", "rsi_passkey_enroll_codes", "rsi_web_challenges")
 WEB_FUNCS = ("amem_rsi_web_challenge(text,uuid,text,text)", "amem_rsi_web_context(uuid,text)",
              "amem_rsi_web_decide(uuid,text,text,bigint)", "amem_rsi_web_enroll_start(text,text)",
@@ -294,7 +294,7 @@ def test_api_roles_reach_only_the_web_functions_and_golive_revokes_owner_undo(pg
         res = subprocess.run([AMEM, "db", "migrate"], env=base_env(AMEM_DB_URL=url), capture_output=True, text=True)
         assert res.returncode == 0, res.stderr
         with psycopg.connect(url) as conn:
-            assert q(conn, "select count(*) from schema_migrations where filename like '%%golive%%'") == 0   # never automatic
+            assert q(conn, "select count(*) from schema_migrations where filename like '%%golive%%'") == 1   # live since go-live
             for fn in WEB_FUNCS:
                 for r in (*roles, "amem_app", "rsi_writer", "rsi_reader"):
                     can = q(conn, "select has_function_privilege(%s, %s, 'execute')", r, f"public.{fn}")
@@ -305,10 +305,7 @@ def test_api_roles_reach_only_the_web_functions_and_golive_revokes_owner_undo(pg
                 for t in WEB_TABLES:
                     for priv in ("select", "insert", "update", "delete"):
                         assert not q(conn, "select has_table_privilege(%s, %s, %s)", r, f"public.{t}", priv), (r, t, priv)
-            assert q(conn, "select has_function_privilege('authenticated', 'public.amem_request_undo_owner(uuid)', 'execute')")
-        with psycopg.connect(url, autocommit=True) as conn:                                 # the go-live step
-            conn.execute(GOLIVE.read_text())
-        with psycopg.connect(url) as conn:
+        with psycopg.connect(url) as conn:                                                   # after the go-live migration
             assert not q(conn, "select has_function_privilege('authenticated', 'public.amem_request_undo_owner(uuid)', 'execute')")
             assert q(conn, "select has_function_privilege('service_role', 'public.amem_request_undo(uuid,text)', 'execute')")
             conn.execute("set role authenticated")
@@ -321,12 +318,10 @@ def test_api_roles_reach_only_the_web_functions_and_golive_revokes_owner_undo(pg
                 conn.execute(f"drop role if exists {r}")
 
 
-def test_no_code_path_applies_the_golive_folder() -> None:
+def test_the_golive_revoke_is_a_normal_migration_now() -> None:
     from agent_memory import config
     assert config.MIGRATIONS_DIR.resolve() == (REPO / "supabase" / "migrations").resolve()
-    hits = sorted(str(p.relative_to(REPO)) for d in ("src", "scripts", "tests") for p in (REPO / d).rglob("*.py")
-                  if "migrations-golive" in p.read_text(errors="replace"))
-    assert hits == ["tests/test_web_decide.py"], hits
+    assert GOLIVE.is_file() and not (REPO / "supabase" / "migrations-golive").exists()
 
 
 # --------------------------------------------------------------------------------------------- Deno / node
