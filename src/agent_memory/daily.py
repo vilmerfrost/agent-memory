@@ -521,6 +521,30 @@ def step_rsi_push(result: DailyResult, *, push: bool, notify: Mapping[str, str] 
     _err(f"rsi-push: {len(result.rsi_push)} proposal(s) {' '.join(result.rsi_push)}".rstrip())
 
 
+def step_alerts(result: DailyResult, *, push: bool, notify: Mapping[str, str] | None) -> None:
+    """Phone alerts the steps above do not send (alerts.py): a staged proposal on its last day (stage mode
+    only, like step_rsi_push), and slips of the safety rules (only when the deviations scan is live). A failure
+    here is a warning: an alert must never block amem-rsi-night."""
+    from agent_memory import alerts, edits  # lazy, like step_edits
+
+    remind = edits.live() and edits.stage_mode()   # proposals exist only in stage mode (step_rsi_push)
+    scan = deviations.live()                         # safety slips come from the deviations scan
+    if not (remind or scan):
+        return
+    if not _postgres_guard("alerts", result):
+        return
+    note = dict(notify) if notify is not None else None
+    try:
+        reminded = alerts.remind_proposals(push=push, notify=note) if remind else []
+        safety = alerts.push_safety_slips(push=push, notify=note) if scan else None
+    except Exception as exc:
+        _err(f"warning: alerts: {_exc(exc)}")
+        result.warn(f"alerts: {_exc(exc)}")
+        return
+    _err(f"alerts: {len(reminded)} expiry reminder(s){' ' + ' '.join(reminded) if reminded else ''}; "
+         f"safety {safety or 'none'}")
+
+
 def step_escalations(
     result: DailyResult, *, push: bool, state_file: Path, now: datetime, notify: Mapping[str, str] | None
 ) -> None:
@@ -675,6 +699,7 @@ def run_daily(
     step_deviations(result, state_file=state_path(state), now=now)
     step_edits(result, push=push, notify=notify)
     step_rsi_push(result, push=push, notify=notify)
+    step_alerts(result, push=push, notify=notify)
     step_sync(result, state_file=state_path(state), now=now)  # last: it feeds nothing the steps above read
     secs = int(time.monotonic() - start)
     result.lines = log_lines(now.strftime(TS_FORMAT), result, secs)

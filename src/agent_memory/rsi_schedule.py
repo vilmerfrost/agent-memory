@@ -667,10 +667,12 @@ def wait_for_night(night: str, root: Path | None, wait_s: float, *, poll_s: floa
 def run_brief_job(*, root: Path | None = None, night: str | None = None, now: datetime | None = None,
                   routines_log: Path | None = None, out_dir: Path | None = None, db_url: str | None = None,
                   write_log: bool = True, wait_s: float = 0.0, poll_s: float = 60.0,
-                  sleep: Callable[[float], None] = time.sleep) -> JobResult:
+                  sleep: Callable[[float], None] = time.sleep, push: bool = False,
+                  notify: dict[str, str] | None = None) -> JobResult:
     """The morning brief for the night key (default: the night that just ended) as markdown + JSON files in
     `out_dir` (default ~/.claude/parent/reports). Waits up to `wait_s` for the night to finish (its lock released
-    and its report written). Stores the completed snapshot for Night Desk. Never pushes."""
+    and its report written). Stores the completed snapshot for Night Desk. With `push` (the scheduled CLI run),
+    one short phone push of the night's result when there is something to say (alerts.push_night)."""
     from agent_memory import rsi_brief as BR
     t0 = time.monotonic()
     fixed = now is not None
@@ -719,6 +721,13 @@ def run_brief_job(*, root: Path | None = None, night: str | None = None, now: da
     if b["health"]["database"]["status"] != "ok":
         res.items.append(f"database: rows not read ({b['health']['database']['detail'] or 'unavailable'})")
         res.status = "FAIL"
+    if push:
+        from agent_memory import alerts
+        try:
+            res.fields["push"] = alerts.push_night(b, notify=notify)
+        except Exception as exc:  # the brief is written; a failed push is a note, not a failed brief
+            res.fields["push"] = "error"
+            res.items.append(f"push: {_one_line(exc, 160)}")
     res.report = str(mdp)
     res.detail.update(brief=b, markdown=md, json_path=str(jsp))
     return finish()
@@ -757,7 +766,8 @@ def cmd_night_job(args: argparse.Namespace) -> int:
 
 def cmd_brief_job(args: argparse.Namespace) -> int:
     res = run_brief_job(root=args.root.expanduser() if args.root else None, night=args.night, now=_now_arg(args.now),
-                        routines_log=args.routines_log, out_dir=args.out, wait_s=args.wait_s)
+                        routines_log=args.routines_log, out_dir=args.out, wait_s=args.wait_s,
+                        push=not args.no_push)
     if args.json:
         print(json.dumps({"status": res.status, "night": res.night, "items": res.items, "fields": res.fields,
                           "report": res.report, "lines": res.lines}, sort_keys=True, default=str))
@@ -777,7 +787,7 @@ def register(sub: argparse._SubParsersAction) -> None:
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_night_job)
     p = sub.add_parser("brief-job", help="the scheduled morning brief: markdown + JSON in the reports dir, one "
-                                         "routines.log line; never pushes")
+                                         "routines.log line, and a short phone push of the night's result")
     p.add_argument("--root", type=Path, default=None, help="the RSI sandbox root (default RSI_SANDBOX_DIR or ~/sandbox)")
     p.add_argument("--night", default=None)
     p.add_argument("--now", default=None, help=argparse.SUPPRESS)
@@ -785,5 +795,6 @@ def register(sub: argparse._SubParsersAction) -> None:
     p.add_argument("--out", type=Path, default=None, help="report dir (default ~/.claude/parent/reports)")
     p.add_argument("--wait-s", type=float, default=0.0,
                    help="wait up to this long for the night to finish (lock released, report written)")
+    p.add_argument("--no-push", action="store_true", help="write the brief, send no phone push")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_brief_job)
