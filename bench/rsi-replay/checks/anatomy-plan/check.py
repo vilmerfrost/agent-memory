@@ -5,6 +5,8 @@ one-mechanism request is a Figure of about 30-90 minutes; the object is a real m
 parts list has 40-80 parts grouped as base, structure, mechanism, controls and subject; the subject is the one lit
 part; the readout uses the request's true numbers; and no geometry is written before the plan. Stdlib only.
 """
+from __future__ import annotations
+
 import json
 import pathlib
 import re

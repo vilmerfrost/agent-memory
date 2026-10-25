@@ -4,6 +4,8 @@ Graded from ~/.agents/skills/meltdown/SKILL.md (intro "Hard rules" and "Pick the
 style and no length, so the default is a 15 s reel; the voice is ElevenLabs v4 with Vilmer's voice id; a separate
 reviewer scores the passes; reel lines are 2-4 words and 15 s is about 25 words. Stdlib only, no network.
 """
+from __future__ import annotations
+
 import json
 import pathlib
 import re

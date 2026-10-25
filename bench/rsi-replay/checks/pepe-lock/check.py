@@ -5,6 +5,8 @@ so it accepts the user's choice (exactly the two named ideas); every other idea 
 parked.md, one line each with its revisit trigger, in the project's idea folder (docs/ideas/ for a confirmed
 personal Git project); Lock writes no briefs (they come after Hyper-focus). Stdlib only, no network.
 """
+from __future__ import annotations
+
 import json
 import pathlib
 import re

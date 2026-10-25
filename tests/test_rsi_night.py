@@ -373,7 +373,11 @@ def test_candidate_under_a_symlink_of_an_allowlisted_file_is_in_scope(env: Simpl
                      "('dev:agent:worker:rules', 'deviations', 'edit_instruction', '~/.claude/agents/worker.md', %s)",
                      (json.dumps({"sessions": 9}),))
     rep = run(env, dry_run=True, config_path=write_config(env.tmp, candidates={"max_considered": 1}))
-    assert [c["key"] for c in rep["candidates"]] == ["dev:agent:worker:rules"]
+    # In scope through the symlink. No replay case uses worker.md, so it is listed with that reason, after the
+    # covered CLAUDE.md candidate that takes the one triage slot (tests/test_rsi_night_coverage.py).
+    worker = [c for c in rep["candidates"] if c["key"] == "dev:agent:worker:rules"]
+    assert len(worker) == 1 and worker[0]["target"] == "~/agent-config/agents/worker.md"
+    assert worker[0]["reason"] == "deferred: no test case uses this file"
     assert "candidates:" not in " ".join(rep["notes"])
     assert candidate(env.url, "dev:agent:worker:rules")["target"] == "~/.claude/agents/worker.md"   # dry: unchanged
     run(env, config_path=write_config(env.tmp, candidates={"max_considered": 1}))
