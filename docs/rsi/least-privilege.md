@@ -3,7 +3,8 @@
 Status (2026-10-16): **E1, E2 and E3 done. Phase G option A done: `amem-decide` deployed (Reject only, no TOTP),
 A4 done (CLI logged out). A5 not done, by Vilmer's decision: T3 stays open, so the decision-record boundary is
 not complete.**
-Unattended promotion stays disabled while R2 is open (see "Decision" below).
+Unattended promotion: the 2026-10-16 decision was replaced on 2026-10-25 ("Within 5 minutes"). The decide job is
+prepared, not installed (see "Unattended decide-job" below). R2 is still open.
 
 ## The problem (verified 2026-10-16)
 
@@ -124,7 +125,9 @@ the dialog by clicking it, even with Accessibility permission. The gate fails on
 into a dialog you did not start (R1). This was observed once, at the split; if a later dialog shows only
 buttons, treat A2 as a safeguard again and say so.
 
-## Decision: no unattended promotion while R2 is open (2026-10-16, Vilmer)
+## Decision: no unattended promotion while R2 is open (2026-10-16, Vilmer) — replaced 2026-10-25
+
+**Replaced** by "Unattended decide-job" below (Vilmer, 2026-10-25: "Within 5 minutes"). Kept for the record.
 
 - No launchd job or scheduled task runs `amem rsi decide-poll`.
 - A promotion runs only when you start `amem rsi decide-poll` in your own terminal. A phone Apply (after
@@ -132,6 +135,68 @@ buttons, treat A2 as a safeguard again and say so.
 - The loop stays the same: Observe → Stage → Sandbox test → Human approval → Promote → Monitor → Undo.
   Only the trigger for Promote is attended.
 - Revisit only after Plan B, or another control that closes R2, is built and verified.
+
+## Unattended decide-job (2026-10-25, prepared, not installed)
+
+Vilmer chose "Within 5 minutes" for Approve / Deny / Undo from Night Desk. `amem rsi decide-job` (launchd
+`com.vilmerfrost.amem-rsi-decide`, every 300 s) runs `decide-poll` and the edit-loop `undo-poll` unattended.
+Install steps: [activation.md](activation.md), step 10b.
+
+**Which login.** `amem_app` (A1). It is already the login of every routine: E3 put its DSN in `.env.local`, and
+the job loads `.env.local` like the other routines. A separate login would add a second password and buy little:
+`amem_app` can already do everything the worker needs and nothing that records a decision. No new secret is needed.
+
+| The worker needs | `amem_app` has it through |
+|------------------|---------------------------|
+| read decisions, proposals, artifacts | `rsi_writer` select + `rsi_read` policy |
+| set proposal status, change id, result, promoted / reverted time | `rsi_writer` column update on `rsi_proposals` |
+| write `rsi_decision_results` (with `reason_code`, `updated_at`) | `rsi_writer` insert + update |
+| arm the Undo token after a promotion | `amem_rsi_arm_token` (unused tokens only) |
+| claim and close edit undo requests, mark the edit reverted | DML + `amem_app_all` policy on `undo_requests`, `edits` |
+| `pg_try_advisory_lock`, `verify-decision` (via improve) | any login; read only |
+
+**What it cannot do (tested on the throwaway Postgres, `tests/test_rsi_decide_job.py`):** insert into
+`rsi_decisions`; run `amem_rsi_record_decision`, `amem_rsi_record_cli_decision` or `rsi_insert_decision`; write
+the two status views; delete result rows.
+
+**The login check (a safeguard, every run).** Before it handles anything, the job asks the database whether its
+login is or can become a superuser or BYPASSRLS role, can insert into `rsi_decisions`, or can execute any function
+in `public` whose body inserts into `rsi_decisions` or calls `rsi_insert_decision`. Any yes: a `FAIL` line and
+nothing handled. So `restore-credentials`, a wrong DSN, or a later grant of a new decision function (the web
+path) to `amem_app` stops the job instead of running it with power to forge. It matches function bodies, so a
+function added later needs no list update.
+
+**What this does not change.** R2 is still open: a compromised process running as `vilmerfrost` can skip the
+approval and write production files directly, or change the job's code. The job makes the *trigger* unattended,
+not the approval. A decision still needs the passkey (web Apply / Undo), the TOTP or token (phone) or your TTY.
+
+**Results for Night Desk** (migration `20261025213700_rsi_decision_status.sql`, owner RLS, read only):
+`rsi_decision_status` (per decision: `waiting | applied | rejected | undone | refused`, a fixed `reason`,
+`state_at`), `edit_undo_status` (per edit undo request) and `rsi_decision_results` itself (owner policy; the API
+roles get nothing else). Rollback (manual, reviewed; the job keeps working without the views):
+
+```sql
+begin;
+drop view if exists public.rsi_decision_status, public.edit_undo_status;
+drop policy if exists dashboard_owner_read on public.rsi_decision_results;
+do $$ begin
+  if exists (select 1 from pg_roles where rolname = 'authenticated') then
+    execute 'revoke all on public.rsi_decision_results from authenticated';
+  end if;
+end $$;
+alter table public.rsi_decision_results drop constraint if exists rsi_decision_results_reason_code_check;
+alter table public.rsi_decision_results drop column if exists reason_code, drop column if exists updated_at;
+delete from public.schema_migrations where filename = '20261025213700_rsi_decision_status.sql';
+commit;
+```
+Drop the columns only after the job is stopped or rolled back to code that does not write them.
+
+| # | Step | Verify | Undo |
+|---|------|--------|------|
+| D1 | Apply `20261025213700_rsi_decision_status.sql` | Night Desk owner reads `rsi_decision_status`; advisors | the SQL above |
+| D2 | `amem admin credentials-status` | exit 0, "connects as amem_app" | — |
+| D3 | `amem rsi decide-job --no-push` in your terminal | `PASS login=amem_app` | — |
+| D4 | Install the plist (activation.md 10b) | an `amem-rsi-decide PASS` line within 5 min | `launchctl bootout`, delete the plist |
 
 ## What Plan A does not close
 

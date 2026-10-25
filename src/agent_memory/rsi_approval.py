@@ -161,6 +161,39 @@ def verify_decision(conn: psycopg.Connection, d: dict[str, Any], now: datetime |
 
 
 # -- the promotion worker ---------------------------------------------------------------------------
+# A function that can create a decision row: it inserts into rsi_decisions or calls rsi_insert_decision. Matched on
+# the source, so a decision function added later (the web path) is covered without a list to keep in sync.
+_DECISION_FN_RE = r"insert\s+into\s+(public\.)?rsi_decisions\M|rsi_insert_decision\s*\("
+
+_LOGIN_SQL = """
+select current_user::text as login,
+       exists (select 1 from pg_roles s where (s.rolsuper or s.rolbypassrls)
+                                          and pg_has_role(current_user, s.oid, 'member')) as powerful,
+       has_table_privilege(current_user, 'public.rsi_decisions', 'insert') as can_insert,
+       array(select p.oid::regprocedure::text from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+              where n.nspname = 'public' and (p.proname = 'rsi_insert_decision' or p.prosrc ~* %(re)s)
+                and has_function_privilege(current_user, p.oid, 'execute')
+              order by 1) as decision_fns
+"""
+
+
+def login_problems(conn: psycopg.Connection) -> tuple[str, list[str]]:
+    """(login, why this login must not run the unattended worker). Empty list: it cannot create a human decision
+    (no superuser or BYPASSRLS role reachable, no insert on rsi_decisions, no function that records one)."""
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(_LOGIN_SQL, {"re": _DECISION_FN_RE})
+        row = cur.fetchone()
+    conn.rollback()
+    out = []
+    if row["powerful"]:
+        out.append(f"{row['login']} is or can become a superuser / BYPASSRLS role")
+    if row["can_insert"]:
+        out.append(f"{row['login']} can insert into rsi_decisions")
+    if row["decision_fns"]:
+        out.append(f"{row['login']} can execute a decision function: {', '.join(row['decision_fns'])}")
+    return row["login"], out
+
+
 @dataclass
 class PollReport:
     handled: list[dict[str, Any]] = field(default_factory=list)
@@ -237,23 +270,36 @@ order by d.decided_at, d.id
 """
 
 
+# The short fixed reason Night Desk shows for a refusal or a retry (rsi_decision_results.reason_code, checked in SQL;
+# migration 20261025213700_rsi_decision_status.sql). `detail` keeps the full text for the worker's own log.
+REASONS = ("hash-mismatch", "decision-expired", "artifact-changed", "live-file-changed", "promotion-refused",
+           "not-promoted", "undo-conflict", "retrying", "gave-up")
+
+
 def _result(conn: psycopg.Connection, decision_id: Any, result: str, *, handled: bool, change_id: str | None = None,
-            detail: str = "") -> None:
+            detail: str = "", reason: str | None = None) -> None:
+    if result == "retry":
+        reason = "gave-up" if handled else "retrying"
+    if reason is not None and reason not in REASONS:
+        raise ValueError(f"unknown decision reason {reason!r}")
     conn.execute(
-        "insert into rsi_decision_results (decision_id, result, change_id, detail, attempts, handled_at) "
-        "values (%s, %s, %s, %s, 1, case when %s then now() end) on conflict (decision_id) do update set "
-        "result = excluded.result, change_id = coalesce(excluded.change_id, rsi_decision_results.change_id), "
-        "detail = excluded.detail, attempts = rsi_decision_results.attempts + 1, handled_at = excluded.handled_at",
-        (decision_id, result, change_id, redact.redact(detail)[:500], handled))
+        "insert into rsi_decision_results (decision_id, result, change_id, detail, reason_code, attempts, handled_at, "
+        "updated_at) values (%s, %s, %s, %s, %s, 1, case when %s then now() end, now()) on conflict (decision_id) do update "
+        "set result = excluded.result, change_id = coalesce(excluded.change_id, rsi_decision_results.change_id), "
+        "detail = excluded.detail, reason_code = excluded.reason_code, attempts = rsi_decision_results.attempts + 1, "
+        "handled_at = excluded.handled_at, updated_at = now()",
+        (decision_id, result, change_id, redact.redact(detail)[:500], reason, handled))
 
 
 def _apply(conn: psycopg.Connection, d: dict[str, Any], push: bool, notify: dict[str, str] | None) -> dict[str, Any]:
     h = d["artifact_hash"]
     if d["p_hash"] != h:
-        _result(conn, d["id"], "refused", handled=True, detail="decision hash differs from the proposal")
+        _result(conn, d["id"], "refused", handled=True, detail="decision hash differs from the proposal",
+                reason="hash-mismatch")
         return {"decision": str(d["id"]), "result": "refused"}
     if d["expires_at"] <= datetime.now(UTC):
-        _result(conn, d["id"], "expired", handled=True, detail="decision expired before promotion")
+        _result(conn, d["id"], "expired", handled=True, detail="decision expired before promotion",
+                reason="decision-expired")
         conn.execute("update rsi_proposals set status = 'expired' where id = %s and status = 'approved'", (d["proposal_id"],))
         return {"decision": str(d["id"]), "result": "expired"}
     adir = RA.artifacts_dir() / h
@@ -266,7 +312,7 @@ def _apply(conn: psycopg.Connection, d: dict[str, Any], push: bool, notify: dict
     else:
         why = "local artifact bytes differ from the stored artifact"
     if not same:
-        _result(conn, d["id"], "refused", handled=True, detail=why)
+        _result(conn, d["id"], "refused", handled=True, detail=why, reason="artifact-changed")
         conn.execute("update rsi_proposals set status = 'failed', result = %s where id = %s", (why[:300], d["proposal_id"]))
         return {"decision": str(d["id"]), "result": "refused"}
     decision = {"format": RA.DECISION_FORMAT, "decision_id": str(d["id"]), "proposal_id": str(d["proposal_id"]),
@@ -296,14 +342,15 @@ def _apply(conn: psycopg.Connection, d: dict[str, Any], push: bool, notify: dict
     reason = res.get("reason") or err or f"improve exit {code}"
     new_status = "stale" if "stale baseline" in reason else "failed"
     conn.execute("update rsi_proposals set status = %s, result = %s where id = %s", (new_status, reason[:300], d["proposal_id"]))
-    _result(conn, d["id"], "refused", handled=True, detail=reason)
+    _result(conn, d["id"], "refused", handled=True, detail=reason,
+            reason="live-file-changed" if new_status == "stale" else "promotion-refused")
     _notify(push, notify, f"Not applied: {d['title']}", f"Promotion refused: {redact.redact(reason)[:300]}")
     return {"decision": str(d["id"]), "result": "refused", "reason": reason}
 
 
 def _undo(conn: psycopg.Connection, d: dict[str, Any], push: bool, notify: dict[str, str] | None) -> dict[str, Any]:
     if d["p_status"] != "promoted" or not d["change_id"]:
-        _result(conn, d["id"], "nothing", handled=True, detail=f"proposal is {d['p_status']}")
+        _result(conn, d["id"], "nothing", handled=True, detail=f"proposal is {d['p_status']}", reason="not-promoted")
         return {"decision": str(d["id"]), "result": "nothing"}
     code, res, err = _improve(["revert-change", d["change_id"], "--json", "--reason", "phone undo" if d["source"] == "phone" else "cli undo"])
     status = res.get("status")
@@ -314,7 +361,8 @@ def _undo(conn: psycopg.Connection, d: dict[str, Any], push: bool, notify: dict[
         _notify(push, notify, f"Undone: {d['title']}", f"{d['change_id']} reverted to the previous version.")
         return {"decision": str(d["id"]), "result": "reverted"}
     if status == "conflict":
-        _result(conn, d["id"], "conflict", handled=True, detail="; ".join(res.get("conflicts") or []))
+        _result(conn, d["id"], "conflict", handled=True, detail="; ".join(res.get("conflicts") or []),
+                reason="undo-conflict")
         _notify(push, notify, f"Undo conflict: {d['title']}", "A file changed after promotion; nothing was overwritten.")
         return {"decision": str(d["id"]), "result": "conflict"}
     _result(conn, d["id"], "retry", handled=d["attempts"] + 1 >= MAX_ATTEMPTS, detail=res.get("reason") or err)
