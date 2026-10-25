@@ -21,6 +21,7 @@ import secrets
 import sys
 from datetime import timedelta
 from typing import Any
+from urllib.parse import quote
 
 import psycopg
 
@@ -28,7 +29,8 @@ from agent_memory import rsi_approval as AP, store
 
 ENROLL_TTL = timedelta(minutes=10)
 CODE_BYTES = 15                       # 120 bits -> 24 base32 characters
-ENROLL_URL = "https://night-desk-vilmer-frosts-projects.vercel.app/enroll"
+# Night Desk routes by hash: the page reads the code from the fragment, then clears it from the address bar.
+ENROLL_URL = "https://night-desk-vilmer-frosts-projects.vercel.app/#approval-face-id/"
 
 
 def normalize_code(code: str) -> str:
@@ -43,6 +45,11 @@ def code_hash(code: str) -> str:
 def new_code() -> str:
     raw = base64.b32encode(secrets.token_bytes(CODE_BYTES)).decode().rstrip("=")
     return "-".join(raw[i:i + 4] for i in range(0, len(raw), 4))
+
+
+def enroll_link(base: str, code: str) -> str:
+    """The Night Desk link for an enroll code: the code goes URL-encoded into the fragment, never a query."""
+    return f"{base}{quote(code, safe='')}"
 
 
 def create_enroll_code(conn: psycopg.Connection, ttl: timedelta = ENROLL_TTL) -> str:
@@ -92,7 +99,7 @@ def cmd_enroll(args: argparse.Namespace) -> int:
         print(f"amem: rsi passkey-enroll failed: {type(exc).__name__}", file=sys.stderr)
         return 1
     print(f"Enroll code (one use, {int(ENROLL_TTL.total_seconds() // 60)} minutes): {enroll}\n"
-          f"Open on your iPhone, signed in to Night Desk:\n  {args.url}#code={enroll}\n"
+          f"Open on your iPhone, signed in to Night Desk:\n  {enroll_link(args.url, enroll)}\n"
           "A new code ends any earlier unused code.")
     return 0
 
@@ -136,7 +143,7 @@ def cmd_revoke(args: argparse.Namespace) -> int:
 
 def register(s: argparse._SubParsersAction) -> None:
     p = s.add_parser("passkey-enroll", help="Vilmer's terminal only: a one-use code to enroll a Night Desk passkey")
-    p.add_argument("--url", default=ENROLL_URL, help="the Night Desk enroll page (the code goes in the #fragment)")
+    p.add_argument("--url", default=ENROLL_URL, help="the Night Desk enroll link base; the code is appended to its #fragment")
     p.set_defaults(func=cmd_enroll)
     p = s.add_parser("passkey-list", help="the enrolled Night Desk passkeys")
     p.add_argument("--json", action="store_true")

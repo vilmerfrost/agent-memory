@@ -388,3 +388,10 @@ def test_web_end_to_end_with_a_software_passkey(db: dict[str, str], sandbox: Pat
         assert conn.execute("select count(*), max(sign_count), bool_and(revoked_at is null) from rsi_passkeys").fetchone() == \
             (1, steps[-1]["passkey_count"], True)
         assert q(conn, "select used_at is not null from rsi_passkey_enroll_codes where code_hash = %s", PK.code_hash(code))
+
+
+def test_enroll_link_puts_the_code_in_night_desks_hash_route() -> None:
+    from agent_memory import rsi_passkey
+    link = rsi_passkey.enroll_link(rsi_passkey.ENROLL_URL, "ABCD2345/+")
+    assert link == "https://night-desk-vilmer-frosts-projects.vercel.app/#approval-face-id/ABCD2345%2F%2B"
+    assert "?" not in link and "/enroll" not in link
