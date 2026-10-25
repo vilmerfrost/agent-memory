@@ -114,6 +114,20 @@ Since 2026-10-23 (verify run of night 2026-10-23, partial, $0.14):
   a preflight failure, an abort or a budget stop.
 - **Provider health carries its reason.** The failing evidence steps' detail (`ch.<query>: error (timeout ...)`)
   goes to the report's optional `health_reasons` map, the brief's Service health lines and the `-fail health` line.
+- **Evidence is about the rule being tested, and carries its numbers** (2026-10-25). Before this, past.dev was
+  searched with the last part of the rule key only (`skill:meltdown:intro` became `intro`), and unrelated records
+  (two worker experiments and a reject decision) showed as supporting evidence. Now:
+  - The recall words are the rule's source and section: `meltdown intro`, `deviations daily`, `worker rules`,
+    `claude md shell habits` (the last heading of a heading path). A file kind (`claude-md`, `agents-md`,
+    `parent-md`) names the source; its scope (`global` or a repo) is never sent.
+  - The pack reads the rule keys and targets of each recalled record (experiment, proposal, decision, edit). A
+    record that names neither the candidate's rule nor its target is `unlinked`: context only. It is not in the
+    experiment's `evidence_refs` (the supporting evidence Night Desk counts). It is listed in the experiment's
+    optional `unlinked_refs` (`ref`, `source`, `why`).
+  - Each ok ClickHouse finding keeps its numbers in the experiment's optional `evidence_measurements` (`ref`,
+    `source`, `n`, `ts`, `measurements`): for example `sessions_hit` 2 of `sessions_total` 5 for the week of
+    2026-10-12. Only numbers, booleans and short labels are kept. Free text and anything the scrubber would change
+    are left out. Older reports have neither field; readers treat them as empty.
 - **Quiet skips.** A lock overlap or a night that is already `done` logs `SKIP` with `-warn` lines, not `-fail`,
   so routine-audit (which flags a SKIP with `-fail` lines) stays green. A night whose run failed is retried by the
   next start (the 01:30 job after a failed manual run), as before.
