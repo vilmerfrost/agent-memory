@@ -135,6 +135,10 @@ passkey); its Deno parts skip when Docker or the image is missing.
 
 ## The promotion worker (`amem rsi decide-poll`)
 
+It runs unattended every 5 minutes through `amem rsi decide-job` (launchd; install steps in
+[activation.md](activation.md), step 10b), together with the edit-loop undo poller. Each result row
+carries a `reason_code` and `updated_at`.
+
 One worker at a time: a file lock (`~/sandbox/run/rsi-decide.lock`) and a Postgres advisory lock.
 Each run:
 
@@ -173,6 +177,8 @@ Under `apply_mode: "stage"`, `improve apply` refuses unattended runs too. Only a
 - `rsi_artifacts`, `rsi_eval_results`, `rsi_decisions`: append-only. UPDATE, DELETE and TRUNCATE
   raise.
 - `rsi_decision_results`: what the worker did with each decision, with attempts.
+- Night Desk reads each decision's state through the owner-only views `rsi_decision_status` and
+  `edit_undo_status` (waiting, applied, rejected, undone, refused with a fixed reason).
 - The improve ledger (`improve/ledger.jsonl`, in git): `promoted` and `reverted` events with the
   artifact hash, the decision id, the files and their snapshots.
 
@@ -188,6 +194,5 @@ and can read the superuser `AMEM_DB_URL` can insert a decision row. What stops a
 - `improve promote` and `decide-poll` refuse agent sessions;
 - the secret-read hooks block agents from reading `.env*` files.
 
-The full fix is a least-privilege login role for the worker (member of `rsi_writer`, no insert on
-`rsi_decisions`). The roles exist. Creating the login and moving the worker to it are activation
-steps ([activation.md](activation.md), step 7).
+The worker runs as the least-privilege `amem_app` login, and `decide-job` refuses to run under any login
+that can create a decision ([least-privilege.md](least-privilege.md), "Unattended decide-job").
