@@ -8,7 +8,10 @@ never retried.
 Caps:
 - per-model call caps (`model_calls`); a model the config does not name gets `default_model_calls` (0 = refused),
   except free stand-ins (stub / fixture / none), which get `free_model_calls`
-- max hypotheses (hard ceiling 2), max implemented experiments, max sandbox runs
+- max hypotheses per hypothesizer reply (hard ceiling 2; one reply per selected candidate, so per candidate, not
+  per night), max implemented experiments per night (hard ceiling 3; rsi_night runs at most one per candidate),
+  max sandbox runs per night
+- max A/B pairs per replay, so per experiment (`max_ab_pairs`); the night refuses a bigger replay
 - a wall clock (`wall_clock_s`) for the whole night
 - a USD cap, checked before a call with the model's estimate (`cost_estimate_usd`) and after it with the real cost
 - bounded retries (`model_retries`, hard ceiling 2): a retry is a new call and counts against the model's cap
@@ -40,11 +43,15 @@ from typing import Any, TypeVar
 
 from agent_memory import config
 
-HARD_MAX_HYPOTHESES = 2          # contract 2.4: at most two hypotheses, whatever the config says
+HARD_MAX_HYPOTHESES = 2          # contract 2.4: at most two hypotheses per hypothesizer reply (per candidate)
 HARD_MAX_EXPERIMENTS = 3
 HARD_MAX_RETRIES = 2
-HARD_MAX_WALL_CLOCK_S = 4 * 3600  # the sandbox's own MAX_TIMEOUT_S
+# The night starts at 01:30 and the brief reads it at 07:30. At this ceiling the night's own SIGALRM comes at 06:30
+# and the watchdog's hard exit (+10 + 2 min, rsi_schedule) at 06:42. Each container keeps its own short timeout.
+HARD_MAX_WALL_CLOCK_S = 5 * 3600
 HARD_MAX_AB_PAIRS = 60           # rsi_replay: 3 cases x 20 reps
+# 3 experiments x 2 providers x 6 subscription runs x (8 reserved tool containers + 1 check) = 324, plus a margin.
+HARD_MAX_SANDBOX_RUNS = 400
 FREE_MODELS = ("stub", "fixture", "none")
 # What each price basis means for the human reading the costs (Mission 005.5: verified provider billing vs local
 # estimates). "reported": the provider's own CLI reported the cost of the call (Claude Code's total_cost_usd); it is
@@ -289,7 +296,7 @@ class BudgetConfig:
         return cls(
             max_hypotheses=_int(d, "max_hypotheses", 2, 1, HARD_MAX_HYPOTHESES),
             max_experiments=_int(d, "max_experiments", 1, 0, HARD_MAX_EXPERIMENTS),
-            max_sandbox_runs=_int(d, "max_sandbox_runs", 16, 0, 200),
+            max_sandbox_runs=_int(d, "max_sandbox_runs", 16, 0, HARD_MAX_SANDBOX_RUNS),
             wall_clock_s=_num(d, "wall_clock_s", 5400.0, 1.0, HARD_MAX_WALL_CLOCK_S),
             max_usd=_num(d, "max_usd", 0.0, 0.0, 100.0),
             model_calls=_caps(d, "model_calls", number=False),

@@ -102,11 +102,53 @@ covered candidates fill the triage slots first.
 
 ## Limits and accounting
 
-The combined profile allows one experiment, up to six provider-specific A/B pairs,
-seven Opus calls, twelve Sol calls and seven Jev calls. It keeps the 45-minute wall clock
-and the existing $1 API-dollar budget. Subscription usage is excluded from that dollar
-subtotal; the observed-token stop is 2,000,000. It is a local resource limit, not a conversion
-to provider allowance. Each A/B run reserves eight tool operations. There is no API fallback.
+Since 2026-10-25 the combined profile runs up to **three experiments** per night (Vilmer's
+approval, after the skill cases went live). Each limit has a scope:
+
+- **Per candidate:** at most 2 hypotheses (one hypothesizer reply). The night runs one
+  experiment per candidate. The second hypothesis waits, pending, for a later night and
+  needs no new model call. So 3 experiments means 3 different candidates. With fewer
+  covered candidates, the night runs fewer experiments.
+- **Per experiment (per replay):** at most 6 provider-specific A/B pairs (`max_ab_pairs`).
+- **Per night:** model calls, sandbox runs, wall clock, API dollars and the token stop.
+
+One shared-skill experiment at its worst case: 1 Opus hypothesis, 3 pairs per provider
+(12 agent runs: 6 Opus, 6 Sol), 6 Sol judgments and 2 Jev calls. Each agent run reserves
+8 tool containers and 1 check container, so one experiment takes 108 sandbox runs.
+
+| Limit (per night) | Need for 3 experiments | Cap |
+|---|---|---|
+| Opus calls | 3 × 7 = 21 | 23 |
+| Sol calls | 3 × 12 = 36 | 40 |
+| Jev calls | 5 triage + 3 × 2 = 11 | 12 |
+| Sandbox runs | 3 × 108 = 324 | 360 |
+| Observed subscription tokens | 3 × 2,000,000 | 6,000,000 |
+| Wall clock | 600 + 3 × 5,460 = 16,980 s | 17,100 s (4 h 45 min) |
+| API dollars (Jev only) | 11 × $0.01 = $0.11 | $1.00 |
+
+**Why 17,100 s.** The bound counts every model stage at its own timeout: hypothesizer 300 s,
+`improve stage` 300 s, each agent run at its case's `timeout_s` (240 s for the skill cases),
+each judge call at `rsi_replay.JUDGE_TIMEOUT_S` (300 s). Steps that wait on no model get an
+allowance: 10 s per check run (a check took under 1 s on night 2026-10-24) and 30 s per Jev call
+(the SDK's 10 s per HTTP operation). Per provider: 6 × (240 + 10) + 3 × 300 + 30 = 2,430 s.
+One experiment: 300 + 300 + 2 × 2,430 = 5,460 s. The night adds 600 s once for the delta, triage
+and evidence packs (all of it took 37 s on 2026-10-24). The night starts at 01:30, so its own
+stop comes at 06:15 and the watchdog's hard exit (+10 + 2 min) at 06:27, an hour before the
+07:30 brief. The code ceiling is 5 h (`HARD_MAX_WALL_CLOCK_S`); a night at that ceiling still ends
+by 06:42.
+
+**Why 6,000,000 tokens.** The 2,000,000 stop was approved for one experiment; three get three
+times that. The qualification replays used about 163,000 tokens for both providers together.
+
+`amem rsi night-job --plan --config config/rsi-night.subscription.json` prints this check as
+"Room for 3 experiment(s)". It lists every per-night limit with its need and cap and says
+"DOES NOT FIT" for a cap that would stop the second or third experiment.
+
+The single-provider qualification profiles (`subscription-claude.json`, `subscription-codex.json`)
+stay at one experiment and the 45-minute wall clock.
+
+Subscription usage is excluded from the dollar subtotal. The token stop is a local resource
+limit, not a conversion to provider allowance. There is no API fallback.
 
 The budget stops subsequent calls when token usage is missing or the observed-token limit
 is reached. A running request can consume additional tokens before it ends; this is not

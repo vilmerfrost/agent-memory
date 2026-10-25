@@ -22,9 +22,11 @@ def test_shared_profile_reserves_both_provider_workloads():
     cfg=N.load_config(config.REPO_ROOT/'config/rsi-night.subscription.json')
     plan=rsi_schedule.paid_plan(cfg)
     assert plan['ab_pairs_per_experiment']==6
-    assert sum(r['count'] for r in plan['calls'] if r['billing_source']=='subscription')==19
-    assert plan['worst_case_usd']==.07
-    assert cfg.budget.max_sandbox_runs>=108
+    # 3 experiments x (1 hypothesis + 6 Opus runs + 6 Sol runs + 6 Sol judgments); the room check covers them all
+    assert sum(r['count'] for r in plan['calls'] if r['billing_source']=='subscription')==3*19
+    assert plan['worst_case_usd']==.11                       # Jev only: 5 triage + 3 x 2 replay calls
+    assert plan['room']['per_experiment']['sandbox_runs']==108
+    assert cfg.budget.max_sandbox_runs>=3*108 and plan['room']['fits']
 
 
 @pytest.mark.parametrize("second", ["IMPROVES","INCONCLUSIVE"])
