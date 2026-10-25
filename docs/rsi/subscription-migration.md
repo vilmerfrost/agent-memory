@@ -2,9 +2,11 @@
 
 Approved by Vilmer on 2026-10-25. Claude calls use `claude-opus-5-5`; Codex calls use
 `gpt-6.1-sol`. Both use **high** effort, including hypothesis writing and judging.
-The deployment template selects `config/rsi-night.subscription.json` after dedicated
-login and live qualification. `rsi-night.first.json` remains the explicit legacy API profile.
-The rule-promotion freeze is unchanged.
+The installed 01:30 job and deployment template now select
+`config/rsi-night.subscription.json`, after dedicated login and live qualification.
+The job was reloaded while idle with RunAtLoad false; no production night was triggered.
+`rsi-night.first.json` remains the explicit legacy API profile. The rule-promotion
+freeze is unchanged (`max_changes_per_week: 0`). Night Desk's reporting update is live.
 
 ## Execution boundary
 
