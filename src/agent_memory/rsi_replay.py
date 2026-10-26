@@ -359,6 +359,8 @@ class RunRecord:
     model: str | None = None
     session_id: str | None = None        # the attempt's canonical session uuid (attempt_links)
     profile: str | None = None           # provider profile of a per-provider replay (part of the attempt identity)
+    native_session_id: str | None = None  # actual trusted client id; never the logical attempt uuid
+    started_at: str | None = None
     check_run_id: str | None = None
     check_exit: int | None = None
     check_duration_s: float = 0.0
@@ -884,6 +886,7 @@ class _Replay:
         fixture = self.stage_dir / "cases" / case.id / "fixture"
         shutil.copytree(fixture, workspace, symlinks=True, dirs_exist_ok=True)
         started_at = datetime.now(UTC)
+        rec.started_at = started_at.isoformat(timespec="milliseconds")
         started = time.monotonic()
         usage_raw: Mapping[str, Any] = {}
         crashed: str | None = None
@@ -901,6 +904,7 @@ class _Replay:
                 setattr(rec, key, value)
             rec.final, rec.tool_calls = result.text, result.tool_calls
             rec.runtime = {k: v for k, v in result.evidence.items() if k != "verified_reads"}
+            rec.native_session_id = AL.native_session_id(cfg.agent, result.evidence.get("native_session_id"))
             rec.verified_reads = result.evidence.get("verified_reads", [])
             rec.exit_code = 0
         except sub.SubscriptionError as exc:
@@ -945,6 +949,8 @@ class _Replay:
             p = Path(home).expanduser()
             for form in sorted({home, str(p), str(p.absolute()), str(p.resolve())}, key=len, reverse=True):
                 final = final.replace(form, RD.MARK)
+        native = ({"native_session_id": rec.native_session_id, "native_identity_source": "trusted_client_response"}
+                  if rec.native_session_id else {})
         _write_json(logs / f"{rec.run_id}.json", {
             "format": LF.SUBSCRIPTION_LOG_FORMAT, "experiment": self.exp, "arm": rec.arm, "run_id": rec.run_id,
             "agent": self.cfg.agent, "model": rec.model, "transport": "official-subscription-client",
@@ -952,7 +958,7 @@ class _Replay:
             "duration_s": rec.duration_s, "started_at": started_at.isoformat(timespec="milliseconds"),
             "timing": "host-measured", "usage": counts, "tools": tools,
             "result": final[-4000:],
-            "run_dir": str(self.sb.experiment_dir(self.exp) / "runs" / rec.run_id), "log_dir": str(logs)})
+            "run_dir": str(self.sb.experiment_dir(self.exp) / "runs" / rec.run_id), "log_dir": str(logs), **native})
 
     def billed_model(self, rec: RunRecord) -> str:
         """The model a run is priced and booked as. A live agent without --model runs its CLI's default model:
@@ -1400,7 +1406,8 @@ def _write_evidence(r: _Replay, result: ReplayResult, cfg: ReplayConfig, policy:
                          "check_passed": run.check_passed, "judge_winner": winner,
                          "eval_verdict": result.verdict.eval_verdict, "baseline_id": result.baseline_id,
                          "artifact_hash": r.h if run.arm == "B" else None, "experiment_id": r.exp, "arm": run.arm,
-                         "profile": run.profile, "attempt_session_id": run.session_id})
+                         "profile": run.profile, "attempt_session_id": run.session_id,
+                         **({"native_session_id": run.native_session_id} if run.native_session_id else {})})
     _write_json(r.evidence / "replay.json", {**result.to_json(), "config": cfg.describe(),
                                              "policy": policy.describe(), "refusals": r.refusals,
                                              "errors": r.errors})

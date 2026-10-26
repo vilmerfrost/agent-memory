@@ -934,6 +934,9 @@ _ALL_COLS = ("session_id", "tool", "kind", "repo", "project_dir", "started_at", 
              "experiment_id", *_KEEP_COLS, "instruction_sources")
 _FACT_COLS = ("tool", "kind", "repo", "project_dir", "started_at", "ended_at", "transcript_bytes", "skills",
               "instructions", "category", "project", "env", "experiment_id")
+_FACT_ASSIGNMENTS = [
+    (f"{c} = case when sessions.meta->>'rsi_native_observation'='true' then sessions.{c} else excluded.{c} end"
+     if c in ("env", "experiment_id") else f"{c} = excluded.{c}") for c in _FACT_COLS]
 _TOKENS_DIFFER = (f"({', '.join('sessions.' + c for c in _TOKEN_COLS)}) is distinct from "
                   f"({', '.join('excluded.' + c for c in _TOKEN_COLS)})")
 _KEPT_DIFFER = (f"({', '.join(f'coalesce(excluded.{c}, sessions.{c})' for c in _KEEP_COLS)}) is distinct from "
@@ -946,8 +949,10 @@ values ({', '.join(f'%({c})s' for c in _ALL_COLS)},
         case when %(title)s::text is null then null else now() end,
         case when %(outcome)s::text is null then null else now() end)
 on conflict (session_id) do update
-    set {', '.join(f'{c} = excluded.{c}' for c in _FACT_COLS)},
-        meta = sessions.meta || excluded.meta,
+    set {', '.join(_FACT_ASSIGNMENTS)},
+        meta = sessions.meta || excluded.meta || case
+          when sessions.meta->>'rsi_native_observation'='true' and excluded.transcript_bytes>0
+          then jsonb_build_object('transcript_available',true) else '{{}}'::jsonb end,
         {', '.join(f'{c} = coalesce(excluded.{c}, sessions.{c})' for c in (*_TOKEN_COLS, *_KEEP_COLS))},
         instruction_sources = coalesce(excluded.instruction_sources, sessions.instruction_sources),
         last_activity_at = greatest(sessions.last_activity_at, excluded.last_activity_at),
@@ -1086,6 +1091,10 @@ def upsert(rows: list[SessionRow], *, db_url: str | None = None, now: datetime |
         from agent_memory import timing_store
         timing_store.upsert_conn(conn, (span for r in rows for span in r.timing_spans))
         timing_store.refresh_profiles(conn, (r.session_id for r in rows if r.tool=='codex'))
+        # A native client transcript may arrive after its replay sidecar. The
+        # join uses only the captured client id and sandbox experiment scope.
+        from agent_memory import attempt_links
+        attempt_links.reconcile_native_sessions(conn)
     return new, updated
 
 
