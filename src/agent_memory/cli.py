@@ -207,6 +207,8 @@ def build_parser() -> argparse.ArgumentParser:
     cli_integrations.register(sub)
     cli_archive.register(sub)
     cli_synth.register(sub)
+    from agent_memory import cli_timing
+    cli_timing.register(sub)
 
     # Handled in main() before parsing: every argument goes to amem_digest as is.
     sub.add_parser("digest-self", add_help=False,
