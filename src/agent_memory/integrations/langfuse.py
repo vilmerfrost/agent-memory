@@ -85,6 +85,11 @@ Run logs: the sink reads `<sandbox root>/experiments/<id>/logs/<run_id>.json` (R
 `<run_id>.stdout` (the agent's own output) and the arm's entry in `sanitize-report.json` (baseline,
 artifact). The orchestrator may add `<run_id>.rsi.json` with {case, rep, kind, env, proposal_id,
 check_passed, judge_winner, eval_verdict}; without it case = run_id and rep = 0.
+A subscription attempt (rsi_replay.subscription_agent_run: the official client on the host, no container)
+leaves `<run_id>.json` with format SUBSCRIPTION_LOG_FORMAT instead: the log itself carries token counts, tool
+names and statuses, the redacted final text and a host-measured `started_at`; there is no `.stdout` and no argv.
+Every trace says where its start came from (root metadata `timing`: host-measured, run-id or reconstructed);
+tool span times are ordinal (`tool_timing`), so only a run's own duration is a measured latency.
 
 Config (env only, never a .env file): AMEM_LANGFUSE_HOST (https, or http to localhost; Cloud EU is
 https://cloud.langfuse.com), AMEM_LANGFUSE_PUBLIC_KEY, AMEM_LANGFUSE_SECRET_KEY, AMEM_LANGFUSE_MIN_INTERVAL_S.
@@ -144,6 +149,10 @@ _RUN_TS_RE = re.compile(r"-(\d{8}T\d{6}Z)-")                       # rsi_sandbox
 _HASH_RE = re.compile(r"[0-9a-f]{64}")
 _UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 _LABEL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}")
+_ERROR_CODE_RE = re.compile(r"[a-z][a-z0-9_]{0,63}")                # rsi_subscription's fixed error codes
+TIMINGS = ("host-measured", "run-id", "reconstructed")
+# The run log a subscription attempt leaves (rsi_replay.write_attempt_log): no container and no stdout file.
+SUBSCRIPTION_LOG_FORMAT = "rsi-subscription-run/1"
 _COUNT_KEY_RE = re.compile(r"[a-z][a-z_]{0,63}")                   # usage_details / counter keys
 _EMAIL_RE = re.compile(r"[^@\s/]+@[^@\s/]+\.[A-Za-z]{2,}")
 _TOKENISH_RE = re.compile(r"[A-Za-z0-9]{32,}")                     # a long unbroken run: a key, a hash, a token
@@ -284,6 +293,11 @@ class SandboxRun:
     check_passed: bool | None = None
     judge_winner: str | None = None
     eval_verdict: str | None = None
+    # Where started_at came from (TIMINGS): `host-measured` (a subscription log's host clock), `run-id` (an
+    # rsi_sandbox run id's own timestamp, seconds) or `reconstructed` (log mtime minus duration). Only a
+    # host-measured start places the run on the clock; the duration is measured either way.
+    timing: str = "reconstructed"
+    error_code: str | None = None          # a subscription attempt's fixed error code (rsi_subscription), else None
 
     def __post_init__(self) -> None:
         self.result = clean_text(self.result)
@@ -544,18 +558,27 @@ def load_run_log(path: Path | str) -> SandboxRun:
     side = side if isinstance(side, dict) else {}
     report = _read_json(exp_dir / "sanitize-report.json")
     arm_rep = report.get(arm) if isinstance(report, dict) and isinstance(report.get(arm), dict) else {}
-    agent, args = _command(meta.get("argv") or [])
-    try:
-        stdout = path.with_name(f"{run_id}.stdout").read_text(errors="replace")
-    except OSError:
-        stdout = ""
-    out = parse_agent_output(agent, stdout, _model_flag(args))
     duration = _float(meta.get("duration_s")) or 0.0
-    m = _RUN_TS_RE.search(run_id)
-    if m:
-        started = datetime.strptime(m.group(1), "%Y%m%dT%H%M%SZ").replace(tzinfo=UTC)
+    started: datetime | None = None
+    error_code: str | None = None
+    if meta.get("format") == SUBSCRIPTION_LOG_FORMAT:
+        agent, out = _subscription_output(meta)
+        started, timing = _host_started(meta.get("started_at")), "host-measured"
+        error_code = _label(meta.get("error"), _ERROR_CODE_RE)
     else:
-        started = datetime.fromtimestamp(path.stat().st_mtime, UTC) - timedelta(seconds=duration)
+        agent, args = _command(meta.get("argv") or [])
+        try:
+            stdout = path.with_name(f"{run_id}.stdout").read_text(errors="replace")
+        except OSError:
+            stdout = ""
+        out = parse_agent_output(agent, stdout, _model_flag(args))
+    if started is None:
+        m = _RUN_TS_RE.search(run_id)
+        if m:
+            started, timing = datetime.strptime(m.group(1), "%Y%m%dT%H%M%SZ").replace(tzinfo=UTC), "run-id"
+        else:
+            started = datetime.fromtimestamp(path.stat().st_mtime, UTC) - timedelta(seconds=duration)
+            timing = "reconstructed"
     rep = side.get("rep", 0)
     exit_code = meta.get("exit_code")
     return SandboxRun(
@@ -569,7 +592,33 @@ def load_run_log(path: Path | str) -> SandboxRun:
         baseline_id=arm_rep.get("baseline") or side.get("baseline_id"),
         artifact_hash=arm_rep.get("artifact_hash") or side.get("artifact_hash"), proposal_id=side.get("proposal_id"),
         check_passed=side.get("check_passed"), judge_winner=side.get("judge_winner"),
-        eval_verdict=side.get("eval_verdict"))
+        eval_verdict=side.get("eval_verdict"), timing=timing, error_code=error_code)
+
+
+def _host_started(value: Any) -> datetime | None:
+    """A subscription log's host clock start (rsi_replay.write_attempt_log); None when absent or unreadable."""
+    if not isinstance(value, str):
+        return None
+    try:
+        dt = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return dt.astimezone(UTC) if dt.tzinfo else None
+
+
+def _subscription_output(meta: Mapping[str, Any]) -> tuple[str, AgentOutput]:
+    """(agent, output) from a subscription attempt log. The official client's raw output is never stored, so the
+    log itself carries what the sink keeps of a CLI stdout: token counts (one generation, no cost: a subscription
+    bills no USD), tool NAMES and statuses, the final text, and the error. Never argv or env."""
+    agent = meta.get("agent") if meta.get("agent") in AGENTS else "unknown"
+    u = meta.get("usage") if isinstance(meta.get("usage"), Mapping) else {}
+    usage = _claude_usage(_int(u.get("input_tokens")), _int(u.get("output_tokens")),
+                          _int(u.get("cache_read_input_tokens")), _int(u.get("cache_creation_input_tokens")))
+    gens = [Generation(_name(meta.get("model")), usage, None)] if usage["total"] else []
+    tools = [ToolCall(_name(t.get("name")), t.get("status") if t.get("status") in TOOL_STATUSES else "unknown")
+             for t in meta.get("tools") or [] if isinstance(t, Mapping)]
+    result = meta.get("result") if isinstance(meta.get("result"), str) else None
+    return agent, AgentOutput(agent, result, bool(meta.get("error")), None, gens, tools)
 
 
 # ---------------------------------------------------------------- deterministic ids and payloads
@@ -643,7 +692,9 @@ def build_spans(run: SandboxRun, dataset_id: str | None = None, *, include_resul
                        "langfuse.experiment.item.root_observation_id": root})
     root_meta = {**tmeta, "run_id": run.run_id, "case": run.case, "rep": run.rep, "kind": run.kind, "agent": agent,
                  "exit_code": run.exit_code, "timed_out": run.timed_out, "duration_s": run.duration_s,
-                 "num_turns": run.num_turns}
+                 "num_turns": run.num_turns, "timing": run.timing if run.timing in TIMINGS else None,
+                 "tool_timing": "ordinal" if run.tools else None,
+                 "error_code": _label(run.error_code, _ERROR_CODE_RE)}
     error = ("timed out" if run.timed_out else f"exit {run.exit_code}" if run.exit_code not in (0, None)
              else "agent error" if run.is_error else None)
     spans = [_span(root, None, tid, f"rsi.{run.kind}", start, end,

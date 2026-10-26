@@ -66,7 +66,10 @@ rep)` with `case_key = <profile>.<case>` for a provider-profile replay. `attempt
 refs.session_uuid(key)`. An unprofiled attempt keeps the id it always had, so existing Langfuse traces still match.
 
 **At creation.** `rsi_replay` puts the identity in the run record (`session_id`, `profile`) and the sidecar
-(`experiment_id`, `arm`, `profile`, `case` = case key, `attempt_session_id`). The night's experiment stage writes
+(`experiment_id`, `arm`, `profile`, `case` = case key, `attempt_session_id`). A subscription attempt has no
+container, so the replay writes its sandbox run log itself (docs/rsi/replay.md, Evidence); its sidecar and its
+Langfuse trace then carry the same identity. Nights before 2026-10-26 have no such log: their attempts were never
+traced and are not backfilled. The night's experiment stage writes
 one `rsi_attempts` row per attempt (`source = runner`) right after the replay returns. A failed write is a night
 note, not a failed experiment.
 
