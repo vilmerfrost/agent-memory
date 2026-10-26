@@ -56,7 +56,9 @@ Output (stdout, one JSON object):
                 when the session was named: the last `custom-title` line, redacted, max 200 chars,
                 `profile` (model, effort, duration: see profile) and `outcome` ({signals, end}:
                 signal names and counts, see SignalTracker; script_version 5+: shell commands
-                are read quote-aware, and `commit` counts only on proof from the call's result)
+                are read quote-aware, and `commit` counts only on proof from the call's result;
+                script_version 6+: delivery waits for matching successful results, with
+                method_version 2 and pending/failed/denied/unknown evidence kept explicit)
   hook mode adds `kind: chat`, `ingested_at: null` and meta.hook (the event); no `routine`.
 """
 
@@ -79,7 +81,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-SCRIPT_VERSION = "5"
+SCRIPT_VERSION = "6"
+OUTCOME_METHOD_VERSION = 2
 SOURCE_PREFIX = "cloud:"
 PROMPT_NAME = "prompt"     # the routine prompt: instruction source routine:<routine>
 
@@ -732,6 +735,55 @@ def command_signals(command: str) -> list[str]:
     return out
 
 
+SUCCESS_OPERATIONS = frozenset({"push", "push_main", "pr_create", "pr_merge", "merge_main", "deploy"})
+
+
+def operation_calls(command: str, *, background: bool = False) -> list[dict[str, str]]:
+    """Observable delivery operations, not their results. No command/argument text is retained.
+
+    Only an unmasked foreground AND-chain can prove every operation from its successful
+    exit. A pipeline, OR/list operator, dry run or asynchronous request remains unknown.
+    This deliberately does not infer a per-command result from a compound shell exit.
+    """
+    names = [n for n in command_signals(command) if n in SUCCESS_OPERATIONS]
+    if not names:
+        return []
+    segs = segments(command)
+    certain = not background and all(op in (None, "&&") for _, op in segs)
+    asynchronous = bool(re.search(r"(?:^|\s)(?:--dry-run|--no-wait|--detach|--detached|--auto|--no-commit)(?:\s|$)", command))
+    if re.search(_PUSH_RE, command) and re.search(r"(?:^|\s)-n(?:\s|$)", command):
+        asynchronous = True
+    how = COMMIT_BACKGROUND if background else (COMMIT_CERTAIN if certain and not asynchronous else COMMIT_UNSURE)
+    return [{"signal": n, "how": how} for n in names]
+
+
+def confirmed_operation_signals(calls: list[dict[str, str]], ok: bool | None,
+                                output: str = "", *, denied: bool = False) -> list[str]:
+    """Result evidence for one exact call ID. Success requires a certain command and
+    terminal success. Other observations remain denied/failed/unknown; no receipt is
+    inferred from an assistant's completion claim or a successful enclosing pipeline.
+    """
+    codes = _EXIT_CODE_RE.findall(output or "")
+    explicit_failure = any(int(code) != 0 for code in codes)
+    still_running = bool(re.search(r"(?:Script|Process) running|session_id[\"']?\s*[:=]", output or "", re.I))
+    out = []
+    for call in calls:
+        signal = call.get("signal")
+        if signal not in SUCCESS_OPERATIONS:
+            continue
+        if denied:
+            out.append("denied_" + signal)
+        elif ok is False or explicit_failure:
+            # An unsuccessful chain does not identify which operation failed. Keep
+            # this as a failed attempt, not proof the external effect did not occur.
+            out.append("failed_" + signal)
+        elif ok is True and call.get("how") == COMMIT_CERTAIN and not still_running:
+            out.append(signal)
+        else:
+            out.append("unknown_" + signal)
+    return out
+
+
 def _report_signals(text: str) -> list[str]:
     return [f"report_{m.lower()}" for m in REPORT_RE.findall(text or "")]
 
@@ -752,7 +804,8 @@ class SignalTracker:
     reply | user (a prompt with no reply yet) | tool (a call with no result yet) | error |
     interrupt.
 
-    Every signal but `commit` counts at the tool call. `commit` counts at the call's result,
+    Delivery operations count as pending at the call, and as succeeded/failed/denied/
+    unknown only at their matching result. `commit` counts at the call's result,
     and only on proof (commit_confirmed): the call id waits in `commit_calls` (state key
     `commit_calls`: {call id: COMMIT_*}, at most PENDING_MAX). A background commit
     (`run_in_background`, `... &`) is never counted here: its output is not in the transcript.
@@ -765,6 +818,12 @@ class SignalTracker:
         raw = s.get("signals") if isinstance(s.get("signals"), dict) else {}
         self.signals: dict[str, int] = {str(k): int(v) for k, v in raw.items()
                                          if isinstance(v, int) and not isinstance(v, bool) and v > 0}
+        # Old incremental states counted delivery at invocation. Preserve that
+        # uncertainty explicitly rather than treating legacy counters as proof.
+        if s and s.get("method_version") != OUTCOME_METHOD_VERSION:
+            for name in SUCCESS_OPERATIONS:
+                if name in self.signals:
+                    self.signals["unknown_" + name] = self.signals.pop(name)
         self.end: str | None = s.get("end") if isinstance(s.get("end"), str) else None
         self.pending: list[str] = [str(p) for p in s.get("pending") or [] if isinstance(p, str)][-self.PENDING_MAX:]
         calls = s.get("commit_calls") if isinstance(s.get("commit_calls"), dict) else {}
@@ -772,9 +831,17 @@ class SignalTracker:
             (str(k), v) for k, v in calls.items()
             if v in (COMMIT_CERTAIN, COMMIT_UNSURE, COMMIT_BACKGROUND))[-self.PENDING_MAX:])
 
+        operations = s.get("operation_calls") if isinstance(s.get("operation_calls"), dict) else {}
+        self.operation_calls: dict[str, list[dict[str, str]]] = {
+            str(cid): [{"signal": c["signal"], "how": c["how"]} for c in calls
+                       if isinstance(c, dict) and c.get("signal") in SUCCESS_OPERATIONS
+                       and c.get("how") in (COMMIT_CERTAIN, COMMIT_UNSURE, COMMIT_BACKGROUND)]
+            for cid, calls in list(operations.items())[-self.PENDING_MAX:] if isinstance(calls, list)}
+
     def state(self) -> dict[str, Any]:
         return {"signals": dict(self.signals), "end": self.end, "pending": list(self.pending),
-                "commit_calls": dict(self.commit_calls)}
+                "commit_calls": dict(self.commit_calls), "operation_calls": dict(self.operation_calls),
+                "method_version": OUTCOME_METHOD_VERSION}
 
     def add(self, names: list[str]) -> None:
         for n in names:
@@ -785,7 +852,16 @@ class SignalTracker:
             self.add(["edit"])
         command = _command_of(name, inp)
         names = command_signals(command)
-        self.add([n for n in names if n != "commit"])
+        operations = operation_calls(command, background=isinstance(inp, dict) and inp.get("run_in_background") is True)
+        if operations:
+            if call_id:
+                self.operation_calls[call_id] = operations
+                self.add(["pending_" + op["signal"] for op in operations])
+                while len(self.operation_calls) > self.PENDING_MAX:
+                    old = self.operation_calls.pop(next(iter(self.operation_calls)))
+                    self._finish_operations(old, None)
+            else:
+                self.add(["unknown_" + op["signal"] for op in operations])
         if "commit" in names and call_id:
             how = commit_call(command)
             if how is not None:
@@ -799,10 +875,22 @@ class SignalTracker:
             self.pending = (self.pending + [call_id])[-self.PENDING_MAX:]
         self.end = "tool"
 
+    def _finish_operations(self, calls: list[dict[str, str]], ok: bool | None, output: str = "",
+                           denied: bool = False) -> None:
+        for call in calls:
+            pending = "pending_" + call["signal"]
+            if self.signals.get(pending, 0) <= 1:
+                self.signals.pop(pending, None)
+            else:
+                self.signals[pending] -= 1
+        self.add(confirmed_operation_signals(calls, ok, output, denied=denied))
+
     def tool_result(self, call_id: str | None, error: bool, output: str = "", denied: bool = False) -> None:
         """One tool result. `error`: the call failed; `denied`: it never ran; `output`: its text."""
         if call_id in self.pending:
             self.pending.remove(call_id)
+        operations = self.operation_calls.pop(call_id, []) if call_id else []
+        self._finish_operations(operations, not error, output, denied)
         how = self.commit_calls.pop(call_id, None) if call_id else None
         if how is not None and how != COMMIT_BACKGROUND and not denied \
                 and commit_confirmed(how, not error, output):
@@ -842,6 +930,9 @@ class SignalTracker:
             if text.lstrip().startswith("[Request interrupted"):
                 self.pending = []
                 self.commit_calls = {}
+                for operations in self.operation_calls.values():
+                    self._finish_operations(operations, None)
+                self.operation_calls = {}
                 self.end = "interrupt"
             elif is_human(text):
                 self.end = "user"
@@ -852,7 +943,8 @@ def outcome_signals(events: list[dict[str, Any]]) -> dict[str, Any]:
     t = SignalTracker()
     for e in events:
         t.feed(e)
-    return {"signals": dict(sorted(t.signals.items())), "end": t.end}
+    return {"signals": dict(sorted(t.signals.items())), "end": t.end,
+            "method_version": OUTCOME_METHOD_VERSION}
 
 
 ACTIVE_HOURS = 2
@@ -867,7 +959,9 @@ def outcome(signals: dict[str, int], end: str | None, last_at: datetime | None,
     hand-back (a tool result) or its final reply, so its end shape never makes it abandoned."""
     now = now or datetime.now(timezone.utc)
     s = {k: v for k, v in signals.items() if isinstance(v, int) and v > 0}
-    evidence: dict[str, Any] = {**dict(sorted(s.items())), "end": end}
+    evidence: dict[str, Any] = {**dict(sorted(s.items())), "end": end,
+                                "method_version": OUTCOME_METHOD_VERSION,
+                                "acceptance": "unverified"}
     age_h = (now - last_at).total_seconds() / 3600 if last_at else None
     if s.get("pr_merge") or s.get("push_main") or s.get("merge_main") or s.get("deploy"):
         return "shipped", evidence
@@ -894,7 +988,7 @@ def outcome(signals: dict[str, int], end: str | None, last_at: datetime | None,
         return "abandoned", evidence
     if s.get("edit"):
         return "partial", evidence
-    if end in ("error", "interrupt"):
+    if end in ("error", "interrupt") or any(k.startswith(("failed_", "denied_")) for k in s):
         return "failed", evidence
     return "no-change", evidence
 
