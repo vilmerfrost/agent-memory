@@ -16,9 +16,12 @@ from typing import Iterator, TextIO
 
 import pytest
 
+from agent_memory.test_timings import Capture, atomic_json
+
 
 class Progress:
-    def __init__(self, console: TextIO, interval: float):
+    def __init__(self, console: TextIO, interval: float, timings: Capture):
+        self.timings = timings
         self.console = console
         self.interval = interval
         self.started = time.monotonic()
@@ -56,14 +59,17 @@ class Progress:
         if not session.config.getoption("numprocesses", default=0):
             with self.lock:
                 self.total = len(session.items)
+                self.timings.collected()
 
     @pytest.hookimpl(optionalhook=True)
     def pytest_xdist_node_collection_finished(self, node: object, ids: list[str]) -> None:
         with self.lock:
             self.total = len(ids)
+            self.timings.collected()
 
     def pytest_runtest_logreport(self, report: pytest.TestReport) -> None:
         with self.lock:
+            self.timings.report(report)
             if report.failed:
                 self.outcomes[report.nodeid] = "failed" if report.when == "call" else "errors"
                 self.line(f"FAIL [{report.when}] {report.nodeid} (traceback in full log)")
@@ -77,11 +83,13 @@ class Progress:
 
     def pytest_collectreport(self, report: pytest.CollectReport) -> None:
         if report.failed:
+            self.timings.collection_errors += 1
             self.line(f"COLLECTION ERROR: {report.nodeid} (details in full log)")
 
     @pytest.hookimpl(optionalhook=True)
     def pytest_testnodedown(self, node: object, error: object | None) -> None:
         if error is not None:
+            self.timings.worker_errors += 1
             self.line("WORKER ERROR: test process exited unexpectedly (details in full log)")
 
 
@@ -123,6 +131,17 @@ def main(argv: list[str] | None = None) -> int:
     log_path = log_dir / f"pytest-{stamp}-{os.getpid()}.log"
     pytest_args = ["-v", "--color=no", "-n", str(args.workers), "--dist", "loadfile",
                    "--max-worker-restart=0", *extra]
+    # Capture context before pytest scrubs its inherited environment.
+    def git(*command: str) -> str | None:
+        result = subprocess.run(["git", *command], capture_output=True, text=True)
+        return result.stdout.strip() if result.returncode == 0 else None
+
+    root = git("rev-parse", "--show-toplevel")
+    common = git("rev-parse", "--path-format=absolute", "--git-common-dir")
+    dirty = git("status", "--porcelain")
+    timings = Capture(repo=Path(common).parent.name if common else Path(root or Path.cwd()).name,
+                      head=git("rev-parse", "HEAD"), dirty=bool(dirty) if dirty is not None else None,
+                      workers=args.workers, selection="custom" if extra else "full", log_ref=log_path.name)
 
     # A separate descriptor keeps heartbeat lines out of tests' capsys/capfd capture.
     with os.fdopen(os.dup(sys.stdout.fileno()), "w", buffering=1) as console, \
@@ -130,17 +149,32 @@ def main(argv: list[str] | None = None) -> int:
         link = log_dir / f".latest-{os.getpid()}"
         link.symlink_to(log_path.name)
         link.replace(log_dir / "latest.log")
-        progress = Progress(console, args.interval)
+        progress = Progress(console, args.interval, timings)
         progress.line(f"Starting pytest with {args.workers} test processes ({'serial' if not args.workers else 'grouped by file'}).")
         progress.line(f"Full log: {log_path}")
         progress.line(f"Follow live: tail -f '{log_path}'")
         progress.thread.start()
+        code = 3
         try:
             with log_output(log):
                 code = int(pytest.main(pytest_args, plugins=[progress]))
+        except KeyboardInterrupt:
+            code = 2
+            raise
         finally:
             progress.stop.set()
             progress.thread.join()
+            try:
+                batch = timings.finish(code)
+                timing_path = log_path.with_suffix(".timings.json")
+                atomic_json(timing_path, batch)
+                progress.line(f"Test timings: {timing_path}")
+                progress.line(f"Timing run: {timings.run['run_id']}")
+                if timings.queue is not None:
+                    atomic_json(timings.queue/f"run-{timings.run['run_id']}.json", batch)
+                    progress.line("Test timings queued for upload.")
+            except (OSError, ValueError, TypeError):
+                progress.line("WARNING: test timing export failed; pytest result is unchanged.")
         progress.summary()
         result = "FAIL" if code else ("PASS" if progress.completed else "NO TESTS RUN")
         progress.line(f"{result} (pytest exit {code}). Full log: {log_path}")
