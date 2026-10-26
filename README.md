@@ -145,25 +145,50 @@ Scoring, lessons, A/B and deviation commands use the Postgres backend only; the 
 
 ## Tests
 
-```sh
-uv run pytest -q
-```
-
-Needs Docker. One throwaway `pgvector/pgvector:pg17` container per session, on
-an OS-assigned port, removed at the end.
-
-For a faster full run, use four test processes. Each process owns its own
-Postgres container, and all tests in a file stay together:
+In the managed integration checkout, the full acceptance gate is:
 
 ```sh
-uv run pytest -q -n 4 --dist loadfile --max-worker-restart=0
+parent-integrate test
 ```
 
-Both commands run the full suite. Append `--durations=25` to see slow test
-setup, execution and cleanup. Use fewer processes when other test suites are
-running on the same machine; the first command remains the serial option.
+It uses the command saved in the local parent profile and records a passing
+result for the clean commit and configuration. A failed run records no passing
+result. Agents should read `AGENTS.md` for this workflow (`CLAUDE.md` imports it).
 
-In a managed worktree, prefix either command with `parent-run --` for the
-normal environment isolation and safety checks. `parent-integrate test`
-uses the full-suite command in the parent profile; a direct `parent-run`
-does not create an integration release receipt.
+For the same full suite with compact live progress in another managed worktree:
+
+```sh
+parent-run -- uv run --locked --quiet python -u scripts/integration_tests.py
+```
+
+The runner uses four pytest processes with file grouping. Every five seconds it
+prints elapsed time, completed/total tests and outcome counts. It reports failures
+immediately and keeps running to collect the remaining results. A test counts as
+complete after teardown, so cleanup failures are included. The runner returns
+pytest's exit code unchanged; it does not retry or suppress failures.
+
+Full verbose pytest output, including failure tracebacks and captured failure
+output, is saved under `test-logs/` in this worktree's Git metadata. These logs
+are not tracked or shared between worktrees. The runner prints the exact path
+and a `tail -f` command; `latest.log` in the same directory points to the latest
+run. Keep the live command output visible instead of piping it through `tail -15`.
+
+Needs Docker. Each test process owns one throwaway `pgvector/pgvector:pg17`
+container on an OS-assigned port, removed at the end. Use `--workers 2` when
+other suites are competing for resources, or `--workers 0` for serial debugging.
+Optional pytest arguments go after `--`, for example `-- --durations=25`.
+
+After a failure, fix and rerun the specific test, or rerun cached failures in
+the same checkout:
+
+```sh
+parent-run -- uv run --locked pytest -q --lf --last-failed-no-failures none
+```
+
+If there are no cached failures, this runs no tests; that is not a passing full
+suite. Once the focused checks pass, commit the fix and run `parent-integrate
+test` again. Passing results from before a code change cannot certify the new
+commit, and a direct `parent-run` does not create an integration release receipt.
+
+The original serial command is still available: `uv run pytest -q` (prefix it
+with `parent-run --` inside a managed worktree).
