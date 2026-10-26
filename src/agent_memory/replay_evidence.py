@@ -32,7 +32,11 @@ def register_evaluations(conn, adir: Path, experiment_id: str) -> dict[str, Any]
     artifact it tested; it does not override intended-intervention or approval
     gates in the orchestrator.
     """
+    if adir.is_symlink() or (adir / "manifest.json").is_symlink():
+        raise RA.ArtifactError("symlinked artifact metadata")
     manifest, digest, _ = RA.load_artifact(adir)
+    if any((adir / "files" / f['after_sha256']).is_symlink() for f in manifest['files']):
+        raise RA.ArtifactError("symlinked artifact content")
     if manifest.get("experiment_id") != experiment_id:
         raise RA.ArtifactError("replay artifact belongs to another experiment")
     records = RA.eval_records(adir)
@@ -85,6 +89,9 @@ def ingest(conn, *, root: Path | None = None, limit: int = 100) -> Report:
                 if not isinstance(row, dict) or row.get("arm") not in AL.ATTEMPT_ARMS:
                     continue
                 at = AL.Attempt(exp, row["arm"], row["case"], row["rep"], row.get("profile") or None)
+                directory_profile = None if path.parent.parent == base else path.parent.parent.name
+                if directory_profile != at.profile:
+                    raise ValueError("replay profile directory mismatch")
                 expected_run = AL._run_id_for(exp + (f"-{at.profile}" if at.profile else ""), at.case, at.arm, at.rep)
                 if row.get("run_id") != expected_run or path.stem != expected_run:
                     raise ValueError("run identity mismatch")

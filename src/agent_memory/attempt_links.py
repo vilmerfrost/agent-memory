@@ -171,6 +171,9 @@ def record_runner(conn: psycopg.Connection, attempts: Iterable[Mapping[str, Any]
         native = native_session_id(a.get("agent"), a.get("native_session_id"))
         sid = None
         if native:
+            previous = conn.execute("select evidence->>'native_session_id' from rsi_attempts where id=%s", (at.key,)).fetchone()
+            if previous and previous[0] not in (None, native):
+                raise refs.RefError("conflicting native identity for the same attempt")
             ev["native_session_id"] = native
             ev["native_identity_source"] = "trusted_client_response"
             sid = record_native_session(conn, at, a)
