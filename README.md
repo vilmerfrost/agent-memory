@@ -151,3 +151,19 @@ uv run pytest -q
 
 Needs Docker. One throwaway `pgvector/pgvector:pg17` container per session, on
 an OS-assigned port, removed at the end.
+
+For a faster full run, use four test processes. Each process owns its own
+Postgres container, and all tests in a file stay together:
+
+```sh
+uv run pytest -q -n 4 --dist loadfile --max-worker-restart=0
+```
+
+Both commands run the full suite. Append `--durations=25` to see slow test
+setup, execution and cleanup. Use fewer processes when other test suites are
+running on the same machine; the first command remains the serial option.
+
+In a managed worktree, prefix either command with `parent-run --` for the
+normal environment isolation and safety checks. `parent-integrate test`
+uses the full-suite command in the parent profile; a direct `parent-run`
+does not create an integration release receipt.

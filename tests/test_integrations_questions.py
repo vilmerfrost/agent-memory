@@ -1,7 +1,8 @@
 """Mission 004B: the investigator's six questions (questions.py) and the Supabase question queries
 (sb_queries.py), on disposable Postgres as amem_app. ClickHouse, Langfuse and past.dev are stand-ins that
 answer with the real named-query specs, so the plans, statuses and re-reads are what is under test; each
-adapter's own queries are tested in its own file."""
+adapter's own queries are tested in its own file. This module uses a private database because
+promotion_history counts every production session in its time window."""
 
 from __future__ import annotations
 
@@ -18,6 +19,7 @@ from psycopg.types.json import Jsonb
 
 from agent_memory import cli
 from agent_memory.integrations import clickhouse as CH, evidence as E, langfuse as LF, pastdev as PD, questions as Q
+from synth_support import fresh_db
 
 APP_PW = "questions-pw-0123456789"
 RULE = "claude-md:global:q-quote-globs"
@@ -116,20 +118,26 @@ def _clean(conn: psycopg.Connection, ids: Ids) -> None:
     conn.execute("delete from sessions where session_id = any(%s)", (ids.sessions,))
 
 
+@pytest.fixture(scope="module")
+def questions_db(pg_url: str) -> Iterator[str]:
+    with fresh_db(pg_url) as url:
+        yield url
+
+
 @pytest.fixture
-def world(pg_url: str, monkeypatch: pytest.MonkeyPatch) -> Iterator[tuple[str, Ids]]:
+def world(questions_db: str, monkeypatch: pytest.MonkeyPatch) -> Iterator[tuple[str, Ids]]:
     ids = Ids()
-    with psycopg.connect(pg_url, autocommit=True) as conn:
+    with psycopg.connect(questions_db, autocommit=True) as conn:
         conn.execute(f"alter role amem_app with login password '{APP_PW}'")
         _seed(conn, ids)
-    app = pg_url.replace("postgres:postgres@", f"amem_app:{APP_PW}@", 1)
+    app = questions_db.replace("postgres:postgres@", f"amem_app:{APP_PW}@", 1)
     monkeypatch.setenv("AMEM_DB_URL", app)
     with psycopg.connect(app) as conn:                       # the trace link the sandbox sink would have written
         E.record(conn, E.EvidenceRef(f"lf:trace/{TRACE}", "lf", "trace", [f"amem:experiment/{EXP}"],
                                      {"check_passed": False, "tool_errors": 2, "arm": "B"}))
         conn.commit()
     yield app, ids
-    with psycopg.connect(pg_url, autocommit=True) as conn:
+    with psycopg.connect(questions_db, autocommit=True) as conn:
         _clean(conn, ids)
 
 
@@ -274,6 +282,26 @@ def test_after_approval_counts_before_and_after(world: tuple[str, Ids]) -> None:
     assert (m["sessions_before"], m["sessions_after"]) == (3, 3)                  # the sandbox session is left out
     assert (m["rate_before"], m["rate_after"], m["after_days_observed"]) == (1.0, 0.3333, 5)
     assert h["type"] == "change" and h["status"] == "authoritative" and MAIL not in (h["summary"] or "")
+
+
+def test_promotion_counts_ignore_sessions_from_other_test_modules(
+    world: tuple[str, Ids], pg_url: str,
+) -> None:
+    """A different file can leave sessions in the shared DB before this module runs."""
+    app, ids = world
+    foreign = f"other-module-{uuid.uuid4().hex}"
+    with psycopg.connect(pg_url, autocommit=True) as conn:
+        conn.execute("insert into sessions (session_id, kind, project_dir, transcript_bytes, env, created_at) "
+                     "values (%s, 'chat', '/other-module', 1, 'prod', %s)",
+                     (foreign, PIVOT + timedelta(days=1)))
+        try:
+            ans, _ = _ask(app, ids, "after_approval", {"proposal": ids.p1, "window_days": "14"})
+            (history,) = [f for f in ans.findings if f["step"] == "sb.promotion_history"]
+            metrics = history["metrics"]
+            assert (metrics["sessions_before"], metrics["sessions_after"]) == (3, 3)
+            assert (metrics["rate_before"], metrics["rate_after"]) == (1.0, 0.3333)
+        finally:
+            conn.execute("delete from sessions where session_id = %s", (foreign,))
 
 
 # ---------------------------------------------------------------- recording, params, the CLI

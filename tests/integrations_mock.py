@@ -100,7 +100,9 @@ class MockService:
             do_GET = do_POST = do_PUT = do_PATCH = do_DELETE = _handle
 
         self._server = ThreadingHTTPServer(("127.0.0.1", 0), _H)
-        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        # Poll shutdown promptly without changing request handling or client timeouts.
+        self._thread = threading.Thread(target=self._server.serve_forever,
+                                        kwargs={"poll_interval": 0.01}, daemon=True)
         self._thread.start()
         return self
 
