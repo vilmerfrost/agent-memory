@@ -447,7 +447,7 @@ def test_paid_rehearsal_refuses_without_the_approved_cap(tmp_path: Path, monkeyp
         err = capsys.readouterr().err
         assert "needs Vilmer's approval" in err and "--approve-max-usd 1" in err and "Nothing ran." in err
     assert ran == [] and not (tmp_path / "w").exists()
-    assert R.main(["--paid-plan"]) == 0 and "worst case $0.9100" in capsys.readouterr().out and ran == []
+    assert R.main(["--paid-plan"]) == 0 and "planned API estimate $0.9100" in capsys.readouterr().out and ran == []
 
 
 def test_live_jev_triage_is_booked_as_an_estimate_not_as_reported(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -474,7 +474,9 @@ def test_paid_plan_lists_every_paid_call_and_fits_the_cap() -> None:
     assert plan["ab_pairs_per_experiment"] == 3 and plan["within_cap"] and plan["worst_case_usd"] == 0.91
     assert plan["expected_usd"] == pytest.approx(0.0734, abs=1e-4) and plan["expected_incomplete"]   # Sonnet unmeasured
     text = S.render_plan(plan)
-    assert "worst case $0.9100, hard cap max_usd $1.00 (the worst case fits)" in text
+    assert "planned API estimate $0.9100, accounting cap max_usd $1.00 (the API estimates fit)" in text
+    assert plan['currency']=='USD' and plan['invoice_cap_verified'] is False
+    assert 'not invoices' in text and 'Subscription billing is separate and unknown' in text
     lean = S.paid_plan(N.load_config())
     assert lean["calls"] == [] and lean["expected_usd"] == 0 and "No paid call" in S.render_plan(lean)
 

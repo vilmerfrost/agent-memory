@@ -73,6 +73,8 @@ def register_artifact(conn: psycopg.Connection, adir: Path) -> str:
     for rec in RA.eval_records(adir):
         if rec.get("artifact_hash") != h:
             continue
+        if (rec.get("experiment_id"), rec.get("baseline_id")) != (m.get("experiment_id"), m.get("baseline_id")):
+            raise RA.ArtifactError("evaluation experiment/baseline differs from artifact")
         conn.execute(
             "insert into rsi_eval_results (artifact_hash, experiment_id, baseline_id, suite, suite_version, model, effort, "
             "verdict, record, record_sha) values (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) on conflict do nothing",

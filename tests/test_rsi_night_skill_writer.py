@@ -304,6 +304,41 @@ def test_a_skill_scores_night_runs_the_writer_end_to_end(env: SimpleNamespace) -
     assert meta[0]["implementation"]["section_from"] == "hypothesis" and meta[0]["new_text"] == staged
 
 
+INTENDED_LINES = {
+    "skill:pepe": "- Return five ranked ideas with name, pitch, slot, score and reason, followed by the pick.",
+    "skill:meltdown": "- If the review loop stops below eight, still render and report each lower criterion and its remaining fix.",
+    "skill:anatomy": "- Before geometry, name the closest shipped example and reuse its kit and structure.",
+}
+
+
+@pytest.mark.parametrize("key", list(CANDS))
+def test_intended_skill_intervention_reaches_exact_bound_artifact(env: SimpleNamespace, key: str) -> None:
+    """Known intended writer output tests matcher→section edit→artifact bytes, not model quality or fallback."""
+    c = seed_skill(env, key)
+    old = (FIX / c["fixture"]).read_bytes()
+    source = env.home / c["target"][2:]
+    before_live = source.read_bytes()
+    w = SectionWriter(added=INTENDED_LINES[key])
+    rep = night(env, w)
+    (e,) = [e for e in rep["experiments"] if e["experiment_id"]]
+    manifest, digest, after_files = RA.load_artifact(RA.artifacts_dir() / e["artifact_hash"])
+    (file,) = manifest["files"]
+    after = after_files[file["after_sha256"]]
+    assert source.read_bytes() == before_live == old  # baseline/live source remains A
+    assert e["implementer"] == "writer" and e["implementer_fallback_reason"] is None
+    assert e["implementation"]["intended_intervention"] is True
+    assert file["path"] == c["target"] and file["before_sha256"] == RA.sha256_bytes(old)
+    assert file["after_sha256"] == RA.sha256_bytes(after) != file["before_sha256"]
+    assert digest == e["artifact_hash"] == RA.artifact_hash(manifest)
+    assert manifest["experiment_id"] == e["experiment_id"] and manifest["baseline_id"] == e["baseline_id"]
+    # The staging identity is synthetic; implementation.section_id names the actual source rule section.
+    assert file["rule_id"].startswith("rsi-night-")
+    assert e["implementation"]["section_id"] == c["section"]
+    assert _one_section_changed(old.decode(), after.decode()) == [c["section"]]
+    assert INTENDED_LINES[key] in edits_sections.section_text(after.decode(), c["section"])
+    assert after.decode() != N.stub_change(old.decode(), _hyp(c["hypothesis"]["what"], c["target"]))
+
+
 def test_a_skill_scores_guard_refusal_falls_back_and_the_night_says_so(env: SimpleNamespace) -> None:
     seed_skill(env)
     w = SectionWriter(added="- See the log in /Users/vilmerfrost/Projects/demo/out.txt first.")
@@ -312,6 +347,26 @@ def test_a_skill_scores_guard_refusal_falls_back_and_the_night_says_so(env: Simp
     assert e["implementer"] == "stub-fallback" and "content guard: project path" in e["implementer_fallback_reason"]
     assert w.sections == ["return-mode"]                           # the writer did run; improve refused its text
     assert rep["writer"]["all_fell_back"] is True and rep["status"] == "partial"
+
+
+@pytest.mark.parametrize("replay_verdict", ["IMPROVES", "NO_EFFECT", "WORSE"])
+def test_fallback_is_never_evidence_for_the_intended_intervention(env: SimpleNamespace,
+                                                                replay_verdict: str) -> None:
+    seed_skill(env)
+    cfg = N.load_config(PROFILE)
+    ad = adapters(implementer=N.WriterImplementer(cfg.implementer, call=SectionWriter("not JSON")),
+                  stager=FakeStager(), replayer=FakeReplayer(replay_verdict), triage=GoTriage(),
+                  hypothesizer=RealHypotheses())
+    rep = N.Night(cfg, ad, night=NIGHT, db_url=env.url, install_signals=False).run()
+    (e,) = [e for e in rep["experiments"] if e["experiment_id"]]
+    assert e["implementer"] == "stub-fallback" and e["verdict"] == "INCONCLUSIVE"
+    assert e["implementation"]["intended_intervention"] is False
+    assert e["implementation"]["replay_verdict"] == replay_verdict
+    assert e["status"] == "not_promotable" and e["proposal_id"] is None
+    assert e["verdict_reasons"][0] == "fallback_intervention:not_the_intended_writer_change"
+    assert rows(env.url, "select count(*) from rsi_proposals") == [(0,)]
+    (meta,) = rows(env.url, "select meta from rsi_experiments")
+    assert meta[0]["intended_intervention"] is False and meta[0]["replay_verdict"] == replay_verdict
 
 
 def test_a_night_where_every_experiment_fell_back_is_loud(env: SimpleNamespace) -> None:

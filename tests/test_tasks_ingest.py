@@ -44,7 +44,7 @@ def test_cli_ingests_real_fixtures_twice(sdb: ScoringDb, tmp_path: Path) -> None
     rows = _rows(sdb.url)
     assert len(rows) == 41
     assert {(r[1], r[2]) for r in rows} == {("dispatch", "dispatch")}
-    by_key = {r[0]: r for r in rows}
+    by_key = {r[8]["legacy_source_key"]: r for r in rows}
     key, routine, source, status, started, finished, summary, reason, meta = by_key["dispatch:t-d2dce9a006"]
     assert status == "fail" and reason == "denied-command"
     assert summary == ("junk-orchestra: BLOCKED, 1 worker, dod_first_pass=false, denials=1 (heredoc), "

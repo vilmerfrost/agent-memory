@@ -203,11 +203,13 @@ def outcome_signals(events: list[dict[str, Any]]) -> tuple[dict[str, int], str |
     `completed`, `exit_code` 0). Without items, a shell function call's commit waits for its
     output: a commit line there, or a certain chain whose output reports exit code 0."""
     from agent_memory.amem_digest import (COMMIT_CERTAIN, REPORT_RE, _EXIT_CODE_RE, command_signals,
-                                          commit_call, commit_confirmed)
+                                          commit_call, commit_confirmed, operation_calls,
+                                          confirmed_operation_signals, SUCCESS_OPERATIONS)
 
     signals: dict[str, int] = {}
     end: str | None = None
     commit_calls: dict[str, str] = {}   # call id -> how its result can prove the commit
+    delivery_calls: dict[str, list[dict[str, str]]] = {}
 
     def add(names: list[str]) -> None:
         for n in names:
@@ -216,7 +218,15 @@ def outcome_signals(events: list[dict[str, Any]]) -> tuple[dict[str, int], str |
     def add_command(command: str, *, ok: bool | None = None, output: str = "", call_id: str = "") -> None:
         """The signals of one command. `ok` None: the result comes later (a function call)."""
         names = command_signals(command)
-        add([n for n in names if n != "commit"])
+        add([n for n in names if n != "commit" and n not in SUCCESS_OPERATIONS])
+        calls = operation_calls(command)
+        if calls:
+            if call_id and ok is None:
+                if call_id not in delivery_calls:
+                    delivery_calls[call_id] = calls
+                    add(["pending_"+c['signal'] for c in calls])
+            else:
+                add(confirmed_operation_signals(calls, ok, output))
         how = commit_call(command) if "commit" in names else None
         if how is None:
             return
@@ -251,9 +261,21 @@ def outcome_signals(events: list[dict[str, Any]]) -> tuple[dict[str, int], str |
                             call_id=str(p.get("call_id") or ""))
         elif t == "response_item" and pt in ("function_call_output", "custom_tool_call_output"):
             end = "result"
-            how = commit_calls.pop(str(p.get("call_id") or ""), None)
+            call_id = str(p.get("call_id") or "")
+            text = message_text(p.get("output"))
+            calls = delivery_calls.pop(call_id, None)
+            if calls:
+                for call in calls:
+                    pending = "pending_"+call['signal']
+                    if signals.get(pending, 0) <= 1:
+                        signals.pop(pending, None)
+                    else:
+                        signals[pending] -= 1
+                code = _EXIT_CODE_RE.search(text)
+                denied = bool(re.search(r"(?:blocked|denied) by|permission denied|tool call blocked", text, re.I))
+                add(confirmed_operation_signals(calls, int(code.group(1))==0 if code else None, text, denied=denied))
+            how = commit_calls.pop(call_id, None)
             if how is not None:
-                text = message_text(p.get("output"))
                 code = _EXIT_CODE_RE.search(text)
                 ok = how == COMMIT_CERTAIN and code is not None and int(code.group(1)) == 0
                 add(["commit"] if commit_confirmed(how, ok, text) else [])
@@ -261,7 +283,7 @@ def outcome_signals(events: list[dict[str, Any]]) -> tuple[dict[str, int], str |
             item = p.get("item") if isinstance(p.get("item"), dict) else {}
             if item.get("type") == "CommandExecution":
                 code = item.get("exit_code")
-                ok = item.get("status") == "completed" and code == 0 and not isinstance(code, bool)
+                ok = (code == 0 and item.get("status") in ("completed", "Completed")) if isinstance(code, int) and not isinstance(code, bool) else None
                 output = item.get("aggregated_output")
                 add_command(command_text(item.get("command")), ok=ok,
                             output=output if isinstance(output, str) else "")

@@ -38,6 +38,10 @@ BRIDGE_PATH = Path(__file__).resolve().parents[2] / "sandbox" / "subscription_to
 class SubscriptionError(RuntimeError):
     """Fixed, secret-free error code; never include raw client errors."""
 
+    def __init__(self, code: str, *, native_session_id: str | None = None):
+        super().__init__(code)
+        self.native_session_id = native_session_id
+
 
 @dataclass(frozen=True)
 class SubscriptionAuth:
@@ -162,6 +166,7 @@ def claude_command(auth: SubscriptionAuth, *, model: str, effort: str, mcp_confi
 
 def _parse_claude(raw: str, *, model: str, tools_allowed: bool) -> tuple[str, dict, dict]:
     initialized = False
+    native_ids: set[str] = set()
     result = None
     tool_count = 0
     for line in raw.splitlines():
@@ -173,6 +178,8 @@ def _parse_claude(raw: str, *, model: str, tools_allowed: bool) -> tuple[str, di
             raise SubscriptionError("client_protocol_invalid")
         if msg.get("type") == "system" and msg.get("subtype") == "init":
             initialized = True
+            if isinstance(msg.get("session_id"), str):
+                native_ids.add(msg["session_id"])
             if msg.get("model") != model:
                 raise SubscriptionError("model_mismatch")
             allowed = {"mcp__rsi__task_shell", "mcp__rsi__task_read_arm", "EndConversation"} if tools_allowed else set()
@@ -191,10 +198,14 @@ def _parse_claude(raw: str, *, model: str, tools_allowed: bool) -> tuple[str, di
                     tool_count += 1
         if msg.get("type") == "result":
             result = msg
+            if isinstance(msg.get("session_id"), str):
+                native_ids.add(msg["session_id"])
+    from agent_memory.attempt_links import native_session_id
+    native = native_session_id("claude", next(iter(native_ids))) if len(native_ids) == 1 else None
     if not initialized or result is None:
-        raise SubscriptionError("client_completion_missing")
+        raise SubscriptionError("client_completion_missing",native_session_id=native if initialized else None)
     if result.get("is_error") or result.get("subtype") != "success":
-        raise SubscriptionError("client_run_failed")
+        raise SubscriptionError("client_run_failed",native_session_id=native)
     if result.get("permission_denials"):
         raise SubscriptionError("client_tool_permission_denied")
     models = result.get("modelUsage")
@@ -209,7 +220,10 @@ def _parse_claude(raw: str, *, model: str, tools_allowed: bool) -> tuple[str, di
              if key in names and isinstance(val, int) and not isinstance(val, bool) and val >= 0}
     return value, usage, {"model_verified": True, "reported_model": model,
                           "effort_verification": "explicit_client_option",
-                          "tool_use_count": tool_count}
+                          "tool_use_count": tool_count,
+                          "native_session_id": native,
+                          "native_identity_source": "client_init_result" if native else
+                              "conflicting_client_ids" if len(native_ids) > 1 else "client_id_unavailable"}
 
 
 def _auth_status(auth: SubscriptionAuth, env: dict, cwd: Path, process) -> dict:
@@ -606,12 +620,14 @@ def _codex_session(rpc, *, model, effort, prompt, cwd, bridge_tools):
         elif method == "turn/completed":
             completed = params.get("turn") or {}
             if params.get("threadId") != thread_id or completed.get("id") != turn_id or completed.get("status") != "completed":
-                raise SubscriptionError("client_run_failed")
+                raise SubscriptionError("client_run_failed",native_session_id="codex:"+thread_id)
             if not text_parts:
                 raise SubscriptionError("client_result_missing")
             return "\n".join(text_parts), usage, {"auth_method": "chatgpt", "subscription_type": account.get("planType"),
                 "model_verified": True, "reported_model": model, "effort_verification": "thread_start_response",
                 "reported_effort": effort, "native_tools": "host_execution_and_file_access_disabled",
-                "native_tool_boundary": "codex-0.163.0/no-environments/no-stable-environment-tools"}
+                "native_tool_boundary": "codex-0.163.0/no-environments/no-stable-environment-tools",
+                "native_session_id": "codex:" + thread_id,
+                "native_identity_source": "thread_start_response", "native_turn_id": turn_id}
         elif method == "error":
-            raise SubscriptionError("client_run_failed")
+            raise SubscriptionError("client_run_failed",native_session_id="codex:"+thread_id)

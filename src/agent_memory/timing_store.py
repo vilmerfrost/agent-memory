@@ -24,15 +24,22 @@ values (%(span_id)s,%(session_id)s,%(parent_span_id)s,%(tool)s,%(category)s,%(op
  %(started_at)s,%(ended_at)s,%(elapsed_ms)s,%(status)s,%(exit_code)s,%(measurement_kind)s,
  %(source)s,%(method_version)s,%(meta)s)
 on conflict(span_id) do update set
+ session_id=coalesce(execution_spans.session_id,excluded.session_id),
  ended_at=excluded.ended_at,elapsed_ms=excluded.elapsed_ms,status=excluded.status,
  exit_code=excluded.exit_code,measurement_kind=excluded.measurement_kind,
- meta=execution_spans.meta || excluded.meta,updated_at=now()
+ meta=(execution_spans.meta || excluded.meta) -
+      case when coalesce(execution_spans.session_id,excluded.session_id) is not null
+           then 'identity_unavailable' else '__no_key__' end,updated_at=now()
 where (excluded.ended_at is not null or execution_spans.ended_at is null)
-  and (execution_spans.ended_at,execution_spans.elapsed_ms,execution_spans.status,
+  and (execution_spans.session_id is null or excluded.session_id is null
+       or execution_spans.session_id=excluded.session_id)
+  and (execution_spans.session_id,execution_spans.ended_at,execution_spans.elapsed_ms,execution_spans.status,
        execution_spans.exit_code,execution_spans.measurement_kind,execution_spans.meta)
       is distinct from
-      (excluded.ended_at,excluded.elapsed_ms,excluded.status,excluded.exit_code,
-       excluded.measurement_kind,execution_spans.meta || excluded.meta)
+      (coalesce(execution_spans.session_id,excluded.session_id),excluded.ended_at,excluded.elapsed_ms,excluded.status,excluded.exit_code,
+       excluded.measurement_kind,(execution_spans.meta || excluded.meta) -
+       case when coalesce(execution_spans.session_id,excluded.session_id) is not null
+            then 'identity_unavailable' else '__no_key__' end)
 returning (xmax=0) as inserted
 """
 

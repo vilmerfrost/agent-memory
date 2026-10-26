@@ -144,19 +144,21 @@ def _stored(url: str, sid: str, kind: str, outcome: str | None, evidence: dict[s
 
 def test_ingest_recomputes_stored_outcomes_and_fills_places(setup_home: Home, db: str) -> None:  # noqa: F811
     old = NOW - timedelta(days=20)      # far outside the ingest window: no transcript is read
-    _stored(db, "p/agent-1", "worker", "abandoned", {"report_done": 1, "end": "result"}, old,
+    _stored(db, "p/agent-1", "worker", "abandoned", {"method_version": 2, "report_done": 1, "end": "result"}, old,
             category="worker", project="demo-repo")
-    _stored(db, "p/agent-2", "worker", "abandoned", {"edit": 2, "end": "tool"}, old,
+    _stored(db, "p/agent-2", "worker", "abandoned", {"method_version": 2, "edit": 2, "end": "tool"}, old,
             category="worker", project="demo-repo")
-    _stored(db, "chat-r", "chat", "abandoned", {"end": "result"}, old, category="chat", project="demo-repo")
-    _stored(db, "chat-u", "chat", "abandoned", {"end": "user"}, old, category="chat", project="demo-repo")
+    _stored(db, "chat-r", "chat", "abandoned", {"method_version": 2, "end": "result"}, old, category="chat", project="demo-repo")
+    _stored(db, "chat-u", "chat", "abandoned", {"method_version": 2, "end": "user"}, old, category="chat", project="demo-repo")
     _stored(db, "chat-null", "chat", None, None, old, cwd="/work/demo-repo")   # a ping row of an old version
+    _stored(db, "legacy", "chat", "shipped", {"push_main": 1, "end": "text"}, old,
+            category="chat", project="demo-repo")
     report = sessions_ingest.ingest(setup_home.projects, days=7, now=NOW, db_url=db)
     assert (report.outcomes, report.places) == (3, 1)
     assert report.line().endswith(" outcomes=3 places=1 summary=off")
     got = dict(_q(db, "select session_id, outcome from sessions"))
     assert got == {"p/agent-1": "no-change", "p/agent-2": "partial", "chat-r": "no-change",
-                   "chat-u": "abandoned", "chat-null": None}
+                   "chat-u": "abandoned", "chat-null": None, "legacy": "shipped"}
     assert _q(db, "select category, project from sessions where session_id = 'chat-null'") == [
         ("chat", "demo-repo")]
     again = sessions_ingest.ingest(setup_home.projects, days=7, now=NOW, db_url=db)

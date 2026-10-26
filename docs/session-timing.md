@@ -1,5 +1,17 @@
 # Session and parent timing
 
+## Integrity follow-up (2026-10-26)
+
+API attribution reads explicit thread/conversation IDs from resource, scope and record attributes. Conflicting or malformed IDs remain unassigned with a reason. Native request/trace identity is independent of actor/duration corrections, so exact late attribution updates one measurement rather than adding a second duration. A known actor cannot be reassigned. Without an explicit native ID, request time or the collector's environment never supplies one. The old sanitized payloads cannot recover discarded identity.
+
+RSI logical attempt UUIDs remain distinct from actual client session/thread IDs. Trusted Claude init/result and Codex thread/start responses carry native identity into replay records and sidecars. A native-session observation is explicitly sandbox-scoped, with zero transcript bytes and unverified task acceptance; it is not a fabricated full transcript. Missing historical client IDs remain unknown. Later real transcript ingestion preserves the proven experimental scope and fills the transcript-availability fact.
+
+The night and existing daily owner now ingest verified artifact/evaluation records for non-improving as well as improving replays. Artifact, baseline and experiment bindings must match. Raw fallback artifact verdicts remain artifact-only context, not evidence that the intended candidate improved. Existing immutable records are not rewritten into passing results.
+
+`amem timing analyze --days 7 --limit 5` reads a bounded deterministic report. The existing daily routine writes the same analysis beside other reports; the morning brief reads a recent bounded summary. It flags expensive captured operations, slow/setup-heavy test observations, repeated tests for review, parent unclassified time, missing links, stale checkpoints and completion/test contradictions. Each lead cites evidence and limitations. Repetition is not proved unnecessary; cumulative time is not wall time; stored rows are not the whole eligible source population. No new routine, model call or timing table is added.
+
+Night coverage also requires `experiments:replay-evidence` and `experiments:native-attempt-sessions` when the new report supplies them. Completed replays/provider run counts define expectations: an empty evaluation/attempt table cannot masquerade as no eligible work. New consumption gaps make the morning conclusion incomplete/findings, not an all clear. Historical reports stay compatible.
+
 Timing data lives in the existing agent-memory Supabase project. `execution_spans`
 stores one small record per observed operation. Session and parent links keep the
 existing identities. No prompt, reasoning text, command arguments or tool result

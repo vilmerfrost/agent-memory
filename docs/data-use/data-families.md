@@ -9,10 +9,7 @@ Every table and view in `supabase/migrations` belongs to exactly one family belo
 Learning families with no automatic analysis consumer:
 
 - **Models, effort, tokens and costs** (`models_costs`)
-- **Command and tool timings** (`command_timings`)
-- **Test runs and individual test timings** (`test_timings`)
 - **Lessons and lesson-use history** (`lessons`)
-- **Reports, ledger events and checkpoints** (`reports_checkpoints`)
 - **Evaluation drafts** (`eval_drafts`)
 
 ## Sessions, outcomes and summaries
@@ -71,8 +68,8 @@ Learning families with no automatic analysis consumer:
 - External sinks: none
 - Consumers:
   - operational: profile refresh (sessions.api_seconds / tool_seconds) (`src/agent_memory/timing_store.py`)
+  - analysis: amem-daily deterministic telemetry review (`src/agent_memory/telemetry_analysis.py`)
   - manual: amem timing report / coverage (`src/agent_memory/cli_timing.py`)
-  - analysis: none found (Stage E gap)
 - Retention: No pruning found: spans are kept indefinitely.
 - Exclusion: Operation names and categories only; no command text or output. Reconstructed and estimated spans (measurement_kind) never count as measured latency.
 - Learning input: yes
@@ -89,8 +86,8 @@ Learning families with no automatic analysis consumer:
 - External sinks: none
 - Consumers:
   - operational: retention prune (`src/agent_memory/timing_collector.py`)
+  - analysis: amem-daily deterministic test review (`src/agent_memory/telemetry_analysis.py`)
   - manual: amem timing tests (`src/agent_memory/test_timings.py`)
-  - analysis: none found (Stage E gap)
 - Retention: Case rows 30 days (test_timings.prune, run by the collector); run summaries kept (details_retained=false after pruning).
 - Exclusion: Measurements and node ids only, never test logs or captured output.
 - Learning input: yes
@@ -107,6 +104,7 @@ Learning families with no automatic analysis consumer:
 - External sinks: ClickHouse skill_calls
 - Consumers:
   - analysis: amem-rsi-night (amem rsi night-job) discovery (`src/agent_memory/rsi_night.py`)
+  - analysis: amem-rsi-night (amem rsi night-job) validated production observations via rsi_evidence (`src/agent_memory/production_feedback.py`)
   - analysis: amem-rsi-night (amem rsi night-job) skill_refresh prerequisite (`src/agent_memory/skill_refresh.py`)
   - export: sync clickhouse (amem daily step_sync) (`src/agent_memory/integrations/clickhouse.py`)
   - manual: amem skills scores / suggest (`src/agent_memory/skills.py`)
@@ -252,9 +250,9 @@ Learning families with no automatic analysis consumer:
 - External sinks: none
 - Consumers:
   - operational: night/brief dependency checks (`src/agent_memory/rsi_night.py`)
+  - analysis: amem-daily checkpoint freshness review (`src/agent_memory/telemetry_analysis.py`)
   - operational: sync cursors (`src/agent_memory/integrations/sync.py`)
   - report: Night Desk (external web app, owner JWT; dashboard_owner_read policy) (`supabase/migrations/20261024230827_night_desk.sql`)
-  - analysis: none found (Stage E gap)
 - Retention: Checkpoints and nights kept indefinitely; report_snapshots one row per kind and date.
 - Exclusion: Summaries only; report bodies stay in local files.
 - Learning input: yes
@@ -296,7 +294,7 @@ Learning families with no automatic analysis consumer:
 
 - Key: `evidence_links`
 - Purpose: Confirm identity, relevance and current availability
-- Producers: amem sync run (evidence links per pushed batch); evidence providers (rsi_evidence_providers); amem integrations ncm record
+- Producers: amem sync run (evidence links per pushed batch); evidence providers (rsi_evidence_providers); amem integrations ncm record; amem rsi outcome (immutable advisory production observations)
 - Owner job: amem-rsi-night (amem rsi night-job)
 - Tables: `rsi_evidence`
 - Views: none

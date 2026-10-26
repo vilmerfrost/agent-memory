@@ -136,7 +136,9 @@ def test_three_experiments_fill_the_night_and_stop_at_the_experiment_cap(env: Si
     assert [e["status"] for e in tested] == ["not_promotable"] * 3
     assert len({e["candidate_key"] for e in tested}) == 3                    # one experiment per candidate
     waiting = [e for e in rep["experiments"] if not e["experiment_id"]]
-    assert [e["status"] for e in waiting] == ["skipped_budget"] * 3          # each candidate's 2nd hypothesis
+    assert [e["status"] for e in waiting] == ["deferred_policy"] * 3        # each candidate's 2nd hypothesis
+    assert all(e["skip_reason"] == "one_experiment_per_candidate" for e in waiting)
+    assert all(e["budget_decision"]["resource"] is None for e in waiting)
     assert {e["candidate_key"] for e in waiting} == {e["candidate_key"] for e in tested}
     cands = rep["candidates"]
     assert len(cands) == 4 and sum(c["selected"] for c in cands) == 3
@@ -164,7 +166,7 @@ def test_one_covered_candidate_runs_exactly_one_experiment(env: SimpleNamespace)
     rep, ad, _ = night(env, verdicts="IMPROVES")
     assert rep["status"] == "ok", rep["notes"]
     assert [(e["status"], bool(e["experiment_id"])) for e in rep["experiments"]] == [("staged", True),
-                                                                                      ("skipped_budget", False)]
+                                                                                      ("deferred_policy", False)]
     assert ad.hypothesizer.calls == 1 and len(ad.replayer.calls) == 1
     assert rep["costs"]["by_model"][OPUS]["calls"] == 7 and rep["costs"]["sandbox_runs"] == 108
     assert len(rows(env.url, "select 1 from rsi_proposals where status = 'staged'")) == 1

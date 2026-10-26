@@ -67,7 +67,7 @@ HYPOTHESES_FIXTURES = config.REPO_ROOT / "tests" / "fixtures" / "rsi-night" / "h
 STATUSES = ("ok", "partial", "aborted", "budget_exhausted", "preflight_failed")
 SKIP_REASONS = ("prerequisites", "credentials")     # report["skipped"]["reason"]: the night job did not start it
 MAX_PREREQ_WARNINGS = 10
-EXP_STATUSES = ("staged", "not_promotable", "failed", "interrupted", "skipped_budget")
+EXP_STATUSES = ("staged", "not_promotable", "failed", "interrupted", "skipped_budget", "deferred_policy")
 VERDICTS = ("IMPROVES", "NO_EFFECT", "WORSE", "INCONCLUSIVE")
 RISKS = ("low", "medium", "high")
 PROVIDERS = ("supabase", "clickhouse", "langfuse", "pastdev")
@@ -777,6 +777,7 @@ class PackEvidence:
     def pack(self, candidate: Mapping[str, Any]) -> Any:
         mod = self._mod()
         kw = {"connect": self._connect} if self.db_url else {}     # no db_url: the store default, as the night
+        kw["current_instruction_sha256"] = current_target_sha(candidate)
         if self.retrievers is None:
             return mod.build_pack(candidate, **kw)
         rs = dict(self.retrievers)
@@ -791,6 +792,19 @@ class PackEvidence:
 
 def _sha16(s: str) -> str:
     return hashlib.sha256(s.encode()).hexdigest()[:16]
+
+
+def current_target_sha(candidate: Mapping[str, Any]) -> str | None:
+    target = candidate.get("target")
+    if not isinstance(target, str):
+        return None
+    try:
+        path = rsi_targets.untilde(target)
+        if path.name.startswith('.env') or not ET.is_allowed(path) or path.stat().st_size > NEW_TEXT_MAX:
+            return None
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except (OSError, ValueError):
+        return None
 
 
 class FixtureHypothesizer:
@@ -2094,6 +2108,8 @@ class Night:
         the last sighted: sources are sighted in a fixed order, so `last_seen_at` favoured whichever came last."""
         assert self.conn is not None
         if not self.dry_run:
+            self._reconsider_production()
+        if not self.dry_run:
             for s in sightings:
                 self._sight(s)
         limit = int(self.cfg.candidates["max_considered"])
@@ -2155,6 +2171,33 @@ class Night:
         uncovered = [c for c in pool if not self._test_cases(c.get("target"))]
         return covered[:limit] + uncovered[:limit]
 
+    def _reconsider_production(self) -> None:
+        """A bounded advisory reopening policy. Keep total attempts/history;
+        only a materially new verified generation gets a named per-generation
+        allowance. No edit, proposal, promotion or Undo authorization here.
+        """
+        from agent_memory import production_feedback as PF
+        assert self.conn is not None
+        with self.conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("select * from rsi_candidates where status in ('tested','rejected') "
+                        "and target=any(%s) order by last_considered_at desc nulls last,id limit 20",
+                        (list(self.allowlist),))
+            candidates = [dict(r) for r in cur.fetchall()]
+        for candidate in candidates:
+            if not self._test_cases(candidate.get('target')):
+                continue
+            sha = current_target_sha(candidate)
+            bound = {**candidate, "rule_key": (candidate.get('meta') or {}).get('last_tested_rule_key') or candidate.get('rule_key')}
+            for finding in PF.for_candidate(self.conn, bound, sha):
+                decision = PF.reconsider(bound, finding, sha)
+                if decision.allowed:
+                    self._update_candidate(candidate['id'], status='new', reason='advisory feedback: '+decision.reason,
+                        meta={"production_feedback_reopened_generation": decision.generation,
+                              "generation_attempts": 0, "attempt_limit_scope": "verified_feedback_generation"})
+                    self.notes.append(f"candidate {candidate['dedupe_key']}: advisory reconsideration {decision.reason}; "
+                                      f"evidence {finding['ref']}"[:300])
+                    break
+
     def _test_cases(self, target: str | None) -> list[str]:
         """Replay cases (the night's `replay.cases`, default all of bench/rsi-replay) that declare `target`. Path
         only: the artifact's kind is checked again by the replay. A bench that does not load covers nothing."""
@@ -2214,6 +2257,19 @@ class Night:
                     "update rsi_candidates set status = %s, rank = %s, jev = %s, decided_reason = %s, "
                     "last_considered_at = now() where id = %s",
                     ("selected" if selected else "deferred", r, Jsonb(c["jev"]), reason[:300], c["id"]))
+                from agent_memory import production_feedback as PF
+                sha = current_target_sha(c)
+                bound = {**c, 'rule_key': (c.get('meta') or {}).get('last_tested_rule_key') or c.get('rule_key')}
+                observations = PF.for_candidate(self.conn, bound, sha)
+                reopened = (c.get('meta') or {}).get('production_feedback_reopened_generation')
+                valid = next((x for x in observations if x['status']=='ok' and x['metrics'].get('generation')==reopened), None)
+                valid = valid or next((x for x in observations if x['status']=='ok'), None)
+                if valid:
+                    metrics = valid['metrics']
+                    extra = {'production_feedback_generation': metrics['generation'],
+                             'production_feedback_sessions_after': metrics['measurements']['sessions_after']}
+                    self._update_candidate(c['id'], meta=extra)
+                    c['meta'] = {**(c.get('meta') or {}), **extra}
             tests = self._test_cases(c.get("target"))
             self.report["candidates"].append({"id": str(c.get("id")) if c.get("id") else None, "key": c["dedupe_key"],
                                               "source": c["source"], "rank": r, "selected": selected, "reason": reason,
@@ -2232,6 +2288,7 @@ class Night:
         assert self.conn is not None
         cand = {k: c.get(k) for k in ("id", "dedupe_key", "source", "kind", "target", "rule_key", "evidence_refs",
                                       "metrics", "seen_count")}
+        cand['rule_key'] = (c.get('meta') or {}).get('last_tested_rule_key') or cand.get('rule_key')
         cand["id"] = str(c["id"]) if c.get("id") else None
         # S4: a bounded evidence pack (untrusted data; it only reaches the model inside its envelope)
         refs = list(c.get("evidence_refs") or [])[:20]
@@ -2297,34 +2354,53 @@ class Night:
         if not hyps:
             # Counted as an attempt: a candidate that never yields a usable hypothesis retires (it returns as
             # `new` when it is seen again) instead of costing a model call every night.
-            attempts = int(meta.get("attempts") or 0) + 1
+            generation = meta.get('attempt_limit_scope') == 'verified_feedback_generation'
+            attempts = int(meta.get('generation_attempts' if generation else 'attempts') or 0) + 1
             final = attempts >= int(self.cfg.candidates["max_attempts"])
             self._update_candidate(c["id"], status="retired" if final else "deferred",
                                    reason="no valid hypothesis" + (" (retired until seen again)" if final else ""),
-                                   meta={"pending_hypotheses": [], "attempts": attempts})
+                                   meta={"pending_hypotheses": [], "attempts": int(meta.get('attempts') or 0)+1,
+                                         **({'generation_attempts':attempts} if generation else {})})
             return
         for i, h in enumerate(hyps):
             later = hyps[i + 1:]
             # One experiment per candidate per night. Triage gave each selected candidate one of tonight's slots, so
             # a candidate's second hypothesis never takes another candidate's slot; it stays pending (stored by
             # _experiment) and runs on a later night without a new model call.
-            if i > 0 or self.budget.experiments_left() <= 0:
-                self.report["experiments"].append(self._entry(None, c, h, refs, status="skipped_budget"))
+            if i > 0:
+                self.report["experiments"].append(self._skipped_entry(
+                    c, h, refs, policy="one_experiment_per_candidate"))
+                continue
+            if self.budget.experiments_left() <= 0:
+                self.report["experiments"].append(self._skipped_entry(c, h, refs, resource="experiments"))
                 continue
             try:
                 self.budget.take_experiment()
-            except BudgetExhausted:
+            except BudgetExhausted as exc:
                 for x in hyps[i:]:
-                    self.report["experiments"].append(self._entry(None, c, x, refs, status="skipped_budget"))
-                self._update_candidate(c["id"], status="deferred", reason="budget",
+                    self.report["experiments"].append(self._skipped_entry(c, x, refs, resource=exc.kind,
+                                                                          detail=str(exc)))
+                self._update_candidate(c["id"], status="deferred", reason=f"budget:{exc.kind}",
                                        meta={"pending_hypotheses": [x.as_dict() for x in hyps[i:]]})
                 raise
             try:
                 self._experiment(c, h, refs, later)
-            except BudgetExhausted:
+            except BudgetExhausted as exc:
                 for x in later:
-                    self.report["experiments"].append(self._entry(None, c, x, refs, status="skipped_budget"))
+                    self.report["experiments"].append(self._skipped_entry(c, x, refs, resource=exc.kind,
+                                                                          detail=str(exc)))
                 raise
+
+    def _skipped_entry(self, c: Mapping[str, Any], h: Hypothesis, refs: list[str], *,
+                       policy: str | None = None, resource: str | None = None, detail: str = "") -> dict[str, Any]:
+        """A deferred hypothesis is not an executed experiment or proof that the USD budget ran out."""
+        entry = self._entry(None, c, h, refs, status="deferred_policy" if policy else "skipped_budget")
+        reason = policy or f"budget:{resource or 'unknown'}"
+        entry.update(skip_reason=reason, budget_decision={**self.budget.snapshot(resource=resource),
+                                                        "decision": "deferred" if policy else "refused",
+                                                        "policy": policy, "detail": detail[:300]})
+        entry["verdict_reasons"] = [reason]
+        return entry
 
     def _update_candidate(self, cid: Any, *, status: str | None = None, reason: str | None = None,
                           meta: dict[str, Any] | None = None) -> None:
@@ -2383,6 +2459,17 @@ class Night:
             self.notes.append(f"experiment {exp_id}: attempt identities not recorded ({type(exc).__name__}); "
                               "amem coverage repair-links rebuilds them"[:300])
 
+    def _record_evaluations(self, exp_id: str, adir: Path, intended: bool) -> None:
+        from agent_memory import replay_evidence
+        assert self.conn is not None
+        try:
+            with self.conn.transaction():
+                result = replay_evidence.register_evaluations(self.conn, adir, exp_id)
+                self.conn.execute("update rsi_experiments set meta=meta || %s where id=%s",
+                                  (Jsonb({'replay_ingestion': result, 'intended_intervention': intended}), exp_id))
+        except (OSError, ValueError, psycopg.Error, RA.ArtifactError) as exc:
+            self.notes.append(f"experiment {exp_id}: replay evaluation evidence not ingested ({type(exc).__name__})"[:300])
+
     def _experiment(self, c: dict[str, Any], h: Hypothesis, refs: list[str], later: list[Hypothesis]) -> None:
         assert self.conn is not None
         exp_id = self._exp_id(c["dedupe_key"])
@@ -2394,7 +2481,9 @@ class Night:
         self.conn.execute("insert into rsi_experiments (id, night, kind, hypothesis, status, meta) "
                           "values (%s, %s, 'edit_instruction', %s, 'running', %s)",
                           (exp_id, self.night, Jsonb(h.as_dict()), Jsonb(base_meta)))
-        attempts = int((c.get("meta") or {}).get("attempts") or 0) + 1
+        previous_total = int((c.get("meta") or {}).get("attempts") or 0)
+        generation = (c.get("meta") or {}).get('attempt_limit_scope') == 'verified_feedback_generation'
+        attempts = int((c.get("meta") or {}).get('generation_attempts' if generation else 'attempts') or 0) + 1
         pending = [x.as_dict() for x in later]
         row: dict[str, Any] = {"status": "failed", "verdict": None, "meta": {}}
         cand_status, cand_reason = "deferred", "experiment failed"
@@ -2446,7 +2535,23 @@ class Night:
                                              budget=self.budget)
             self._record_attempts(exp_id, rr)
             verdict = rr.verdict if rr.verdict in VERDICTS else "INCONCLUSIVE"
-            entry.update(verdict=verdict, verdict_reasons=rr.reasons[:20],
+            reasons = list(rr.reasons)
+            intended = impl.implementer != "stub-fallback"
+            # A fallback tests other bytes than the hypothesizer asked the writer to produce. It can inform
+            # diagnostics, but an improving fallback is not evidence for that intended intervention.
+            replay_verdict = verdict
+            if not intended:
+                verdict = "INCONCLUSIVE"
+                reasons = ["fallback_intervention:not_the_intended_writer_change", *reasons]
+            entry["implementation"].update(intended_intervention=intended, replay_verdict=replay_verdict)
+            self._record_evaluations(exp_id, Path(st.artifact_dir or RA.artifacts_dir()/st.artifact_hash), intended)
+            tested = {'last_tested_instruction_sha256': hashlib.sha256(old.encode()).hexdigest()}
+            if impl.section_id:
+                tested['last_tested_rule_key'] = (str(c.get('rule_key') or c.get('dedupe_key'))+':'+impl.section_id
+                    if c.get('source')=='skill_scores' else str(c.get('rule_key') or '').removeprefix('dev:'))
+            self._update_candidate(c['id'], meta=tested)
+            c['meta'] = {**(c.get('meta') or {}), **tested}
+            entry.update(verdict=verdict, verdict_reasons=reasons[:20],
                          arms={"A": dict(rr.arms.get("A") or {}), "B": dict(rr.arms.get("B") or {})},
                          judge=_summary(getattr(rr, "judge", None), JUDGE_KEYS),
                          jev=_summary(getattr(rr, "jev", None), JEV_KEYS))
@@ -2454,10 +2559,11 @@ class Night:
             views = report_provider_results(rr.provider_results)
             entry.update(test_setup=rr.setup, relevance=rr.relevance, judge_pairs=pairs, provider_results=views)
             row = {"status": "evaluated", "verdict": verdict,
-                   "meta": {"verdict_reasons": rr.reasons[:20], "arms": entry["arms"], "eval_path": rr.eval_path,
+                   "meta": {"verdict_reasons": reasons[:20], "arms": entry["arms"], "eval_path": rr.eval_path,
                             "replay_runs": rr.runs, "budget_stop": rr.budget_stop, "judge": entry["judge"],
                             "jev": entry["jev"], "test_setup": rr.setup, "relevance": rr.relevance,
-                            "judge_pairs": pairs, "provider_results": views}}
+                            "judge_pairs": pairs, "provider_results": views,
+                            "intended_intervention": intended, "replay_verdict": replay_verdict}}
             if rr.budget_stop:
                 entry["status"] = "skipped_budget"
                 cand_status, cand_reason = "deferred", f"replay stopped by the budget ({rr.budget_stop})"
@@ -2485,6 +2591,9 @@ class Night:
             raise
         except BudgetExhausted as exc:
             entry["status"] = "skipped_budget"
+            entry.update(skip_reason=f"budget:{exc.kind}",
+                         budget_decision={**self.budget.snapshot(resource=exc.kind),
+                                          "decision": "stopped", "detail": str(exc)[:300]})
             if row["status"] != "evaluated":
                 row = {**row, "status": "aborted"}
             row["meta"] = {**row["meta"], "reason": f"budget: {exc.kind}"}
@@ -2514,10 +2623,12 @@ class Night:
             counted = attempts - 1 if stopped else attempts
             if stopped:
                 pending = [h.as_dict()] + pending
+            total = previous_total + (0 if stopped else 1)
+            generation_fields = {'generation_attempts': counted} if generation else {}
             self._update_candidate(c["id"], status=cand_status, reason=cand_reason,
-                                   meta={"attempts": counted, "history": hist, "pending_hypotheses": pending,
+                                   meta={"attempts": total, **generation_fields, "history": hist, "pending_hypotheses": pending,
                                          "last_experiment": exp_id})
-            c["meta"] = {**(c.get("meta") or {}), "attempts": counted, "history": hist}
+            c["meta"] = {**(c.get("meta") or {}), "attempts": total, **generation_fields, "history": hist}
 
     # -- unwinding, S9, the report ----------------------------------------------------------------------
     def _reap_tonight(self) -> None:
@@ -2961,7 +3072,10 @@ def cli(args: argparse.Namespace) -> int:
         print(f"rsi night {rep['night']}: {rep['status']}"
               f"{' (dry run, nothing written)' if args.dry_run else ''}; delta sessions={rep['delta']['sessions']} "
               f"deviations={rep['delta']['deviations']}; candidates={len(rep['candidates'])} "
-              f"selected={sum(c['selected'] for c in rep['candidates'])}; experiments={len(rep['experiments'])} "
+              f"selected={sum(c['selected'] for c in rep['candidates'])}; "
+              f"experiments={sum(bool(e.get('experiment_id')) for e in rep['experiments'])} "
+              f"hypothesis_entries={len(rep['experiments'])} "
+              f"policy_deferred={sum(e['status'] == 'deferred_policy' for e in rep['experiments'])} "
               f"staged={len(staged)}; checkpoint {'advanced' if rep['checkpoint']['advanced'] else 'not advanced'}; "
               f"cost ${rep['costs'].get('total_usd', 0):.2f}" + (f"; {rep['notes'][-1]}" if rep.get("notes") else ""))
     return EXIT.get(rep["status"], 1)

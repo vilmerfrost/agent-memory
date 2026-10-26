@@ -4,9 +4,10 @@
 `<parent-dir>/<repo>/tasks.jsonl`. Each worker's checkpoint file is
 `<parent-dir>/<repo>/checkpoints/<worker name>.md`. Both are read only.
 
-One `runs` row per task:
+One `runs` row per explicit execution attempt:
 
-- routine = source = `dispatch`, source_key = `dispatch:<task id>`.
+- routine = source = `dispatch`; namespaced canonical source_key for new rows.
+  Exact matching legacy rows keep `dispatch:<task id>` and their UUID.
 - status: DONE -> pass, PARTIAL and BLOCKED -> fail, anything else (or none)
   -> error with the raw word in `meta.raw_status`.
 - started_at / finished_at = `started` / `ended`; summary = one deterministic
@@ -29,7 +30,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -52,14 +53,16 @@ SECTION_KEYS = ("Decisions", "Denied", "Open")
 TASK_INTS = ("duration_s", "tokens", "follow_ups", "nudges", "denials", "escalations",
              "merge_conflicts", "clarifying_questions", "n_workers")
 TASK_BOOLS = ("dod_first_pass", "integration_first_pass")
-TASK_STRS = ("session", "parent_model", "parent_effort")
+TASK_STRS = ("session", "parent_model", "parent_effort", "retry_of", "resumed_from", "parent_span_id")
 
-WORKER_STRS = ("name", "agent_id", "model", "effort", "final_status", "first_status")
+WORKER_STRS = ("name", "agent_id", "model", "effort", "final_status", "first_status", "spawn_id",
+               "spawned", "first_handback", "last_handback", "completed_at", "parent_span_id",
+               "retry_of", "resumed_from", "repo")
 WORKER_INTS = ("denials", "tool_errors", "repeat_cmds", "fg_sleeps", "tokens", "duration_s",
-               "handbacks", "nudges", "follow_ups", "open_questions")
+               "handbacks", "nudges", "follow_ups", "open_questions", "info_pushes")
 WORKER_BOOLS = ("lessons_read_first",)
 WORKER_LISTS = ("brief_gaps", "reasons")
-WORKER_DICTS = ("denied_shapes", "errors")
+WORKER_DICTS = ("denied_shapes", "errors", "denials_by")
 
 _WS_RE = re.compile(r"\s+")
 _SAFE_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._ -]{0,127}")
@@ -85,7 +88,7 @@ class TasksParse:
     runs: list[TaskRun] = field(default_factory=list)
     unparsed: list[tuple[Path, int]] = field(default_factory=list)  # (file, 1-based line)
     files: list[Path] = field(default_factory=list)  # tasks.jsonl files read (one per repo)
-    duplicates: int = 0  # earlier lines whose task id appears again (the last line wins)
+    duplicates: int = 0  # repeated observations of one exact attempt (all states retained)
     incomplete: list[Path] = field(default_factory=list)  # files whose unterminated last line was skipped
 
     @property
@@ -238,6 +241,11 @@ def compact_worker(raw: dict[str, Any], repo_dir: Path) -> dict[str, Any]:
         w[k] = _list(raw.get(k))
     for k in WORKER_DICTS:
         w[k] = _dict(raw.get(k))
+    for target, source in (("spawned_at", "spawned"), ("reported_at", "last_handback"),
+                           ("completed_at", "completed_at")):
+        at = parse_ts(raw.get(target)) or parse_ts(raw.get(source))
+        w[target] = at.astimezone(UTC).isoformat() if at else None
+    w["span_ids"] = _list(raw.get("span_ids"))
     w["checkpoint_excerpt"] = read_excerpt(repo_dir, w["name"])
     return w
 
@@ -264,6 +272,54 @@ def summary_line(repo: str, final_status: str | None, task: dict[str, Any],
 def _content_sha(fields: dict[str, Any]) -> str:
     canonical = json.dumps(fields, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _identity(obj: dict[str, Any], repo: str, repo_dir: Path, task_id: str) -> dict[str, Any]:
+    """Exact source identifiers only. A source-path namespace is explicit local
+    provenance when the producer supplies no stable machine identity."""
+    producer = _str(obj.get("producer_id")) or _str(obj.get("producer"))
+    if producer is None:
+        producer = "source:" + hashlib.sha256(str(repo_dir.parent.resolve()).encode()).hexdigest()[:20]
+        authority = "local-source-path"
+    else:
+        authority = "producer-declared"
+    logical = _str(obj.get("logical_task_id")) or task_id
+    attempt = _str(obj.get("attempt_id"))
+    if attempt is not None:
+        basis, parts = "explicit-attempt", [attempt]
+    elif _str(obj.get("session")) or _str(obj.get("started")):
+        # These are source-provided execution boundaries, never proximity matches.
+        basis, parts = "source-execution", [_str(obj.get("session")), _str(obj.get("started"))]
+        attempt = _content_sha({"session": parts[0], "started": parts[1]})[:24]
+    else:
+        basis, parts, attempt = "unresolved", [task_id], "unresolved"
+    key = _content_sha({"producer": producer, "repo": repo, "task": logical, "attempt": parts})
+    return {"task_contract": "task-attempt/2", "producer_id": producer,
+            "namespace_authority": authority, "logical_task_id": logical,
+            "attempt_id": attempt, "attempt_identity_basis": basis,
+            "canonical_source_key": "dispatch:v2:" + key,
+            "legacy_source_key": KEY_PREFIX + task_id}
+
+
+def _observation_key(r: TaskRun) -> tuple[str, int, str]:
+    at = r.meta.get("source_observed_at") or ""
+    # If no later source timestamp exists, retain a conclusive DONE update over
+    # PARTIAL. This orders observations; it does not manufacture task acceptance.
+    rank = {"pass": 2, "fail": 1, "error": 0}.get(r.status, 0)
+    return at, rank, str(r.meta.get("source_record_sha") or "")
+
+
+def merge_observations(a: TaskRun, b: TaskRun) -> TaskRun:
+    """Keep all source observations, one current projection per exact attempt.
+    Source timestamps, not ingestion order, determine the projection. Unknown
+    chronology remains explicit; exact retry/attempt identities are separate rows.
+    """
+    latest = b if _observation_key(b) >= _observation_key(a) else a
+    meta = {**latest.meta, "observations": {**a.meta.get("observations", {}), **b.meta.get("observations", {})}}
+    meta["content_sha256"] = _content_sha({"status": latest.status, "started_at": latest.started_at,
+        "finished_at": latest.finished_at, "summary": latest.summary,
+        "failure_reason": latest.failure_reason, "meta": {k:v for k,v in meta.items() if k != "content_sha256"}})
+    return replace(latest, meta=meta)
 
 
 def task_run(obj: Any, repo_dir: Path, path: Path, line_no: int) -> TaskRun | None:
@@ -294,6 +350,21 @@ def task_run(obj: Any, repo_dir: Path, path: Path, line_no: int) -> TaskRun | No
     meta["blocked_partial_reasons"] = reasons
     meta["workers"] = workers
     meta["log_source"] = LOG_SOURCE
+    meta.update(_identity(obj, repo, repo_dir, task_id))
+    meta["reported_result"] = final_status
+    meta["acceptance"] = "unknown"
+    observed = parse_ts(obj.get("recorded")) or parse_ts(obj.get("ended")) or parse_ts(obj.get("started"))
+    meta['observation_time_basis'] = ('recorded' if parse_ts(obj.get('recorded')) else
+                                     'ended_proxy' if parse_ts(obj.get('ended')) else
+                                     'started_proxy' if parse_ts(obj.get('started')) else 'unknown')
+    meta['projection_policy'] = 'source_time_then_status_priority_not_acceptance'
+    meta["source_observed_at"] = observed.astimezone(UTC).isoformat() if observed else None
+    meta["source_record_sha"] = _content_sha(obj)
+    meta["observations"] = {meta["source_record_sha"]: {
+        "reported_result": final_status, "status": status,
+        "observed_at": meta["source_observed_at"],
+        "time_basis": meta['observation_time_basis'],
+        "worker_results": [{k:w.get(k) for k in (*WORKER_STRS,'spawned_at','reported_at','span_ids')} for w in workers]}}
 
     started, finished = parse_ts(obj.get("started")), parse_ts(obj.get("ended"))
     summary = summary_line(repo, final_status, meta, workers, reasons)
@@ -302,7 +373,7 @@ def task_run(obj: Any, repo_dir: Path, path: Path, line_no: int) -> TaskRun | No
         "status": status, "started_at": started, "finished_at": finished,
         "summary": summary, "failure_reason": failure_reason, "meta": meta,
     })
-    return TaskRun(KEY_PREFIX + task_id, status, started, finished, summary, failure_reason,
+    return TaskRun(meta["canonical_source_key"], status, started, finished, summary, failure_reason,
                    meta, path, line_no)
 
 
@@ -343,7 +414,7 @@ def parse_file(path: Path, result: TasksParse) -> None:
 
 
 def parse_parent(parent_dir: Path) -> TasksParse:
-    """Every repo's tasks.jsonl. A task id seen twice keeps its last line."""
+    """Every repo's tasks.jsonl, preserving exact attempts and their observations."""
     result = TasksParse()
     for path in discover(parent_dir):
         result.files.append(path)
@@ -352,7 +423,8 @@ def parse_parent(parent_dir: Path) -> TasksParse:
     for run in result.runs:
         if run.source_key in by_key:
             result.duplicates += 1
-            del by_key[run.source_key]  # re-insert so the order follows the last line
+            run = merge_observations(by_key[run.source_key], run)
+            del by_key[run.source_key]
         by_key[run.source_key] = run
     result.runs = list(by_key.values())
     return result
@@ -380,7 +452,39 @@ def ingest(runs: list[TaskRun], *, db_url: str | None = None) -> IngestReport:
     """Upsert task rows keyed by source_key, in one transaction (Postgres only)."""
     report = IngestReport()
     with store.connect(db_url) as conn:
+        # Serialize the one dispatch collector transaction, including the first
+        # insert (a missing row cannot be SELECT FOR UPDATE locked). This avoids
+        # concurrent daily/ingest runs dropping each other's observation maps.
+        conn.execute("select pg_advisory_xact_lock(hashtextextended('amem:dispatch-ingest/v2',0))")
         for r in runs:
+            # Lock the current attempt, including an exact matching legacy row.
+            # Keep a legacy run's UUID/source key so scores/labels/refs remain valid.
+            legacy = r.meta["legacy_source_key"]
+            found = conn.execute("select source_key,status,started_at,finished_at,summary,failure_reason,meta "
+                                 "from runs where source_key = any(%s) for update", ([r.source_key, legacy],)).fetchall()
+            current = next((row for row in found if row[0] == r.source_key), None)
+            if current is None:
+                current = next((row for row in found if row[0] == legacy and row[6].get("repo") == r.meta["repo"]
+                                and row[6].get("task_id") == r.meta["task_id"]
+                                and row[6].get("session") == r.meta.get("session")
+                                and (not row[6].get("canonical_source_key")
+                                     or row[6]["canonical_source_key"] == r.source_key)
+                                and row[2] == r.started_at), None)
+            if current:
+                old = TaskRun(current[0], current[1], current[2], current[3], current[4], current[5],
+                              dict(current[6]), r.path, r.line_no)
+                merged = merge_observations(old, r)
+                # Unknown metadata from existing consumers is retained, but never
+                # used to decide whether source observations changed.
+                meta = {**old.meta, **merged.meta}
+                same = (old.status,old.started_at,old.finished_at,old.summary,old.failure_reason,
+                        {k:v for k,v in old.meta.items() if k != "content_sha256"}) == (
+                        merged.status,merged.started_at,merged.finished_at,merged.summary,merged.failure_reason,
+                        {k:v for k,v in meta.items() if k != "content_sha256"})
+                if same:
+                    report.unchanged += 1
+                    continue
+                r = replace(merged, source_key=current[0], meta=meta)
             got = conn.execute(
                 _UPSERT_SQL,
                 (ROUTINE, SOURCE, r.started_at, r.finished_at, r.status, r.summary,
