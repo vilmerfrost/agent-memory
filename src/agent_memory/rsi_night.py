@@ -135,6 +135,8 @@ class NightConfig:
     staging: dict[str, Any]
     path: str
     sha256: str
+    # The skill_refresh prerequisite (skill_refresh.py): `mode` report | enforce, `max_lag_h` (default 2).
+    skill_refresh: tuple[str, float] = ("report", 2.0)
 
 
 _STAGE_MODES = {"triage": ("fixture", "live"), "hypothesizer": ("fixture", "claude-cli"),
@@ -188,10 +190,15 @@ def load_config(path: Path | None = None) -> NightConfig:
             raise ConfigError(f"{p}: {name} must be an object")
         return {k: x for k, x in v.items() if not k.startswith("_")}
 
+    from agent_memory import skill_refresh as SR
+    try:
+        skill_refresh = SR.settings(section("skill_refresh"))
+    except ValueError as exc:
+        raise ConfigError(f"{p}: {exc}") from None
     result = NightConfig(budget=budget, stages=stages, candidates=cands, weights=weights, min_rank=float(min_rank),
                          hypothesizer=section("hypothesizer"), implementer=section("implementer"),
                          replay=section("replay"), staging=section("staging"), path=str(p),
-                         sha256=hashlib.sha256(raw).hexdigest())
+                         sha256=hashlib.sha256(raw).hexdigest(), skill_refresh=skill_refresh)
     from agent_memory.rsi_subscription_config import validate_role
     roles = [("claude", result.hypothesizer, "") ] if stages["hypothesizer"] == "claude-cli" else []
     if stages["implementer"] == "writer":
@@ -586,6 +593,7 @@ class ReplayOutcome:
     relevance: dict[str, Any] = field(default_factory=dict)
     judge_pairs: list[dict[str, Any]] = field(default_factory=list)
     provider_results: list[dict[str, Any]] = field(default_factory=list)
+    attempts: list[dict[str, Any]] = field(default_factory=list)   # attempt identities (attempt_links.runner_identity)
 
 
 JUDGE_KEYS = ("mode", "judged", "wins_a", "wins_b", "ties", "unfired_b", "errors", "b_winrate")
@@ -1326,6 +1334,13 @@ class ImproveStager:
         return StageResult("staged", artifact_hash=res["artifact_hash"], artifact_dir=res.get("artifact_dir"))
 
 
+def _attempts(experiment_id: str, runs: Sequence[Any], profile: str | None) -> list[dict[str, Any]]:
+    """The replay's agent runs as attempt identities (R1): what the experiment stage records in rsi_attempts."""
+    from agent_memory import attempt_links
+    return [attempt_links.runner_identity(experiment_id, x, profile) for x in runs
+            if getattr(x, "arm", None) in attempt_links.ATTEMPT_ARMS]
+
+
 class SandboxReplayer:
     """rsi_replay.run_replay (w-replay, contract 2.2), imported lazily. Stub agent in the real Docker sandbox by
     default (no network, no credentials)."""
@@ -1407,7 +1422,8 @@ class SandboxReplayer:
                                     "judge_effort": rc.judge_effort, "judge_auth_mode": rc.judge_auth_mode,
                                     "tasks": [{"id": c.id, "title": c.title or c.id} for c in cases]},
                              relevance=dict(_dget(r, "relevance") or {}),
-                             judge_pairs=list(getattr(_dget(r, "judge"), "pairs", ()) or ()))
+                             judge_pairs=list(getattr(_dget(r, "judge"), "pairs", ()) or ()),
+                             attempts=_attempts(experiment_id, _dget(r, "runs") or [], getattr(rc, "profile", None)))
 
 
 class ApprovalProposer:
@@ -1573,8 +1589,11 @@ def _now_iso() -> str:
 class Night:
     def __init__(self, cfg: NightConfig, adapters: Adapters, *, night: str, db_url: str | None = None,
                  dry_run: bool = False, clock: Callable[[], float] = time.monotonic,
-                 install_signals: bool = True, prerequisite_warnings: Sequence[str] = ()) -> None:
+                 install_signals: bool = True, prerequisite_warnings: Sequence[str] = (),
+                 routines_log: Path | None = None) -> None:
         self.cfg, self.ad, self.night, self.db_url, self.dry_run = cfg, adapters, night, db_url, dry_run
+        self.routines_log = routines_log           # the skill_refresh prerequisite's fallback source
+        self.skill_refresh: Any = None             # skill_refresh.Check, set in S1 before any sighting
         self.budget = Budget(cfg.budget, clock=clock)
         self.install_signals = install_signals
         self.conn: psycopg.Connection | None = None
@@ -1764,6 +1783,20 @@ class Night:
             (JOB, self.night)).fetchone()
         return row[0] if row else None
 
+    def _check_skill_refresh(self, night_window_end: datetime) -> None:
+        """The skill_refresh prerequisite (skill_refresh.py, data-use plan R2): did a successful score refresh cover
+        skill calls up to tonight's window end? Recorded in report.prerequisites.skill_refresh. When the decision is
+        skip_skill_candidates (failed or missing; stale in enforce mode), _skill_sightings and _pool leave out
+        skill candidates only; every other candidate continues."""
+        from agent_memory import skill_refresh as SR
+        mode, lag = self.cfg.skill_refresh
+        self.skill_refresh = SR.check(self.conn, night_window_end=night_window_end, mode=mode, max_lag_h=lag,
+                                      log=self.routines_log)
+        self.report.setdefault("prerequisites", {})["skill_refresh"] = self.skill_refresh.as_report()
+
+    def _skip_skill_candidates(self) -> bool:
+        return self.skill_refresh is not None and self.skill_refresh.skip
+
     def _collect(self) -> None:
         assert self.conn is not None
         self._poll()
@@ -1788,6 +1821,7 @@ class Night:
         counts = counts() if callable(counts) else {}
         self.report["delta"] = {"since": since, **{k: int(counts.get(k, len(_dget(delta, k) or [])))
                                                    for k in ("sessions", "deviations", "eval_failures", "routine_failures")}}
+        self._check_skill_refresh(_parse_ts(_dget(delta, "until")) or datetime.now(UTC))
         self._poll()
         sightings = self._sightings(delta)
         self.report["patterns"] = [self._pattern(s) for s in sightings if s.pattern][:20]
@@ -1913,6 +1947,9 @@ class Night:
                         "and score < %s and refreshed_at > %s order by score, skill limit 20",
                         (int(c["skill_min_scored"]), float(c["skill_score_below"]), since))
             rows = cur.fetchall()
+        if self._skip_skill_candidates():      # the skill_refresh prerequisite failed: no skill candidate tonight
+            self.skill_refresh.skipped.update(f"skill:{r['skill']}" for r in rows)
+            return []
         out = []
         for r in rows:
             target = f"~/.agents/skills/{r['skill']}/SKILL.md"
@@ -2039,6 +2076,9 @@ class Night:
                                  "target": s.target, "rule_key": s.rule_key, "evidence_refs": s.evidence_refs,
                                  "metrics": s.metrics, "seen_count": 1, "status": "new", "meta": {}, "rank": None})
             pool.sort(key=lambda c: (c.get("rank") is not None, -(c.get("rank") or 0.0), -recurrence(c)))
+        if self._skip_skill_candidates():      # earlier nights' skill candidates wait too (skill_refresh)
+            self.skill_refresh.skipped.update(c["dedupe_key"] for c in pool if c.get("source") == "skill_scores")
+            pool = [c for c in pool if c.get("source") != "skill_scores"]
         # A candidate whose file no replay case uses can only end INCONCLUSIVE: covered candidates take the triage
         # slots first. Up to `limit` uncovered ones are still listed (no triage call) so the report says why.
         covered = [c for c in pool if self._test_cases(c.get("target"))]
@@ -2256,6 +2296,21 @@ class Night:
         if impl.fallback_reason and line not in self.notes:
             self.notes.append(line)
 
+    def _record_attempts(self, exp_id: str, rr: ReplayOutcome) -> None:
+        """R1: each attempt's canonical identity goes to rsi_attempts when it ran (source runner). A failed write is a
+        note, never a failed experiment: `amem coverage repair-links` can rebuild it from the run records."""
+        attempts = [a for a in (getattr(rr, "attempts", None) or []) if a.get("experiment_id") == exp_id]
+        if not attempts:
+            return
+        from agent_memory import attempt_links
+        assert self.conn is not None
+        try:
+            with self.conn.transaction():
+                attempt_links.record_runner(self.conn, attempts)
+        except (psycopg.Error, ValueError) as exc:
+            self.notes.append(f"experiment {exp_id}: attempt identities not recorded ({type(exc).__name__}); "
+                              "amem coverage repair-links rebuilds them"[:300])
+
     def _experiment(self, c: dict[str, Any], h: Hypothesis, refs: list[str], later: list[Hypothesis]) -> None:
         assert self.conn is not None
         exp_id = self._exp_id(c["dedupe_key"])
@@ -2317,6 +2372,7 @@ class Night:
             with self._interruptible():
                 rr = self.ad.replayer.replay(artifact_hash=st.artifact_hash, experiment_id=exp_id, baseline_id=bid,
                                              budget=self.budget)
+            self._record_attempts(exp_id, rr)
             verdict = rr.verdict if rr.verdict in VERDICTS else "INCONCLUSIVE"
             entry.update(verdict=verdict, verdict_reasons=rr.reasons[:20],
                          arms={"A": dict(rr.arms.get("A") or {}), "B": dict(rr.arms.get("B") or {})},
@@ -2480,6 +2536,8 @@ class Night:
                 reasons[k] = [f"{where}: {v}, no step detail"]
         if reasons:
             r["health_reasons"] = reasons
+        if self.skill_refresh is not None:       # final: the skipped skill candidates are known only after S2
+            r.setdefault("prerequisites", {})["skill_refresh"] = self.skill_refresh.as_report()
         ws = self._writer_summary()
         notes = list(self.notes)
         if ws is not None:
@@ -2529,10 +2587,12 @@ def _prereq_warnings(warnings: Sequence[str]) -> list[str]:
 def run_night(*, night: str | None = None, config_path: Path | None = None, dry_run: bool = False,
               db_url: str | None = None, adapters: Adapters | None = None,
               clock: Callable[[], float] = time.monotonic, install_signals: bool = True,
-              prerequisite_warnings: Sequence[str] = ()) -> dict[str, Any]:
+              prerequisite_warnings: Sequence[str] = (), routines_log: Path | None = None) -> dict[str, Any]:
     """One night. Returns the report (rsi-night/1); writes it to $RSI_SANDBOX_DIR/nights/<night>/report.json
     unless dry_run (then nothing is written: no lock, no rows, no report file). `prerequisite_warnings` (the night
-    job's gate: failed prerequisite steps the night does not read) go into the report as they are."""
+    job's gate: failed prerequisite steps the night does not read) go into the report as they are. `routines_log`:
+    the skill_refresh prerequisite's fallback when its database read fails (default: AMEM_ROUTINES_LOG or
+    ~/.claude/parent/routines.log)."""
     night = night or AP.night_key()
     try:
         cfg = load_config(config_path)
@@ -2547,7 +2607,8 @@ def run_night(*, night: str | None = None, config_path: Path | None = None, dry_
             rep["prerequisite_warnings"] = _prereq_warnings(prerequisite_warnings)
         return rep
     return Night(cfg, adapters or default_adapters(cfg, db_url), night=night, db_url=db_url, dry_run=dry_run,
-                 clock=clock, install_signals=install_signals, prerequisite_warnings=prerequisite_warnings).run()
+                 clock=clock, install_signals=install_signals, prerequisite_warnings=prerequisite_warnings,
+                 routines_log=routines_log).run()
 
 
 # =========================================================================== the contract check
@@ -2581,7 +2642,8 @@ def validate_report(obj: Any) -> list[str]:
                "health_reasons",                               # optional: provider -> why it was not ok
                "budget",                                       # optional: the budget caps (_finish, since 1df19d2)
                "blocked",                                      # optional: ideas no experiment can use (2026-10-25)
-               "writer"}                                       # optional: the section writer's tally (2026-10-26)
+               "writer",                                       # optional: the section writer's tally (2026-10-26)
+               "prerequisites"}                                # optional: the night's own prerequisite checks (R2)
     errs += [f"unknown key {k}" for k in sorted(set(obj) - allowed)]
     if obj.get("format") != FORMAT:
         errs.append("format is not rsi-night/1")
@@ -2739,6 +2801,13 @@ def validate_report(obj: Any) -> list[str]:
         errs += _blocked_problems(obj["blocked"])
     if "writer" in obj:
         errs += _writer_problems(obj["writer"])
+    if "prerequisites" in obj:
+        pr = obj["prerequisites"]
+        if not isinstance(pr, dict) or set(pr) - {"skill_refresh"}:
+            errs.append("prerequisites must be an object with skill_refresh only")
+        elif "skill_refresh" in pr:
+            from agent_memory import skill_refresh as SR
+            errs += SR.report_problems(pr["skill_refresh"])
     return errs
 
 

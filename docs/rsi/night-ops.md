@@ -75,6 +75,52 @@ The rules live in `schedule.prerequisites` of the night config. Each entry: `rou
 routine: `DAILY_NONBLOCKING_STEPS` for amem-daily, none for the others; `[]` restores the strict rule "any FAIL
 blocks"). Configs without the key keep working unchanged.
 
+### The skill_refresh prerequisite (data-use plan R2, 2026-10-26)
+
+Skill candidates come from `skill_scores`. The night must know which score refresh it read and how far that
+refresh's input reached. It checks the **recorded run and its input window**, never a schedule time or a file
+time (`src/agent_memory/skill_refresh.py`).
+
+- **Recorded run.** `amem skills scores --refresh` writes one `rsi_checkpoints` row: job `skills-refresh`,
+  run_key = the run id (`sr-<UTC>-<hex>`), status `running`, then `done` in the same transaction as the scores (or
+  `failed` with the error). meta: `window_start` (earliest skill call scored), `window_end` (the last complete read
+  of the skill log, recorded by `amem ingest skills` as job `skills-ingest`/`latest`; without that record, the
+  newest `skill_calls.created_at`), `scored`, `calls`, `matched`, `basis`. Its last stdout line is the contract the
+  agent-config wrapper copies into its routines.log `rsi-skills` line:
+  `skills-refresh run=<id> window_start=<ISO|-> window_end=<ISO|-> status=<ok|failed> scored=<n>`.
+- **Check.** In S1, right after the delta and before any candidate is sighted. The night's window end is the delta's
+  `until`. Fresh = the latest successful refresh has `window_end >= until - max_lag_h`.
+- **Tolerance.** `max_lag_h` defaults to 2 h. A refresh inside the 00:40 amem-daily chain (R7) passes, even when
+  amem-daily runs long and the night starts late. The old 03:30 refresh, about 22 h before the next night's window
+  end, never passes.
+- **Policy.**
+
+| Status | Meaning | Decision |
+|---|---|---|
+| `fresh` | a successful refresh covers the window (within the tolerance) | `use` |
+| `stale` | the latest success ends too early, or recorded no window | `report` mode (default): `warn`, skill candidates are still considered. `enforce` mode: `skip_skill_candidates` |
+| `failed` | the latest refresh failed or never finished, and no success is fresh | `skip_skill_candidates` (every mode) |
+| `missing` | no refresh is recorded | `skip_skill_candidates` (every mode) |
+
+  `skip_skill_candidates` leaves out tonight's skill sightings and earlier nights' open `skill_scores` candidates.
+  Deviation, routine and finding candidates continue (the existing dependency policy: skip only what needs the
+  prerequisite).
+- **Mode.** The night config's `skill_refresh` object: `{"mode": "report" | "enforce", "max_lag_h": 2}`; env
+  `AMEM_SKILL_REFRESH_MODE` overrides the mode. The default stays **`report`** until the refresh runs before the
+  night (the R7 schedule change). With today's 03:30 refresh every night is stale, so `enforce` would skip every
+  skill candidate. Switch to `enforce` after the schedule change has run for a night.
+- **Source.** The database rows. Only when that read fails, the night reads routines.log `rsi-skills` lines (their
+  `run=`, `window_start=`, `window_end=` fields, or `window=<from>..<to>`). A line without a window has an unknown
+  window: stale, never fresh.
+- **Record.** The report's `prerequisites.skill_refresh`: `run`, `window_start`, `window_end`, `status`,
+  `run_status`, `mode`, `decision`, `night_window_end`, `required_end`, `max_lag_h`, `source`, `reason`,
+  `skipped_candidates`, `skipped_keys`. It is additive and optional (format stays `rsi-night/1`; a night that fails
+  before S1 has no such field). The night job's line carries `skill_refresh=<status> skill_refresh_run=<id>`. The
+  brief turns a stale, failed or missing refresh into a `- Warning: prerequisite skill_refresh ...` line. The
+  report's own `prerequisite_warnings` stays the gate's list.
+- **First night after deploy.** No refresh is recorded yet, so that night is `missing` and skips skill candidates,
+  unless a recorded `amem skills scores --refresh` runs after the deploy.
+
 ## What the night job guarantees
 
 | Requirement (brief, phase E) | How |
