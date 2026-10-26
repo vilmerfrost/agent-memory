@@ -183,11 +183,16 @@ FAMILIES: tuple[Family, ...] = (
         key="deviations",
         title="Instruction sources and deviations",
         purpose="Assess adherence against the correct instructions",
-        producers=("amem deviations scan (amem daily step_deviations)", "amem deviations reref"),
+        producers=("amem deviations scan (amem daily step_deviations)", "amem deviations reref",
+                   "sessions_ingest (instruction_sources capture: authority, version, texts)",
+                   "amem sessions instruction-sources --apply (historical backfill, bounded and resumable)"),
         owner_job=DAILY,
-        tables=("deviations",),
-        columns=("sessions.instructions", "sessions.skills"),
+        tables=("deviations", "instruction_texts"),
+        columns=("sessions.instructions", "sessions.skills", "sessions.instruction_sources",
+                 "deviations.instruction_authority"),
         local=("instruction files read by rule_catalog (CLAUDE.md, AGENTS.md, skills) at scan time",
+               "~/.claude/plugins/installed_plugins.json (plugin skill resolution, read only)",
+               "git history of tracked instruction files (versions in force at a session start)",
                "~/.claude/parent/amem-daily-state.json (pushed ids)"),
         external=("ClickHouse deviations", "past.dev (through proposals/edits)"),
         consumers=(_c(NIGHT, "src/agent_memory/rsi_evidence_pack.py", "analysis"),
@@ -197,9 +202,13 @@ FAMILIES: tuple[Family, ...] = (
                    _c(BRIEF, "src/agent_memory/rsi_brief.py", "report"),
                    _c(SYNC_CH, "src/agent_memory/integrations/clickhouse.py", "export"),
                    _c(NIGHT_DESK, "supabase/migrations/20261024230827_night_desk.sql", "report")),
-        retention="Kept indefinitely. instruction_sha is the scan-time hash; it is not proof of the historical "
-                  "version (plan section 5).",
-        exclusion="The writer's own words only: no transcript quotes, paths, code or secrets.",
+        retention="Kept indefinitely. instruction_sha is the hash of the text graded against: the recorded version "
+                  "when deviations.instruction_authority is observed or reconstructed, today's file when it is "
+                  "unverified (plan section 5). instruction_texts is insert-only and content-addressed.",
+        exclusion="The writer's own words only: no transcript quotes, paths, code or secrets. instruction_texts "
+                  "holds instruction files only (never transcript text), redacted, at most 100 kB each, only from "
+                  "the Claude / Codex homes, agent-config and the session's own repo and ancestor memory files; "
+                  "never env files.",
     ),
     Family(
         key="routine_runs",

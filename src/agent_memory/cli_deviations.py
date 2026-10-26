@@ -1,4 +1,5 @@
-"""`amem sessions ingest|summarize|tokens|cost|find|hosts` and `amem deviations scan|report|reref|rules`
+"""`amem sessions ingest|summarize|tokens|cost|find|hosts|instruction-sources` and
+`amem deviations scan|report|reref|rules`
 (docs/deviations.md, docs/sessions-live.md). `amem sessions ping` is session_live.main (cli.main
 routes it). `sessions summarize` without `--dry-run` needs AMEM_SUMMARY_LIVE=1 (else exit 2).
 
@@ -170,6 +171,25 @@ def cmd_sessions_hosts(args: argparse.Namespace) -> int:
     except (OSError, psycopg.Error) as exc:
         return _err("sessions hosts", exc)
     print(json.dumps(doc, sort_keys=True) if args.json else line)
+    return 0
+
+
+def cmd_sessions_instruction_sources(args: argparse.Namespace) -> int:
+    """Historical backfill of sessions.instruction_sources (docs/data-use/instruction-sources.md):
+    bounded (--limit), resumable (only rows still null), idempotent; dry run unless --apply."""
+    from agent_memory import instruction_sources
+
+    if (code := (_write_guard if args.apply else _read_guard)("sessions instruction-sources")) is not None:
+        return code
+    try:
+        report = instruction_sources.reconcile(apply=args.apply, limit=args.limit, days=args.days)
+    except (OSError, psycopg.Error) as exc:
+        return _err("sessions instruction-sources", exc)
+    if args.json:
+        print(json.dumps(report.to_json(), sort_keys=True))
+    else:
+        for line in report.lines():
+            print(line)
     return 0
 
 
@@ -384,6 +404,17 @@ def register(sub: Any) -> None:
     p.add_argument("--revert", action="store_true", help="remove every host --apply wrote")
     p.add_argument("--json", action="store_true", help="counts and one row per candidate session")
     p.set_defaults(func=cmd_sessions_hosts)
+
+    p = s_sub.add_parser("instruction-sources",
+                         help="backfill sessions.instruction_sources (authority and version of every instruction "
+                              "file in force) for rows that have none, newest first (docs/data-use/"
+                              "instruction-sources.md); dry run unless --apply")
+    p.add_argument("--apply", action="store_true", help="write the entries (only rows still empty: a rerun changes "
+                                                        "nothing and an interrupted run resumes)")
+    p.add_argument("--limit", type=_positive, default=200, help="sessions per run (default 200)")
+    p.add_argument("--days", type=_positive, default=None, help="only sessions started in the last N days")
+    p.add_argument("--json", action="store_true", help="the counts as one JSON object")
+    p.set_defaults(func=cmd_sessions_instruction_sources)
 
     # Handled in cli.main before parsing (it must exit 0 even for bad arguments).
     s_sub.add_parser("ping", add_help=False,

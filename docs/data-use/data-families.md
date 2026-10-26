@@ -118,12 +118,12 @@ Learning families with no automatic analysis consumer:
 
 - Key: `deviations`
 - Purpose: Assess adherence against the correct instructions
-- Producers: amem deviations scan (amem daily step_deviations); amem deviations reref
+- Producers: amem deviations scan (amem daily step_deviations); amem deviations reref; sessions_ingest (instruction_sources capture: authority, version, texts); amem sessions instruction-sources --apply (historical backfill, bounded and resumable)
 - Owner job: amem-daily (amem daily)
-- Tables: `deviations`
+- Tables: `deviations`; `instruction_texts`
 - Views: none
-- Columns elsewhere: `sessions.instructions`; `sessions.skills`
-- Local files: instruction files read by rule_catalog (CLAUDE.md, AGENTS.md, skills) at scan time; ~/.claude/parent/amem-daily-state.json (pushed ids)
+- Columns elsewhere: `sessions.instructions`; `sessions.skills`; `sessions.instruction_sources`; `deviations.instruction_authority`
+- Local files: instruction files read by rule_catalog (CLAUDE.md, AGENTS.md, skills) at scan time; ~/.claude/plugins/installed_plugins.json (plugin skill resolution, read only); git history of tracked instruction files (versions in force at a session start); ~/.claude/parent/amem-daily-state.json (pushed ids)
 - External sinks: ClickHouse deviations; past.dev (through proposals/edits)
 - Consumers:
   - analysis: amem-rsi-night (amem rsi night-job) (`src/agent_memory/rsi_evidence_pack.py`)
@@ -133,8 +133,8 @@ Learning families with no automatic analysis consumer:
   - report: amem-rsi-brief (amem rsi brief-job) (`src/agent_memory/rsi_brief.py`)
   - export: sync clickhouse (amem daily step_sync) (`src/agent_memory/integrations/clickhouse.py`)
   - report: Night Desk (external web app, owner JWT; dashboard_owner_read policy) (`supabase/migrations/20261024230827_night_desk.sql`)
-- Retention: Kept indefinitely. instruction_sha is the scan-time hash; it is not proof of the historical version (plan section 5).
-- Exclusion: The writer's own words only: no transcript quotes, paths, code or secrets.
+- Retention: Kept indefinitely. instruction_sha is the hash of the text graded against: the recorded version when deviations.instruction_authority is observed or reconstructed, today's file when it is unverified (plan section 5). instruction_texts is insert-only and content-addressed.
+- Exclusion: The writer's own words only: no transcript quotes, paths, code or secrets. instruction_texts holds instruction files only (never transcript text), redacted, at most 100 kB each, only from the Claude / Codex homes, agent-config and the session's own repo and ancestor memory files; never env files.
 - Learning input: yes
 
 ## Routine runs, scores and labels
