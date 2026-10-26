@@ -73,6 +73,42 @@ def test_otel_api_measurements_have_stable_identity_and_no_payload() -> None:
     assert T.parse_record(one.record())==one
 
 
+def test_otel_zero_event_clock_uses_observed_clock() -> None:
+    payload=otlp()
+    record=payload['resourceLogs'][0]['scopeLogs'][0]['logRecords'][0]
+    record['observedTimeUnixNano']=record['timeUnixNano']
+    record['timeUnixNano']='0'
+    one,=T.otlp_spans(payload)
+    assert one.ended_at==NOW
+    assert one.meta['clock']=='provider_observed'
+    first_id=one.span_id
+    record['observedTimeUnixNano']=str(int((NOW+timedelta(seconds=1)).timestamp()*1e9))
+    assert T.otlp_spans(payload)[0].span_id!=first_id
+
+
+def test_otel_missing_clocks_keep_duration_without_inventing_interval() -> None:
+    payload=otlp()
+    record=payload['resourceLogs'][0]['scopeLogs'][0]['logRecords'][0]
+    record['timeUnixNano']='0'
+    record['observedTimeUnixNano']='0'
+    one,=T.otlp_spans(payload)
+    assert one.started_at is None and one.ended_at is None
+    assert one.elapsed_ms==125.5 and one.session_id=='codex:thread'
+    assert one.meta['clock']=='unavailable'
+    assert T.parse_record(one.record())==one
+
+
+def test_replaying_legacy_zero_clock_record_cannot_restore_epoch_interval() -> None:
+    one,=T.otlp_spans(otlp())
+    old=one.record()
+    old['started_at']='1969-12-31T23:59:59.874500+00:00'
+    old['ended_at']='1970-01-01T00:00:00+00:00'
+    parsed=T.parse_record(old)
+    assert parsed.started_at is None and parsed.ended_at is None
+    assert parsed.elapsed_ms==125.5 and parsed.span_id==one.span_id
+    assert parsed.meta['clock']=='unavailable'
+
+
 def test_record_validation_rejects_false_durations_and_unsafe_metadata() -> None:
     record=span().record()
     for bad in (float("nan"),float("inf"),-1,True,"1"):
@@ -115,6 +151,20 @@ def test_codex_api_totals_only_come_from_api_measurements(db: str) -> None:
     assert timing_store.summary("codex:thread",db_url=db)['api_seconds'] is None
     timing_store.upsert([api],db_url=db)
     assert timing_store.summary("codex:thread",db_url=db)['api_seconds']==pytest.approx(.1255)
+
+
+def test_api_duration_without_clock_is_stored_without_wall_time(db: str) -> None:
+    payload=otlp()
+    record=payload['resourceLogs'][0]['scopeLogs'][0]['logRecords'][0]
+    record['timeUnixNano']='0'
+    api,=T.otlp_spans(payload)
+    api.session_id='codex:clockless';api.span_id='clockless-api'
+    add_session(db,api.session_id)
+    timing_store.upsert([api],db_url=db)
+    result=timing_store.summary(api.session_id,db_url=db)
+    assert result['api_seconds']==pytest.approx(.1255)
+    assert result['observed_wall_seconds'] is None
+    assert float(result['window_seconds'])==60
 
 
 def test_api_event_before_its_session_is_reflected_when_the_session_arrives(db: str) -> None:
