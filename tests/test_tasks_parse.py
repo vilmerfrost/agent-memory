@@ -65,7 +65,8 @@ def test_real_fixture_files_parse_every_line() -> None:
     statuses = [r.status for r in parsed.runs]
     assert statuses.count("pass") == 39 and statuses.count("fail") == 2
     for r in parsed.runs:
-        assert r.source_key == f"dispatch:{r.meta['task_id']}"
+        assert r.source_key == r.meta["canonical_source_key"]
+        assert r.meta["legacy_source_key"] == f"dispatch:{r.meta['task_id']}"
         assert META_KEYS <= set(r.meta)
         assert r.meta["repo"] in REPOS  # meta.repo is always set (lessons scope)
         assert r.meta["log_source"] == "tasks.jsonl"
@@ -152,7 +153,7 @@ def test_status_mapping(tmp_path: Path, raw: Any, status: str, raw_status: str |
 def test_minimal_line_with_only_an_id(tmp_path: Path) -> None:
     _write_repo(tmp_path, "my-repo", [{"id": "t-min"}])
     (r,) = parse_parent(tmp_path).runs
-    assert r.source_key == "dispatch:t-min" and r.status == "error"
+    assert r.meta["legacy_source_key"] == "dispatch:t-min" and r.status == "error"
     assert r.meta["repo"] == "my-repo"  # falls back to the folder name
     assert r.started_at is None and r.finished_at is None and r.failure_reason is None
     assert r.summary == "my-repo: UNKNOWN, 0 workers, dod_first_pass=null, denials=0"
@@ -196,7 +197,7 @@ def test_unparsed_lines_and_blank_lines(tmp_path: Path) -> None:
     ]) + "\n"
     folder = _write_repo(tmp_path, "r", [], raw=raw)
     parsed = parse_parent(tmp_path)
-    assert [r.source_key for r in parsed.runs] == ["dispatch:t-a", "dispatch:t-b"]
+    assert [r.meta["task_id"] for r in parsed.runs] == ["t-a", "t-b"]
     path = folder / "tasks.jsonl"
     assert parsed.unparsed == [(path, 3), (path, 4), (path, 5), (path, 6)]
 
@@ -206,7 +207,7 @@ def test_unterminated_last_line(tmp_path: Path) -> None:
     _write_repo(tmp_path, "whole", [], raw=whole)  # complete object without a newline: kept
     _write_repo(tmp_path, "partial", [], raw=json.dumps(_task(id="t-c")) + "\n" + '{"id": "t-d", "rep')
     parsed = parse_parent(tmp_path)
-    assert sorted(r.source_key for r in parsed.runs) == ["dispatch:t-a", "dispatch:t-b", "dispatch:t-c"]
+    assert sorted(r.meta["task_id"] for r in parsed.runs) == ["t-a", "t-b", "t-c"]
     assert parsed.unparsed == []
     assert [p.parent.name for p in parsed.incomplete] == ["partial"]
 
@@ -216,7 +217,8 @@ def test_repeated_task_id_keeps_the_last_line(tmp_path: Path) -> None:
                                 _task(id="t-a", final_status="DONE")])
     parsed = parse_parent(tmp_path)
     assert parsed.duplicates == 1
-    assert [(r.source_key, r.status) for r in parsed.runs] == [("dispatch:t-b", "pass"), ("dispatch:t-a", "pass")]
+    assert [(r.meta["task_id"], r.status) for r in parsed.runs] == [("t-b", "pass"), ("t-a", "pass")]
+    assert len(parsed.runs[-1].meta["observations"]) == 2
 
 
 def test_missing_parent_dir_and_folders_without_tasks(tmp_path: Path) -> None:

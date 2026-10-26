@@ -186,7 +186,8 @@ def test_row_shape_redaction_and_no_env(files: dict[str, Path], tmp_path: Path) 
                     "transcript_bytes": files["transcript"].stat().st_size, "tool_calls": 5, "prompts": 1,
                     "tokens": {"input": 0, "output": 0, "cache_read": 0, "cache_creation": 0, "models": {}}}
     assert profile["duration_seconds"] == 720.0 and profile["model"] is None and profile["api_seconds"] is None
-    assert outcome["signals"] == {"push": 1}  # the `git push` call: a signal name, never the command
+    assert outcome["signals"] == {"failed_push": 1}  # fixture push failed: invocation is not delivery
+    assert outcome["method_version"] == 2
     (instr,) = row["instructions"]
     assert instr["name"] == "nightly-md" and "[redacted]" in instr["text"]
     assert instr["sha256"] == hashlib.sha256(nightly.read_bytes()).hexdigest()
