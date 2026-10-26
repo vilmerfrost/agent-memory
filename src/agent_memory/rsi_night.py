@@ -86,6 +86,11 @@ SELF_FILES = ("rsi-night.json", "rsi-night.first.json", "rsi-triage.toml", "rsi-
 TARGET_KINDS = ("instruction", "lessons", "skill")
 NEW_TEXT_MAX = 200_000
 
+# Messenger routines only report other routines' failures, so their FAIL is not a defect of their own SKILL.md: no
+# routine:<messenger> candidate, sighted or picked from the pool (Night Desk src/plain.ts MESSENGERS, decision 24).
+MESSENGER_ROUTINES = ("routine-audit", "config-check")
+MESSENGER_KEYS = tuple(f"routine:{r}" for r in MESSENGER_ROUTINES)
+
 # Names this module must never call (tests grep for them): the investigator cannot approve its own work.
 FORBIDDEN_CALLS = ("record_cli_decision", "record_phone_decision", "decide_poll", "issue_tokens",
                    "push_proposals", "amem_rsi_record", "rsi_insert_decision")
@@ -1996,6 +2001,12 @@ class Night:
         for f in all_fails:
             if isinstance(f, Mapping) and f.get("routine"):
                 groups.setdefault(str(f["routine"]), []).append(f)
+        messenger = {r: len(groups.pop(r)) for r in MESSENGER_ROUTINES if r in groups}
+        if messenger:       # counted as skipped in coverage and named in the notes, never silently dropped
+            self.notes.append(_one_line(
+                f"candidates: {sum(messenger.values())} failure(s) of messenger routines not sighted ("
+                + ", ".join(f"{r} {n}" for r, n in messenger.items())
+                + "): they only report other routines' failures", 300))
         out = []
         for routine, fails in sorted(groups.items()):
             r = _token(routine, 60).replace(" ", "-")
@@ -2006,8 +2017,9 @@ class Night:
                                 {"failures": len(fails), "count": len(fails), "sessions": len(fails)},
                                 {"summary": f"routine {r} failed {len(fails)} time(s)", "n": len(fails),
                                  "sessions": 0, "refs": refs[:5]}, file=target))
-        grouped = sum(len(v) for v in groups.values())
-        self._cov().routine_failures(used=grouped, no_routine=len(all_fails) - grouped, sightings=out)
+        grouped, skipped = sum(len(v) for v in groups.values()), sum(messenger.values())
+        self._cov().routine_failures(used=grouped, no_routine=len(all_fails) - grouped - skipped, messenger=skipped,
+                                     sightings=out)
         return out
 
     def _finding_sightings(self, delta: Any) -> list[Sighting]:
@@ -2095,9 +2107,15 @@ class Night:
                     cur.execute("update rsi_candidates set target = %s where target = %s and status in ('new', 'deferred')",
                                 (real, alias))
             scope = list(self.allowlist) + list(aliases)
+            # an earlier night's messenger candidate (MESSENGER_ROUTINES) stays open but is never picked; the notes
+            # name it so the report says why
+            cur.execute("select dedupe_key, status from rsi_candidates where status in ('new', 'deferred') "
+                        "and dedupe_key = any(%s) order by dedupe_key", (list(MESSENGER_KEYS),))
+            messengers = [f"{r['dedupe_key']} ({r['status']})" for r in cur.fetchall()]
             cur.execute("select * from rsi_candidates where status in ('new', 'deferred') and target = any(%s) "
+                        "and not dedupe_key = any(%s) "
                         f"order by rank desc nulls first, {RECURRENCE_SQL} desc, last_seen_at desc, dedupe_key "
-                        "limit %s", (scope, limit * POOL_FETCH))
+                        "limit %s", (scope, list(MESSENGER_KEYS), limit * POOL_FETCH))
             pool = [{**r, "target": aliases.get(r["target"], r["target"])} for r in cur.fetchall()]
             cur.execute("select count(*) as n from rsi_candidates where status in ('new', 'deferred') "
                         "and not coalesce(target = any(%s), false)", (scope,))
@@ -2110,6 +2128,9 @@ class Night:
                 cur.execute("select count(*) as n from rsi_candidates where status in ('new', 'deferred') "
                             "and target = any(%s)", (list(self.pinned),))
                 pinned = int(cur.fetchone()["n"])
+        if messengers:
+            self.notes.append(_one_line(f"candidates: {', '.join(messengers)} not considered: a messenger routine only "
+                                        "reports other routines' failures", 300))
         if out_of_scope - pinned:
             self.notes.append(f"candidates: {out_of_scope - pinned} without an in-scope target, not considered")
         if pinned:      # the full list (report.blocked has it per file); bounded only as a backstop

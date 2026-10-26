@@ -210,11 +210,14 @@ class Ledger:
         u.done = True
 
     @_safe
-    def routine_failures(self, *, used: int, no_routine: int, sightings: Sequence[Any]) -> None:
+    def routine_failures(self, *, used: int, no_routine: int, sightings: Sequence[Any], messenger: int = 0) -> None:
+        """`messenger`: failures of a messenger routine (rsi_night.MESSENGER_ROUTINES), skipped by design."""
         u = self.uses[ROUTINE_FAILURES]
         u.considered, u.used, u.findings = u.queried, used, len(sightings)
         if no_routine:
             u.skipped["no_routine_name"] += no_routine
+        if messenger:
+            u.skipped["messenger"] += messenger
         for s in sightings:
             u.ref(*list(_dget(s, "evidence_refs") or [])[:3])
         u.done = True
