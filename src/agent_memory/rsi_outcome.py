@@ -19,13 +19,16 @@ Verdicts (`judge`):
 - helped: the after-share of the deviations is low by a one-sided exact test (given k_b + k_a deviations, the after
   count is binomial with p = n_a / (n_a + n_b)) at p <= ALPHA, and the rate fell by at least MIN_EFFECT;
 - worse: the same test the other way, and the rate rose by at least MIN_EFFECT (or from zero);
-- no-change: anything else (also: no deviations of the rule in either window).
+- no-change: anything else (also: no deviations of the rule in either window);
+- mixed: helped / worse / no-change, but the rule's own text changed again inside the windows (a hand edit or another
+  change: rule_versions.changes, git history of the rule's file). The numbers are kept; the verdict is neither
+  credited nor blamed on this change, and it suggests no Undo.
 `worse` always records a suggested Undo; `no-change` does once the full WINDOW_DAYS window has been observed
 (UNDO_AFTER_DAYS). Never automatic: Night Desk shows the advice next to its Undo button.
 
 Writes: one `rsi_outcomes` row per change (the latest verdict), `rsi-outcome-<date>.md` and `.json` in the reports
 dir, and one routines.log line `amem-rsi-outcome PASS|FAIL changes=N helped=.. no_change=.. worse=.. too_early=..
-suggest_undo=.. <secs>s report=<path>` plus `amem-rsi-outcome-fail <item>` lines (the format routine-audit reads).
+mixed=.. suggest_undo=.. <secs>s report=<path>` plus `amem-rsi-outcome-fail <item>` lines (the format routine-audit reads).
 """
 
 from __future__ import annotations
@@ -53,7 +56,8 @@ MIN_SESSIONS = 5          # per window
 ALPHA = 0.10              # one-sided exact test
 MIN_EFFECT = 0.25         # the rate must move by at least a quarter
 UNDO_AFTER_DAYS = 14.0    # no-change suggests Undo once the full window was observed
-VERDICTS = ("helped", "no-change", "worse", "too-early")
+VERDICTS = ("helped", "no-change", "worse", "too-early", "mixed")
+OWN_CHANGE_S = 3600       # a rule text change this close to the apply time is the change itself
 PROD = "coalesce(s.env, 'prod') not in ('sandbox', 'eval')"
 
 
@@ -91,6 +95,7 @@ class Outcome:
     reason: str = ""
     suggest_undo: bool = False
     observed_days: float = 0.0
+    other_changes: int = 0    # other changes to the rule's text inside the windows (mixed)
 
     def as_dict(self) -> dict[str, Any]:
         d = asdict(self)
@@ -228,7 +233,29 @@ from s left join d using (session_id)
 """
 
 
-def measure(conn: Any, c: Change, now: datetime) -> Outcome:
+def source_paths(conn: Any, source: str) -> list[str]:
+    """The files of an instruction source today, from the newest session that loaded it (deviations._targets)."""
+    from agent_memory import deviations
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute("""select s.tool, s.kind, s.repo, s.project_dir, s.skills, s.meta, s.started_at, s.title,
+                              s.outcome, s.session_id
+                       from sessions s where s.instructions ? %s
+                       order by coalesce(s.started_at, s.created_at) desc limit 1""", (source,))
+        row = cur.fetchone()
+    try:
+        return deviations._targets(source, row) if row else []
+    except Exception:  # noqa: BLE001 - no paths means no mixed check, never a failed run
+        return []
+
+
+def other_changes(paths: list[str], rule_id: str, t: datetime, w: timedelta) -> int:
+    """Changes of the rule's own text within [t - w, t + w), not counting the change itself."""
+    from agent_memory import rule_versions
+    times = {x for p in paths for x in rule_versions.changes(Path(p).expanduser(), rule_id)}
+    return sum(1 for x in times if abs((x - t).total_seconds()) > OWN_CHANGE_S and t - w <= x < t + w)
+
+
+def measure(conn: Any, c: Change, now: datetime, paths: list[str] | None = None) -> Outcome:
     observed = max(0.0, (now - c.applied_at).total_seconds() / 86400)
     w = min(WINDOW_DAYS, observed)
     o = Outcome(c, window_days=round(w, 3), observed_days=round(observed, 3))
@@ -241,6 +268,12 @@ def measure(conn: Any, c: Change, now: datetime) -> Outcome:
         o.rate_after = round(k_a / n_a, 4) if n_a else None
     o.verdict, o.p_value, o.reason, o.suggest_undo = judge(o.deviations_before, o.sessions_before,
                                                            o.deviations_after, o.sessions_after, observed)
+    if o.verdict != "too-early" and paths and w > 0:
+        o.other_changes = other_changes(paths, c.rule_id, c.applied_at, timedelta(days=w))
+        if o.other_changes:
+            o.reason = (f"the rule's text also changed {o.other_changes} other time(s) inside the windows (a hand edit "
+                        f"or another change), so this is not credited to the change; was {o.verdict}: {o.reason}")
+            o.verdict, o.suggest_undo = "mixed", False
     o.reason = redact.redact(o.reason)[:500]
     return o
 
@@ -267,7 +300,7 @@ def store_outcomes(conn: Any, outcomes: list[Outcome], now: datetime) -> None:
              redact.redact(c.title)[:200] if c.title else None, c.applied_at, now, now, o.window_days,
              o.sessions_before, o.sessions_after, o.deviations_before, o.deviations_after, o.rate_before, o.rate_after,
              o.p_value, o.verdict, o.reason, o.suggest_undo, c.undo_hint() if o.suggest_undo else None,
-             Jsonb({"observed_days": o.observed_days, "format": FORMAT,
+             Jsonb({"observed_days": o.observed_days, "format": FORMAT, "other_changes": o.other_changes,
                     "thresholds": {"window_days": WINDOW_DAYS, "min_days": MIN_DAYS, "min_sessions": MIN_SESSIONS,
                                    "alpha": ALPHA, "min_effect": MIN_EFFECT, "undo_after_days": UNDO_AFTER_DAYS}})))
 
@@ -280,8 +313,11 @@ def check(*, db_url: str | None = None, now: datetime | None = None, write_db: b
     try:
         with store.connect(db_url) as conn:
             changes, rep.skipped = applied_changes(conn)
+            paths: dict[str, list[str]] = {}
             for c in changes:
-                rep.outcomes.append(measure(conn, c, now))
+                if c.instruction_source not in paths:
+                    paths[c.instruction_source] = source_paths(conn, c.instruction_source)
+                rep.outcomes.append(measure(conn, c, now, paths[c.instruction_source]))
             if write_db:
                 store_outcomes(conn, rep.outcomes, now)
     except Exception as exc:  # noqa: BLE001 - the routine logs a FAIL line instead
@@ -292,19 +328,20 @@ def check(*, db_url: str | None = None, now: datetime | None = None, write_db: b
 # ---------------------------------------------------------------- report files and the routines.log line
 
 
-VERDICT_WORDS = {"helped": "helped", "no-change": "no change", "worse": "worse", "too-early": "too early"}
+VERDICT_WORDS = {"helped": "helped", "no-change": "no change", "worse": "worse", "too-early": "too early",
+                 "mixed": "mixed (rule also changed by hand)"}
 
 
 def render_markdown(rep: Report) -> str:
     c = rep.counts()
     lines = [f"# Outcome check: {rep.checked_at:%Y-%m-%d %H:%M}", "",
              f"{len(rep.outcomes)} applied change(s): {c['helped']} helped, {c['no-change']} no change, "
-             f"{c['worse']} worse, {c['too-early']} too early. Suggested Undo: {rep.suggest_undo}.", "",
+             f"{c['worse']} worse, {c['too-early']} too early, {c['mixed']} mixed. Suggested Undo: {rep.suggest_undo}.", "",
              f"Rule: deviations per session in real sessions that loaded the rule's file, {WINDOW_DAYS:g} days (at "
              f"most) before vs after the apply time; at least {MIN_SESSIONS} sessions each side and {MIN_DAYS:g} "
              f"days; helped / worse need a one-sided exact test at p <= {ALPHA:g} and a {MIN_EFFECT:.0%} change. "
              "Nothing is undone automatically.", ""]
-    order = {"worse": 0, "no-change": 1, "helped": 2, "too-early": 3}
+    order = {"worse": 0, "no-change": 1, "helped": 2, "mixed": 3, "too-early": 4}
     for o in sorted(rep.outcomes, key=lambda o: (order[o.verdict], o.change.applied_at)):
         ch = o.change
         lines.append(f"## {VERDICT_WORDS[o.verdict].capitalize()}: {ch.title or ch.rule_key}")
@@ -360,7 +397,8 @@ def run_job(*, db_url: str | None = None, now: datetime | None = None, out_dir: 
     res = S.JobResult(ROUTINE, rep.status, rep.checked_at.strftime("%Y-%m-%d"), items=list(rep.failures),
                       warnings=list(rep.skipped),
                       fields={"changes": len(rep.outcomes), "helped": c["helped"], "no_change": c["no-change"],
-                              "worse": c["worse"], "too_early": c["too-early"], "suggest_undo": rep.suggest_undo},
+                              "worse": c["worse"], "too_early": c["too-early"], "mixed": c["mixed"],
+                              "suggest_undo": rep.suggest_undo},
                       report=report)
     lines = S.log_lines(res, now=rep.checked_at, secs=int(time.monotonic() - t0))
     if write_log:

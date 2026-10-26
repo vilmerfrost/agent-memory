@@ -28,8 +28,10 @@ import fnmatch
 import json
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 from agent_memory import config
 from agent_memory.sessions_ingest import agent_config_dir, claude_home
@@ -154,11 +156,21 @@ def is_allowed(path: Path) -> bool:
 class Pins:
     files: dict[str, str]    # pins.json key (`~/...` or absolute) -> reason
     rules: dict[str, str]    # improve rule id (namespaced, or a lesson `Id:`) -> reason
+    sections: dict[str, str] = field(default_factory=dict)   # "<file key>#<heading text>" -> reason
+
+
+def _expired(entry: Any) -> bool:
+    """An auto-pin with an `until` in the past no longer counts (improve's `expired`)."""
+    until = entry.get("until") if isinstance(entry, dict) else None
+    try:
+        return bool(until) and datetime.fromisoformat(str(until)) < datetime.now().astimezone()
+    except ValueError:
+        return False
 
 
 def pins() -> Pins:
-    """improve/pins.json ({"files": {key: {"reason"}}, "rules": {id: {"reason"}}}). Missing or
-    unreadable: no pins."""
+    """improve/pins.json ({"files": {key: {"reason"}}, "rules": {id: {"reason"}}, "sections": {"<file>#<heading>":
+    {"reason", "until"}}}). Expired entries are left out. Missing or unreadable: no pins."""
     try:
         data = json.loads((agent_config_dir() / "improve" / "pins.json").read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, ValueError):
@@ -170,11 +182,13 @@ def pins() -> Pins:
             return {}
         out = {}
         for k, v in raw.items():
+            if _expired(v):
+                continue
             reason = v.get("reason") if isinstance(v, dict) else None
             out[str(k)] = " ".join(reason.split()) if isinstance(reason, str) and reason.strip() else "pinned"
         return out
 
-    return Pins(part("files"), part("rules"))
+    return Pins(part("files"), part("rules"), part("sections"))
 
 
 def _pin_paths(key: str) -> list[Path]:
@@ -221,6 +235,23 @@ def pinned_rule(improve_rule_id: str, section_text: str | None = None,
             if re.search(rf"(?m)(improve:{re.escape(rid)}\b|^Id:\s*{re.escape(rid)}\s*$)", section_text):
                 return rid, reason
     return None
+
+
+def pinned_sections(path: Path | None, section_text: str, p: Pins | None = None) -> list[str]:
+    """Headings of `section_text` (one rule's text in `path`) that a section pin locks: a hand-edited section,
+    pinned by improve for a while. A rule whose text holds one must not be rewritten."""
+    if path is None or not section_text:
+        return []
+    p = p or pins()
+    if not p.sections:
+        return []
+    heads = {m.group(1).strip() for m in re.finditer(r"(?m)^#{1,6} +(.+?)[ \t#]*$", section_text)}
+    hit = []
+    for key in p.sections:
+        file_key, _, heading = key.rpartition("#")
+        if heading in heads and pinned_file(path, Pins({file_key: "x"}, {})) is not None:
+            hit.append(heading)
+    return sorted(set(hit))
 
 
 @dataclass(frozen=True)

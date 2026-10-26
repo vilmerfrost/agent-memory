@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable, Iterator
+from datetime import timedelta
 from pathlib import Path
 
 import psycopg
@@ -279,6 +280,13 @@ def test_scan_stores_rule_ids_and_counts_recurrence_across_spellings(
     (top, _) = deviations.candidates(now=NOW)
     assert (top["rule_id"], top["sessions"], top["count"]) == ("safety-guards", 5, 5)
     assert len(top["refs"]) == len(SPELLINGS)
+    assert top["since_rule_change"] is None
+    # Version-aware: only deviations from sessions after the rule's own text last changed count.
+    seen: list[str | None] = []
+    assert deviations.candidates(now=NOW, rule_since=lambda paths, rid: seen.append(rid) or NOW + timedelta(days=1)) == []
+    assert "safety-guards" in seen
+    (top2, _) = deviations.candidates(now=NOW, rule_since=lambda paths, rid: NOW - timedelta(days=365))
+    assert (top2["count"], top2["since_rule_change"][:4]) == (5, "2025")
 
 
 def test_unmatched_ref_is_stored_flagged_and_grouped_by_its_ref(

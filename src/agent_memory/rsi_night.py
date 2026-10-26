@@ -1188,6 +1188,8 @@ class WriterImplementer:
         section_text = edits_sections.section_text(old_text, sec.id)
         if ET.pinned_rule(f"rsi-night-{sec.id}", section_text) is not None:
             return fallback("the rule is pinned: no writer call")
+        if ET.pinned_sections(path, section_text):
+            return fallback("the rule's section was edited by hand recently (section pin): no writer call")
         prev, nxt = edits_sections.neighbours(old_text, sec.id)
         heading_note = (f"({sec.heading.strip()!r}, unchanged)" if sec.heading
                         else "(this section has no heading of its own: keep it that way)")
@@ -1871,9 +1873,12 @@ class Night:
         new = set(_ids(_dget(delta, "deviations")))
         if not new:
             return []
-        from agent_memory import deviations
+        from agent_memory import deviations, rule_versions
         out = []
-        for g in deviations.candidates(days=int(self.cfg.candidates["window_days_max"]), db_url=self.db_url):
+        # Only deviations against the rule's current wording count: a rule rewritten by hand (or by the loop)
+        # starts clean, so the night never "fixes" what was already fixed (docs/rsi/hand-edits.md).
+        for g in deviations.candidates(days=int(self.cfg.candidates["window_days_max"]), db_url=self.db_url,
+                                       rule_since=rule_versions.since):
             ids = [str(i) for i in g.get("deviation_ids") or []]
             fresh = [i for i in ids if i in new]
             if not fresh or g.get("team"):
