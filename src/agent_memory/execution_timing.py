@@ -136,9 +136,15 @@ def parse_record(d: Any) -> Span | None:
     version = d.get('method_version',1)
     if isinstance(version,bool) or not isinstance(version,int) or not 0 < version <= 1000:
         return None
+    meta = clean_meta(d.get("meta"))
+    # Older collectors interpreted OTLP's unset (zero) clock as the Unix epoch.
+    # Normalize retained spool records too, so a replay cannot restore that date.
+    if d.get("source") == "codex.otel" and end is not None and end.timestamp() == 0:
+        start = end = None
+        meta["clock"] = "unavailable"
     return Span(d["span_id"], sid, d["tool"], d["category"], label(d.get("operation")), start, end,
                 elapsed, d["status"], d["measurement_kind"], label(d.get("source")), parent, code,
-                method_version=version, meta=clean_meta(d.get("meta")))
+                method_version=version, meta=meta)
 
 
 def native_duration(value: Any) -> float | None:
@@ -266,25 +272,34 @@ def otlp_spans(payload: Any) -> list[Span]:
                     try: duration = float(duration)
                     except ValueError: duration = None
                 elapsed = number(duration)
-                try:
-                    end = datetime.fromtimestamp(int(rec.get("timeUnixNano") or rec.get("observedTimeUnixNano")) / 1e9, UTC)
-                except (ValueError, TypeError, OverflowError, OSError):
-                    continue
                 if elapsed is None:
                     continue
+                end, clock, clock_key = None, 'unavailable', rec.get('timeUnixNano')
+                for field_name, clock_name in (('timeUnixNano', 'provider_event_end'),
+                                               ('observedTimeUnixNano', 'provider_observed')):
+                    try:
+                        raw_clock = rec.get(field_name)
+                        nanos = int(raw_clock) if not isinstance(raw_clock, bool) else 0
+                        if nanos <= 0:
+                            continue
+                        end = datetime.fromtimestamp(nanos / 1e9, UTC)
+                    except (ValueError, TypeError, OverflowError, OSError):
+                        continue
+                    clock, clock_key = clock_name, raw_clock
+                    break
                 raw_sid = attrs.get("thread.id") or attrs.get("thread_id") or attrs.get("conversation.id") or attrs.get("conversation_id")
                 raw_sid = identity(raw_sid)
                 session = (raw_sid if raw_sid.startswith("codex:") else "codex:"+raw_sid) if raw_sid else None
                 meta = clean_meta({"model": attrs.get("model"), "attempt": attrs.get("attempt"),
                                    "http_status": attrs.get("status"), "request_id": attrs.get("request.id")})
-                span_id = key(session, name, rec.get("timeUnixNano"), rec.get("traceId"), rec.get("spanId"), elapsed, meta)
+                span_id = key(session, name, clock_key, rec.get("traceId"), rec.get("spanId"), elapsed, meta)
                 success = attrs.get("success")
                 http = str(attrs.get("status") or "")
                 status = ("failed" if success is False or success == "false" or (http.isdigit() and int(http)>=400)
                           else "passed" if success is True or success == "true" or (http.isdigit() and 200<=int(http)<400)
                           else "unknown")
-                meta.update(duration_source='otel_duration_ms', clock='provider_event_end')
-                found[span_id] = Span(span_id, session, "codex", "api", name, end-timedelta(milliseconds=elapsed),
+                meta.update(duration_source='otel_duration_ms', clock=clock)
+                found[span_id] = Span(span_id, session, "codex", "api", name, end-timedelta(milliseconds=elapsed) if end else None,
                                       end, elapsed, status, "provider_reported", "codex.otel", meta=meta)
     return list(found.values())
 
