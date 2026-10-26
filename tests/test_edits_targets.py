@@ -142,6 +142,29 @@ def test_pinned_rule_uses_improve_namespacing_and_markers(ehome: EHome) -> None:
     assert edits_targets.pinned_rule("", "Id: no-compound-cmds-v2\nidea: spawn later") is None
 
 
+def test_section_pins_lock_only_the_hand_edited_section_and_expire(ehome: EHome) -> None:  # noqa: F811
+    key = "~/.agents/skills/dispatch/SKILL.md"
+    data = {"files": {}, "rules": {}, "sections": {
+        f"{key}#Spawn": {"reason": "auto-pin: edited by hand after imp-1", "until": "2999-01-01T00:00:00+00:00"},
+        f"{key}#Record": {"reason": "auto-pin: edited by hand after imp-2", "until": "2000-01-01T00:00:00+00:00"}}}
+    (ehome.agent_config / "improve" / "pins.json").write_text(json.dumps(data))
+    p = edits_targets.pins()
+    assert list(p.sections) == [f"{key}#Spawn"]                              # the expired one is gone
+    assert edits_targets.pinned_file(ehome.skill) is None                    # the file itself is open
+    assert edits_targets.pinned_sections(ehome.skill, "## 4. Spawn\n- x") == [] # heading text must match exactly
+    assert edits_targets.pinned_sections(ehome.skill, "## Spawn\n- x\n### Detail\n- y") == ["Spawn"]
+    assert edits_targets.pinned_sections(ehome.skill, "## Record\n- z") == []  # expired
+    assert edits_targets.pinned_sections(ehome.agent_config / "x.md", "## Spawn\n- x") == []   # another file
+
+
+def test_expired_file_and_rule_pins_no_longer_count(ehome: EHome) -> None:  # noqa: F811
+    data = {"files": {str(ehome.skill.resolve()): {"reason": "auto-pin", "until": "2000-01-01T00:00:00+00:00"}},
+            "rules": {"spawn": {"reason": "pinned by Vilmer"}}}
+    (ehome.agent_config / "improve" / "pins.json").write_text(json.dumps(data))
+    assert edits_targets.pinned_file(ehome.skill) is None
+    assert edits_targets.pinned_rule("spawn") == ("spawn", "pinned by Vilmer")   # no until: never expires
+
+
 def test_improve_rule_id_is_kebab_and_namespaced() -> None:
     rx = re.compile(r"[a-z0-9][a-z0-9-]{2,60}")
     cases = {

@@ -49,6 +49,7 @@ import json
 import os
 import re
 from collections import Counter, defaultdict
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -1475,9 +1476,13 @@ def cost_of(recs: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def candidates(*, days: int = DEFAULT_DAYS, now: datetime | None = None,
-               db_url: str | None = None) -> list[dict[str, Any]]:
+               db_url: str | None = None,
+               rule_since: Callable[[list[str], str | None], datetime | None] | None = None) -> list[dict[str, Any]]:
     """One entry per instruction source + rule, most recurring first (docs/deviations.md).
-    The rule is the catalog id; unmatched rows and rows without an id group by their ref."""
+    The rule is the catalog id; unmatched rows and rows without an id group by their ref.
+    rule_since(target_paths, rule_id): when the rule's own text last changed (rule_versions.since). Given, only
+    deviations from sessions that started after it count (`since_rule_change` in the entry); a rule rewritten after
+    its last deviation has no entry. None: every deviation in the window counts."""
     now = now or datetime.now(UTC)
     with store.connect(db_url) as conn, conn.cursor(row_factory=dict_row) as cur:
         cur.execute(_REPORT_SQL, (now - timedelta(days=days),))
@@ -1491,6 +1496,13 @@ def candidates(*, days: int = DEFAULT_DAYS, now: datetime | None = None,
         titles = Counter(r["rule_title"] for r in recs if r["rule_title"])
         rule_id = key if not key.startswith("ref:") else (rule_catalog.UNMATCHED if any(
             r["rule_id"] == rule_catalog.UNMATCHED for r in recs) else None)
+        since = rule_since(_targets(source, recs[0]), rule_id) if rule_since and rule_id else None
+        if since is not None:
+            recs = [r for r in recs if (r.get("started_at") or r["created_at"]) >= since]
+            if not recs:
+                continue
+            refs = Counter(r["instruction_ref"] for r in recs)
+            titles = Counter(r["rule_title"] for r in recs if r["rule_title"])
         verdicts = Counter(r["jev_verdict"] or "unjudged" for r in recs)
         confs = [float(r["jev_confidence"]) for r in recs if r["jev_confidence"] is not None]
         judged = {v: verdicts[v] for v in VERDICTS}
@@ -1507,6 +1519,7 @@ def candidates(*, days: int = DEFAULT_DAYS, now: datetime | None = None,
             "instruction_ref": refs.most_common(1)[0][0],
             "refs": dict(refs),
             "instruction_shas": sorted({r["instruction_sha"] for r in recs if r["instruction_sha"]}),
+            "since_rule_change": since.isoformat(timespec="seconds") if since else None,
             "target_paths": _targets(source, recs[0]),
             "count": len(recs),
             "sessions": len({r["session_id"] for r in recs}),

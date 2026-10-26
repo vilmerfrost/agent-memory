@@ -136,7 +136,7 @@ def test_outcome_check_finds_the_drop_the_rise_and_too_little_data(odb: str, san
            ("worse", 10, 1, 10, 8) and b.suggest_undo and b.change.kind == "edit"
     assert (c.verdict, c.sessions_after) == ("too-early", 2) and "needs 5 on each side" in c.reason
     assert d.verdict == "too-early" and "applied 1.0 days ago" in d.reason
-    assert rep.counts() == {"helped": 1, "no-change": 0, "worse": 1, "too-early": 2} and rep.suggest_undo == 1
+    assert rep.counts() == {"helped": 1, "no-change": 0, "worse": 1, "too-early": 2, "mixed": 0} and rep.suggest_undo == 1
     # the database rows Night Desk reads
     with psycopg.connect(odb) as conn:
         got = {r[0]: r[1:] for r in conn.execute(
@@ -154,7 +154,8 @@ def test_outcome_check_finds_the_drop_the_rise_and_too_little_data(odb: str, san
     assert data["format"] == "rsi-outcome/1" and data["counts"]["worse"] == 1 and len(data["outcomes"]) == 4
     (run,) = RL.parse_file(log).runs
     assert (run.routine, run.status) == ("amem-rsi-outcome", "pass") and lines[0].startswith(
-        "2026-10-26T09:20:00+0200 amem-rsi-outcome PASS changes=4 helped=1 no_change=0 worse=1 too_early=2 suggest_undo=1 ")
+        "2026-10-26T09:20:00+0200 amem-rsi-outcome PASS changes=4 helped=1 no_change=0 worse=1 too_early=2 mixed=0 "
+        "suggest_undo=1 ")
     assert run.report_path == str(tmp_path / "reports" / "rsi-outcome-2026-10-26.md")
     # a second run rewrites the same rows (latest verdict), keeping first_checked_at
     O.run_job(db_url=odb, now=NOW + timedelta(days=1), out_dir=tmp_path / "reports", routines_log=log)
@@ -162,6 +163,38 @@ def test_outcome_check_finds_the_drop_the_rise_and_too_little_data(odb: str, san
         n, first, checked = conn.execute("select count(*), min(first_checked_at), max(checked_at) from rsi_outcomes"
                                          ).fetchone()
     assert n == 4 and first < checked
+
+
+def test_a_rule_changed_by_hand_inside_the_windows_is_mixed(odb: str, sandbox: Path, tmp_path: Path,  # noqa: F811
+                                                            monkeypatch: pytest.MonkeyPatch) -> None:
+    ids = seed_fixture(odb, sandbox)
+    monkeypatch.setattr(O, "source_paths", lambda conn, source: [f"~/{source}.md"])
+    seen: list[tuple[str, str]] = []
+
+    def other(paths: list[str], rule_id: str, t: datetime, w: timedelta) -> int:
+        seen.append((paths[0], rule_id))
+        return 1 if rule_id in ("closing-line", "intro") else 0
+    monkeypatch.setattr(O, "other_changes", other)
+    rep = O.check(db_url=odb, now=NOW)
+    by_id = {o.change.id: o for o in rep.outcomes}
+    a, b = by_id[ids["helped"]], by_id[ids["worse"]]
+    assert (a.verdict, a.other_changes, a.suggest_undo) == ("mixed", 1, False) and "was helped" in a.reason
+    assert (b.verdict, b.suggest_undo) == ("mixed", False) and "was worse" in b.reason   # no Undo advice on mixed
+    assert by_id[ids["few"]].verdict == "too-early" and ("~/parent-md.md", "safety-guards") not in seen
+    assert rep.counts()["mixed"] == 2 and rep.suggest_undo == 0
+    with psycopg.connect(odb) as conn:   # the check constraint accepts the new verdict
+        assert conn.execute("select verdict, (meta->>'other_changes')::int from rsi_outcomes where change_id = %s",
+                            (ids["helped"],)).fetchone() == ("mixed", 1)
+    assert "## Mixed (rule also changed by hand):" in O.render_markdown(rep)
+
+
+def test_other_changes_skips_the_change_itself(monkeypatch: pytest.MonkeyPatch) -> None:
+    from agent_memory import rule_versions
+    t = NOW - timedelta(days=5)
+    monkeypatch.setattr(rule_versions, "changes", lambda path, rid: [t + timedelta(minutes=2), t + timedelta(days=2),
+                                                                      t - timedelta(days=9)])
+    assert O.other_changes(["~/a.md"], "rules", t, timedelta(days=5)) == 1     # only the edit 2 days after
+    assert O.other_changes(["~/a.md"], "rules", t, timedelta(days=10)) == 2
 
 
 def test_outcome_job_logs_a_fail_line_when_the_database_is_gone(tmp_path: Path) -> None:
@@ -178,7 +211,7 @@ def test_cli_outcome_dry_run_writes_nothing(odb: str, sandbox: Path, tmp_path: P
     r = run_amem("rsi", "outcome", "--dry-run", "--json", "--now", NOW.isoformat(), env=base_env(AMEM_DB_URL=odb))
     assert r.returncode == 0, r.stderr
     out = json.loads(r.stdout)
-    assert out["counts"] == {"helped": 1, "no-change": 0, "worse": 1, "too-early": 2}
+    assert out["counts"] == {"helped": 1, "no-change": 0, "worse": 1, "too-early": 2, "mixed": 0}
     with psycopg.connect(odb) as conn:
         assert conn.execute("select count(*) from rsi_outcomes").fetchone() == (0,)
     refused = run_amem("rsi", "outcome", env=base_env(AMEM_DB_URL=odb, AMEM_REQUIRE_REMOTE="1",

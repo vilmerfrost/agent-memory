@@ -496,7 +496,7 @@ def test_report_groups_and_json_candidates(setup_home: Home, db: str, writer: Wr
     doc = json.loads(res.stdout)
     assert doc["version"] == 2 and doc["window_days"] == 3650
     assert set(doc["candidates"][0]) == {
-        "instruction_source", "rule_id", "rule_title", "instruction_ref", "refs", "instruction_shas",
+        "instruction_source", "rule_id", "rule_title", "instruction_ref", "refs", "instruction_shas", "since_rule_change",
         "target_paths", "count", "sessions", "kinds", "tools", "team", "team_sessions",
         "followed_grade_mean", "result_grade_mean", "objective_result_mean", "outcomes", "cost", "jev", "verdict", "session_ids", "deviation_ids", "examples",
         "session_titles"}  # session_titles: {session id: title} for sessions with a known title
