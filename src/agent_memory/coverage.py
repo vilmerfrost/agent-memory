@@ -10,11 +10,14 @@ thing twice leaves one row.
 snapshot covering the input window with status `complete`, and a consumption record for that run with
 status `used_no_finding`. Anything else comes back as the specific missing-evidence distinction.
 
-Nothing here is wired into a routine yet (Stages D-F).
+Routines write through `record_best_effort` (one savepoint per record, never raises, off with
+AMEM_COVERAGE_WRITE=0) and name datasets with `dataset_key(<family>, <part>)`.
 """
 
 from __future__ import annotations
 
+import os
+import re
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -36,6 +39,8 @@ MAX_EVIDENCE_REFS = 20
 MAX_FIELDS = 50
 
 Recorded = Literal["inserted", "updated", "unchanged"]
+WRITE_SWITCH = "AMEM_COVERAGE_WRITE"      # 0 / off / false / no: routines record nothing
+DATASET_RE = re.compile(r"^[a-z][a-z0-9_.:-]{0,79}$")   # the migration's dataset check
 
 
 def _nonneg(name: str, value: int | None) -> None:
@@ -298,3 +303,42 @@ def verdict(conn: psycopg.Connection, *, job: str, run_key: str,
                             (name, u["window_start"], u["window_end"]))
             snaps[name] = cur.fetchone()
     return evaluate(reqs, snaps, uses)
+
+
+# --------------------------------------------------------------------------- routine writers
+
+
+def writes_enabled(environ: Mapping[str, str] | None = None) -> bool:
+    v = ((os.environ if environ is None else environ).get(WRITE_SWITCH) or "").strip().lower()
+    return v not in ("0", "off", "false", "no")
+
+
+def dataset_key(family_key: str, part: str) -> str:
+    """`<family>:<part>`, the dataset name every routine writes (e.g. `deviations:deviations`,
+    `skills:skill_calls`). The family must exist in data_families, so a dataset always maps to its owner."""
+    from agent_memory import data_families
+    data_families.family(family_key)                    # KeyError for an unknown family
+    key = f"{family_key}:{part}"
+    if not DATASET_RE.fullmatch(key):
+        raise ValueError(f"dataset key {key!r} does not match {DATASET_RE.pattern}")
+    return key
+
+
+def record_best_effort(conn: psycopg.Connection, records: Iterable[Snapshot | Consumption], *,
+                       environ: Mapping[str, str] | None = None) -> list[str]:
+    """Write each record in its own savepoint and return one problem line per record that failed (for the job's
+    notes). Never raises: coverage must not fail the routine it describes. Nothing is written when
+    AMEM_COVERAGE_WRITE is off."""
+    if not writes_enabled(environ):
+        return []
+    problems: list[str] = []
+    for r in records:
+        try:
+            with conn.transaction():
+                if isinstance(r, Snapshot):
+                    record_snapshot(conn, r)
+                else:
+                    record_consumption(conn, r)
+        except Exception as exc:  # noqa: BLE001 - reported, never raised
+            problems.append(f"coverage {getattr(r, 'dataset', '?')}: {type(exc).__name__}: {str(exc)[:160]}")
+    return problems
