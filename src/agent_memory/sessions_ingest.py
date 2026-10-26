@@ -57,6 +57,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import sys
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -465,6 +466,11 @@ class SessionRow:
     commits: list[dict[str, Any]] | None = None   # session_commits: {sha, message, repo, branch}; None: not read
     copy_only: bool = False   # a pure copy of an earlier transcript (session_resume): no row is stored
     timing_spans: list[Any] = field(default_factory=list)  # sanitized operation facts, never transcript text
+    # docs/data-use/instruction-sources.md: the stored `sessions.instruction_sources` JSON (a row read
+    # back from the database) and the entries captured at ingest (instruction_sources.Entry, with texts;
+    # None: not captured, the stored value stays).
+    instruction_sources: list[dict[str, Any]] | None = None
+    instruction_entries: list[Any] | None = None
 
     def with_summary(self, s: session_tokens.Summary) -> SessionRow:
         """Title, profile and outcome signals from a full read."""
@@ -640,7 +646,7 @@ def session_row(path: Path, project_dir: str, *, parent_session: str | None = No
     row.timing_spans = claude_spans(own_events, sid)
     row.commits = confirm_commits(row, session_commits.claude_commits(own_events, cwd=cwd, own_session=own,
                                                                       fallback=commit_fallback(row)))
-    return _with_instructions(row)
+    return _with_instructions(row, events)
 
 
 def own_events(path: Path, events: list[dict[str, Any]], session_id: str,
@@ -665,10 +671,20 @@ def confirm_commits(row: SessionRow, commits: list[dict[str, Any]]) -> list[dict
     return commits
 
 
-def _with_instructions(row: SessionRow) -> SessionRow:
+def _with_instructions(row: SessionRow, events: list[dict[str, Any]] | None = None) -> SessionRow:
+    """`instructions` (source names with a file today) and the captured entries with authority and
+    version (docs/data-use/instruction-sources.md). A capture failure never stops ingest: the entries
+    stay None and the stored ones are kept."""
     from agent_memory import deviations  # local import: deviations imports this module
+    from agent_memory import instruction_sources
 
     row.instructions = [src.name for src in deviations.instruction_sources(row)]
+    try:
+        row.instruction_entries = instruction_sources.capture(row, events, instruction_sources.resolver())
+    except Exception as exc:  # noqa: BLE001 - best effort: the names above are still stored
+        row.instruction_entries = None
+        print(f"amem: instruction sources of {row.session_id} not captured: {type(exc).__name__}: {exc}",
+              file=sys.stderr)
     return row
 
 
@@ -749,7 +765,7 @@ def codex_row(path: Path, rel_dir: str, titles: dict[str, str] | None = None) ->
     row.meta["timing_coverage"] = {"method": "codex_items_v1", "tool_spans": len(durations),
                                    "api": "requires_otel", "model_output_is_api": False}
     row.commits = confirm_commits(row, session_commits.codex_commits(events, cwd=cwd, fallback=commit_fallback(row)))
-    return _with_instructions(row)
+    return _with_instructions(row, events)
 
 
 # ---------------------------------------------------------------- discovery
@@ -842,14 +858,17 @@ def collect(root: Path | None, *, days: int = DEFAULT_DAYS, now: datetime | None
     projects folder; `codex`: the Codex home (default `codex_home()`)."""
     now = now or datetime.now(UTC)
     since = now - timedelta(days=days)
+    from agent_memory import instruction_sources
+
     found: list[SessionRow] = []
-    if "claude" in tools and root is not None:
-        found += [session_row(path, project, parent_session=parent)
-                  for path, project, parent in transcripts(root, since)]
-    if "codex" in tools:
-        home = codex_home(codex)
-        titles = codex_titles(home)
-        found += [codex_row(path, rel, titles) for path, rel in codex_transcripts(home, since)]
+    with instruction_sources.batch():   # one set of git caches for every row of this run
+        if "claude" in tools and root is not None:
+            found += [session_row(path, project, parent_session=parent)
+                      for path, project, parent in transcripts(root, since)]
+        if "codex" in tools:
+            home = codex_home(codex)
+            titles = codex_titles(home)
+            found += [codex_row(path, rel, titles) for path, rel in codex_transcripts(home, since)]
     rows: list[SessionRow] = []
     skipped = 0
     for row in found:
@@ -912,7 +931,7 @@ PROFILE_COLS = ("model", "model_last", "effort", "effort_last", "efforts", "dura
 _KEEP_COLS = ("title", *PROFILE_COLS, "outcome", "outcome_evidence")
 _ALL_COLS = ("session_id", "tool", "kind", "repo", "project_dir", "started_at", "ended_at", "transcript_bytes",
              "skills", "instructions", "meta", *_TOKEN_COLS, "last_activity_at", "category", "project", "env",
-             "experiment_id", *_KEEP_COLS)
+             "experiment_id", *_KEEP_COLS, "instruction_sources")
 _FACT_COLS = ("tool", "kind", "repo", "project_dir", "started_at", "ended_at", "transcript_bytes", "skills",
               "instructions", "category", "project", "env", "experiment_id")
 _TOKENS_DIFFER = (f"({', '.join('sessions.' + c for c in _TOKEN_COLS)}) is distinct from "
@@ -930,6 +949,7 @@ on conflict (session_id) do update
     set {', '.join(f'{c} = excluded.{c}' for c in _FACT_COLS)},
         meta = sessions.meta || excluded.meta,
         {', '.join(f'{c} = coalesce(excluded.{c}, sessions.{c})' for c in (*_TOKEN_COLS, *_KEEP_COLS))},
+        instruction_sources = coalesce(excluded.instruction_sources, sessions.instruction_sources),
         last_activity_at = greatest(sessions.last_activity_at, excluded.last_activity_at),
         tokens_updated_at = case when excluded.tokens_input is not null and {_TOKENS_DIFFER}
                                  then now() else sessions.tokens_updated_at end,
@@ -942,6 +962,8 @@ on conflict (session_id) do update
        or not (sessions.meta @> excluded.meta)
        or (excluded.tokens_input is not null and {_TOKENS_DIFFER})
        or {_KEPT_DIFFER}
+       or (excluded.instruction_sources is not null
+           and excluded.instruction_sources is distinct from sessions.instruction_sources)
        or excluded.last_activity_at > coalesce(sessions.last_activity_at, '-infinity'::timestamptz)
 returning (xmax = 0) as inserted
 """
@@ -1009,7 +1031,8 @@ def env_values(r: SessionRow) -> dict[str, Any]:
     return {"env": env, "experiment_id": exp if sandbox else None}
 
 
-def _params(r: SessionRow, now: datetime | None = None) -> dict[str, Any]:
+def _params(r: SessionRow, now: datetime | None = None,
+            sources: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     tv = token_values(r.tokens)
     last = _last_activity(r)
     category, project = place(r)
@@ -1018,16 +1041,42 @@ def _params(r: SessionRow, now: datetime | None = None) -> dict[str, Any]:
             "transcript_bytes": r.transcript_bytes, "skills": Jsonb(r.skills),
             "instructions": Jsonb(r.instructions), "meta": Jsonb(r.meta), **dict(zip(_TOKEN_COLS, tv)),
             "last_activity_at": last, "category": category, "project": project, "title": r.title,
+            "instruction_sources": Jsonb(sources) if sources is not None else None,
             **env_values(r),
             **profile_values(r.profile), **outcome_values(r.signals, r.end, last, now, r.kind, r.commits)}
 
 
+def instruction_params(conn: Any, rows: list[SessionRow]) -> dict[str, tuple[list[dict[str, Any]], list[Any]]]:
+    """session id -> (entries to store, texts to store) for the rows with captured entries: the stored
+    entries merged with the new ones (instruction_sources.merge: a stronger authority wins, a tie keeps the
+    earliest capture), so a replay changes nothing."""
+    from agent_memory import instruction_sources
+
+    ids = [r.session_id for r in rows if r.instruction_entries is not None]
+    if not ids:
+        return {}
+    stored = dict(conn.execute("select session_id, instruction_sources from sessions where session_id = any(%s)",
+                               (ids,)).fetchall())
+    out: dict[str, tuple[list[dict[str, Any]], list[Any]]] = {}
+    for r in rows:
+        if r.instruction_entries is None:
+            continue
+        kept = instruction_sources.merge(stored.get(r.session_id), r.instruction_entries)
+        out[r.session_id] = (kept, instruction_sources.texts_to_store(r.instruction_entries, kept))
+    return out
+
+
 def upsert(rows: list[SessionRow], *, db_url: str | None = None, now: datetime | None = None) -> tuple[int, int]:
     """(new, updated). Unchanged rows are not touched. One transaction."""
+    from agent_memory import instruction_sources
+
     new = updated = 0
     with store.connect(db_url) as conn:
+        sources = instruction_params(conn, rows)
         for r in rows:
-            got = conn.execute(_UPSERT_SQL, _params(r, now)).fetchone()
+            kept, texts = sources.get(r.session_id, (None, []))
+            got = conn.execute(_UPSERT_SQL, _params(r, now, kept)).fetchone()
+            instruction_sources.store_texts(conn, texts)
             if got is None:
                 continue
             if got[0]:
@@ -1096,6 +1145,9 @@ def cloud_row(rec: dict[str, Any]) -> SessionRow | None:
     row = SessionRow(key, kind, repo, CLOUD_PROJECT_DIR, rec.get("started_at"), rec.get("ended_at"),
                      size, skills, names, meta, tokens=cloud_tokens(src, rec.get("ended_at")),
                      title=session_tokens.clean_title(src.get("title")))
+    from agent_memory import instruction_sources   # local import: it imports this module
+
+    row.instruction_entries = instruction_sources.cloud_entries(routine, rec.get("instructions"))
     prof = src.get("profile") if isinstance(src.get("profile"), dict) else None
     if prof is not None:
         row.profile = cloud_profile(prof)
@@ -1182,7 +1234,8 @@ def ingest_cloud(*, db_url: str | None = None, now: datetime | None = None) -> C
                     row.kind = "routine"
                     row.meta["routine"] = stored[1]
                     row.instructions = list(stored[2] or [])
-            got = conn.execute(_UPSERT_SQL, _params(row, now)).fetchone()
+            kept, _texts = instruction_params(conn, [row]).get(row.session_id, (None, []))
+            got = conn.execute(_UPSERT_SQL, _params(row, now, kept)).fetchone()
             if got is not None:
                 if got[0]:
                     report.new += 1

@@ -60,12 +60,11 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
 from agent_memory import codex_sessions, config, distill, jev, questions, rule_catalog, sessions_ingest, store
+from agent_memory import instruction_sources as instr
 from agent_memory import redact as _redact
 from agent_memory.codex_sessions import payload
 from agent_memory.sessions_ingest import (
     SessionRow,
-    agent_config_dir,
-    claude_home,
     codex_home,
     is_human,
     load_events,
@@ -73,7 +72,6 @@ from agent_memory.sessions_ingest import (
     projects_dir,
     text_of,
 )
-from agent_memory.sessions_ingest import main_checkout as _main_checkout
 
 LIVE_ENV = "AMEM_DEVIATIONS_LIVE"
 CLAUDE_ENV = "AMEM_DEVIATIONS_CLAUDE"
@@ -135,92 +133,24 @@ def _safe(path: Path) -> bool:
     return not path.name.lower().startswith(".env") and path.is_file()
 
 
-def _skill_files(skill: str) -> list[Path]:
-    """Where a Codex skill can live, in lookup order: the shared skills (symlinked into the
-    Claude home), the Codex home's own skills and its system skills."""
-    cx = codex_home()
-    return [claude_home() / "skills" / skill / "SKILL.md", cx / "skills" / skill / "SKILL.md",
-            cx / "skills" / ".system" / skill / "SKILL.md"]
-
-
 def instruction_sources(row: SessionRow) -> list[InstructionSource]:
-    """Instruction sources in force for a session whose file exists. Reads nothing but names.
-
-    Claude Code: the global CLAUDE.md, the agent definition, the routine prompt, PARENT.md,
-    each skill, the repo's CLAUDE.md / CLAUDE.local.md and the repo's AGENTS.md.
-    Codex: the global AGENTS.md (`~/.codex/AGENTS.override.md`, else `AGENTS.md`), each
-    skill, the repo's AGENTS.md."""
-    home = claude_home()
+    """Instruction sources in force for a session whose file exists today, grouped by source
+    name in reading order. Resolution lives in instruction_sources.candidates (docs/data-use/
+    instruction-sources.md): the global CLAUDE.md, the agent definition, the routine prompt,
+    PARENT.md, every skill (plugin skills through installed_plugins.json), the repo's and every
+    ancestor directory's CLAUDE.md / .claude/CLAUDE.md / CLAUDE.local.md, the repo's AGENTS.md and
+    the @import targets; for Codex the global and the repo's AGENTS(.override).md and the skills.
+    Unresolved names (a built-in skill, an uninstalled plugin) have no file and are left out here;
+    `sessions.instruction_sources` records them with a reason."""
     out: list[InstructionSource] = []
-    seen: set[Path] = set()
-
-    def add(name: str, *candidates: Path) -> None:
-        paths = []
-        for p in candidates:
-            try:
-                key = p.resolve()
-            except OSError:
-                continue
-            if key in seen or not _safe(p):
-                continue
-            seen.add(key)
-            paths.append(p)
-        if paths:
-            out.append(InstructionSource(name, paths))
-
-    def add_first(name: str, *candidates: Path) -> None:
-        for p in candidates:
-            if _safe(p):
-                add(name, p)
-                return
-
-    def repo_dirs() -> list[Path]:
-        if not row.cwd:
-            return []
-        base = Path(row.cwd)
-        main = _main_checkout(base)
-        return [base] if main is None else [base, main]
-
-    def repo_name() -> str:
-        return row.repo or Path(row.cwd).name
-
-    if is_cloud(row):
-        # A cloud routine ran in a VM: no file on this machine was in force. Its instructions
-        # are the texts it sent along (`cloud_sources`).
-        return out
-
-    if row.tool == "codex":
-        cx = codex_home()
-        add_first("agents-md:global", cx / "AGENTS.override.md", cx / "AGENTS.md")
-        for skill in row.skills:
-            if re.fullmatch(r"[\w.-]+", skill):
-                add_first(f"skill:{skill}", *_skill_files(skill))
-        if row.cwd:
-            add(f"agents-md:{repo_name()}", *[d / "AGENTS.md" for d in repo_dirs()])
-        return out
-
-    add("claude-md:global", home / "CLAUDE.md")
-    if row.kind == "worker" and row.meta.get("agent_type"):
-        agent = str(row.meta["agent_type"])
-        if re.fullmatch(r"[\w.-]+", agent):
-            add(f"agent:{agent}", home / "agents" / f"{agent}.md")
-    if row.kind == "routine" and row.meta.get("routine"):
-        name = str(row.meta["routine"])
-        if re.fullmatch(r"[\w.-]+", name):
-            # The tag's file= attribute is the fallback, only when it is a SKILL.md under the home.
-            alt = Path(str(row.meta.get("routine_file") or "")).expanduser()
-            alt_ok = alt.name == "SKILL.md" and alt.is_absolute() and home in alt.parents
-            standard = home / "scheduled-tasks" / name / "SKILL.md"
-            add(f"routine:{name}", standard if standard.is_file() or not alt_ok else alt)
-    if row.kind == "parent":
-        add("parent-md", agent_config_dir() / "parent" / "PARENT.md")
-    for skill in row.skills:
-        if re.fullmatch(r"[\w.-]+", skill):  # namespaced plugin skills have no local SKILL.md
-            add(f"skill:{skill}", home / "skills" / skill / "SKILL.md")
-    if row.cwd:
-        dirs = repo_dirs()
-        add(f"claude-md:{repo_name()}", *[d / n for d in dirs for n in ("CLAUDE.md", "CLAUDE.local.md")])
-        add(f"agents-md:{repo_name()}", *[d / "AGENTS.md" for d in dirs])
+    by_name: dict[str, InstructionSource] = {}
+    for c in instr.candidates(row):
+        if c.path is None or c.reason is not None or not _safe(c.path):
+            continue
+        if c.name not in by_name:
+            by_name[c.name] = InstructionSource(c.name, [])
+            out.append(by_name[c.name])
+        by_name[c.name].paths.append(c.path)
     return out
 
 
@@ -237,7 +167,10 @@ class LoadedSource:
     name: str
     text: str                       # redacted, capped: what the writer reads
     rules: list[rule_catalog.Rule]  # catalog built from the full files
-    sha: str                        # sha256 of the files as read
+    sha: str                        # sha256 of the files as read (of the recorded versions, when versioned)
+    # observed | reconstructed: graded against the version in force at the session start;
+    # unverified: today's file, its version at the session start is not known (docs/deviations.md)
+    authority: str = "unverified"
 
 
 def _read_parts(src: InstructionSource) -> list[str]:
@@ -270,12 +203,15 @@ def load_sources(sources: list[InstructionSource]) -> list[LoadedSource]:
     return _load_texts([(src.name, _read_parts(src), None) for src in sources])
 
 
-def _load_texts(items: list[tuple[str, list[str], str | None]]) -> list[LoadedSource]:
-    """(name, file texts, sha or None) per source -> LoadedSource, with the per-source and
-    total caps. `sha` None: the sha256 of the texts (rule_catalog.sha)."""
+def _load_texts(items: list[tuple[str, list[str], str | None]] | list[tuple[str, list[str], str | None, str]],
+                ) -> list[LoadedSource]:
+    """(name, file texts, sha or None[, authority]) per source -> LoadedSource, with the per-source
+    and total caps. `sha` None: the sha256 of the texts (rule_catalog.sha)."""
     out: list[LoadedSource] = []
     total = 0
-    for name, parts, sha in items:
+    for item in items:
+        name, parts, sha = item[0], item[1], item[2]
+        authority = item[3] if len(item) > 3 else "unverified"
         text = redact("\n\n".join(parts)).strip()
         if not text:
             continue
@@ -287,8 +223,60 @@ def _load_texts(items: list[tuple[str, list[str], str | None]]) -> list[LoadedSo
                 break
             text = text[:room].rstrip() + "\n[... cut ...]"
         total += len(text)
-        out.append(LoadedSource(name, text, _catalog(parts), sha or rule_catalog.sha(parts)))
+        out.append(LoadedSource(name, text, _catalog(parts), sha or rule_catalog.sha(parts), authority))
     return out
+
+
+def load_versioned(row: SessionRow, db_url: str | None = None,
+                   events: list[dict[str, Any]] | None = None) -> list[LoadedSource]:
+    """The instructions to grade a session against (docs/deviations.md, "Version in force").
+
+    A session with `instruction_sources` entries: per source, the texts of the recorded versions
+    (instruction_texts, git, or today's file when its sha matches) when every file of the source has
+    one (authority observed / reconstructed, the weaker of its files); otherwise today's files of
+    that source, authority `unverified`. A file recorded as not in force is not read. A legacy
+    session without entries: today's files (`instruction_sources`), all `unverified`. `events`:
+    the transcript, whose loaded texts also recover observed versions that were not stored."""
+    entries = [e for e in (instr.Entry.from_json(d) for d in row.instruction_sources or []) if e is not None]
+    if not entries:
+        return load_sources(instruction_sources(row))
+    groups: dict[str, list[instr.Entry]] = {}
+    for e in entries:
+        groups.setdefault(e.name, []).append(e)
+    shas = [e.sha256 for e in entries if e.sha256]
+    with store.connect(db_url) as conn:
+        texts = instr.fetch_texts(conn, shas)
+    if events:
+        ev = instr.evidence(events, row.tool)
+        for t in [*ev.files.values(), *(body for _, body in ev.skills)]:
+            texts.setdefault(instr.sha256(t), t)
+    r = instr.Resolver()
+    items: list[tuple[str, list[str], str | None, str]] = []
+    for name, group in groups.items():
+        parts: list[str] = []
+        authorities: list[str] = []
+        shas: list[str] = []
+        for e in group:
+            text = instr.entry_text(e, texts, r)
+            if text is not None:
+                parts.append(text)
+                authorities.append(e.authority)
+                shas.append(e.sha256 or "")
+                continue
+            p = instr.unlabel(e.path)   # today's file: its version at the session start is not known
+            if p is not None and _safe(p):
+                today = _read_parts(InstructionSource(name, [p]))
+                parts += today
+                authorities += ["unverified"] * len(today)
+        if not parts:
+            continue
+        if "unverified" in authorities:
+            items.append((name, parts, None, "unverified"))
+            continue
+        weakest = max(authorities, key=lambda a: instr.RANK[a])
+        sha = shas[0] if len(shas) == 1 else hashlib.sha256("\n".join(shas).encode()).hexdigest()
+        items.append((name, parts, sha, weakest))
+    return _load_texts(items)
 
 
 # --------------------------------------------------------------------------- cloud routines
@@ -307,7 +295,7 @@ def cloud_loaded(rec: dict[str, Any]) -> tuple[str, list[LoadedSource]]:
     `routine:<routine>`, a file `cloud-file:<name>`. The digest is redacted again (it was
     built by a script that may be older than this module's patterns)."""
     routine = str(rec.get("routine") or "")
-    items: list[tuple[str, list[str], str | None]] = []
+    items: list[tuple[str, list[str], str | None, str]] = []
     seen: set[str] = set()
     for item in rec.get("instructions") or []:
         if not isinstance(item, dict) or not isinstance(item.get("text"), str):
@@ -317,7 +305,8 @@ def cloud_loaded(rec: dict[str, Any]) -> tuple[str, list[LoadedSource]]:
             continue
         seen.add(name)
         sha = str(item.get("sha256") or "")
-        items.append((name, [item["text"]], sha if _SHA_RE.fullmatch(sha) else None))
+        # The texts the routine sent are the ones it loaded: observed.
+        items.append((name, [item["text"]], sha if _SHA_RE.fullmatch(sha) else None, "observed"))
     return cap(redact(str(rec.get("digest") or ""))), _load_texts(items)
 
 
@@ -758,6 +747,7 @@ class Finding:
     ref_match: str | None = None      # exact | snapped | unmatched
     ref_score: float | None = None
     instruction_sha: str | None = None
+    instruction_authority: str | None = None   # of the source text graded against (LoadedSource.authority)
 
     def key(self) -> tuple[str, str, int | None]:
         return (self.instruction_source, self.rule_key(), self.turn)
@@ -908,7 +898,8 @@ def resolve(findings: list[Finding], instructions: list[LoadedSource]) -> list[F
         src = by_name.get(f.instruction_source)
         m = rule_catalog.snap(f.instruction_ref, src.rules if src else [])
         r = replace(f, rule_id=m.rule_id, rule_title=m.rule_title, ref_match=m.how,
-                    ref_score=round(m.score, 3), instruction_sha=src.sha if src else None)
+                    ref_score=round(m.score, 3), instruction_sha=src.sha if src else None,
+                    instruction_authority=src.authority if src else None)
         if r.key() in seen:
             continue
         seen.add(r.key())
@@ -1131,7 +1122,8 @@ def _row(rec: dict[str, Any]) -> SessionRow:
     return SessionRow(rec["session_id"], rec["kind"], rec["repo"], rec["project_dir"], rec["started_at"],
                       rec["ended_at"], int(rec["transcript_bytes"] or 0), list(rec["skills"] or []),
                       list(rec["instructions"] or []), dict(rec["meta"] or {}), tool=rec.get("tool") or "claude",
-                      title=rec.get("title"), outcome=rec.get("outcome"))
+                      title=rec.get("title"), outcome=rec.get("outcome"),
+                      instruction_sources=rec.get("instruction_sources"))
 
 
 def pick_sessions(*, since: datetime, limit: int, session_id: str | None = None,
@@ -1224,8 +1216,9 @@ class _Recurrence:
 _UPSERT_SQL = """
 insert into deviations (source_key, session_id, instruction_source, instruction_ref, turn, what, why, how,
                         followed_grade, result_grade, jev_verdict, jev_confidence, jev_mode, jev_answers,
-                        writer_model, rule_id, rule_title, instruction_sha, meta, result_outcome, objective_result)
-values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        writer_model, rule_id, rule_title, instruction_sha, meta, result_outcome, objective_result,
+                        instruction_authority)
+values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
 on conflict (source_key) do update
     set what = excluded.what, why = excluded.why, how = excluded.how,
         followed_grade = excluded.followed_grade, result_grade = excluded.result_grade,
@@ -1233,7 +1226,8 @@ on conflict (source_key) do update
         jev_verdict = excluded.jev_verdict, jev_confidence = excluded.jev_confidence,
         jev_mode = excluded.jev_mode, jev_answers = excluded.jev_answers, writer_model = excluded.writer_model,
         rule_id = excluded.rule_id, rule_title = excluded.rule_title,
-        instruction_sha = excluded.instruction_sha, meta = deviations.meta || excluded.meta
+        instruction_sha = excluded.instruction_sha, meta = deviations.meta || excluded.meta,
+        instruction_authority = excluded.instruction_authority
 """
 
 
@@ -1246,6 +1240,7 @@ def _store(o: Outcome, db_url: str | None) -> None:
                 f.what, f.why, f.how, f.followed_grade, f.result_grade, j.verdict, j.confidence, j.mode,
                 Jsonb(j.answers), f"claude-cli:{distill.WRITER_MODEL}",
                 f.rule_id, f.rule_title, f.instruction_sha, Jsonb(f.meta()), o.session_outcome, o.objective,
+                f.instruction_authority,
             ))
         meta: dict[str, Any] = {"scan_found": len(o.judged), "scan_instructions": o.instructions}
         if o.skipped:  # skipped writer items stay visible on the session
@@ -1342,15 +1337,15 @@ def _scan_one(row: SessionRow, *, dry_run: bool, timeout: float, qset: questions
             return out
         # A resumed transcript's copied lines are the earlier session's (session_resume): its
         # own scan finds them, so they are left out here (no finding twice).
-        digest = build_digest(own_events(path, load_events(path), row.session_id,
-                                         row.meta.get("parent_session")))
-        sources = instruction_sources(row)
+        events = load_events(path)
+        digest = build_digest(own_events(path, events, row.session_id, row.meta.get("parent_session")))
+        # Graded against the version in force when it is recorded (docs/deviations.md).
+        instructions = load_versioned(row, db_url, events)
         out.digest_chars = len(digest)
-        out.instructions = [s.name for s in sources]
+        out.instructions = [s.name for s in instructions]
         out.missing = [n for n in row.instructions if n not in out.instructions]
         if dry_run:
             return out
-        instructions = load_sources(sources)
     if not instructions:
         return out  # nothing in force that we can read: scanned, nothing found
     try:
@@ -1518,8 +1513,7 @@ def candidates(*, days: int = DEFAULT_DAYS, now: datetime | None = None,
             "rule_title": titles.most_common(1)[0][0] if titles else None,
             "instruction_ref": refs.most_common(1)[0][0],
             "refs": dict(refs),
-            "instruction_shas": sorted({r["instruction_sha"] for r in recs if r["instruction_sha"]}),
-            "since_rule_change": since.isoformat(timespec="seconds") if since else None,
+            "instruction_shas": sorted({r["instruction_sha"] for r in recs if r["instruction_sha"]}),            "since_rule_change": since.isoformat(timespec="seconds") if since else None,
             "target_paths": _targets(source, recs[0]),
             "count": len(recs),
             "sessions": len({r["session_id"] for r in recs}),
