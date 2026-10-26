@@ -159,6 +159,7 @@ Since 2026-10-23 (verify run of night 2026-10-23, partial, $0.14):
   `edits_targets.pinned_file` / `is_allowed` like the edits step) are removed from the night's allowlist, so their
   candidates are never triaged or hypothesized. The report notes
   `candidates: N on a target improve refuses (pinned or out of scope: ...), not considered`.
+- **Messenger routines are never candidates** (2026-10-26). `routine-audit` and `config-check` (`MESSENGER_ROUTINES`, as Night Desk decision 24) only report other routines' failures: their failures make no `routine:<name>` sighting (coverage `routine_failures` skipped `messenger: N`, plus a `candidates: N failure(s) of messenger routines not sighted` note), and an earlier night's open `routine:routine-audit` / `routine:config-check` stays in `rsi_candidates` unchanged but is not picked (note `candidates: <key> (<status>) not considered: ...`).
 - **A failed experiment or hypothesizer still advances the checkpoint.** The sightings are stored before S3 and the
   candidate stays `deferred` (or `retired` after repeated failures) in `rsi_candidates`, so the pool retries it;
   rereading the window added nothing and kept the checkpoint at 2026-10-14 for every failing night. The status is
