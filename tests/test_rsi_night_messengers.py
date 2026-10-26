@@ -115,6 +115,20 @@ def test_the_constant_names_both_messengers() -> None:
     assert N.MESSENGER_KEYS == ("routine:routine-audit", "routine:config-check")
 
 
+def test_sighting_code_alone_gives_no_messenger_sighting() -> None:
+    # Built like tests/test_rsi_night_skill_writer.py's helper (no database). Night.__init__ always sets `notes`
+    # before any stage runs, so a real night has it; a bare __new__ Night gets it here the same way.
+    night = N.Night.__new__(N.Night)
+    night.cfg, night.allowlist, night.notes = N.load_config(), [], []
+    fails = [{"routine": r, "run_id": f"r{i}", "ref": f"amem:run/r{i}"}
+             for i, r in enumerate(("config-check", "routine-audit", "amem-daily"))]
+    (s,) = night._routine_sightings(SimpleNamespace(routine_failures=fails))
+    assert s.rule_key == "routine:amem-daily"
+    assert night._cov().uses[NC.ROUTINE_FAILURES].skipped == {"messenger": 2}
+    assert night.notes == ["candidates: 2 failure(s) of messenger routines not sighted (routine-audit 1, config-check 1)"
+                           ": they only report other routines' failures"]
+
+
 def test_messenger_failures_are_skipped_and_counted_not_sighted(env: SimpleNamespace) -> None:
     assert ingest(env, REAL_LOG) == 3
     rep = night(env)

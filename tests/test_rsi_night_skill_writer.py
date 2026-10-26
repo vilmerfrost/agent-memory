@@ -138,7 +138,7 @@ def _sighting_rule_keys(home: Path) -> dict[str, Any]:
     night = N.Night.__new__(N.Night)
     night.cfg = N.load_config(PROFILE)
     night.allowlist = []
-    delta = SimpleNamespace(routine_failures=[{"routine": "config-check", "run_id": "r1", "ref": "amem:run/r1"}],
+    delta = SimpleNamespace(routine_failures=[{"routine": "amem-daily", "run_id": "r1", "ref": "amem:run/r1"}],
                             findings=[SimpleNamespace(status="ok", n=9, source="clickhouse", ref="ch:q.rule_gap/x",
                                                       measurements={"gap": 0.4})])
     (routine,) = night._routine_sightings(delta)
@@ -148,7 +148,7 @@ def _sighting_rule_keys(home: Path) -> dict[str, Any]:
 
 def test_the_writer_runs_for_every_source_kind(home: Path) -> None:
     keys = _sighting_rule_keys(home)
-    assert keys == {"routine_failures": "routine:config-check", "finding": None}
+    assert keys == {"routine_failures": "routine:amem-daily", "finding": None}
     pepe = CANDS["skill:pepe"]
     cases = [  # (source, rule key, file text, hypothesis, expected section, how it was picked)
         ("deviations", f"claude-md:global:{RULE_A[0]}", CLAUDE_MD, "Make the closing line a fixed two-line summary",
