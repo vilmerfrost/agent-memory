@@ -337,10 +337,14 @@ FAMILIES: tuple[Family, ...] = (
         key="coverage",
         title="Coverage snapshots and routine consumption",
         purpose="Record what each routine read, used and skipped, and what evidence was missing",
-        producers=("coverage.record_snapshot / record_consumption (Stage B contract; no routine wired yet)",),
-        owner_job="each consuming routine (wired in Stages D-F)",
+        producers=("amem-daily: deviations scan, score, sync (coverage_daily.py)",
+                   "rsi-skills: amem skills scores --refresh (coverage_daily.py)",
+                   "rsi-harvest: amem evals harvest (coverage_daily.py)",
+                   "amem-rsi-night: S1 delta and S4 evidence pack (night_coverage.py)"),
+        owner_job="each consuming routine, through coverage.record_best_effort (R4)",
         tables=("coverage_snapshots", "routine_consumption"),
-        consumers=(_c("amem coverage (contract checks)", "src/agent_memory/cli_coverage.py", "manual"),),
+        consumers=(_c("amem-rsi-brief coverage verdict", "src/agent_memory/rsi_brief.py", "report"),
+                   _c("amem coverage (contract checks)", "src/agent_memory/cli_coverage.py", "manual")),
         retention="One row per dataset and window, and per job run and dataset (natural keys, upserts). "
                   "No per-row audit trail.",
         exclusion="Counts, checkpoints and at most 20 evidence refs per row; never row contents. Reporting "
