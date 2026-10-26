@@ -120,6 +120,12 @@ skills-refresh run=sr-20261026T011002Z-3fa9c1 window_start=2026-04-06T19:34:40+0
 
   A failed run prints `window_start=- window_end=- status=failed scored=0` and exits 1. The night's
   `skill_refresh` prerequisite reads these rows: docs/rsi/night-ops.md.
+- Coverage (data-use plan R4, docs/data-use/coverage.md): job `rsi-skills`, run key = the run id, dataset
+  `skills:skill_calls`. The snapshot counts the prod calls of the window (plus the last read's unparsed log lines,
+  which make it `not_collected`) and how many are linked to a session. The consumption record: calls read,
+  prod calls considered, calls that moved a score (a session with a final outcome) and the skip reasons
+  `env_sandbox`, `no_session`, `outcome_not_final`. A failed refresh records `analysis_failed`. A write problem
+  is a stderr note before the final line; the line and the exit code do not change.
 
 ### Score
 

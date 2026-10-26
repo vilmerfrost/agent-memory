@@ -70,6 +70,14 @@ every step failed on that). The steps run either way.
    its provider's credit cap is a **warning** (`amem-daily-warn sync <sink>: ...`), never a failed step: the
    night's prerequisite check (docs/rsi/night-ops.md) blocks only on `ingest`, `tasks` and `deviations`, and the
    night does not read what sync writes.
+   Then **coverage** (data-use plan R4, `coverage_daily.py`): the deviations, score and sync steps write their
+   coverage snapshots and consumption records (docs/data-use/coverage.md), job `amem-daily`, run key = the summary
+   line's timestamp. Datasets: `sessions:sessions` (ingest window; the scan's funnel, skip reasons and the deviation
+   refs it stored), `deviations:deviations` (scan-eligible sessions in the window vs. scanned: a backlog is
+   `not_collected`), `routine_runs:runs` (score step), `<family>:<table>.<sink>` per synced table (delivery as the
+   sink acknowledged it; readback stays unmeasured). A step that is off or not due records nothing. Best effort:
+   a write problem is a stderr line and `coverage_problems=N` on the summary line, never a failure.
+   `AMEM_COVERAGE_WRITE=0` turns it off (and skips the extra reads).
 4. **log**: one line appended to the routines log.
 
 Scoring and escalations need the Postgres backend (V1). `AMEM_REQUIRE_REMOTE=1`
@@ -114,6 +122,7 @@ overrides it. House format (`%Y-%m-%dT%H:%M:%S%z`):
   a warning, not a failed step (each is named on stderr). When the edits step ran, `edits=N edits_kept=K
   edits_reverted=R edits_suggested=S edit_errors=E` follows (docs/edits.md). When the sync step ran a sink,
   `sync=clickhouse:ok,langfuse:ok,pastdev:partial sync_rows=N` follows (each sink's `sync run` status).
+  `coverage_problems=N` follows only when coverage records could not be written (a note, not a failure).
   One `amem-daily-fail <reason>` line per failed step, one `amem-daily-warn <reason>` line per warning.
 - `amem ingest routines-log` reads these back as routine `amem-daily`
   (`meta.scored`, `meta.escalations`, `meta.new`, `meta.push`, `meta.tasks`, `meta.duration_s`,
