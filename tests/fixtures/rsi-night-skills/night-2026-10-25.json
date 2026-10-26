@@ -1,0 +1,29 @@
+{
+  "_note": "Structured fields of the 2026-10-25 night's selected candidates and their first hypotheses (~/sandbox/nights/2026-10-25/report.json and the skill_scores rule keys). No transcript text. Each one fell back to the stub then: no rule section matched.",
+  "candidates": [
+    {"key": "skill:pepe", "source": "skill_scores", "kind": "edit_skill", "rule_key": "skill:pepe",
+     "target": "~/.agents/skills/pepe/SKILL.md", "test_cases": ["pepe-lock"], "fixture": "pepe.SKILL.md",
+     "metrics": {"score": 0.469, "n_scored": 14, "sessions": 14},
+     "hypothesis": {"what": "Finish the truncated Return mode section by spelling out its return block in prose: five ranked ideas, each with name, one-line pitch, slot, score 1-10 and one-line reason, then the pick.",
+                    "why": "The production text ends Return mode with an opened, empty output block, so callers using mode:return get no defined format."},
+     "section": "return-mode"},
+    {"key": "skill:meltdown", "source": "skill_scores", "kind": "edit_skill", "rule_key": "skill:meltdown",
+     "target": "~/.agents/skills/meltdown/SKILL.md", "test_cases": ["meltdown-brief"], "fixture": "meltdown.SKILL.md",
+     "metrics": {"score": 0.45, "n_scored": 6, "sessions": 6},
+     "hypothesis": {"what": "In the review-loop step, add: if the loop stops (4 passes or no score raised) with any score below 8, still render and report, listing each sub-8 criterion, its score and the remaining fix.",
+                    "why": "The hard rule says never show anything before every score is 8+, but step 7 stops after 4 passes or a flat pass."},
+     "section": "gate-review-loop-render"},
+    {"key": "skill:anatomy", "source": "skill_scores", "kind": "edit_skill", "rule_key": "skill:anatomy",
+     "target": "~/.agents/skills/anatomy/SKILL.md", "test_cases": ["anatomy-plan"], "fixture": "anatomy.SKILL.md",
+     "metrics": {"score": 0.48, "n_scored": 3, "sessions": 3},
+     "hypothesis": {"what": "Add to workflow step 1: before any geometry, name the closest shipped example you will start from and reuse its kit and structure rather than writing the figure from scratch.",
+                    "why": "The file asks agents to open the closest example but never makes them commit to one."},
+     "section": "workflow"}
+  ],
+  "second_hypotheses": [
+    {"key": "skill:pepe", "what": "Add to Phase 1: keep the whole pitch message under about 250 words, five pitches of at most two lines plus the pick, ending with exactly one question.", "section": "phase-1-pitch"},
+    {"key": "skill:meltdown", "what": "At the start of step 1, add: state in one line the chosen style, length, word budget and the trigger phrase that picked the style, before any material gathering.", "section": "material-brief-script-script-md"},
+    {"key": "skill:anatomy", "what": "Add a closing rule: the final message must state the size, the part count against that size's range, and whether the geometry audit passed, reporting any failure or skipped check plainly.", "section": null,
+     "_why": "No heading names it. The real file's Workflow body shares its words (geometry, audit, size), so the real file picks workflow; the trimmed copy keeps one body line per section, so nothing qualifies and the writer is not called."}
+  ]
+}

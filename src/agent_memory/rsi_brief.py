@@ -701,6 +701,19 @@ def skip_info(rep: Mapping[str, Any]) -> dict[str, Any] | None:
             "items": [text(i, 260) for i in (sk.get("items") or [])[:MAX_NOTES] if isinstance(i, str)]}
 
 
+WRITER_NEVER_RAN = "writer never ran"     # rsi_night.WRITER_NEVER_RAN: the report's own note, shown as a warning
+
+
+def writer_info(rep: Mapping[str, Any]) -> dict[str, Any] | None:
+    """The report's optional `writer` tally (2026-10-26): counts and the top fallback reason, or None."""
+    w = rep.get("writer")
+    if not isinstance(w, dict) or not all(_count(w.get(k)) for k in ("experiments", "wrote", "fell_back")):
+        return None
+    top = next((text(x.get("reason"), 200) for x in w.get("reasons") or [] if isinstance(x, dict)), "") or None
+    return {"experiments": w["experiments"], "wrote": w["wrote"], "fell_back": w["fell_back"],
+            "all_fell_back": w.get("all_fell_back") is True, "top_reason": top}
+
+
 def headline(rep: Mapping[str, Any]) -> str:
     sk = skip_info(rep)
     if sk:
@@ -751,13 +764,20 @@ def build_brief(rep: Mapping[str, Any], db: Db, *, artifacts_root: Path, report:
              "estimated_usd": c.get("estimated_usd") if _num(c.get("estimated_usd")) else None,
              "total_usd": c.get("total_usd") or 0.0, "budget_exhausted": rep["status"] == "budget_exhausted"}
     services = {text(k, 32): text(v, 80) for k, v in rep["health"].items()}
+    writer = writer_info(rep)
+    writer_warning = ([f"{WRITER_NEVER_RAN}: {writer['fell_back']}/{writer['experiments']} experiments fell back to the "
+                       f"stub change ({writer['top_reason'] or 'no reason recorded'}). No writer change was tested."]
+                      if writer and writer["all_fell_back"] else [])
     health = {"services": services,
               "degraded": sorted(k for k, v in services.items() if v not in HEALTHY + NEUTRAL),
-              "database": {"status": db.status, "detail": db.detail}, "warnings": list(warnings or []),
+              "database": {"status": db.status, "detail": db.detail},
+              "warnings": writer_warning + list(warnings or []),
               "reasons": {text(k, 32): [text(x, 160) for x in v[:3]]
                           for k, v in _obj(rep.get("health_reasons")).items() if isinstance(v, list)}}
     pending = pending_items(rep, db, artifacts_root=artifacts_root, suites=suites)
     n_pending = len(pending["items"])
+    notes = [text(n, 200) for n in (rep.get("notes") or [])          # the writer's note is shown as a warning instead
+             if not (writer_warning and str(n).startswith(WRITER_NEVER_RAN))][:MAX_NOTES]
     ck = rep["checkpoint"]
     return {
         "format": BRIEF_FORMAT, "night": rep["night"], "status": rep["status"],
@@ -772,7 +792,7 @@ def build_brief(rep: Mapping[str, Any], db: Db, *, artifacts_root: Path, report:
                        "ready)" if any(not x["actions"]["apply"] for x in passed) else "")
                     + f", {len(failed)} failed or inconclusive, {_plural(n_pending, 'decision')} waiting for you. "
                     f"Total cost {usd(costs['total_usd'])}."),
-        "notes": [text(n, 200) for n in (rep.get("notes") or [])[:MAX_NOTES]],
+        "notes": notes,
         "sessions": sessions,
         "patterns": {"total": len(rep["patterns"]), "items": patterns},
         "candidates": {"total": len(cands), "selected": sum(x["selected"] for x in cands), "backlog": db.backlog,
@@ -1106,6 +1126,8 @@ def notification(b: Mapping[str, Any]) -> tuple[str, str]:
     other = len(b["health"]["degraded"]) - len(deg)
     if deg or other:
         lines.append("Degraded: " + ", ".join(deg + ([f"{other} other"] if other else [])) + ".")
+    if any(str(w).startswith(WRITER_NEVER_RAN) for w in b["health"]["warnings"]):
+        lines.append("Writer never ran: every experiment used the stub change.")
     if b["health"]["database"]["status"] != "ok":
         lines.append("Database rows not read.")
     for it in pd["items"][:PUSH_ITEMS]:

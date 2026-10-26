@@ -718,6 +718,11 @@ def classify(rep: Mapping[str, Any]) -> tuple[str, list[str]]:
         if v in ("error", "unavailable", "fixture-missing", "stale", "truncated"):
             why = "; ".join(str(x) for x in (reasons.get(k) or [])[:2])
             items.append(f"health {k}: {v}" + (f" ({why})" if why else ""))
+    w = rep.get("writer")
+    if isinstance(w, dict) and w.get("all_fell_back") is True:     # no writer change was tested (2026-10-25)
+        top = next((str(x.get("reason")) for x in w.get("reasons") or [] if isinstance(x, dict)), "no reason recorded")
+        items.append(f"writer never ran: {w.get('fell_back')}/{w.get('experiments')} experiments fell back to the "
+                     f"stub ({top})")
     for e in rep.get("experiments") or []:
         if e.get("status") in ("failed", "interrupted"):
             why = (e.get("verdict_reasons") or [e.get("status")])[0]

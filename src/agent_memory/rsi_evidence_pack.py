@@ -544,6 +544,19 @@ class _Runner:
         return out
 
 
+def _health_step(retr: str, status: str, detail: str) -> dict[str, Any]:
+    """A health() check as a step line ({retr}.health), so its outcome explains the provider's health like a query."""
+    return {"step": f"{retr}.health", "status": status, "found": 0, "detail": _free(detail, 120) or ""}
+
+
+def _health_detail(state: str, val: Any, timeout_s: float) -> str:
+    if state == "timeout":
+        return f"timeout after {timeout_s:g}s"
+    if state == "error":
+        return f"health: {type(val).__name__}"
+    return "" if getattr(val, "ok", False) else str(getattr(val, "detail", "") or "health not ok")
+
+
 # ---------------------------------------------------------------- re-reading subjects in Supabase
 
 
@@ -870,10 +883,13 @@ def build_pack(candidate: Mapping[str, Any], *, retrievers: Mapping[str, Retriev
     per_source_status: dict[str, list[str]] = defaultdict(list)
     for st, res in done:
         per_source_status[st.source].append(res.status)
-    for retr, (status, _) in idle_health.items():
+    for retr, (status, detail) in idle_health.items():
         per_source_status[SERVICE[retr]].append(status)
+        runner.log.append(_health_step(retr, status, detail))   # the pack's steps then explain its health too
     if sb_read != "skipped":
         per_source_status["supabase"].append(sb_read)
+        if sb_read != "ok":
+            runner.log.append({"step": "sb.reread", "status": sb_read, "found": 0, "detail": "subjects not re-read"})
     health = {s: _combine(per_source_status.get(s, [])) for s in SOURCES}
     for retr in RETRIEVERS:
         if _owner_off(rs.get(retr)):            # the raw retriever (the runner wraps it)
@@ -1103,6 +1119,9 @@ class Delta:
     truncated: dict[str, bool] = field(default_factory=dict)
     boundary_skipped: list[str] = field(default_factory=list)
     next_checkpoint: str = ""
+    # The provider steps S1 ran ({step, status, found, detail}, as EvidencePack.steps), so a provider whose health is
+    # not ok carries its reason into the night report (2026-10-25: langfuse "error" with no reason).
+    steps: list[dict[str, Any]] = field(default_factory=list)
 
     def counts(self) -> dict[str, int]:
         return {"sessions": len(self.sessions), "deviations": len(self.deviations),
@@ -1260,12 +1279,15 @@ def delta_since(checkpoint_ts: str | datetime | None, *, conn: psycopg.Connectio
                 r = runner.r.get(retr)
                 if r is None:
                     stat[SERVICE[retr]].append("unavailable")
+                    runner.log.append(_health_step(retr, "unavailable", "no retriever"))
                 else:
                     state, val = runner.call(retr, r.health)
-                    stat[SERVICE[retr]].append("ok" if state == "ok" and val.ok else
-                                               "error" if state == "timeout" else "unavailable")
+                    st = ("ok" if state == "ok" and val.ok else "error" if state == "timeout" else "unavailable")
+                    stat[SERVICE[retr]].append(st)
+                    runner.log.append(_health_step(retr, st, _health_detail(state, val, limits.timeout_s)))
         for svc, sts in stat.items():
             d.health[svc] = _combine(sts)
+        d.steps = list(runner.log)
         for retr in ("ch", "lf", "pd"):
             if _owner_off(retrievers.get(retr)):
                 d.health[SERVICE[retr]] = "skipped"
