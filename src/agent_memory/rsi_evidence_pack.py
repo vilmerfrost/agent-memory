@@ -90,7 +90,7 @@ import time
 import unicodedata
 from collections import Counter, defaultdict
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -738,6 +738,8 @@ def _finding(raw: _Raw, found: set[str] | None, lim: PackLimits, c: _Cand | None
     if raw.source == "pastdev" and status == "ok" and c is not None and not _about(c, subjects, scopes or {}):
         # a similar past record that is about another rule and another file: context, never support
         status, authority, detail = "unlinked", None, "about another rule or target: context only"
+    if ev.kind == "production-outcome":
+        status, authority, detail = "unlinked", None, "production observation needs current-version and coverage validation"
     m = _measure(ev.metrics)
     return Finding(raw.source, ev.ref, ev.observed_at, m, _n(ev.metrics), status, ev.kind, authority, raw.step.name,
                    _free(ev.summary, lim.text_max), detail)
@@ -792,7 +794,8 @@ def _select(meta: list[Finding], evidence: dict[str, list[Finding]],
 def build_pack(candidate: Mapping[str, Any], *, retrievers: Mapping[str, Retriever | None] | None = None,
                limits: PackLimits = PackLimits(), environ: Mapping[str, str] | None = None,
                connect: Callable[[], psycopg.Connection] | None = None,
-               now: Callable[[], datetime] | None = None, clock: Callable[[], float] = time.monotonic) -> EvidencePack:
+               now: Callable[[], datetime] | None = None, clock: Callable[[], float] = time.monotonic,
+               current_instruction_sha256: str | None = None) -> EvidencePack:
     """The bounded evidence pack for one candidate. Never raises for a provider: an unconfigured, down, slow or
     broken one shows in `health` and as an unavailable/error finding. Writes nothing (read-only connections)."""
     c = _candidate(candidate)
@@ -831,13 +834,19 @@ def build_pack(candidate: Mapping[str, Any], *, retrievers: Mapping[str, Retriev
     recalled = [s for raw in raws if raw.source == "pastdev" for s in raw.ev.subject_refs if s.startswith("amem:")]
     found: set[str] | None = None
     scopes: dict[str, tuple[set[str], set[str]]] = {}
+    production_refs: set[str] = set()
     sb_read = "skipped"
     if ro is not None and wanted:
-        def reread() -> tuple[set[str], dict[str, tuple[set[str], set[str]]]]:
+        def reread() -> tuple[set[str], dict[str, tuple[set[str], set[str]]], set[str]]:
             with ro() as conn:
-                return existing(conn, wanted), (subject_scopes(conn, recalled) if recalled else {})
+                ids = [refs.parse(r).id for r in c.evidence_refs if refs.is_ref(r)
+                       and refs.parse(r).kind == "evidence" and _UUID.fullmatch(refs.parse(r).id)]
+                prs = {refs.amem("evidence", str(row[0])) for row in conn.execute(
+                    "select id from rsi_evidence where id=any(%s::uuid[]) and kind='production-outcome'",
+                    (ids,)).fetchall()} if ids else set()
+                return existing(conn, wanted), (subject_scopes(conn, recalled) if recalled else {}), prs
         state, val = runner.call("sb", reread)
-        found, scopes = val if state == "ok" else (None, {})
+        found, scopes, production_refs = val if state == "ok" else (None, {}, set())
         sb_read = "ok" if state == "ok" else ("error" if state == "timeout" else "unavailable")
     elif ro is None and wanted:
         sb_read = "unavailable"
@@ -847,6 +856,9 @@ def build_pack(candidate: Mapping[str, Any], *, retrievers: Mapping[str, Retriev
     by_key: dict[tuple[str, str, str], Finding] = {}
     for raw in raws:
         f = _finding(raw, found, limits, c, scopes)
+        if f.ref in production_refs:
+            f = replace(f, status="unlinked", authority=None,
+                        detail="production observation requires current-version and coverage validation")
         old = by_key.get((f.source, f.kind, f.ref))
         if old is None or (raw.live and old.via.startswith("sb.")):
             by_key[(f.source, f.kind, f.ref)] = f
@@ -855,9 +867,44 @@ def build_pack(candidate: Mapping[str, Any], *, retrievers: Mapping[str, Retriev
         if r in cited or found is None:                 # already cited, or cannot be re-read (health says why)
             continue
         ok = r in found
+        production = r in production_refs
         by_key[("supabase", "candidate-evidence", r)] = Finding(
-            "supabase", r, None, {}, None, "ok" if ok else "stale", "candidate-evidence", r if ok else None,
-            "candidate.evidence_refs", None, "" if ok else "no longer resolves")
+            "supabase", r, None, {}, None, "unlinked" if production else "ok" if ok else "stale",
+            "candidate-evidence", r if ok and not production else None,
+            "candidate.evidence_refs", None, "requires production observation validation" if production
+            else "" if ok else "no longer resolves")
+    # Only the caller can supply a freshly measured target version. Merely
+    # resolving an old evidence ref never validates production observations.
+    if current_instruction_sha256 is not None and ro is not None and c.rule:
+        from agent_memory import production_feedback as PF
+
+        def production_read() -> list[dict[str, Any]]:
+            with ro() as conn:
+                return PF.for_candidate(conn, candidate, current_instruction_sha256,
+                                        now=(now or (lambda: datetime.now(UTC)))(), limit=limits.per_source)
+        state, observations = runner.call("sb", production_read)
+        if state != "ok":
+            sb_read = "error" if state == "timeout" else "unavailable"
+        elif sb_read == "skipped":
+            sb_read = "ok"
+        runner.log.append({"step": "sb.production_outcomes", "status": "ok" if state == "ok" else "error",
+                           "found": len(observations) if state == "ok" else 0})
+        if state == "ok":
+            for item in observations:
+                m = item["metrics"]
+                measures = {"rule_key": m.get("rule_key"), "verdict": m.get("verdict"),
+                            "advisory_only": True, "design": m.get("design"), "generation": m.get("generation"),
+                            "coverage_status": (m.get("coverage") or {}).get("status"),
+                            **(m.get("measurements") or {})}
+                n = min(measures.get("sessions_before", 0), measures.get("sessions_after", 0))
+                by_key[("supabase", PF.KIND, item["ref"])] = Finding(
+                    "supabase", item["ref"], item["observed_at"], _measure(measures), n, item["status"], PF.KIND,
+                    item["ref"] if item["status"] == "ok" else None, "sb.production_outcomes",
+                    "Advisory before/after production observation; not causal", item["reason"])
+        else:
+            by_key[("supabase", "query", "query:sb.production_outcomes")] = Finding(
+                "supabase", "query:sb.production_outcomes", None, {}, None, "error", "query",
+                via="sb.production_outcomes", detail="production observation read failed")
     evidence: dict[str, list[Finding]] = defaultdict(list)
     for f in by_key.values():
         evidence[f.source].append(f)
@@ -1214,8 +1261,13 @@ def _evidence_finding(row: tuple[Any, ...], found: set[str], lim_text: int) -> F
         status = "ok" if len(resolved) == len(subj) else "stale"
         authority = resolved[0] if resolved else None
     m = dict(metrics or {}) if isinstance(metrics, Mapping) else {}
+    if kind == "production-outcome":
+        # Delta reads have no freshly measured target bytes. The dedicated
+        # consumer validates the full record before it becomes supporting input.
+        status, authority = "unlinked", None
     return Finding(source, ref, _ts_str(observed), _measure(m), _n(m), status, kind, authority, "sb.rsi_evidence",
-                   _free(summary, lim_text), "")
+                   _free(summary, lim_text), "requires current instruction version and complete coverage"
+                   if kind == "production-outcome" else "")
 
 
 def delta_since(checkpoint_ts: str | datetime | None, *, conn: psycopg.Connection,
