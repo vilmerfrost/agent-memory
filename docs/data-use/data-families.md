@@ -259,6 +259,22 @@ Learning families with no automatic analysis consumer:
 - Exclusion: Summaries only; report bodies stay in local files.
 - Learning input: yes
 
+## Night Desk read status
+
+- Key: `night_read_state`
+- Purpose: Sync the owner's unread report inbox across devices
+- Producers: Night Desk explicit Mark as read / Mark unread actions (owner session)
+- Owner job: Night Desk owner
+- Tables: `night_reads`
+- Views: none
+- Local files: none
+- External sinks: none
+- Consumers:
+  - report: Night Desk inbox (external web app, owner JWT) (`supabase/migrations/20261026160937_night_desk_reads.sql`)
+- Retention: Kept until marked unread or the referenced night is removed.
+- Exclusion: Never a learning input. Reading does not resolve failures or approve changes; automation has no access.
+- Learning input: no
+
 ## Coverage snapshots and routine consumption
 
 - Key: `coverage`

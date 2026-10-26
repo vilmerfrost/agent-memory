@@ -98,3 +98,20 @@ def test_receipts_fail_closed_without_configured_owner(receipts):
     identity(c)
     assert c.execute("select amem_mark_nights_read()").fetchone() == (0,)
     assert c.execute("select * from night_reads").fetchall() == []
+
+
+def test_automation_cannot_read_or_change_human_read_status(receipts):
+    for role in ("amem_app", "rsi_writer", "rsi_reader"):
+        for privilege in ("select", "insert", "update", "delete"):
+            assert receipts.execute("select has_table_privilege(%s,'public.night_reads',%s)", (role, privilege)).fetchone() == (False,)
+        assert receipts.execute("select has_function_privilege(%s,'public.amem_mark_nights_read(text[])','execute')", (role,)).fetchone() == (False,)
+
+
+def test_reapplying_receipt_migration_preserves_flags(receipts):
+    identity(receipts)
+    receipts.execute("select amem_mark_nights_read(array['2026-10-24'])")
+    before = receipts.execute("select * from night_reads").fetchall()
+    receipts.execute("reset role")
+    receipts.execute(next(MIGRATIONS.glob("*_night_desk_reads.sql")).read_text())
+    identity(receipts)
+    assert receipts.execute("select * from night_reads").fetchall() == before
