@@ -309,7 +309,7 @@ def render_markdown(rep: Report) -> str:
         ch = o.change
         lines.append(f"## {VERDICT_WORDS[o.verdict].capitalize()}: {ch.title or ch.rule_key}")
         lines.append(f"- Change: {ch.kind} `{ch.id}`, rule `{ch.rule_key}`, applied "
-                     f"{ch.applied_at:%Y-%m-%d %H:%M} ({o.observed_days:.1f} days ago)")
+                     f"{ch.applied_at.astimezone(rep.checked_at.tzinfo):%Y-%m-%d %H:%M} ({o.observed_days:.1f} days ago)")
         lines.append(f"- Windows: {o.window_days:.1f} days each; before {o.deviations_before} deviation(s) in "
                      f"{o.sessions_before} session(s), after {o.deviations_after} in {o.sessions_after}"
                      + (f"; p = {o.p_value:g}" if o.p_value is not None else ""))
