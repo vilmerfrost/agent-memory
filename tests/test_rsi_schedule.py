@@ -37,13 +37,13 @@ GOOD_LOG = """\
 2026-10-18T00:08:31+0200 amem-ingest PASS heartbeat 5s
 2026-10-18T03:30:18+0200 rsi-harvest PASS rc=0 1s drafted 20 new
 2026-10-18T08:45:09+0200 amem-archive PASS heartbeat 5s
-2026-10-18T09:20:04+0200 amem-daily PASS scored=16 escalations=14 new=0 push=none tasks=10 deviations=68 707s
 2026-10-19T00:09:12+0200 amem-ingest PASS heartbeat 4s
+2026-10-19T00:40:04+0200 amem-daily PASS scored=16 escalations=14 new=0 push=none tasks=10 deviations=68 707s
 """
-# The real 2026-10-17 amem-daily line: one malformed grade failed the deviations step.
+# The real 2026-10-17 amem-daily line (moved to the 00:40 slot): one malformed grade failed the deviations step.
 DAILY_FAIL = """\
-2026-10-18T09:20:04+0200 amem-daily FAIL scored=16 escalations=14 new=0 push=none tasks=10 deviations=68 deviation_errors=1 707s
-2026-10-18T09:20:04+0200 amem-daily-fail deviations: 1 error; first: session b1b2011c/agent-a079: writer output: deviation 0: followed_grade must be a number in 0..1, got None
+2026-10-19T00:40:04+0200 amem-daily FAIL scored=16 escalations=14 new=0 push=none tasks=10 deviations=68 deviation_errors=1 707s
+2026-10-19T00:40:04+0200 amem-daily-fail deviations: 1 error; first: session b1b2011c/agent-a079: writer output: deviation 0: followed_grade must be a number in 0..1, got None
 """
 DEV_FAIL = ("deviations: 1 error; first: session b1b2011c/agent-a079: writer output: deviation 0: followed_grade must "
             "be a number in 0..1, got None")
@@ -63,12 +63,21 @@ def test_gate_passes_only_on_completion_checkpoints(tmp_path: Path) -> None:
     assert S.check_prerequisites(write_log(tmp_path, GOOD_LOG), NIGHT, NOW, pre) == []
     # amem-daily ran but failed (the real 10-17 line): the night waits for a successful run
     reasons = S.check_prerequisites(write_log(tmp_path, GOOD_LOG.replace(
-        GOOD_LOG.splitlines()[3] + "\n", DAILY_FAIL)), NIGHT, NOW, pre)
-    assert reasons == [f"prerequisite amem-daily: last run FAIL at 2026-10-18T09:20:04+0200 ({DEV_FAIL})"]
-    # only yesterday's PASS: completion today is missing (the clock alone would have let it run)
-    yday = GOOD_LOG.replace("2026-10-18T09:20:04+0200 amem-daily", "2026-10-17T09:20:04+0200 amem-daily")
+        GOOD_LOG.splitlines()[4] + "\n", DAILY_FAIL)), NIGHT, NOW, pre)
+    assert reasons == [f"prerequisite amem-daily: last run FAIL at 2026-10-19T00:40:04+0200 ({DEV_FAIL})"]
+    # only the previous night's PASS (00:40 on the night's own date belongs to night 2026-10-17): the clock or the
+    # calendar date alone would have let it run
+    yday = GOOD_LOG.replace("2026-10-19T00:40:04+0200 amem-daily", "2026-10-18T00:40:04+0200 amem-daily")
     assert S.check_prerequisites(write_log(tmp_path, yday), NIGHT, NOW, pre) == [
-        "prerequisite amem-daily: no PASS on 2026-10-18 (last PASS 2026-10-17T09:20:04+0200)"]
+        "prerequisite amem-daily: no PASS for night 2026-10-18 (last PASS 2026-10-18T00:40:04+0200)"]
+    # the old 09:20 slot on the night's date is the previous night's run too
+    old_slot = GOOD_LOG.replace("2026-10-19T00:40:04+0200 amem-daily", "2026-10-18T09:20:04+0200 amem-daily")
+    assert S.check_prerequisites(write_log(tmp_path, old_slot), NIGHT, NOW, pre) == [
+        "prerequisite amem-daily: no PASS for night 2026-10-18 (last PASS 2026-10-18T09:20:04+0200)"]
+    # any time between the night's noon and the next morning counts (a manual evening run, a late wake)
+    for ts in ("2026-10-18T12:00:00+0200", "2026-10-18T23:10:00+0200", "2026-10-19T01:29:00+0200"):
+        late = GOOD_LOG.replace("2026-10-19T00:40:04+0200 amem-daily", f"{ts} amem-daily")
+        assert S.check_prerequisites(write_log(tmp_path, late), NIGHT, NOW, pre) == [], ts
     # never ran, ingest failing now, a run logged after `now` does not count
     no_daily = "".join(ln + "\n" for ln in GOOD_LOG.splitlines() if " amem-daily " not in ln)
     ingest_fail = GOOD_LOG + "2026-10-19T00:24:12+0200 amem-ingest FAIL rc=1 0s amem: ingest failed: OperationalError\n"
@@ -93,12 +102,12 @@ def test_first_config_names_the_prerequisites() -> None:
         S.prerequisites({"prerequisites": [{"routine": "../evil"}]})
 
 
-DAILY_PASS_LINE = GOOD_LOG.splitlines()[3] + "\n"
+DAILY_PASS_LINE = GOOD_LOG.splitlines()[4] + "\n"
 SCORE_FAIL = "score dispatch: 1 Jev error; first: run 4f1c: ReadTimeout"
 EDITS_FAIL = "edits: 1 error; first: claude rule-7: writer timed out"
 
 
-def daily_fail(*details: str, ts: str = "2026-10-18T09:20:04+0200") -> str:
+def daily_fail(*details: str, ts: str = "2026-10-19T00:40:04+0200") -> str:
     return (f"{ts} amem-daily FAIL scored=16 escalations=14 new=0 push=none tasks=10 707s\n"
             + "".join(f"{ts} amem-daily-fail {d}\n" for d in details))
 
@@ -109,8 +118,8 @@ def test_gate_runs_the_night_when_only_steps_it_does_not_read_failed(tmp_path: P
                                  NIGHT, NOW, pre)
     assert g.reasons == [] and g.summary() == ""
     assert g.warnings == [
-        f"prerequisite amem-daily: step score failed at 2026-10-18T09:20:04+0200; the night does not read it: {SCORE_FAIL}",
-        f"prerequisite amem-daily: step edits failed at 2026-10-18T09:20:04+0200; the night does not read it: {EDITS_FAIL}"]
+        f"prerequisite amem-daily: step score failed at 2026-10-19T00:40:04+0200; the night does not read it: {SCORE_FAIL}",
+        f"prerequisite amem-daily: step edits failed at 2026-10-19T00:40:04+0200; the night does not read it: {EDITS_FAIL}"]
     for step in ("distill: 1 error; first: run 9: x", "escalations: OperationalError: x", "rsi-push: OSError: x",
                  "state: cannot write amem-daily-state.json: OSError: x"):
         assert S.check_prerequisites(write_log(tmp_path, GOOD_LOG.replace(DAILY_PASS_LINE, daily_fail(step))),
@@ -119,7 +128,7 @@ def test_gate_runs_the_night_when_only_steps_it_does_not_read_failed(tmp_path: P
 
 def test_gate_skips_when_a_step_the_night_reads_failed(tmp_path: Path) -> None:
     pre = S.DEFAULT_PREREQS
-    ts = "2026-10-18T09:20:04+0200"
+    ts = "2026-10-19T00:40:04+0200"
     # a needed step next to a tolerated one: the needed one blocks and names itself, the other is a warning
     g = S.evaluate_prerequisites(write_log(tmp_path, GOOD_LOG.replace(DAILY_PASS_LINE, daily_fail(SCORE_FAIL, DEV_FAIL))),
                                  NIGHT, NOW, pre)
@@ -136,9 +145,9 @@ def test_gate_skips_when_a_step_the_night_reads_failed(tmp_path: Path) -> None:
     assert g.reasons == [f"prerequisite amem-daily: last run FAIL at {ts}"]
     assert g.causes == [f"prerequisite amem-daily failed (last run FAIL at {ts}, no failed step named)"]
     # a tolerated FAIL still has to be the night's own run
-    old = daily_fail(SCORE_FAIL, ts="2026-10-17T09:20:04+0200")
+    old = daily_fail(SCORE_FAIL, ts="2026-10-18T00:40:04+0200")
     assert S.check_prerequisites(write_log(tmp_path, GOOD_LOG.replace(DAILY_PASS_LINE, old)), NIGHT, NOW, pre) == [
-        "prerequisite amem-daily: no PASS on 2026-10-18 (last completed run 2026-10-17T09:20:04+0200)"]
+        "prerequisite amem-daily: no PASS for night 2026-10-18 (last completed run 2026-10-18T00:40:04+0200)"]
     # amem-archive and amem-ingest keep the strict rule: any FAIL blocks
     arch = GOOD_LOG.replace("2026-10-18T08:45:09+0200 amem-archive PASS heartbeat 5s\n",
                             "2026-10-18T08:45:09+0200 amem-archive FAIL 5s\n"
@@ -152,7 +161,13 @@ def test_nonblocking_steps_are_configurable_and_backward_compatible() -> None:
     daily_p, arch = S.prerequisites(old_shape)
     assert daily_p.nonblocking_steps == S.DAILY_NONBLOCKING_STEPS and arch.nonblocking_steps == ()
     strict = S.prerequisites({"prerequisites": [{"routine": "amem-daily", "nonblocking_steps": []}]})
-    assert strict == (S.Prereq("amem-daily", True, None, ()),)
+    assert strict == (S.Prereq("amem-daily", True, None, (), "night_key", S.DAILY_WAIT_S),)
+    assert daily_p.match == "night_key" and daily_p.wait_s == 1800 and (arch.match, arch.wait_s) == ("date", 0.0)
+    by_date = S.prerequisites({"prerequisites": [{"routine": "amem-daily", "match": "date", "wait_running_s": 0}]})
+    assert (by_date[0].match, by_date[0].wait_s) == ("date", 0.0)
+    for bad in ({"match": "noon"}, {"wait_running_s": -1}, {"wait_running_s": True}, {"wait_running_s": 99999}):
+        with pytest.raises(ValueError):
+            S.prerequisites({"prerequisites": [{"routine": "amem-daily", **bad}]})
     custom = S.prerequisites({"prerequisites": [{"routine": "amem-archive", "nonblocking_steps": ["verify"]}]})
     assert custom[0].nonblocking_steps == ("verify",)
     for bad in ("score", ["Score"], [1], ["../x"]):
@@ -164,7 +179,7 @@ def test_strict_config_restores_the_old_gate(tmp_path: Path) -> None:
     strict = S.prerequisites({"prerequisites": [{"routine": "amem-daily", "nonblocking_steps": []}]})
     log = write_log(tmp_path, GOOD_LOG.replace(DAILY_PASS_LINE, daily_fail(SCORE_FAIL)))
     assert S.check_prerequisites(log, NIGHT, NOW, strict) == [
-        f"prerequisite amem-daily: last run FAIL at 2026-10-18T09:20:04+0200 ({SCORE_FAIL})"]
+        f"prerequisite amem-daily: last run FAIL at 2026-10-19T00:40:04+0200 ({SCORE_FAIL})"]
 
 
 def test_skip_reports_say_why_and_stay_valid_for_every_reader() -> None:
@@ -650,13 +665,13 @@ def log_runs(env: SimpleNamespace, routine: str) -> list[RL.ParsedRun]:
 
 def test_night_skips_with_a_recorded_reason_until_amem_daily_completed(env: SimpleNamespace) -> None:
     seed_rule(env.url, RULE_A, "a")
-    env.log.write_text(GOOD_LOG.replace(GOOD_LOG.splitlines()[3] + "\n", DAILY_FAIL))
+    env.log.write_text(GOOD_LOG.replace(GOOD_LOG.splitlines()[4] + "\n", DAILY_FAIL))
     ev = FakeEvidence()
     res = night_job(env, adapters=adapters(evidence=ev))
     assert res.status == "SKIP" and res.exit_code == 0 and ev.since_calls == []          # the night never started
     (run,) = log_runs(env, "amem-rsi-night")
     assert run.status == "skip" and run.meta["skipped"] == "prerequisites"
-    reason = f"prerequisite amem-daily: last run FAIL at 2026-10-18T09:20:04+0200 ({DEV_FAIL})"
+    reason = f"prerequisite amem-daily: last run FAIL at 2026-10-19T00:40:04+0200 ({DEV_FAIL})"
     assert run.meta["failures"] == [reason]
     rep = json.loads(N.report_path(NIGHT).read_text())                                   # the brief will say why
     assert N.validate_report(rep) == [] and rep["status"] == "preflight_failed"
@@ -668,7 +683,7 @@ def test_night_skips_with_a_recorded_reason_until_amem_daily_completed(env: Simp
         assert rows(env.url, f"select count(*) from {t}") == [(0,)], t
     # once amem-daily has passed, the same night runs
     with env.log.open("a") as fh:
-        fh.write("2026-10-18T11:02:10+0200 amem-daily PASS scored=3 1s\n")
+        fh.write("2026-10-19T01:02:10+0200 amem-daily PASS scored=3 1s\n")
     res2 = night_job(env)
     assert res2.status == "PASS" and res2.fields["status"] == "ok" and res2.fields["staged"] == 1
     assert json.loads(N.report_path(NIGHT).read_text())["status"] == "ok"                 # the real report replaced it
@@ -679,7 +694,7 @@ def test_night_runs_with_a_warning_when_only_a_step_it_does_not_read_failed(env:
     env.log.write_text(GOOD_LOG.replace(DAILY_PASS_LINE, daily_fail(SCORE_FAIL)))
     res = night_job(env)
     assert res.status == "PASS" and res.fields["status"] == "ok" and res.fields["staged"] == 1, res.items
-    warning = (f"prerequisite amem-daily: step score failed at 2026-10-18T09:20:04+0200; the night does not read it: "
+    warning = (f"prerequisite amem-daily: step score failed at 2026-10-19T00:40:04+0200; the night does not read it: "
                f"{SCORE_FAIL}")
     assert res.warnings == [warning]
     (run,) = log_runs(env, "amem-rsi-night")

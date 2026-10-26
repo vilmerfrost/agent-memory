@@ -1,19 +1,23 @@
 """Phone alerts the existing pushes missed, through the same ntfy channel (`edits_push._publish`, notify.env).
 
-- A staged proposal on its last day: one reminder, with fresh Reject / Review buttons (re-armed tokens).
-- The night's result, from the morning brief, when there is something to say (skipped, partly run, tested,
-  or a decision waits). A quiet night sends nothing.
-- Slips of the safety rules (working around a guard, the push and merge policy, the safety guards).
+Since 2026-10-26 the morning has one push: the 07:30 brief job's `push_morning`. It carries
+- the night's result, when there is something to say (skipped, partly run, tested, or a decision waits);
+- what amem-daily used to push itself before it moved to 00:40: new escalations (counts and routine names only,
+  never run summaries, failures or ids), slips of the safety rules (working around a guard, the push and merge
+  policy, the safety guards), and staged proposals on their last day.
+A quiet night with none of those sends nothing; a quiet night with new escalations still pushes.
 
-Each alert goes out once: the row records it (`rsi_proposals.meta.reminded`, `deviations.meta.alert`); the night
-push is sent by the brief job, which runs once per night. Messages carry plain words, rule names and file names
-only, then `redact`, like the other pushes. Raises nothing that should stop a routine: callers log a warning.
+Each part goes out once: escalation ids are marked pushed in amem-daily's state file after ntfy answered 200, the
+rows record the rest (`rsi_proposals.meta.reminded`, `deviations.meta.alert`). `remind_proposals` (with re-armed
+buttons) and `push_safety_slips` stay as stand-alone commands. Messages carry plain words, rule names and file
+names only, then `redact`, like the other pushes. Raises nothing that should stop a routine: callers log a warning.
 """
 
 from __future__ import annotations
 
 import re
 from collections.abc import Mapping
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -23,7 +27,7 @@ from psycopg.types.json import Jsonb
 from agent_memory import edits_push, redact, store
 from agent_memory import rsi_approval as AP
 
-REMIND_WITHIN = timedelta(hours=30)   # the daily run (09:20) catches every proposal on its last day
+REMIND_WITHIN = timedelta(hours=30)   # the daily 07:30 brief push catches every proposal on its last day
 SAFETY_RULES = ("approval-without-handing-work-back", "safety-guards", "push-and-merge-policy")
 SAFETY_DAYS = 3
 SAFETY_LINES = 5
@@ -111,9 +115,12 @@ def remind_proposals(*, db_url: str | None = None, push: bool = True, notify: di
 
 def _skip_words(b: Mapping[str, Any]) -> str:
     for n in b.get("notes") or []:
-        m = re.match(r"skipped by amem-rsi-night: prerequisite ([\w-]+): last run (\w+)", str(n))
+        m = re.match(r"skipped by amem-rsi-night: prerequisite ([\w-]+): (last run \w+|still running)", str(n))
+        if m and m.group(2) == "still running":
+            return (f"the deviation scan ({m.group(1)}) was still running" if m.group(1) == "amem-daily"
+                    else f"the routine it depends on ({m.group(1)}) was still running")
         if m:
-            return ("the morning scan (amem-daily) failed" if m.group(1) == "amem-daily"
+            return ("the deviation scan (amem-daily) failed" if m.group(1) == "amem-daily"
                     else f"the routine it depends on ({m.group(1)}) did not pass")
     sk = b.get("skipped") or {}
     return str(sk.get("summary") or "a check before the night failed")
@@ -152,14 +159,172 @@ def night_message(b: Mapping[str, Any]) -> tuple[str, str] | None:
     return redact.redact(title)[:120], redact.redact("\n".join(lines))[:1500]
 
 
-def push_night(b: Mapping[str, Any], *, notify: dict[str, str] | None = None) -> str:
-    """'phone' | 'mac' when sent, 'quiet' when the night has nothing to say."""
-    msg = night_message(b)
+def push_night(b: Mapping[str, Any], *, notify: dict[str, str] | None = None,
+               extra: MorningExtras | None = None) -> str:
+    """'phone' | 'mac' when sent, 'quiet' when the night and `extra` have nothing to say. `extra`: what
+    amem-daily used to push on its own (new escalations, safety slips, proposals on their last day), so the
+    morning brings one notification (push_morning)."""
+    msg = morning_message(b, extra) if extra is not None else night_message(b)
     if msg is None:
         return "quiet"
     title, body = msg
-    return edits_push._publish(lambda topic: {"topic": topic, "title": title, "message": body, "priority": 3,
-                                              "tags": ["crescent_moon"]}, title, body, notify)
+    priority = 4 if extra is not None and (extra.safety or extra.expiring) else 3
+    tags = ["warning"] if extra is not None and extra.safety else ["crescent_moon"]
+    return edits_push._publish(lambda topic: {"topic": topic, "title": title, "message": body, "priority": priority,
+                                              "tags": tags}, title, body, notify)
+
+
+# --------------------------------------------------------------------------- the one morning push
+
+
+@dataclass
+class MorningExtras:
+    """What joins the night's push: new escalations (amem-daily's counts-and-routines push: `escalations` is the
+    open count, `new_rows` the ones not pushed yet), safety-rule slips not alerted yet, and staged proposals on
+    their last day not reminded yet. Ids never reach the message."""
+    open_escalations: int = 0
+    new_rows: list[dict[str, Any]] = field(default_factory=list)
+    kept_ids: set[str] = field(default_factory=set)
+    safety: list[dict[str, Any]] = field(default_factory=list)
+    expiring: list[dict[str, Any]] = field(default_factory=list)
+    problems: list[str] = field(default_factory=list)   # a part that could not be read (a warning, not a failure)
+
+    def empty(self) -> bool:
+        return not (self.new_rows or self.safety or self.expiring)
+
+
+def escalation_lines(new_rows: list[Mapping[str, Any]], open_count: int) -> tuple[str, str]:
+    """(title, line) for new escalations: counts and routine names only (the old amem-daily push)."""
+    from agent_memory import daily
+    rows = [dict(r) for r in new_rows]
+    return daily.message(rows, open_count)
+
+
+def expiring_lines(rows: list[Mapping[str, Any]], now: datetime) -> list[str]:
+    out = []
+    for p in rows[:SAFETY_LINES]:
+        hours = max(1, round((p["expires_at"] - now).total_seconds() / 3600))
+        title = re.sub(r"\s+", " ", str(p.get("title") or "a proposal")).strip()[:120]
+        out.append(f"- Expires in {hours} h: {title}")
+    if len(rows) > SAFETY_LINES:
+        out.append(f"- and {len(rows) - SAFETY_LINES} more")
+    return out
+
+
+def morning_message(b: Mapping[str, Any], extra: MorningExtras,
+                    now: datetime | None = None) -> tuple[str, str] | None:
+    """The night's message plus amem-daily's parts, or None when there is nothing at all to say. The title is the
+    night's when it has one, else the most urgent part's (safety, then last-day proposals, then escalations)."""
+    now = now or datetime.now(UTC)
+    night = night_message(b)
+    parts: list[tuple[str, list[str]]] = []          # (title, lines)
+    if extra.safety:
+        s_title, s_body = safety_message(extra.safety)
+        parts.append((s_title, [s_title + ":"] + [ln for ln in s_body.splitlines() if ln.startswith("- ")]))
+    if extra.expiring:
+        n = len(extra.expiring)
+        e_title = f"{n} proposal{'s' if n != 1 else ''} on the last day"
+        parts.append((e_title, [e_title + " (decide in Night Desk):"] + expiring_lines(extra.expiring, now)))
+    if extra.new_rows:
+        x_title, x_body = escalation_lines(extra.new_rows, extra.open_escalations)
+        parts.append((x_title, [x_body]))
+    if night is None and not parts:
+        return None
+    if night is not None:
+        title, lines = night[0], night[1].splitlines()
+        details = [ln for ln in lines if ln.startswith("Details:")]
+        lines = [ln for ln in lines if not ln.startswith("Details:")]
+    else:
+        title = parts[0][0] if len(parts) == 1 else f"amem morning: {parts[0][0]} + {len(parts) - 1} more"
+        lines, details = [], []
+    for _, part in parts:
+        if lines:
+            lines.append("")
+        lines += part
+    lines += details or ["Details: Night Desk."]
+    return redact.redact(title)[:120], redact.redact("\n".join(lines))[:2000]
+
+
+def gather_morning(*, db_url: str | None = None, state_file: Any = None,
+                   now: datetime | None = None) -> MorningExtras:
+    """Read the parts amem-daily no longer pushes. Each part that fails is noted in `problems` and left out; the
+    night's push still goes. Postgres only, and AMEM_REQUIRE_REMOTE applies (a local database never pushes)."""
+    from agent_memory import config, daily, scoring
+    now = now or datetime.now(UTC)
+    x = MorningExtras()
+    try:
+        backend = config.backend()
+        refused = config.remote_write_error(for_backend="postgres") if backend == "postgres" else None
+    except config.BackendError as exc:
+        backend, refused = "?", str(exc)
+    if backend != "postgres" or refused is not None:
+        x.problems.append(f"morning parts: needs the Postgres backend ({'remote required' if refused else backend})")
+        return x
+    try:
+        rows = scoring.escalations(db_url=db_url)
+        state = daily.state_path(state_file)
+        dr = daily.DailyResult()
+        before = daily.load_state(state, dr)
+        x.new_rows, x.kept_ids = daily.plan_push(rows, before)
+        x.open_escalations = len(rows)
+        x.problems += dr.failures
+    except Exception as exc:  # noqa: BLE001 - one part only
+        x.problems.append(f"escalations: {type(exc).__name__}: {str(exc)[:160]}")
+    try:
+        with store.connect(db_url) as conn, conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("select id, instruction_source, rule_id, rule_title, what from deviations "
+                        "where created_at > now() - %s and coalesce(meta->>'alert', '') = '' and ("
+                        + " or ".join(["rule_id like %s"] * len(SAFETY_RULES)) + ") order by created_at",
+                        (timedelta(days=SAFETY_DAYS), *[f"%{r}" for r in SAFETY_RULES]))
+            x.safety = cur.fetchall()
+            cur.execute("select id, title, expires_at from rsi_proposals where status = 'staged' and expires_at > %s "
+                        "and expires_at <= %s and coalesce(meta->>'reminded', '') = '' order by expires_at",
+                        (now, now + REMIND_WITHIN))
+            x.expiring = cur.fetchall()
+    except Exception as exc:  # noqa: BLE001 - one part only
+        x.problems.append(f"alerts: {type(exc).__name__}: {str(exc)[:160]}")
+    return x
+
+
+def mark_morning(extra: MorningExtras, result: str, *, db_url: str | None = None, state_file: Any = None,
+                 now: datetime | None = None) -> list[str]:
+    """After the push: escalation ids become pushed only on 'phone' (a Mac fallback retries tomorrow, as amem-daily
+    did); safety rows and reminded proposals record the result (sent once, as before). Returns problems."""
+    from agent_memory import daily
+    problems: list[str] = []
+    now = now or datetime.now(UTC)
+    if extra.new_rows or extra.kept_ids:
+        pushed = set(extra.kept_ids)
+        if result == "phone":
+            pushed |= {str(r["run_id"]) for r in extra.new_rows}
+        try:
+            daily.save_state(daily.state_path(state_file), pushed, now.astimezone())
+        except OSError as exc:
+            problems.append(f"escalations: cannot write the state file: {type(exc).__name__}")
+    if extra.safety or extra.expiring:
+        try:
+            with store.connect(db_url) as conn:
+                if extra.safety:
+                    conn.execute("update deviations set meta = coalesce(meta, '{}'::jsonb) || %s where id = any(%s)",
+                                 (Jsonb({"alert": result}), [r["id"] for r in extra.safety]))
+                if extra.expiring:
+                    conn.execute("update rsi_proposals set meta = meta || %s where id = any(%s)",
+                                 (Jsonb({"reminded": result}), [r["id"] for r in extra.expiring]))
+        except Exception as exc:  # noqa: BLE001
+            problems.append(f"alerts: cannot mark what was sent: {type(exc).__name__}")
+    return problems
+
+
+def push_morning(b: Mapping[str, Any], *, notify: dict[str, str] | None = None, db_url: str | None = None,
+                 state_file: Any = None, now: datetime | None = None) -> tuple[str, MorningExtras, list[str]]:
+    """The brief job's one morning push: the night's result plus amem-daily's parts. A quiet night with new
+    escalations (or a safety slip, or a last-day proposal) still pushes. (result, parts, problems)."""
+    extra = gather_morning(db_url=db_url, state_file=state_file, now=now)
+    result = push_night(b, notify=notify, extra=extra)
+    problems = list(extra.problems)
+    if result != "quiet":
+        problems += mark_morning(extra, result, db_url=db_url, state_file=state_file, now=now)
+    return result, extra, problems
 
 
 # --------------------------------------------------------------------------- safety-rule slips

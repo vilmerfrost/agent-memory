@@ -79,70 +79,91 @@ def _questions(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *routines: str) 
 # ---------------------------------------------------------------- happy path + push memory
 
 
-def test_all_steps_then_push_only_new_ids_and_prune(sdb: ScoringDb, daily_io: DailyIO) -> None:  # noqa: F811
+QUIET_NIGHT = {"night": "2026-10-12", "status": "ok", "notes": [], "skipped": None,
+               "experiments": {"items": [], "total": 0}, "pending_decisions": {"total": 0},
+               "costs": {"total_usd": 0.0}, "health": {"degraded": []}}
+
+
+def _morning(sdb: ScoringDb, daily_io: DailyIO, notify: dict[str, str]) -> str:  # noqa: F811
+    """The 07:30 brief job's push after a quiet night: it carries amem-daily's new escalations."""
+    from agent_memory import alerts
+    result, _, problems = alerts.push_morning(QUIET_NIGHT, notify=notify, db_url=sdb.url, state_file=daily_io.state)
+    assert problems == []
+    return result
+
+
+def test_daily_counts_new_ids_and_the_morning_brief_pushes_them_once(sdb: ScoringDb,  # noqa: F811
+                                                                      daily_io: DailyIO) -> None:
     gh = daily_io.use_gh(FakeGh(0, gh_contents(CLOUD_LOG)))
     push = daily_io.use_push(Push(status=200))
     runs = _edge_runs(sdb.url)
     notify = {"NTFY_TOPIC": TOPIC}
 
-    # 1. ingest + score + push the two open escalations.
+    # 1. ingest + score; amem-daily (00:40) sends nothing: the two new escalations wait for the morning push.
     r = daily.run_daily(notify=notify, now=NOW)
     assert r.failures == [] and r.verdict == "PASS"
     assert (r.ingested, r.scored, r.missing) == (2, 4, 1)  # a missing fixture is not a failure
-    assert (r.escalations, r.new, r.push) == (2, 2, "phone")
-    assert len(gh.calls) == 1
+    assert (r.escalations, r.new, r.push) == (2, 2, "brief")
+    assert len(gh.calls) == 1 and push.posts == [] and push.macs == []
     assert _count(sdb.url, "select count(*) from runs where source = 'cloud'") == 2
+    assert daily_io.pushed_ids() == []
+    (line,) = daily_io.log_lines()
+    assert line.startswith(f"{STAMP} amem-daily PASS scored=4 escalations=2 new=2 push=brief ")
+    assert re.fullmatch(LOG_LINE_RE, line)
+
+    # 2. The morning brief's one push: counts and routines only; the ids are marked after ntfy said 200.
+    assert _morning(sdb, daily_io, notify) == "phone"
     escalated = {str(runs["edge below"]), str(runs["edge score low"])}
     assert set(daily_io.pushed_ids()) == escalated
     (post,) = push.posts
-    assert post["url"] == f"https://ntfy.sh/{TOPIC}"
-    assert post["headers"] == {"Title": "amem: 2 new runs to label", "Priority": "default", "Tags": "label"}
-    assert post["body"].startswith("2 new escalations (2 open): t-routine 2.")
-    # The body names counts and routines only: no summaries, failures or ids.
-    for secret in ("edge", "recorded", *escalated):
-        assert secret not in post["body"] and secret not in post["headers"]["Title"]
-    (line,) = daily_io.log_lines()
-    assert line.startswith(f"{STAMP} amem-daily PASS scored=4 escalations=2 new=2 push=phone ")
-    assert re.fullmatch(LOG_LINE_RE, line)
+    assert post["url"] == "https://ntfy.sh/"
+    import json
+    body = json.loads(post["body"])
+    assert body["topic"] == TOPIC and body["title"] == "amem: 2 new runs to label"
+    assert body["message"].startswith("2 new escalations (2 open): t-routine 2.")
+    for secret in ("edge", "recorded", *escalated):        # no summaries, failures or ids
+        assert secret not in body["message"] and secret not in body["title"]
 
-    # 2. Same open set: nothing new, no push. Ingest is idempotent.
+    # 3. Same open set: nothing new; the next daily and the next morning send nothing. Ingest is idempotent.
     r = daily.run_daily(notify=notify, now=NOW)
     assert (r.ingested, r.scored, r.escalations, r.new, r.push) == (0, 0, 2, 0, "none")
-    assert len(push.posts) == 1
+    assert _morning(sdb, daily_io, notify) == "quiet" and len(push.posts) == 1
 
-    # 3. A label closes one escalation: its id is pruned from the state.
+    # 4. A label closes one escalation: daily prunes its id from the state.
     scoring.set_label(runs["edge below"], "down", None, db_url=sdb.url)
     r = daily.run_daily(notify=notify, now=NOW)
     assert (r.escalations, r.new, r.push) == (1, 0, "none")
     assert daily_io.pushed_ids() == [str(runs["edge score low"])]
 
-    # 4. A new escalation: one push, for the new id only.
+    # 5. A new escalation: one morning push, for the new id only.
     fresh = add_run(sdb.url, "t-routine", "fail", "edge below", T0 + timedelta(days=1))
     r = daily.run_daily(notify=notify, now=NOW)
-    assert (r.scored, r.escalations, r.new, r.push) == (1, 2, 1, "phone")
-    assert push.posts[-1]["body"].startswith("1 new escalation (2 open): t-routine 1.")
+    assert (r.scored, r.escalations, r.new, r.push) == (1, 2, 1, "brief") and len(push.posts) == 1
+    assert _morning(sdb, daily_io, notify) == "phone"
+    assert json.loads(push.posts[-1]["body"])["message"].startswith("1 new escalation (2 open): t-routine 1.")
     assert set(daily_io.pushed_ids()) == {str(runs["edge score low"]), str(fresh)}
     assert len(daily_io.log_lines()) == 4 and push.macs == []
 
 
-def test_failed_push_does_not_mark_ids(sdb: ScoringDb, daily_io: DailyIO) -> None:  # noqa: F811
+def test_failed_morning_push_does_not_mark_ids(sdb: ScoringDb, daily_io: DailyIO) -> None:  # noqa: F811
     push = daily_io.use_push(Push(status=500))
     _edge_runs(sdb.url)
     r = daily.run_daily(notify={"NTFY_TOPIC": TOPIC}, now=NOW)
-    assert (r.verdict, r.new, r.push) == ("PASS", 2, "mac")  # the Mac fallback is not a failure
+    assert (r.verdict, r.new, r.push) == ("PASS", 2, "brief") and push.posts == []
+    assert _morning(sdb, daily_io, {"NTFY_TOPIC": TOPIC}) == "mac"   # the Mac fallback is not a failure
     assert daily_io.pushed_ids() == []
     assert len(push.posts) == 1 and len(push.macs) == 1
 
-    # Next day ntfy works: the same ids are still new, pushed, and marked.
+    # Next morning ntfy works: the same ids are still new, pushed, and marked.
     push.status = 200
-    r = daily.run_daily(notify={"NTFY_TOPIC": TOPIC}, now=NOW)
-    assert (r.new, r.push) == (2, "phone")
+    assert _morning(sdb, daily_io, {"NTFY_TOPIC": TOPIC}) == "phone"
     assert len(daily_io.pushed_ids()) == 2
 
     # No topic at all: Mac only, never marked.
     add_run(sdb.url, "t-routine", "fail", "edge below", T0 + timedelta(days=2))
     r = daily.run_daily(notify={}, now=NOW)
-    assert (r.new, r.push) == (1, "mac")
+    assert (r.new, r.push) == (1, "brief")
+    assert _morning(sdb, daily_io, {}) == "mac"
     assert len(daily_io.pushed_ids()) == 2 and len(push.posts) == 2
 
 

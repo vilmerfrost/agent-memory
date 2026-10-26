@@ -1,4 +1,4 @@
-"""`amem daily`: ingest cloud runs, score, push new escalations, log one line (docs/daily.md)."""
+"""`amem daily`: ingest cloud runs, score, count new escalations, scan deviations, log one line (docs/daily.md)."""
 
 from __future__ import annotations
 
@@ -23,10 +23,11 @@ def cmd_daily(args: argparse.Namespace) -> int:
 
 def register(sub: Any) -> None:
     p = sub.add_parser(
-        "daily", help="daily job: ingest git-ref, score every routine, push new escalations, log one line"
+        "daily", help="daily job (00:40): ingest git-ref, score every routine, count new escalations (the 07:30 "
+                      "brief pushes them), scan deviations, log one line"
     )
     p.add_argument("--no-push", action="store_true",
-                   help="never push; new escalations stay unmarked in the state file")
+                   help="never push (only the legacy AMEM_DAILY_EDITS=1 edits step pushes from here)")
     p.add_argument("--routines-log", type=Path, default=None,
                    help="routines log to append to (default AMEM_ROUTINES_LOG or ~/.claude/parent/routines.log)")
     p.add_argument("--state", type=Path, default=None,

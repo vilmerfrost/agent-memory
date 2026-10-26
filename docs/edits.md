@@ -379,8 +379,17 @@ often than before. `more` on a kept edit is a reason to undo it (`amem edits und
 
 ## Daily
 
-`amem daily` runs `edits run` after the deviations step, only with `AMEM_EDITS_LIVE=1` (the
-launchd job sets it; off is not a failure). Kept edits are pushed (not with `--no-push`).
+Retired on 2026-10-26: the RSI night has its own writer and stages its own proposals, so
+`amem daily` (now at 00:40) no longer runs `edits run`. The launchd job sets neither
+`AMEM_EDITS_LIVE` nor `AMEM_EDITS_MODE`, and the code default is off even when they are set:
+only `AMEM_DAILY_EDITS=1` plus `AMEM_EDITS_LIVE=1` runs the old step again (off is not a
+failure). Undo of older edits is unchanged: `amem edits undo <id>`, Night Desk's Undo, and
+`amem edits undo-poll` (amem-ingest every 15 min, the decide job every 5 min). The morning
+step's proposals that still waited were retired with `amem rsi supersede-morning` (status
+`superseded`; nothing deleted). Whether a kept edit helped is now checked daily by
+`amem rsi outcome` ([rsi/outcome.md](rsi/outcome.md)).
+
+With the legacy switch on, kept edits are pushed (not with `--no-push`).
 When the step ran, the log line gets `edits=N edits_kept=K edits_reverted=R
 edits_suggested=S edit_errors=E` (N = edits improve answered or garbled; K = kept + trial;
 R = auto-reverted by improve's evals). Any candidate error fails the step; the other

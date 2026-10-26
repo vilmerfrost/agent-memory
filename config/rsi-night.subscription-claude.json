@@ -100,7 +100,7 @@
     "timeout_s": 300
   },
   "schedule": {
-    "_note": "Completion checkpoints for `amem rsi night-job` (rsi_schedule.py): each routine's latest routines.log line must be a PASS; same_night = dated on the night key's date (the 09:20 amem-daily and 08:45 amem-archive of that day); max_age_h = younger than that.",
+    "_note": "Completion checkpoints for `amem rsi night-job` (rsi_schedule.py): each routine's latest routines.log line must be a PASS; same_night = the night's own run: amem-daily by its night key (the 00:40 run after the evening; the gate waits up to 30 min while it still runs), amem-archive dated on the night key's date (08:45 that day); max_age_h = younger than that.",
     "prerequisites": [
       {
         "routine": "amem-daily",
