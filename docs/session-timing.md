@@ -8,9 +8,10 @@ is stored in this table.
 ## Read the data
 
 ```sh
-amem timing coverage
-amem timing report --session 'codex:<thread-id>'
-amem timing ingest
+cd ~/Projects/agent-memory
+uv run --locked amem timing coverage
+uv run --locked amem timing report --session 'codex:<thread-id>'
+uv run --locked amem timing ingest
 ```
 
 These commands use the configured Postgres backend. `report` returns JSON from
@@ -61,6 +62,12 @@ and raw payload fields are discarded before disk persistence. User-prompt export
 is disabled. Existing processes may need a new Codex session/process to load the
 new exporter configuration; historical API timings cannot be reconstructed from
 turn duration or token counts.
+
+An unset API event clock remains unknown. The parser uses the provider's observed
+timestamp when available, and records that clock source. If both clocks are absent,
+it keeps the reported duration with NULL interval bounds. Events without a session
+identifier remain unassigned; receiving an API event alone does not prove that a
+session has API timing coverage.
 
 The collector binds only to `127.0.0.1:43927`, rejects browser-origin requests,
 and acknowledges only after writing sanitized records to a private local spool.
