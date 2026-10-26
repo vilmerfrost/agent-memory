@@ -99,7 +99,7 @@ Learning families with no automatic analysis consumer:
 
 - Key: `skills`
 - Purpose: Identify weak or ineffective skills
-- Producers: amem ingest skills (~/.agents/skill-usage/log.jsonl); amem skills scores --refresh
+- Producers: amem ingest skills (~/.agents/skill-usage/log.jsonl; records rsi_checkpoints skills-ingest/latest with the log read time); amem skills scores --refresh (records rsi_checkpoints skills-refresh/<run> with its input window)
 - Owner job: rsi-nightly skill refresh (agent-config routine, outside this repo)
 - Tables: `skill_calls`; `skill_scores`
 - Views: none
@@ -107,6 +107,7 @@ Learning families with no automatic analysis consumer:
 - External sinks: ClickHouse skill_calls
 - Consumers:
   - analysis: amem-rsi-night (amem rsi night-job) discovery (`src/agent_memory/rsi_night.py`)
+  - analysis: amem-rsi-night (amem rsi night-job) skill_refresh prerequisite (`src/agent_memory/skill_refresh.py`)
   - export: sync clickhouse (amem daily step_sync) (`src/agent_memory/integrations/clickhouse.py`)
   - manual: amem skills scores / suggest (`src/agent_memory/skills.py`)
 - Retention: skill_calls kept indefinitely; skill_scores rewritten on every refresh.
