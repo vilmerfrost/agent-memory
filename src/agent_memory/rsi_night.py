@@ -67,7 +67,7 @@ HYPOTHESES_FIXTURES = config.REPO_ROOT / "tests" / "fixtures" / "rsi-night" / "h
 STATUSES = ("ok", "partial", "aborted", "budget_exhausted", "preflight_failed")
 SKIP_REASONS = ("prerequisites", "credentials")     # report["skipped"]["reason"]: the night job did not start it
 MAX_PREREQ_WARNINGS = 10
-EXP_STATUSES = ("staged", "not_promotable", "failed", "interrupted", "skipped_budget")
+EXP_STATUSES = ("staged", "not_promotable", "failed", "interrupted", "skipped_budget", "deferred_policy")
 VERDICTS = ("IMPROVES", "NO_EFFECT", "WORSE", "INCONCLUSIVE")
 RISKS = ("low", "medium", "high")
 PROVIDERS = ("supabase", "clickhouse", "langfuse", "pastdev")
@@ -2308,23 +2308,40 @@ class Night:
             # One experiment per candidate per night. Triage gave each selected candidate one of tonight's slots, so
             # a candidate's second hypothesis never takes another candidate's slot; it stays pending (stored by
             # _experiment) and runs on a later night without a new model call.
-            if i > 0 or self.budget.experiments_left() <= 0:
-                self.report["experiments"].append(self._entry(None, c, h, refs, status="skipped_budget"))
+            if i > 0:
+                self.report["experiments"].append(self._skipped_entry(
+                    c, h, refs, policy="one_experiment_per_candidate"))
+                continue
+            if self.budget.experiments_left() <= 0:
+                self.report["experiments"].append(self._skipped_entry(c, h, refs, resource="experiments"))
                 continue
             try:
                 self.budget.take_experiment()
-            except BudgetExhausted:
+            except BudgetExhausted as exc:
                 for x in hyps[i:]:
-                    self.report["experiments"].append(self._entry(None, c, x, refs, status="skipped_budget"))
-                self._update_candidate(c["id"], status="deferred", reason="budget",
+                    self.report["experiments"].append(self._skipped_entry(c, x, refs, resource=exc.kind,
+                                                                          detail=str(exc)))
+                self._update_candidate(c["id"], status="deferred", reason=f"budget:{exc.kind}",
                                        meta={"pending_hypotheses": [x.as_dict() for x in hyps[i:]]})
                 raise
             try:
                 self._experiment(c, h, refs, later)
-            except BudgetExhausted:
+            except BudgetExhausted as exc:
                 for x in later:
-                    self.report["experiments"].append(self._entry(None, c, x, refs, status="skipped_budget"))
+                    self.report["experiments"].append(self._skipped_entry(c, x, refs, resource=exc.kind,
+                                                                          detail=str(exc)))
                 raise
+
+    def _skipped_entry(self, c: Mapping[str, Any], h: Hypothesis, refs: list[str], *,
+                       policy: str | None = None, resource: str | None = None, detail: str = "") -> dict[str, Any]:
+        """A deferred hypothesis is not an executed experiment or proof that the USD budget ran out."""
+        entry = self._entry(None, c, h, refs, status="deferred_policy" if policy else "skipped_budget")
+        reason = policy or f"budget:{resource or 'unknown'}"
+        entry.update(skip_reason=reason, budget_decision={**self.budget.snapshot(resource=resource),
+                                                        "decision": "deferred" if policy else "refused",
+                                                        "policy": policy, "detail": detail[:300]})
+        entry["verdict_reasons"] = [reason]
+        return entry
 
     def _update_candidate(self, cid: Any, *, status: str | None = None, reason: str | None = None,
                           meta: dict[str, Any] | None = None) -> None:
@@ -2446,7 +2463,16 @@ class Night:
                                              budget=self.budget)
             self._record_attempts(exp_id, rr)
             verdict = rr.verdict if rr.verdict in VERDICTS else "INCONCLUSIVE"
-            entry.update(verdict=verdict, verdict_reasons=rr.reasons[:20],
+            reasons = list(rr.reasons)
+            intended = impl.implementer != "stub-fallback"
+            # A fallback tests other bytes than the hypothesizer asked the writer to produce. It can inform
+            # diagnostics, but an improving fallback is not evidence for that intended intervention.
+            replay_verdict = verdict
+            if not intended:
+                verdict = "INCONCLUSIVE"
+                reasons = ["fallback_intervention:not_the_intended_writer_change", *reasons]
+            entry["implementation"].update(intended_intervention=intended, replay_verdict=replay_verdict)
+            entry.update(verdict=verdict, verdict_reasons=reasons[:20],
                          arms={"A": dict(rr.arms.get("A") or {}), "B": dict(rr.arms.get("B") or {})},
                          judge=_summary(getattr(rr, "judge", None), JUDGE_KEYS),
                          jev=_summary(getattr(rr, "jev", None), JEV_KEYS))
@@ -2454,10 +2480,11 @@ class Night:
             views = report_provider_results(rr.provider_results)
             entry.update(test_setup=rr.setup, relevance=rr.relevance, judge_pairs=pairs, provider_results=views)
             row = {"status": "evaluated", "verdict": verdict,
-                   "meta": {"verdict_reasons": rr.reasons[:20], "arms": entry["arms"], "eval_path": rr.eval_path,
+                   "meta": {"verdict_reasons": reasons[:20], "arms": entry["arms"], "eval_path": rr.eval_path,
                             "replay_runs": rr.runs, "budget_stop": rr.budget_stop, "judge": entry["judge"],
                             "jev": entry["jev"], "test_setup": rr.setup, "relevance": rr.relevance,
-                            "judge_pairs": pairs, "provider_results": views}}
+                            "judge_pairs": pairs, "provider_results": views,
+                            "intended_intervention": intended, "replay_verdict": replay_verdict}}
             if rr.budget_stop:
                 entry["status"] = "skipped_budget"
                 cand_status, cand_reason = "deferred", f"replay stopped by the budget ({rr.budget_stop})"
@@ -2485,6 +2512,9 @@ class Night:
             raise
         except BudgetExhausted as exc:
             entry["status"] = "skipped_budget"
+            entry.update(skip_reason=f"budget:{exc.kind}",
+                         budget_decision={**self.budget.snapshot(resource=exc.kind),
+                                          "decision": "stopped", "detail": str(exc)[:300]})
             if row["status"] != "evaluated":
                 row = {**row, "status": "aborted"}
             row["meta"] = {**row["meta"], "reason": f"budget: {exc.kind}"}
@@ -2961,7 +2991,10 @@ def cli(args: argparse.Namespace) -> int:
         print(f"rsi night {rep['night']}: {rep['status']}"
               f"{' (dry run, nothing written)' if args.dry_run else ''}; delta sessions={rep['delta']['sessions']} "
               f"deviations={rep['delta']['deviations']}; candidates={len(rep['candidates'])} "
-              f"selected={sum(c['selected'] for c in rep['candidates'])}; experiments={len(rep['experiments'])} "
+              f"selected={sum(c['selected'] for c in rep['candidates'])}; "
+              f"experiments={sum(bool(e.get('experiment_id')) for e in rep['experiments'])} "
+              f"hypothesis_entries={len(rep['experiments'])} "
+              f"policy_deferred={sum(e['status'] == 'deferred_policy' for e in rep['experiments'])} "
               f"staged={len(staged)}; checkpoint {'advanced' if rep['checkpoint']['advanced'] else 'not advanced'}; "
               f"cost ${rep['costs'].get('total_usd', 0):.2f}" + (f"; {rep['notes'][-1]}" if rep.get("notes") else ""))
     return EXIT.get(rep["status"], 1)

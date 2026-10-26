@@ -83,7 +83,9 @@ def test_happy_path_stages_one_proposal_and_defers_the_rest(env: SimpleNamespace
     staged, skipped = rep["experiments"]                                          # 2 hypotheses, 1 experiment
     assert staged["status"] == "staged" and staged["verdict"] == "IMPROVES" and staged["proposal_id"]
     assert staged["target"] == "~/.claude/CLAUDE.md" and staged["artifact_hash"] and staged["baseline_id"]
-    assert skipped["status"] == "skipped_budget" and skipped["experiment_id"] is None
+    assert skipped["status"] == "deferred_policy" and skipped["experiment_id"] is None
+    assert skipped["skip_reason"] == "one_experiment_per_candidate"
+    assert skipped["budget_decision"]["resource"] is None
     assert rep["pending_decisions"] == [staged["proposal_id"]]
     assert rep["checkpoint"]["advanced"] and rep["checkpoint"]["before"] is None and rep["checkpoint"]["after"]
     assert rep["costs"]["sandbox_runs"] == 4 and rep["costs"]["total_usd"] == 0.0
@@ -146,7 +148,7 @@ def test_pending_hypothesis_is_tried_next_night_without_a_model_call(env: Simple
     seed_rule(env.url, RULE_A, "a")
     r1 = run(env, replayer=FakeReplayer("NO_EFFECT"))
     first, second = (e["hypothesis"]["what"] for e in r1["experiments"])
-    assert r1["experiments"][1]["status"] == "skipped_budget"
+    assert r1["experiments"][1]["status"] == "deferred_policy"
     r2 = run(env, N2, replayer=FakeReplayer("NO_EFFECT"))
     assert [c["key"] for c in r2["candidates"] if c["selected"]] == [KEY_A]
     assert [e["hypothesis"]["what"] for e in r2["experiments"]] == [second]
@@ -669,7 +671,7 @@ def test_the_investigator_cannot_approve_or_promote(env: SimpleNamespace, monkey
         monkeypatch.setattr(AP, name, tripwire)
     seed_ab(env)
     rep = run(env)
-    assert rep["status"] == "ok" and [e["status"] for e in rep["experiments"]] == ["staged", "skipped_budget"]
+    assert rep["status"] == "ok" and [e["status"] for e in rep["experiments"]] == ["staged", "deferred_policy"]
     assert rows(env.url, "select count(*) from rsi_decisions") == [(0,)]
     assert rows(env.url, "select count(*) from rsi_decision_tokens") == [(0,)]
     assert rows(env.url, "select status from rsi_proposals") == [("staged",)]

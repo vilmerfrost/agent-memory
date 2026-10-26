@@ -54,7 +54,7 @@ REPORT_FORMAT = "rsi-night/1"
 BRIEF_FORMAT = "rsi-brief/1"
 NIGHT_STATUSES = ("ok", "partial", "aborted", "budget_exhausted", "preflight_failed")
 SKIP_REASONS = ("prerequisites", "credentials")                       # rsi_night.SKIP_REASONS
-EXPERIMENT_STATUSES = ("staged", "not_promotable", "failed", "interrupted", "skipped_budget")
+EXPERIMENT_STATUSES = ("staged", "not_promotable", "failed", "interrupted", "skipped_budget", "deferred_policy")
 VERDICTS = ("IMPROVES", "NO_EFFECT", "WORSE", "INCONCLUSIVE")        # rsi_verdict.VERDICTS (plan 2.1)
 RISKS = ("low", "medium", "high")
 HEALTHY = ("ok", "fixture", "live")
@@ -777,15 +777,23 @@ WHY_NOT = {
     "failed": "the experiment failed before it could be judged",
     "interrupted": "interrupted when the night was aborted; nothing was staged",
     "skipped_budget": "skipped: the budget ran out before it ran",
+    "deferred_policy": "deferred: one experiment per candidate per night; its next hypothesis remains pending",
 }
 
 
 def failed_item(e: Mapping[str, Any]) -> dict[str, Any]:
     hyp = e.get("hypothesis") or {}
     v = e.get("verdict")
+    why = WHY_NOT.get(e["status"], "")
+    decision = e.get("budget_decision")
+    if e["status"] == "skipped_budget" and isinstance(decision, dict):
+        why = (f"stopped by budget limit {decision.get('resource') or 'unknown'}: "
+               f"{text(decision.get('detail'), 200) or e.get('skip_reason') or 'no detail recorded'}")
     return {"experiment_id": e.get("experiment_id"), "candidate_key": text(e.get("candidate_key"), 120) or None,
-            "verdict": v, "status": e["status"], "why_not_staged": WHY_NOT.get(e["status"], ""),
+            "verdict": v, "status": e["status"], "why_not_staged": why,
             "reasons": [text(r, 200) for r in (e.get("verdict_reasons") or [])[:6]],
+            "skip_reason": text(e.get("skip_reason"), 120) or None,
+            "budget_decision": e.get("budget_decision") if isinstance(e.get("budget_decision"), dict) else None,
             "what": text(hyp.get("what"), 300), "artifact_hash": e.get("artifact_hash"), "cost_usd": e.get("cost_usd"),
             "judgments": judgment_text(e.get("judge"), e.get("jev")) if e.get("judge") or e.get("jev") else None}
 
@@ -859,6 +867,7 @@ def build_brief(rep: Mapping[str, Any], db: Db, *, artifacts_root: Path, report:
     suites = required_suites()
     passed = [proposal_block(e, db, artifacts_root, suites) for e in exps if e["status"] == "staged"]
     failed = [failed_item(e) for e in exps if e["status"] != "staged"]
+    policy_deferred = sum(e["status"] == "deferred_policy" for e in exps)
     d = rep["delta"]
     skipped = skip_info(rep)
     sessions = {"since": text(d.get("since"), 40) or None, **{k: d.get(k) or 0 for k in COUNTS}}
@@ -923,7 +932,11 @@ def build_brief(rep: Mapping[str, Any], db: Db, *, artifacts_root: Path, report:
         "summary": (f"{_plural(sum(1 for x in passed if x['actions']['apply']), 'improvement')} ready to apply"
                     + (f" ({len(passed) - sum(1 for x in passed if x['actions']['apply'])} more staged but not "
                        "ready)" if any(not x["actions"]["apply"] for x in passed) else "")
-                    + f", {len(failed)} failed or inconclusive, {_plural(n_pending, 'decision')} waiting for you. "
+                    + f", {len(failed) - policy_deferred} failed or inconclusive"
+                    + (f", {policy_deferred} hypotheses deferred by policy "
+                       f"({sum(bool(e.get('experiment_id')) for e in exps)} experiments executed)"
+                       if policy_deferred else "")
+                    + f", {_plural(n_pending, 'decision')} waiting for you. "
                     f"Total cost {usd(costs['total_usd'])}."),
         "notes": notes,
         "sessions": sessions,
@@ -1265,7 +1278,7 @@ def notification(b: Mapping[str, Any]) -> tuple[str, str]:
     ready = sum(1 for x in b["passed"] if x["actions"].get("apply"))
     sk = b.get("skipped")
     lines = [f"Night {b['status']}. Ready to apply {ready}, staged not ready {len(b['passed']) - ready}, "
-             f"failed or inconclusive {len(b['failed'])}.",
+             f"failed or inconclusive {sum(x.get('status') != 'deferred_policy' for x in b['failed'])}.",
              f"Not run: skipped by the night job ({sk['reason']}); nothing analyzed. Cost {usd(b['costs']['total_usd'])}."
              if sk and sk.get("reason") in SKIP_REASONS else
              f"Sessions {int(s['sessions'])}, candidates {int(b['candidates']['total'])}, "
