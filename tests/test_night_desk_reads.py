@@ -30,6 +30,9 @@ def receipts(pg_url):
         c.execute("drop function public.amem_mark_nights_read(text[])")
         c.execute(next(MIGRATIONS.glob("*_night_desk_reads.sql")).read_text())
         c.execute("insert into amem_private.dashboard_owner values (true,%s) on conflict (singleton) do update set uid=excluded.uid", (OWNER,))
+        # Other files share this process's disposable DB and may leave reports.
+        # Keep this fixture's two-night backlog isolated, restoring it on rollback.
+        c.execute("delete from public.rsi_nights")
         for night in ("2026-10-24", "2026-10-25"):
             c.execute("insert into rsi_nights(night,status,headline,brief,report,costs,checkpoint) values (%s,'partial','Original report','{}','{}','{}','{}')", (night,))
         yield c
