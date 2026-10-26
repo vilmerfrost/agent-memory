@@ -48,7 +48,7 @@ from typing import Any
 import psycopg
 from psycopg.rows import dict_row
 
-from agent_memory import config, edits_push, redact, rsi_artifact as RA, store
+from agent_memory import config, coverage as CV, edits_push, night_coverage as NC, redact, rsi_artifact as RA, store
 
 REPORT_FORMAT = "rsi-night/1"
 BRIEF_FORMAT = "rsi-brief/1"
@@ -232,6 +232,10 @@ def validate_report(rep: Any) -> list[str]:
     pr = rep.get("prerequisites")                         # optional (R2): the night's own prerequisite checks
     if pr is not None and not (isinstance(pr, dict) and isinstance(pr.get("skill_refresh", {}), dict)):
         p.append("prerequisites: not an object with a skill_refresh object")
+    if rep.get("coverage") is not None:                   # optional (R4): the coverage rows the night wrote
+        p += NC.report_problems(rep["coverage"])
+        if isinstance(rep["coverage"], dict) and rep["coverage"].get("run_key") != rep["night"]:
+            p.append("coverage.run_key: not the report's night")
     _check_map(rep["delta"], "delta", COUNTS, p)
     for name in ("patterns", "candidates"):
         p += [f"{name}[{i}]: not a JSON object" for i, x in enumerate(rep[name]) if not isinstance(x, dict)]
@@ -416,6 +420,71 @@ def read_db(rep: Mapping[str, Any], *, db_url: str | None = None) -> Db:
     except psycopg.Error as exc:
         return Db("unavailable", type(exc).__name__)
     return db
+
+
+# --------------------------------------------------------------------------- the coverage verdict (data-use R4)
+
+# "No problem found" only when coverage.verdict says all_clear for the night's required datasets
+# (night_coverage.requirements); any other answer says why it is not one.
+VERDICT_HEADLINES = {"all_clear": "No problem found", "findings": "Findings", "incomplete": "Analysis incomplete",
+                     "not_recorded": "Verdict not recorded", "unknown": "Verdict unknown"}
+MAX_GAPS = 8
+
+
+def _verdict(conclusion: str, detail: str = "", **kw: Any) -> dict[str, Any]:
+    return {"conclusion": conclusion, "headline": VERDICT_HEADLINES[conclusion], "detail": text(detail, 200),
+            "findings": 0, "gaps": [], "empty": [], **kw}
+
+
+def report_verdict(rep: Mapping[str, Any]) -> dict[str, Any] | None:
+    """The verdict the report alone decides (nothing recorded), or None when the database must be read."""
+    cov = rep.get("coverage")
+    if not isinstance(cov, dict):
+        why = ("the night did not run" if rep.get("status") == "preflight_failed" and rep.get("skipped")
+               else "the night report has no coverage record")
+        return _verdict("not_recorded", why)
+    if cov.get("enabled") is not True:
+        return _verdict("not_recorded", "coverage writing was off for this night (AMEM_COVERAGE_WRITE=0)")
+    return None
+
+
+def coverage_verdict(rep: Mapping[str, Any], *, db_url: str | None = None) -> dict[str, Any]:
+    """coverage.verdict for the night's job and run key, read-only. A database problem makes it `unknown`, never
+    clear."""
+    early = report_verdict(rep)
+    if early is not None:
+        return early
+    try:
+        if db_url is None and config.backend() != "postgres":
+            return _verdict("unknown", "the REST backend has no coverage tables")
+        reqs = NC.requirements(rep["coverage"].get("required") or [])
+        with store.connect(db_url, connect_timeout=10) as conn:
+            conn.read_only = True
+            v = CV.verdict(conn, job=NC.JOB, run_key=rep["night"], required=reqs)
+            rows = {r["dataset"]: r["status"] for r in CV.consumption(conn, job=NC.JOB, run_key=rep["night"], limit=200)}
+    except (psycopg.Error, config.BackendError, ValueError) as exc:
+        return _verdict("unknown", f"coverage not read ({type(exc).__name__})")
+    gaps = [{"dataset": text(g.dataset, 80), "distinction": g.distinction, "detail": text(g.detail, 120)}
+            for g in v.gaps]
+    empty = [text(d, 80) for d in v.datasets if rows.get(d) == "analysis_not_run"] if v.all_clear else []
+    return _verdict(v.conclusion, findings=v.findings, gaps=gaps, empty=empty)
+
+
+def verdict_line(v: Mapping[str, Any]) -> str:
+    """The verdict as one markdown line. Only all_clear says "No problem found"."""
+    gaps = v.get("gaps") or []
+    listed = "; ".join(f"{g['dataset']} {g['distinction']}" + (f" ({g['detail']})" if g.get("detail") else "")
+                       for g in gaps[:MAX_GAPS]) + (f"; and {len(gaps) - MAX_GAPS} more" if len(gaps) > MAX_GAPS else "")
+    c = v.get("conclusion")
+    if c == "all_clear":
+        empty = f" Nothing new to check in: {', '.join(v['empty'])}." if v.get("empty") else ""
+        return f"**Verdict: No problem found.** Every dataset the night's conclusions need was analysed.{empty}"
+    if c == "findings":
+        return (f"**Verdict: Findings ({v.get('findings', 0)}).** See the patterns and experiments below."
+                + (f" Coverage gaps: {listed}." if gaps else ""))
+    if c == "incomplete":
+        return f"**Verdict: Analysis incomplete.** Missing evidence, so this is not an all clear: {listed or '-'}."
+    return f"**{v.get('headline') or 'Verdict unknown'}:** {v.get('detail') or '-'}. This is not an all clear."
 
 
 # --------------------------------------------------------------------------- building blocks
@@ -767,7 +836,12 @@ def skill_refresh_warning(rep: Mapping[str, Any]) -> list[str]:
 
 
 def build_brief(rep: Mapping[str, Any], db: Db, *, artifacts_root: Path, report: dict[str, str] | None = None,
-                warnings: list[str] | None = None, now: datetime | None = None) -> dict[str, Any]:
+                warnings: list[str] | None = None, now: datetime | None = None,
+                verdict: dict[str, Any] | None = None) -> dict[str, Any]:
+    """`verdict`: coverage_verdict's answer (make_brief reads it); without one, only what the report decides, else
+    unknown (never clear)."""
+    if verdict is None:
+        verdict = report_verdict(rep) or _verdict("unknown", "coverage verdict not read")
     exps = rep["experiments"]
     suites = required_suites()
     passed = [proposal_block(e, db, artifacts_root, suites) for e in exps if e["status"] == "staged"]
@@ -830,7 +904,7 @@ def build_brief(rep: Mapping[str, Any], db: Db, *, artifacts_root: Path, report:
         "started_at": text(rep.get("started_at"), 40) or None, "finished_at": text(rep.get("finished_at"), 40) or None,
         "checkpoint": {"before": text(ck.get("before"), 40) or None, "after": text(ck.get("after"), 40) or None,
                        "advanced": ck.get("advanced") is True},
-        "headline": headline(rep), "skipped": skipped,
+        "headline": headline(rep), "skipped": skipped, "verdict": verdict,
         "prerequisite_warnings": [text(w, 300) for w in (rep.get("prerequisite_warnings") or [])[:MAX_NOTES]]
                                  + skill_refresh_warning(rep),
         "summary": (f"{_plural(sum(1 for x in passed if x['actions']['apply']), 'improvement')} ready to apply"
@@ -918,7 +992,8 @@ def make_brief(*, night: str | None = None, root: Path | None = None, db_url: st
     rep, sha = load_report(path)
     db = read_db(rep, db_url=db_url)
     return build_brief(rep, db, artifacts_root=artifacts_root, warnings=warnings, now=now,
-                       report={"path": f"nights/{path.parent.name}/report.json", "sha256": sha})
+                       report={"path": f"nights/{path.parent.name}/report.json", "sha256": sha},
+                       verdict=coverage_verdict(rep, db_url=db_url))
 
 
 # --------------------------------------------------------------------------- markdown
@@ -1002,6 +1077,8 @@ def render_markdown(b: dict[str, Any]) -> str:
                 else f"Checkpoint not advanced (stays at {ck['before'] or 'start'}): the next night reads this window "
                      "again.")
     out.append(run)
+    if b.get("verdict"):
+        out.append(verdict_line(b["verdict"]))
     for n in b["notes"]:
         out.append(f"- Note: {n}")
     for w in b.get("prerequisite_warnings") or []:
@@ -1180,6 +1257,12 @@ def notification(b: Mapping[str, Any]) -> tuple[str, str]:
              if sk and sk.get("reason") in SKIP_REASONS else
              f"Sessions {int(s['sessions'])}, candidates {int(b['candidates']['total'])}, "
              f"experiments {int(b['experiments']['total'])}. Cost {usd(b['costs']['total_usd'])}."]
+    v = b.get("verdict") or {}
+    if v.get("conclusion") in VERDICT_HEADLINES:
+        n = len(v.get("gaps") or [])
+        lines.append(f"Verdict: {VERDICT_HEADLINES[v['conclusion']]}"
+                     + (f" ({int(v.get('findings') or 0)})" if v["conclusion"] == "findings" else "")
+                     + (f", {_plural(n, 'coverage gap')}" if n else "") + ".")
     deg = [f"{k} {_word(b['health']['services'][k])}" for k in b["health"]["degraded"] if NAME_RE.fullmatch(k)]
     other = len(b["health"]["degraded"]) - len(deg)
     if deg or other:
