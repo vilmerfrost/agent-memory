@@ -47,7 +47,14 @@ SEED = [
     "insert into rsi_experiments (id, kind) values ('exp-20261025-01', 'edit')",
     "insert into sessions (session_id, kind, project_dir, env, experiment_id) values"
     " ('s1', 'eval', 'x', 'sandbox', 'exp-20261025-01'), ('s2', 'eval', 'x', 'sandbox', null),"
-    " ('s3', 'eval', 'x', 'eval', 'exp-20261025-99')",
+    " ('s3', 'eval', 'x', 'eval', 'exp-20261025-99'),"
+    " ('e1', 'eval', '-Users-v--cache-agent-evals-eval-jo-1', 'eval', null), ('e2', 'eval', 'x', 'eval', null)",
+    # attempts (R1): linked and covering s1; linked to a missing experiment; unresolved with a reason
+    "insert into rsi_attempts (id, status, experiment_id, arm, case_id, rep, attempt_session_id, session_id, source,"
+    " reason) values ('exp-20261025-01/A/fix-add/0', 'linked', 'exp-20261025-01', 'A', 'fix-add', 0, 'u1', 's1',"
+    " 'runner', null), ('exp-20261025-98/B/fix-add/0', 'linked', 'exp-20261025-98', 'B', 'fix-add', 0, 'u2', null,"
+    " 'repair', null), ('unresolved:run:exp-20261025-01/r9', 'unresolved', 'exp-20261025-01', null, null, null,"
+    " null, null, 'repair', 'run log without a sidecar: case and rep are not explicit')",
     "insert into rsi_evidence (system, kind, subject_refs, external_ref) values"
     " ('langfuse', 'trace', '{amem:experiment/exp-20261025-01}', 'lf:trace/' || repeat('1', 32)),"
     " ('langfuse', 'trace', '{}', 'lf:trace/' || repeat('2', 32)),"
@@ -113,7 +120,7 @@ EXPECTED = {   # key: (eligible, linked, unlinked, unresolvable)
     "command_test_runs": (3, 1, 1, 1),
     "session_test_runs": (3, 1, 1, 1),
     "test_run_cases": (3, 3, 0, 0),
-    "experiment_attempt_sessions": (3, 1, 1, 1),
+    "experiment_attempt_sessions": (5, 1, 3, 1),     # 3 attempt rows + s2 + s3; eval sessions excluded
     "experiment_eval_results": (3, 1, 1, 1),
     "experiment_traces": (3, 1, 1, 1),
     "experiment_scores": (2, 1, 1, 0),
@@ -135,6 +142,8 @@ def test_counts_on_mixed_linked_and_unlinked_rows(links_db: str) -> None:
     assert {k: as_tuple(r) for k, r in rows.items()} == EXPECTED
     assert rows["test_run_cases"]["runs_missing_cases"] == 1              # run 2 reported 3 tests, stored 1
     assert rows["edit_undo_requests"]["outcome_pending"] == 1
+    att = rows["experiment_attempt_sessions"]                             # eval sessions are not attempts
+    assert (att["excluded_eval_harness"], att["excluded_eval_other"]) == (1, 1) and "eval" in att["excluded"]
     assert rows["test_run_cases"]["enforced"] == "foreign key" and rows["session_commands"]["enforced"] == "none"
     assert {r["status"] for r in rows.values()} == {"gaps", "ok"}
 

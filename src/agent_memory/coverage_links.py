@@ -6,7 +6,8 @@ For each relationship it counts, from the existing link columns only:
   unlinked      the link is not set (null, empty or missing key): visible, never guessed
   unresolvable  the link is set but its target row is missing (late arrival or dangling)
 
-Read-only: one READ ONLY transaction, static SQL, nothing is written or repaired (repairs are Stage C).
+Read-only: one READ ONLY transaction, static SQL, nothing is written or repaired. The one repair so far is
+`amem coverage repair-links` (attempt_links.py) for experiment attempts.
 A relationship whose tables are missing reports status `missing_table` instead of failing the rest.
 """
 
@@ -16,6 +17,8 @@ from dataclasses import asdict, dataclass
 from typing import Any
 
 import psycopg
+
+from agent_memory import attempt_links as AL
 
 Enforced = str   # "foreign key" | "none" | "partial"
 
@@ -31,11 +34,12 @@ class Relationship:
     unlinked_visible: str  # how an unlinked row shows up
     tables: tuple[str, ...]
     sql: str               # returns eligible, linked, unlinked, unresolvable (bigint) and optional extra columns
+    excluded: str = ""     # rows that look related but are not eligible, and why (counted in the extra columns)
 
 
 def _rel(key: str, title: str, child: str, link: str, target: str, enforced: Enforced, visible: str,
-         tables: tuple[str, ...], sql: str) -> Relationship:
-    return Relationship(key, title, child, link, target, enforced, visible, tables, " ".join(sql.split()))
+         tables: tuple[str, ...], sql: str, excluded: str = "") -> Relationship:
+    return Relationship(key, title, child, link, target, enforced, visible, tables, " ".join(sql.split()), excluded)
 
 
 _EXPERIMENT_REF = "'^amem:experiment/'"
@@ -80,15 +84,30 @@ RELATIONSHIPS: tuple[Relationship, ...] = (
                 0::bigint, 0::bigint,
                 (select count(*) from public.test_timing_runs r where r.details_retained and r.tests_reported >
                     (select count(*) from public.test_timing_cases c where c.run_id = r.run_id)) as runs_missing_cases"""),
-    _rel("experiment_attempt_sessions", "experiments and attempts (sandbox sessions)",
-         "sessions (env sandbox or eval, or experiment_id set)", "sessions.experiment_id", "rsi_experiments.id",
-         "none", "sandbox/eval session with experiment_id null", ("sessions", "rsi_experiments"), """
+    _rel("experiment_attempt_sessions", "experiments and attempts (sandbox experiment attempts)",
+         "rsi_attempts, plus sessions (env sandbox or experiment_id set) that no rsi_attempts row covers",
+         "rsi_attempts.experiment_id with status linked (attempt key and attempt_session_id)", "rsi_experiments.id",
+         "none", "rsi_attempts row with status unresolved (and its reason), or a sandbox session with no attempt row",
+         ("rsi_attempts", "sessions", "rsi_experiments"), f"""
+         with a as (
+             select t.experiment_id, t.status = 'linked' as identified from public.rsi_attempts t
+             union all
+             select s.experiment_id, false from public.sessions s
+             where (s.env = 'sandbox' or s.experiment_id is not null)
+               and not exists (select 1 from public.rsi_attempts t
+                               where t.session_id = s.session_id or t.attempt_session_id = s.session_id))
          select count(*),
-                count(*) filter (where s.experiment_id is not null and x.id is not null),
-                count(*) filter (where s.experiment_id is null),
-                count(*) filter (where s.experiment_id is not null and x.id is null)
-         from public.sessions s left join public.rsi_experiments x on x.id = s.experiment_id
-         where s.env in ('sandbox', 'eval') or s.experiment_id is not null"""),
+                count(*) filter (where a.identified and x.id is not null),
+                count(*) filter (where not a.identified),
+                count(*) filter (where a.identified and x.id is null),
+                (select count(*) from public.sessions s where s.env = 'eval' and s.experiment_id is null
+                 and s.project_dir ~ '{AL.EVAL_HARNESS_SQL}') as excluded_eval_harness,
+                (select count(*) from public.sessions s where s.env = 'eval' and s.experiment_id is null
+                 and s.project_dir !~ '{AL.EVAL_HARNESS_SQL}') as excluded_eval_other
+         from a left join public.rsi_experiments x on x.id = a.experiment_id""",
+         excluded="sessions with env eval and no experiment_id are eval runs, not experiment attempts "
+                  "(eval-harness clones under ~/.cache/agent-evals or skill-evals, and other eval sessions); "
+                  "judge (J), check (K) and implementer (I) sandbox runs are not attempts either"),
     _rel("experiment_eval_results", "experiments and evaluation results", "rsi_eval_results",
          "rsi_eval_results.experiment_id", "rsi_experiments.id", "none", "eval result with experiment_id null",
          ("rsi_eval_results", "rsi_experiments"), """

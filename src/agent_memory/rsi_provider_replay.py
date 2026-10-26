@@ -85,4 +85,5 @@ def replay(stages, settings, *, artifact_hash, experiment_id, baseline_id, budge
         budget_stop=next((r.budget_stop for r in results if r.budget_stop), None), runs=sum(r.runs for r in results),
         judge=single.judge if single else None, jev=single.jev if single else None,
         setup=single.setup if single else {"agent":"separate provider comparisons","auth_mode":"subscription","effort":"high"},
-        relevance=single.relevance if single else {}, judge_pairs=single.judge_pairs if single else [], provider_results=views)
+        relevance=single.relevance if single else {}, judge_pairs=single.judge_pairs if single else [], provider_results=views,
+        attempts=[a for r in results for a in getattr(r, "attempts", [])])

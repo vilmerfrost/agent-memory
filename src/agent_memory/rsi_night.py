@@ -586,6 +586,7 @@ class ReplayOutcome:
     relevance: dict[str, Any] = field(default_factory=dict)
     judge_pairs: list[dict[str, Any]] = field(default_factory=list)
     provider_results: list[dict[str, Any]] = field(default_factory=list)
+    attempts: list[dict[str, Any]] = field(default_factory=list)   # attempt identities (attempt_links.runner_identity)
 
 
 JUDGE_KEYS = ("mode", "judged", "wins_a", "wins_b", "ties", "unfired_b", "errors", "b_winrate")
@@ -1326,6 +1327,13 @@ class ImproveStager:
         return StageResult("staged", artifact_hash=res["artifact_hash"], artifact_dir=res.get("artifact_dir"))
 
 
+def _attempts(experiment_id: str, runs: Sequence[Any], profile: str | None) -> list[dict[str, Any]]:
+    """The replay's agent runs as attempt identities (R1): what the experiment stage records in rsi_attempts."""
+    from agent_memory import attempt_links
+    return [attempt_links.runner_identity(experiment_id, x, profile) for x in runs
+            if getattr(x, "arm", None) in attempt_links.ATTEMPT_ARMS]
+
+
 class SandboxReplayer:
     """rsi_replay.run_replay (w-replay, contract 2.2), imported lazily. Stub agent in the real Docker sandbox by
     default (no network, no credentials)."""
@@ -1407,7 +1415,8 @@ class SandboxReplayer:
                                     "judge_effort": rc.judge_effort, "judge_auth_mode": rc.judge_auth_mode,
                                     "tasks": [{"id": c.id, "title": c.title or c.id} for c in cases]},
                              relevance=dict(_dget(r, "relevance") or {}),
-                             judge_pairs=list(getattr(_dget(r, "judge"), "pairs", ()) or ()))
+                             judge_pairs=list(getattr(_dget(r, "judge"), "pairs", ()) or ()),
+                             attempts=_attempts(experiment_id, _dget(r, "runs") or [], rc.profile))
 
 
 class ApprovalProposer:
@@ -2256,6 +2265,21 @@ class Night:
         if impl.fallback_reason and line not in self.notes:
             self.notes.append(line)
 
+    def _record_attempts(self, exp_id: str, rr: ReplayOutcome) -> None:
+        """R1: each attempt's canonical identity goes to rsi_attempts when it ran (source runner). A failed write is a
+        note, never a failed experiment: `amem coverage repair-links` can rebuild it from the run records."""
+        attempts = [a for a in (getattr(rr, "attempts", None) or []) if a.get("experiment_id") == exp_id]
+        if not attempts:
+            return
+        from agent_memory import attempt_links
+        assert self.conn is not None
+        try:
+            with self.conn.transaction():
+                attempt_links.record_runner(self.conn, attempts)
+        except (psycopg.Error, ValueError) as exc:
+            self.notes.append(f"experiment {exp_id}: attempt identities not recorded ({type(exc).__name__}); "
+                              "amem coverage repair-links rebuilds them"[:300])
+
     def _experiment(self, c: dict[str, Any], h: Hypothesis, refs: list[str], later: list[Hypothesis]) -> None:
         assert self.conn is not None
         exp_id = self._exp_id(c["dedupe_key"])
@@ -2317,6 +2341,7 @@ class Night:
             with self._interruptible():
                 rr = self.ad.replayer.replay(artifact_hash=st.artifact_hash, experiment_id=exp_id, baseline_id=bid,
                                              budget=self.budget)
+            self._record_attempts(exp_id, rr)
             verdict = rr.verdict if rr.verdict in VERDICTS else "INCONCLUSIVE"
             entry.update(verdict=verdict, verdict_reasons=rr.reasons[:20],
                          arms={"A": dict(rr.arms.get("A") or {}), "B": dict(rr.arms.get("B") or {})},
