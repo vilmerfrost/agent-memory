@@ -37,7 +37,17 @@ this is not a claim to observe private reasoning or override organization-enforc
   exact model, effort, tasks and execution boundary. Fresh task workspaces prevent carryover.
 - Shared rules produce separate provider records. A combined passing record requires
   every required provider to improve. Metrics and judge votes are never pooled across models.
-- The deterministic implementer stays in place. Jev remains a separate API-backed service.
+- S6 uses the section writer (`stages.implementer: "writer"`, since 2026-10-26): the morning edit
+  loop's Opus writer (`edits_writer` strategy, policy, reply shape and `parse_proposal`) rewrites the
+  candidate's rule section instead of appending a line. It runs like the hypothesizer: `claude-opus-5-5`,
+  high effort, no tools, subscription runner, counted in the night budget; the evidence reaches it only
+  inside its untrusted-data envelope. A pinned file or rule, no matching section, a writer or proposal
+  error, a budget stop or an `improve stage` refusal (its content guard) makes that one experiment use
+  the deterministic stub change; `implementer` ("writer" | "stub-fallback"), `implementer_fallback_reason`
+  and `implementation` (section, kind, diff) are on the experiment in report.json and `rsi_experiments.meta`
+  (which also keeps the exact new text), and a fallback adds a report note the brief prints. A failed
+  subscription call has no usage record, so the budget then stops the night (fail closed). The sandbox
+  implementer stays refused under subscription. Jev remains a separate API-backed service.
 
 ## Relevance is mandatory
 
@@ -112,29 +122,30 @@ approval, after the skill cases went live). Each limit has a scope:
 - **Per experiment (per replay):** at most 6 provider-specific A/B pairs (`max_ab_pairs`).
 - **Per night:** model calls, sandbox runs, wall clock, API dollars and the token stop.
 
-One shared-skill experiment at its worst case: 1 Opus hypothesis, 3 pairs per provider
+One shared-skill experiment at its worst case: 1 Opus hypothesis, 1 Opus section writer, 3 pairs per provider
 (12 agent runs: 6 Opus, 6 Sol), 6 Sol judgments and 2 Jev calls. Each agent run reserves
 8 tool containers and 1 check container, so one experiment takes 108 sandbox runs.
 
 | Limit (per night) | Need for 3 experiments | Cap |
 |---|---|---|
-| Opus calls | 3 × 7 = 21 | 23 |
+| Opus calls | 3 × 8 = 24 | 26 |
 | Sol calls | 3 × 12 = 36 | 40 |
 | Jev calls | 5 triage + 3 × 2 = 11 | 12 |
 | Sandbox runs | 3 × 108 = 324 | 360 |
 | Observed subscription tokens | 3 × 2,000,000 | 6,000,000 |
-| Wall clock | 600 + 3 × 5,460 = 16,980 s | 17,100 s (4 h 45 min) |
+| Wall clock | 600 + 3 × 5,760 = 17,880 s | 17,940 s (4 h 59 min) |
 | API dollars (Jev only) | 11 × $0.01 = $0.11 | $1.00 |
 
-**Why 17,100 s.** The bound counts every model stage at its own timeout: hypothesizer 300 s,
-`improve stage` 300 s, each agent run at its case's `timeout_s` (240 s for the skill cases),
+**Why 17,940 s** (60 s slack over the 17,880 s need) (was 17,100 s before the section writer, 17,280 s with its first 90 s timeout). The bound counts every model stage at its
+own timeout: hypothesizer 300 s, section writer 300 s, `improve stage` 300 s, each agent run at its
+case's `timeout_s` (240 s for the skill cases),
 each judge call at `rsi_replay.JUDGE_TIMEOUT_S` (300 s). Steps that wait on no model get an
 allowance: 10 s per check run (a check took under 1 s on night 2026-10-24) and 30 s per Jev call
 (the SDK's 10 s per HTTP operation). Per provider: 6 × (240 + 10) + 3 × 300 + 30 = 2,430 s.
-One experiment: 300 + 300 + 2 × 2,430 = 5,460 s. The night adds 600 s once for the delta, triage
+One experiment: 300 + 300 + 300 + 2 × 2,430 = 5,760 s. The night adds 600 s once for the delta, triage
 and evidence packs (all of it took 37 s on 2026-10-24). The night starts at 01:30, so its own
-stop comes at 06:15 and the watchdog's hard exit (+10 + 2 min) at 06:27, an hour before the
-07:30 brief. The code ceiling is 5 h (`HARD_MAX_WALL_CLOCK_S`); a night at that ceiling still ends
+stop comes at 06:28 and the watchdog's hard exit (+10 + 2 min) at 06:40, 50 min before the
+07:30 brief at the latest 45 min ahead (tested; Vilmer raised the writer to the morning loop's 300 s on 2026-10-26, so the margin went from 60 to 50 min; the brief job waits up to 90 min anyway). The code ceiling is 5 h (`HARD_MAX_WALL_CLOCK_S`); a night at that ceiling still ends
 by 06:42.
 
 **Why 6,000,000 tokens.** The 2,000,000 stop was approved for one experiment; three get three
