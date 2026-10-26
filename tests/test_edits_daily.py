@@ -35,8 +35,14 @@ NOW = datetime(2026, 10, 15, 9, 20, 0, tzinfo=timezone(timedelta(hours=2)))
 FIELDS = re.compile(r" edits=\d+ edits_kept=\d+ edits_reverted=\d+ edits_suggested=\d+ edit_errors=\d+ ")
 
 
+@pytest.fixture
+def legacy(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The morning edits step only runs when it is explicitly brought back (AMEM_DAILY_EDITS=1, 2026-10-26)."""
+    monkeypatch.setenv(daily.DAILY_EDITS_ENV, "1")
+
+
 def test_off_without_live_flag(sdb: ScoringDb, daily_io: DailyIO, ehome: EHome, ewriter: Any,  # noqa: F811
-                               capsys: pytest.CaptureFixture[str]) -> None:
+                               capsys: pytest.CaptureFixture[str], legacy: None) -> None:
     seed(sdb.url, "skill:dispatch", "spawn", "4. Spawn", n=3, sha=sha_of(ehome.skill))
     w = ewriter()
     r = daily.run_daily(push=False, now=NOW)
@@ -47,8 +53,33 @@ def test_off_without_live_flag(sdb: ScoringDb, daily_io: DailyIO, ehome: EHome, 
     assert ehome.improve.calls() == []
 
 
+@pytest.mark.parametrize("mode", ["stage", ""])
+def test_daily_runs_no_edits_step_even_with_the_old_plist_env(sdb: ScoringDb, daily_io: DailyIO,  # noqa: F811
+                                                               ehome: EHome, ewriter: Any, mode: str,
+                                                               monkeypatch: pytest.MonkeyPatch,
+                                                               capsys: pytest.CaptureFixture[str]) -> None:
+    """The 2026-10-26 default: AMEM_EDITS_LIVE=1 (+ AMEM_EDITS_MODE=stage, the old plist) no longer makes amem-daily
+    write, stage or push anything: no writer call, no improve call, no edits or proposal rows, no edits_* fields."""
+    from agent_memory import rsi_approval
+    monkeypatch.setenv(edits.LIVE_ENV, "1")
+    if mode:
+        monkeypatch.setenv("AMEM_EDITS_MODE", mode)
+    monkeypatch.setattr(rsi_approval, "push_proposals", lambda **kw: pytest.fail("staged proposals were pushed"))
+    seed(sdb.url, "skill:dispatch", "spawn", "4. Spawn", n=3, sha=sha_of(ehome.skill))
+    w = ewriter(envelope(proposal(SPAWN_NEW)))
+    r = daily.run_daily(now=NOW)                    # push on: daily_io fails the test on any push
+    assert r.verdict == "PASS" and r.edits is None and r.rsi_push is None and w.prompts == []
+    assert ehome.improve.calls() == [] and edit_rows(sdb.url) == []
+    (line,) = daily_io.log_lines()
+    assert "edits" not in line and "rsi_push" not in line
+    assert "edits: not run by amem-daily (AMEM_DAILY_EDITS is not 1" in capsys.readouterr().err
+    import psycopg
+    with psycopg.connect(sdb.url) as conn:
+        assert conn.execute("select count(*) from rsi_proposals").fetchone() == (0,)
+
+
 def test_on_runs_after_deviations_and_logs_fields(sdb: ScoringDb, daily_io: DailyIO, ehome: EHome,  # noqa: F811
-                                                  ewriter: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+                                                  ewriter: Any, monkeypatch: pytest.MonkeyPatch, legacy: None) -> None:
     monkeypatch.setenv(edits.LIVE_ENV, "1")
     push = daily_io.use_push(Push(status=200))
     daily_io.notify_env.parent.mkdir(parents=True, exist_ok=True)
@@ -71,7 +102,7 @@ def _json(post: dict[str, Any]) -> dict[str, Any]:
 
 
 def test_no_push_flag_never_pushes(sdb: ScoringDb, daily_io: DailyIO, ehome: EHome, ewriter: Any,  # noqa: F811
-                                   monkeypatch: pytest.MonkeyPatch) -> None:
+                                   monkeypatch: pytest.MonkeyPatch, legacy: None) -> None:
     monkeypatch.setenv(edits.LIVE_ENV, "1")
     seed(sdb.url, "skill:dispatch", "spawn", "4. Spawn", n=3, sha=sha_of(ehome.skill))
     ewriter(envelope(proposal(SPAWN_NEW)))
@@ -81,7 +112,8 @@ def test_no_push_flag_never_pushes(sdb: ScoringDb, daily_io: DailyIO, ehome: EHo
 
 
 def test_candidate_error_fails_the_step_not_the_others(sdb: ScoringDb, daily_io: DailyIO, ehome: EHome,  # noqa: F811
-                                                       ewriter: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+                                                       ewriter: Any, monkeypatch: pytest.MonkeyPatch,
+                                                       legacy: None) -> None:
     monkeypatch.setenv(edits.LIVE_ENV, "1")
     seed(sdb.url, "claude-md:global", "shell-habits", "Shell Habits", n=4, sha=sha_of(ehome.global_md))
     seed(sdb.url, "skill:dispatch", "spawn", "4. Spawn", n=3, sha=sha_of(ehome.skill))
@@ -95,7 +127,7 @@ def test_candidate_error_fails_the_step_not_the_others(sdb: ScoringDb, daily_io:
 
 
 def test_require_remote_refuses_the_step(sdb: ScoringDb, daily_io: DailyIO, ehome: EHome,  # noqa: F811
-                                         monkeypatch: pytest.MonkeyPatch) -> None:
+                                         monkeypatch: pytest.MonkeyPatch, legacy: None) -> None:
     monkeypatch.setenv(edits.LIVE_ENV, "1")
     monkeypatch.setenv("AMEM_REQUIRE_REMOTE", "1")
     r = daily.run_daily(push=False, now=NOW)
@@ -103,9 +135,11 @@ def test_require_remote_refuses_the_step(sdb: ScoringDb, daily_io: DailyIO, ehom
     assert "edits: AMEM_REQUIRE_REMOTE=1 refused a local or empty database" in r.failures
 
 
-def test_plist_sets_edits_live() -> None:
+def test_plist_no_longer_runs_the_edits_step() -> None:
     data = plistlib.loads((REPO / "deploy" / "launchd" / "com.vilmerfrost.amem-daily.plist").read_bytes())
-    assert data["EnvironmentVariables"]["AMEM_EDITS_LIVE"] == "1"
+    env = data["EnvironmentVariables"]
+    assert not {edits.LIVE_ENV, "AMEM_EDITS_MODE", daily.DAILY_EDITS_ENV} & set(env)
+    assert daily.edits_in_daily(env) is False
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")

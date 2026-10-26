@@ -1,24 +1,30 @@
 # Daily job: `amem daily`
 
 One command runs the learning loop once a day, on real data, with no human step.
-A launchd job calls it at 09:20.
+A launchd job calls it at 00:40 (since 2026-10-26; before: 09:20), so the 01:30 RSI night reads that evening's
+deviations instead of day-old ones. It sends no phone push and runs no edits step any more.
 
 ```
 amem daily [--no-push] [--routines-log PATH] [--state PATH]
 ```
 
 ```
- cloud routines.log ──ingest──▶ runs ──score (Jev, per routine)──▶ scores
-                                                                     │
-          routines.log ◀── one summary line ◀── push new ids ◀── escalations
+ cloud routines.log ──ingest──▶ runs ──score (Jev, per routine)──▶ scores ──▶ escalations (counted)
+                                                                                 │
+ 00:40 amem-daily ── sessions + deviations ──▶ routines.log line ──▶ 01:30 night gate
+                                                                                 ▼
+                                    07:30 brief-job: ONE push (night result + new escalations + safety slips)
 ```
+
+The job keeps `~/.claude/parent/amem-daily.running` (pid, start time) while it runs and removes it after its line
+is written. The 01:30 night waits up to 30 minutes while that marker is live (docs/rsi/night-ops.md).
 
 ## Steps
 
 A failed step is recorded, and the next step still runs.
 
 First the job waits for the database: it tries `select 1` up to 10 times, 60 seconds apart
-(launchd runs a missed 09:20 job right after wake, often before DNS is back; on 2026-10-14
+(launchd runs a missed job right after wake, often before DNS is back; on 2026-10-14
 every step failed on that). The steps run either way.
 
 1. **ingest**: the `ingest git-ref` logic (docs/cloud.md): `gh api` GET of
@@ -36,24 +42,25 @@ every step failed on that). The steps run either way.
    silently stay in fixture mode).
 3. **escalations**: the open escalations (docs/scoring.md). The state file holds
    the run ids already pushed.
-   - New = open ids not in the state. A push goes out only when there are new ids.
+   - New = open ids not in the state (`new=`). amem-daily does not push them (since 2026-10-26): the 07:30
+     brief job's one morning push (`alerts.push_morning`, docs/rsi/night-ops.md) carries them, also after a
+     quiet night. The log line says `push=brief` when there are new ids (`none` with `--no-push`).
    - Ids that are no longer open (labeled) are pruned from the state.
-   - An id is marked as pushed only after ntfy answers 200. The Mac fallback
-     does not mark it, so it is pushed again the next day.
-   - `--no-push` never pushes and never marks; it still prunes.
+   - The brief job marks an id as pushed only after ntfy answers 200. The Mac fallback
+     does not mark it, so it is pushed again the next morning.
    Then **deviations** (daily, docs/deviations.md): `sessions ingest` + `deviations scan --limit 40`
    when `deviations_last_scan` in the state file is missing or at least 20 hours old (`AMEM_DEVIATIONS_EVERY_HOURS`). Off (not a
    failure) unless `AMEM_DEVIATIONS_LIVE=1`; the launchd job sets it. A session error is a warning (an `amem-daily-warn` line); it fails the step only when systemic: 2+ errors and at least half the scanned sessions.
    A database connection error before the scan loop waits for the database again and retries once.
-   Then **edits** (docs/edits.md): `edits run` after the deviations step. Off (not a failure)
-   unless `AMEM_EDITS_LIVE=1`; the launchd job sets it. Kept edits are pushed with an Undo
-   button (not with `--no-push`). Any candidate error fails the step; the others still run.
+   Then **edits** (docs/edits.md): retired on 2026-10-26. The RSI night has its own writer and stages its own
+   proposals, so amem-daily no longer runs `edits run` or stages proposals, even with `AMEM_EDITS_LIVE=1` /
+   `AMEM_EDITS_MODE=stage` set. Only `AMEM_DAILY_EDITS=1` (plus `AMEM_EDITS_LIVE=1`) brings the old step and its
+   stage-mode push back. `amem edits undo` and `amem edits undo-poll` (amem-ingest, and the 5-minute decide job)
+   keep working for older edits. The morning proposals still waiting are retired with
+   `amem rsi supersede-morning` (status `superseded`, nothing deleted).
    (The `lessons distill` step after scoring is frozen: off unless `AMEM_DISTILL_LIVE=1`.)
-   Then **alerts** (`alerts.py`, since 2026-10-25): one phone reminder for each staged proposal that expires within
-   30 hours (its Reject / Review tokens are re-armed, so the reminder's buttons work), and one push for slips of the
-   safety rules (approval without handing work back, safety guards, push and merge policy) from the last 3 days.
-   Each is sent once (`rsi_proposals.meta.reminded`, `deviations.meta.alert`). Not with `--no-push`. A failure is a
-   **warning**, never a failed step: an alert must not block the night.
+   No **alerts** step any more: the safety-slip push and the last-day proposal reminder joined the 07:30 brief
+   job's one morning push (`alerts.push_morning`), so nothing reaches the phone at 00:40.
    Then, last, **sync** (daily, since 2026-10-24; docs/integrations/activation.md): `sync run --sink <sink>`
    (incremental, a 120 s budget each, plus the sink's client-side daily limits) for every sink that has its
    settings and is switched on: clickhouse (`AMEM_CLICKHOUSE_URL`/`_USER`/`_KEY`), langfuse (`AMEM_LANGFUSE_HOST`/
@@ -71,7 +78,10 @@ refused (escalations too, so a local database can never cause a push).
 
 ## Push
 
-Same as routine-audit:
+amem-daily itself no longer pushes (2026-10-26). The escalation message below is now one part of the 07:30 brief
+job's single morning push (`alerts.push_morning`): the night's result, then the safety slips, the proposals on
+their last day and the new escalations. A quiet night with new escalations still pushes; a morning with nothing
+to say sends nothing. The channel is the same as routine-audit:
 
 - Topic from `~/.claude/parent/notify.env`: `NTFY_TOPIC=`, optional `NTFY_SERVER=`
   (default `https://ntfy.sh`). Only these two keys are read. The topic is never printed.
@@ -94,7 +104,8 @@ overrides it. House format (`%Y-%m-%dT%H:%M:%S%z`):
 2026-10-13T09:20:04+0200 amem-daily-fail score t-other: 1 Jev error; first: upstream 500
 ```
 
-- `push=none|phone|mac`. `tasks=N` = new dispatch tasks ingested (always present). When the
+- `push=none|brief` (`brief`: new escalations wait for the 07:30 morning push; `phone|mac` on lines before
+  2026-10-26). `tasks=N` = new dispatch tasks ingested (always present). When the
   distill step ran, `distilled=N lessons_new=A lessons_merged=M lessons_rejected=R distill_errors=E`
   follows `tasks=N` (docs/lessons.md). When the deviations step ran,
   `deviations=D deviation_sessions=N deviations_edit=E deviations_enforce=F deviations_leave=L
@@ -130,13 +141,14 @@ An unreadable file is a failed step and is treated as empty (worst case: one rep
 - Runs `/opt/homebrew/bin/uv run --directory /Users/vilmerfrost/Projects/agent-memory --quiet amem daily`.
 - Env: `AMEM_REQUIRE_REMOTE=1`, `AMEM_JEV_LIVE=1`, `AMEM_DEVIATIONS_LIVE=1` (the daily
   deviations step runs: one `claude -p` writer call per scanned session, at most 40 a day),
-  `AMEM_EDITS_LIVE=1` (the edits step runs: at most 5 writer calls and `improve apply` runs a day),
+  no `AMEM_EDITS_LIVE` / `AMEM_EDITS_MODE` since 2026-10-26 (no morning edits step),
   and `PATH` with `~/.local/bin` (launchd's default PATH has no `gh`; `claude` lives there
   too). The DB URL and the Jev key come from the main checkout's env file, which `amem`
   loads itself.
 - After installing a new copy, run `amem deviations reref` once if the database holds
   deviations from before the rule catalog (docs/deviations.md).
-- Daily at 09:20 (`StartCalendarInterval`), `RunAtLoad` false.
+- Daily at 00:40 (`StartCalendarInterval`, since 2026-10-26), `RunAtLoad` false. Its line carries the night's
+  key (00:00-11:59 counts as the previous evening), which is what the 01:30 night's gate looks for.
 - stdout and stderr: `~/.claude/parent/reports/launchd.log`.
 
 Install (by hand; nothing in this repo installs it):

@@ -146,6 +146,7 @@ def test_deviation_errors_do_not_stop_the_edits_step(live: ScoringDb, daily_io: 
 
     ids = make_all_kinds(setup_home)
     monkeypatch.setenv(edits.LIVE_ENV, "1")
+    monkeypatch.setenv(daily.DAILY_EDITS_ENV, "1")      # the legacy morning edits step (off by default since 10-26)
     runs: list[object] = []
     monkeypatch.setattr(edits, "run", lambda **kw: runs.append(kw) or edits.Report())
     bad = envelope({"deviations": [finding(followed=None)]})

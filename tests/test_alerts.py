@@ -56,7 +56,7 @@ def test_night_message_says_what_happened_and_stays_quiet_otherwise() -> None:
         "skipped by amem-rsi-night: prerequisite amem-daily: last run FAIL at 2026-10-21T09:20:05+0200"]))
     assert skipped is not None
     assert skipped[0] == "Night 2026-10-24: skipped"
-    assert "Skipped: the morning scan (amem-daily) failed." in skipped[1]
+    assert "Skipped: the deviation scan (amem-daily) failed." in skipped[1]
     waiting = alerts.night_message(brief(pending_decisions={"total": 2}))
     assert waiting is not None and "Waiting for your OK: 2." in waiting[1]
 
@@ -106,3 +106,80 @@ def test_last_day_proposals_get_one_reminder(rdb: str, sandbox, sent: list[dict[
     with psycopg.connect(rdb) as conn:
         meta = dict(conn.execute("select id::text, meta->>'reminded' from rsi_proposals").fetchall())
     assert meta[soon] == "phone" and meta[later] is None
+
+
+# --------------------------------------------------------------------------- the one morning push (2026-10-26)
+
+ESC_IDS = ("11111111-1111-1111-1111-111111111111", "22222222-2222-2222-2222-222222222222")
+
+
+@pytest.fixture
+def escalations(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
+    """What scoring.escalations returns for two open runs. Their summaries and ids must never reach a message."""
+    from agent_memory import scoring
+    rows = [{"run_id": ESC_IDS[0], "routine": "config-check", "summary": "SECRET-SUMMARY", "failures": ["SECRET-F"]},
+            {"run_id": ESC_IDS[1], "routine": "routine-audit", "summary": "SECRET-TWO", "failures": []}]
+    monkeypatch.setattr(scoring, "escalations", lambda **kw: list(rows))
+    return rows
+
+
+def state_ids(path: Any) -> list[str]:
+    return json.loads(path.read_text())["pushed_run_ids"]
+
+
+def test_quiet_night_with_new_escalations_still_pushes_once(rdb: str, sent: list[dict[str, Any]],  # noqa: F811
+                                                            escalations: list[dict[str, Any]], tmp_path: Any) -> None:
+    state = tmp_path / "state.json"
+    assert alerts.night_message(brief()) is None                                  # the night alone is quiet
+    result, extra, problems = alerts.push_morning(brief(), notify=TOPIC, db_url=rdb, state_file=state)
+    assert (result, problems, len(extra.new_rows), extra.open_escalations) == ("phone", [], 2, 2)
+    (msg,) = sent
+    assert msg["title"] == "amem: 2 new runs to label"
+    assert msg["message"].startswith("2 new escalations (2 open): config-check 1, routine-audit 1.")
+    for secret in ("SECRET", *ESC_IDS):                                           # counts and routines only
+        assert secret not in msg["message"] and secret not in msg["title"]
+    assert sorted(state_ids(state)) == sorted(ESC_IDS)                            # marked after ntfy said 200
+    again = alerts.push_morning(brief(), notify=TOPIC, db_url=rdb, state_file=state)
+    assert again[0] == "quiet" and len(sent) == 1                                 # pushed once
+
+
+def test_morning_push_joins_the_night_escalations_and_safety_slips(rdb: str, sent: list[dict[str, Any]],  # noqa: F811
+                                                                    escalations: list[dict[str, Any]],
+                                                                    tmp_path: Any) -> None:
+    with psycopg.connect(rdb) as conn:
+        deviation(conn, "s1", "safety-guards", source="parent-md")
+    b = brief(experiments={"items": [{"candidate_key": "dev:skill:meltdown:intro", "verdict": "IMPROVES"}],
+                           "total": 1}, pending_decisions={"total": 1})
+    result, extra, _ = alerts.push_morning(b, notify=TOPIC, db_url=rdb, state_file=tmp_path / "s.json")
+    assert result == "phone" and len(sent) == 1 and len(extra.safety) == 1
+    msg = sent[0]
+    assert msg["title"] == "Night 2026-10-24: Tested Meltdown skill › Intro: it won and waits for your OK"
+    body = msg["message"]
+    assert "Waiting for your OK: 1." in body and "Safety rule broken: 1 slip:" in body
+    assert "PARENT.md › Safety guards" in body and "2 new escalations (2 open)" in body
+    assert body.rstrip().endswith("Details: Night Desk, Last night.") and msg["priority"] == 4
+    with psycopg.connect(rdb) as conn:                                           # each part goes out once
+        assert conn.execute("select meta->>'alert' from deviations").fetchall() == [("phone",)]
+    assert alerts.push_morning(brief(), notify=TOPIC, db_url=rdb, state_file=tmp_path / "s.json")[0] == "quiet"
+
+
+def test_morning_push_fallback_leaves_escalations_unmarked_and_quiet_sends_nothing(
+        rdb: str, monkeypatch: pytest.MonkeyPatch, escalations: list[dict[str, Any]], tmp_path: Any) -> None:  # noqa: F811
+    macs: list[tuple[str, str]] = []
+    monkeypatch.setattr(daily, "http_post", lambda url, body, headers: 500)
+    monkeypatch.setattr(daily, "mac_notify", lambda title, body: macs.append((title, body)))
+    state = tmp_path / "state.json"
+    result, _, _ = alerts.push_morning(brief(), notify=TOPIC, db_url=rdb, state_file=state)
+    assert result == "mac" and len(macs) == 1 and state_ids(state) == []          # retried tomorrow, as daily did
+    from agent_memory import scoring
+    monkeypatch.setattr(scoring, "escalations", lambda **kw: [])
+    quiet = alerts.push_morning(brief(), notify=TOPIC, db_url=rdb, state_file=tmp_path / "other.json")
+    assert quiet[0] == "quiet" and len(macs) == 1 and not (tmp_path / "other.json").exists()
+
+
+def test_morning_parts_need_a_remote_postgres(rdb: str, sent: list[dict[str, Any]], monkeypatch: pytest.MonkeyPatch,  # noqa: F811
+                                             escalations: list[dict[str, Any]], tmp_path: Any) -> None:
+    monkeypatch.setenv("AMEM_REQUIRE_REMOTE", "1")                                # the test DB is local: refused
+    result, extra, problems = alerts.push_morning(brief(), notify=TOPIC, db_url=rdb, state_file=tmp_path / "s.json")
+    assert result == "quiet" and extra.empty() and sent == []
+    assert problems == ["morning parts: needs the Postgres backend (remote required)"]

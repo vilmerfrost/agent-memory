@@ -6,10 +6,6 @@
 	<dict>
 		<key>AMEM_DEVIATIONS_LIVE</key>
 		<string>1</string>
-		<key>AMEM_EDITS_LIVE</key>
-		<string>1</string>
-		<key>AMEM_EDITS_MODE</key>
-		<string>stage</string>
 		<key>AMEM_JEV_LIVE</key>
 		<string>1</string>
 		<key>AMEM_REQUIRE_REMOTE</key>
@@ -38,9 +34,9 @@
 	<key>StartCalendarInterval</key>
 	<dict>
 		<key>Hour</key>
-		<integer>9</integer>
+		<integer>0</integer>
 		<key>Minute</key>
-		<integer>20</integer>
+		<integer>40</integer>
 	</dict>
 </dict>
 </plist>
