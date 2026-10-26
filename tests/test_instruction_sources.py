@@ -140,7 +140,7 @@ def test_a_plugin_updated_after_the_session_started_is_unresolved(setup_home: Ho
     _plugin(setup_home, last_updated="2026-10-20T10:00:00Z")   # the cache file is new too (mtime now)
     e = one(IS.capture(row(setup_home, skills=["magicpath:magicpath"])), "skill:magicpath:magicpath")
     assert e.authority == "unresolved" and e.version is None and e.sha256 is None
-    assert "plugin magicpath@magicpath was updated after the session started" in (e.reason or "")
+    assert "plugin magicpath@magicpath was installed or updated after the session started" in (e.reason or "")
 
 
 # --------------------------------------------------------------------------- ancestors and imports

@@ -678,7 +678,7 @@ def version_at(path: Path, start: datetime | None, r: Resolver,
     if plugin is not None:
         updated = _iso(plugin.get("last_updated"))
         if updated is not None and _ts(updated) is not None and (_ts(updated) or 0) > t0:
-            return ("unresolved", None, None, f"plugin {plugin.get('id')} was updated after the session started "
+            return ("unresolved", None, None, f"plugin {plugin.get('id')} was installed or updated after the session started "
                                               f"(now {plugin.get('version', '?')}): the version in force is unknown")
     return "unresolved", None, None, "changed after the session started and not in git: the version in force is unknown"
 
