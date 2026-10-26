@@ -37,6 +37,7 @@ RUN_KEY = "cursor"
 MAX_ATTEMPTS = 6
 BACKOFF_MIN = (1, 5, 30, 120)
 SINKS = ("clickhouse", "langfuse", "pastdev")
+TABLE_COUNTS = ("seen", "delivered", "dead", "failed", "backoff", "stopped")
 
 
 def job(sink: str) -> str:
@@ -74,6 +75,14 @@ class SyncReport:
     skipped_tables: list[str] = field(default_factory=list)
     seconds: float = 0.0
     detail: str = ""
+    # Per cursor key, rows this run read: seen = delivered + dead + failed + backoff + stopped (coverage records).
+    tables: dict[str, dict[str, int]] = field(default_factory=dict)
+    last_ok_at: str | None = None  # the cursor's previous successful run (or try), before this one
+
+    def count(self, table: str, **n: int) -> None:
+        t = self.tables.setdefault(table, dict.fromkeys(TABLE_COUNTS, 0))
+        for k, v in n.items():
+            t[k] += v
 
     def line(self) -> str:
         extra = f" skipped={','.join(self.skipped_tables)}" if self.skipped_tables else ""
@@ -225,6 +234,7 @@ def run(sink: Sink, conn: psycopg.Connection, *, budget_s: float = 60.0, replay:
         rep.status, rep.detail = "off", "kill switch"
         return rep
     meta = load(conn, sink.name)
+    rep.last_ok_at = meta.get("last_ok_at") or meta.get("last_try_at")
     stored: dict[str, str] = dict(meta.get("watermarks") or {})
     watermarks: dict[str, str] = dict(stored)
     if replay:
@@ -252,16 +262,27 @@ def run(sink: Sink, conn: psycopg.Connection, *, budget_s: float = 60.0, replay:
     blocked = {t for t, f in failures.items() if not _due(f, now)}
     rep.skipped_tables = sorted(blocked)
     for batch in sink.batches(conn, {} if replay else stored, replay=replay):
+        n = len(batch.rows)
         if batch.table in blocked:
+            rep.count(batch.table, seen=n, backoff=n)
             continue
         if clock() - start > budget_s:
             rep.status, rep.detail = "partial", "time budget"
+            rep.count(batch.table, seen=n, stopped=n)
             break
         if usage["rows"] + len(batch.rows) > max_rows or usage["requests"] + 1 > max_requests:
             rep.status = "capped"
             rep.detail = f"client-side daily limit: {usage['rows']}/{max_rows} rows, {usage['requests']}/{max_requests} requests"
+            rep.count(batch.table, seen=n, stopped=n)
             break
         ok, dead, err = _deliver(sink, batch, usage, now)
+        landed_n = sum(len(p.rows) for p in ok)
+        if err is None:                    # refused rows become dead letters; the table moves on
+            dead_n = min(len(dead), n - landed_n)
+            rep.count(batch.table, seen=n, delivered=landed_n, dead=dead_n, failed=n - landed_n - dead_n)
+        else:                              # the batch is sent again later: nothing of it is dead yet
+            rep.count(batch.table, seen=n, delivered=landed_n,
+                      **{"stopped" if provider_cap(err) else "failed": n - landed_n})
         for part in ok:                    # idempotent links for whatever did land
             for ev in part.evidence:
                 record(conn, ev)

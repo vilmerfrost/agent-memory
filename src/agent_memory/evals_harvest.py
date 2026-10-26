@@ -93,6 +93,12 @@ class Item:
         slug = re.sub(r"[^a-z0-9]+", "-", tail.lower()).strip("-")[:40].strip("-") or self.kind
         return f"{PREFIX[self.kind]}{digest}-{slug}"
 
+    def ref(self) -> str:
+        """The evidence ref a draft cites: its deviation row, or a handoff's session (handoffs have no ref kind)."""
+        if self.source.startswith("deviation:"):
+            return f"amem:deviation/{self.source.split(':', 1)[1]}"
+        return f"amem:session/{self.session_id}"
+
 
 @dataclass
 class Report:
@@ -101,6 +107,18 @@ class Report:
     skipped: Counter[str] = field(default_factory=Counter)
     by_kind: Counter[str] = field(default_factory=Counter)
     handoffs_table: bool = True
+    # Coverage (coverage_daily.harvest_records), per source dataset ("deviations" | "handoffs"): queried, drafted and
+    # each skip reason (already_drafted, team-repo, incomplete-handoff, limit); `cited`: refs of the drafted sources.
+    sources: dict[str, Counter[str]] = field(default_factory=dict)
+    cited: dict[str, list[str]] = field(default_factory=dict)
+
+    def tally(self, item: Item, outcome: str) -> None:
+        name = "handoffs" if item.kind == "handoff" else "deviations"
+        got = self.sources.setdefault(name, Counter())
+        got["queried"] += 1
+        got[outcome] += 1
+        if outcome == "drafted":
+            self.cited.setdefault(name, []).append(item.ref())
 
     def line(self, dry_run: bool = False) -> str:
         reasons = ", ".join(f"{k}={v}" for k, v in sorted(self.skipped.items()))
@@ -266,14 +284,18 @@ def harvest(out: Path, *, days: int = DEFAULT_DAYS, limit: int = DEFAULT_LIMIT, 
     for item in items:
         if item.source in seen:
             report.already += 1
+            report.tally(item, "already_drafted")
             continue
         seen.add(item.source)   # one source drafts once even if a query returned it twice
         if item.skip:
             report.skipped[item.skip] += 1
+            report.tally(item, item.skip)
             continue
         if len(planned) >= limit:
             report.skipped["limit"] += 1
+            report.tally(item, "limit")
             continue
+        report.tally(item, "drafted")
         planned.append((item, out / f"{item.case_id()}.md"))
     for item, path in planned:
         report.drafted.append(path.name)
