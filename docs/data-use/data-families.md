@@ -199,11 +199,11 @@ Learning families with no automatic analysis consumer:
 
 - Key: `experiments`
 - Purpose: Compare attempts and avoid repeating failed approaches
-- Producers: amem rsi night (experiments, candidates, artifacts, eval results); rsi_replay sandbox runs; amem rsi outcome (rsi_outcomes)
+- Producers: amem rsi night (experiments, candidates, artifacts, eval results); rsi_replay sandbox runs; amem rsi night experiment stage (rsi_attempts at creation); amem coverage repair-links (historical rsi_attempts, explicit identifiers only, undo manifest); amem rsi outcome (rsi_outcomes)
 - Owner job: amem-rsi-night (amem rsi night-job)
-- Tables: `rsi_experiments`; `rsi_candidates`; `rsi_artifacts`; `rsi_eval_results`; `rsi_outcomes`
+- Tables: `rsi_experiments`; `rsi_candidates`; `rsi_artifacts`; `rsi_eval_results`; `rsi_attempts`; `rsi_outcomes`
 - Views: none
-- Local files: <RSI sandbox>/experiments/<id>/logs/*.json (sandbox run logs); <RSI sandbox>/nights/<night>/report.json; bench/rsi-replay cases
+- Local files: <RSI sandbox>/experiments/<id>/logs/*.json (sandbox run logs and .rsi.json sidecars); <RSI sandbox>/replays/<id>[/<profile>]/runs/*.json (replay run records); <RSI sandbox>/nights/<night>/report.json; bench/rsi-replay cases
 - External sinks: Langfuse traces and scores (sandbox runs); past.dev experiments; ClickHouse rsi_eval_results
 - Consumers:
   - analysis: amem-rsi-night (amem rsi night-job) discovery (`src/agent_memory/rsi_night.py`)
@@ -213,8 +213,9 @@ Learning families with no automatic analysis consumer:
   - export: sync pastdev (amem daily step_sync) (`src/agent_memory/integrations/pastdev.py`)
   - export: sync clickhouse (amem daily step_sync) (`src/agent_memory/integrations/clickhouse.py`)
   - report: Night Desk (external web app, owner JWT; dashboard_owner_read policy) (`supabase/migrations/20261024230827_night_desk.sql`)
-- Retention: Kept indefinitely. Artifacts and eval results are append-only (rsi_immutable trigger). Candidates are never deleted, only retired.
-- Exclusion: Sandbox sessions only; production transcripts never enter an experiment.
+  - manual: amem coverage links / repair-links (attempt links) (`src/agent_memory/attempt_links.py`)
+- Retention: Kept indefinitely. Artifacts and eval results are append-only (rsi_immutable trigger). Candidates are never deleted, only retired. rsi_attempts: runner rows are never deleted; a repair's rows are removed only by its own undo or when a later repair resolves them.
+- Exclusion: Sandbox sessions only; production transcripts never enter an experiment. rsi_attempts holds ids, sandbox-relative paths and refs, never run output. Eval-harness sessions are not attempts.
 - Learning input: yes
 
 ## Proposals, decisions, edits and undo history

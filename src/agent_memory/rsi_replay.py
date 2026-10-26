@@ -53,7 +53,7 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any
 
-from agent_memory import config, jev as J, questions as Q, rsi_artifact as RA
+from agent_memory import attempt_links as AL, config, jev as J, questions as Q, rsi_artifact as RA
 from agent_memory import rsi_budget as BU
 from agent_memory import rsi_verdict as V
 from agent_memory import rsi_relevance as REL
@@ -353,7 +353,8 @@ class RunRecord:
     timed_out: bool = False
     agent: str = "stub"
     model: str | None = None
-    session_id: str | None = None
+    session_id: str | None = None        # the attempt's canonical session uuid (attempt_links)
+    profile: str | None = None           # provider profile of a per-provider replay (part of the attempt identity)
     check_run_id: str | None = None
     check_exit: int | None = None
     check_duration_s: float = 0.0
@@ -419,13 +420,12 @@ def run_id_for(experiment_id: str, case: str, arm: str, rep: int, suffix: str = 
     return f"{experiment_id[:36]}-{tag}-{arm}-r{rep}" + (f"-{suffix}" if suffix else "")
 
 
-def session_id_for(experiment_id: str, arm: str, case: str, rep: int) -> str | None:
-    """The deterministic session uuid the Langfuse sink derives from the same run key (None for a free-form id)."""
-    from agent_memory.integrations import refs
-    try:
-        return refs.session_uuid(refs.run_key(experiment_id, arm, case, rep))
-    except refs.RefError:
-        return None
+def session_id_for(experiment_id: str, arm: str, case: str, rep: int, profile: str | None = None) -> str | None:
+    """The attempt's canonical session uuid (attempt_links): the one the sidecar hands the Langfuse sink and the night
+    records in rsi_attempts. A provider profile is part of the identity (case key `<profile>.<case>`), so the claude
+    and the codex attempt of one case no longer share an id. None for a free-form experiment id."""
+    from agent_memory import attempt_links
+    return attempt_links.session_id_for(experiment_id, arm, case, rep, profile)
 
 
 def blind_flip(seed: str, case: str, rep: int, salt: str = "judge") -> bool:
@@ -828,7 +828,8 @@ class _Replay:
         rid = run_id_for(self.run_prefix, case.id, arm, rep)
         rec = RunRecord(run_id=rid, arm=arm, case=case.id, rep=rep, agent=cfg.agent,
                         model=cfg.model if cfg.agent != "stub" else "stub-agent",
-                        session_id=session_id_for(self.exp, arm, case.id, rep))
+                        session_id=session_id_for(self.exp, arm, case.id, rep, cfg.profile or None),
+                        profile=cfg.profile or None)
         self.runs.append(rec)
         if cfg.auth_mode == "subscription":
             return self.subscription_agent_run(case, rec)
@@ -1342,11 +1343,15 @@ def _write_evidence(r: _Replay, result: ReplayResult, cfg: ReplayConfig, policy:
         if (logs / f"{run.run_id}.json").is_file():      # the Langfuse sink's sidecar (integrations/langfuse.py)
             winner = next((p.get("winner") for p in (result.judge.pairs if result.judge else ())
                            if p.get("case") == run.case and p.get("rep") == run.rep), None)
+            # The attempt identity rides along (attempt_links): `case` is the case key, so the sink's run key and
+            # amem_session_id are the attempt's own, also for a provider-profile replay.
             _write_json(logs / f"{run.run_id}.rsi.json",
-                        {"case": run.case, "rep": run.rep, "kind": "sandbox", "env": "sandbox", "proposal_id": None,
+                        {"case": AL.case_key(run.case, run.profile), "rep": run.rep, "kind": "sandbox",
+                         "env": "sandbox", "proposal_id": None,
                          "check_passed": run.check_passed, "judge_winner": winner,
                          "eval_verdict": result.verdict.eval_verdict, "baseline_id": result.baseline_id,
-                         "artifact_hash": r.h if run.arm == "B" else None})
+                         "artifact_hash": r.h if run.arm == "B" else None, "experiment_id": r.exp, "arm": run.arm,
+                         "profile": run.profile, "attempt_session_id": run.session_id})
     _write_json(r.evidence / "replay.json", {**result.to_json(), "config": cfg.describe(),
                                              "policy": policy.describe(), "refusals": r.refusals,
                                              "errors": r.errors})
