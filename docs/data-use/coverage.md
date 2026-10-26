@@ -70,7 +70,9 @@ then not run. `analysis_failed` is never derived: the caller says so.
 - `incomplete` otherwise.
 
 Each gap names the dataset and its distinction. A missing snapshot is `not_collected`; a missing consumption
-record is `analysis_not_run`. `Requirement(dataset, allow_no_eligible=True)` lets an empty dataset pass when
+record is `analysis_not_run`, and then the dataset's latest snapshot is judged instead of one for the run's
+window. A consumption record without an input window cannot be matched to a snapshot, so it counts as
+`not_collected`. `Requirement(dataset, allow_no_eligible=True)` lets an empty dataset pass when
 "nothing to check" is an acceptable answer for that conclusion.
 
 ```mermaid

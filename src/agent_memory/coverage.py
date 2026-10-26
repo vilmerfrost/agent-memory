@@ -255,7 +255,8 @@ def evaluate(required: Iterable[str | Requirement], snaps: Mapping[str, Mapping[
     for req in reqs:
         s, u = snaps.get(req.dataset), uses.get(req.dataset)
         if s is None:
-            gaps.append(Gap(req.dataset, "not_collected", "no coverage snapshot covers the input window"))
+            gaps.append(Gap(req.dataset, "not_collected", "no coverage snapshot for this dataset" if u is None
+                            else "no coverage snapshot covers the input window"))
         elif s["status"] != "complete" and not (s["status"] == "no_eligible_data" and req.allow_no_eligible):
             gaps.append(Gap(req.dataset, s["status"], s.get("detail") or f"snapshot status {s['status']}"))
         if u is None:
@@ -283,12 +284,17 @@ def verdict(conn: psycopg.Connection, *, job: str, run_key: str,
         snaps: dict[str, dict[str, Any] | None] = {}
         for name in names:
             u = uses.get(name)
-            if u is None or u["window_start"] is None:
+            if u is None:
+                # Not analysed: the latest snapshot still tells whether the data was there to analyse.
+                cur.execute("select * from public.coverage_snapshots where dataset = %s "
+                            "order by window_end desc, updated_at desc limit 1", (name,))
+            elif u["window_start"] is None:
                 # Without an input window no snapshot can be shown to cover the run's input.
                 snaps[name] = None
                 continue
-            cur.execute("select * from public.coverage_snapshots where dataset = %s and window_start <= %s "
-                        "and window_end >= %s order by recorded_at desc, updated_at desc limit 1",
-                        (name, u["window_start"], u["window_end"]))
+            else:
+                cur.execute("select * from public.coverage_snapshots where dataset = %s and window_start <= %s "
+                            "and window_end >= %s order by updated_at desc limit 1",
+                            (name, u["window_start"], u["window_end"]))
             snaps[name] = cur.fetchone()
     return evaluate(reqs, snaps, uses)

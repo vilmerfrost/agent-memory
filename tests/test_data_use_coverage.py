@@ -201,6 +201,15 @@ def test_coverage_gaps_block_all_clear_and_findings_are_never_all_clear(db: dict
                                                             ("execution_spans", "measurement_unavailable")}
 
 
+def test_collected_but_never_analysed_is_analysis_not_run_only(db: dict[str, str]) -> None:
+    record(db["app"], [snap("sessions"), snap("test_timing_cases", denominator="cases of uploaded runs")],
+           [use("sessions")])
+    v = guard(db["app"], "sessions", "test_timing_cases")
+    assert v.conclusion == "incomplete"
+    assert [(g.dataset, g.distinction, g.detail) for g in v.gaps] == [
+        ("test_timing_cases", "analysis_not_run", "no consumption record for this run")]
+
+
 def test_a_snapshot_must_cover_the_input_window(db: dict[str, str]) -> None:
     record(db["app"], [snap("sessions", window_start=T0 + timedelta(hours=12))], [use("sessions")])
     v = guard(db["app"], "sessions")
