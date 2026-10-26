@@ -69,6 +69,10 @@ class Change:
     rule_id: str
     applied_at: datetime
     title: str | None = None
+    target: str | None = None
+    before_sha256: str | None = None
+    after_sha256: str | None = None
+    artifact_hash: str | None = None
 
     @property
     def rule_key(self) -> str:
@@ -96,6 +100,7 @@ class Outcome:
     suggest_undo: bool = False
     observed_days: float = 0.0
     other_changes: int = 0    # other changes to the rule's text inside the windows (mixed)
+    feedback: dict[str, Any] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
         d = asdict(self)
@@ -189,29 +194,42 @@ def applied_changes(conn: Any) -> tuple[list[Change], list[str]]:
     skipped: list[str] = []
     with conn.cursor(row_factory=dict_row) as cur:
         cur.execute("""select p.id::text as id, p.title, p.promoted_at, c.rule_key, c.dedupe_key,
-                              e.instruction_source as e_source, e.rule_id as e_rule
+                              e.instruction_source as e_source, e.rule_id as e_rule,
+                              p.artifact_hash, a.manifest, x.meta as experiment_meta
                        from rsi_proposals p
                        left join rsi_candidates c on c.id = p.candidate_id
+                       left join rsi_artifacts a on a.hash = p.artifact_hash
+                       left join rsi_experiments x on x.id = p.experiment_id
                        left join lateral (select instruction_source, rule_id from edits
                                           where meta->>'proposal_id' = p.id::text order by created_at desc limit 1) e
                               on true
                        where p.status = 'promoted' and p.promoted_at is not null and p.reverted_at is null
                        order by p.promoted_at, p.id""")
         for r in cur.fetchall():
-            rule = (split_rule(r["rule_key"]) if r["rule_key"] else None) or \
-                   ((r["e_source"], r["e_rule"]) if r["e_source"] and r["e_rule"] else None) or \
-                   (split_rule(r["dedupe_key"]) if r["dedupe_key"] else None)
+            # Skill-score candidates name a file, not a rule. The manifest's
+            # improve rule_id may also be synthetic. Only the actual persisted
+            # writer section identifies the intended rule in that case.
+            skill = isinstance(r["dedupe_key"], str) and r["dedupe_key"].startswith("skill:")
+            section = ((r["experiment_meta"] or {}).get("implementation") or {}).get("section_id")
+            rule = ((r["dedupe_key"], section) if skill and isinstance(section, str) and section else None) if skill else \
+                   (split_rule(r["rule_key"]) if r["rule_key"] else None)
+            rule = rule or ((r["e_source"], r["e_rule"]) if r["e_source"] and r["e_rule"] else None) or \
+                   (split_rule(r["dedupe_key"]) if r["dedupe_key"] and not skill else None)
             if rule is None:
                 skipped.append(f"proposal {r['id']}: no rule to measure (no candidate rule_key or edits row)")
                 continue
-            out.append(Change("proposal", r["id"], rule[0], rule[1], r["promoted_at"], r["title"]))
+            files = (r["manifest"] or {}).get("files") or []
+            f = files[0] if len(files) == 1 and isinstance(files[0], dict) else {}
+            out.append(Change("proposal", r["id"], rule[0], rule[1], r["promoted_at"], r["title"],
+                              f.get("path"), f.get("before_sha256"), f.get("after_sha256"), r["artifact_hash"]))
         cur.execute("""select id::text as id, coalesce(rule_title, rule_id) as title, created_at, instruction_source,
-                              rule_id
+                              rule_id, target_path, instruction_sha_before, instruction_sha_after
                        from edits
                        where status in ('kept', 'trial') and reverted_at is null and undo_requested_at is null
                        order by created_at, id""")
         for r in cur.fetchall():
-            out.append(Change("edit", r["id"], r["instruction_source"], r["rule_id"], r["created_at"], r["title"]))
+            out.append(Change("edit", r["id"], r["instruction_source"], r["rule_id"], r["created_at"], r["title"],
+                              r["target_path"], r["instruction_sha_before"], r["instruction_sha_after"]))
     return out, skipped
 
 
@@ -279,8 +297,13 @@ def measure(conn: Any, c: Change, now: datetime, paths: list[str] | None = None)
 
 
 def store_outcomes(conn: Any, outcomes: list[Outcome], now: datetime) -> None:
+    from agent_memory import production_feedback
     for o in outcomes:
         c = o.change
+        # History uses the existing evidence store. It has an immutable natural
+        # key and records incomplete authority as incomplete, including all
+        # legacy NULL-authority deviations. It grants no application authority.
+        evidence_ref = production_feedback.store_observation(conn, o, now)
         conn.execute(
             """insert into rsi_outcomes (change_kind, change_id, rule_key, instruction_source, rule_id, title, applied_at,
                    checked_at, first_checked_at, window_days, sessions_before, sessions_after, deviations_before,
@@ -301,6 +324,7 @@ def store_outcomes(conn: Any, outcomes: list[Outcome], now: datetime) -> None:
              o.sessions_before, o.sessions_after, o.deviations_before, o.deviations_after, o.rate_before, o.rate_after,
              o.p_value, o.verdict, o.reason, o.suggest_undo, c.undo_hint() if o.suggest_undo else None,
              Jsonb({"observed_days": o.observed_days, "format": FORMAT, "other_changes": o.other_changes,
+                    "production_feedback": {**o.feedback, "evidence_ref": evidence_ref},
                     "thresholds": {"window_days": WINDOW_DAYS, "min_days": MIN_DAYS, "min_sessions": MIN_SESSIONS,
                                    "alpha": ALPHA, "min_effect": MIN_EFFECT, "undo_after_days": UNDO_AFTER_DAYS}})))
 
@@ -340,7 +364,9 @@ def render_markdown(rep: Report) -> str:
              f"Rule: deviations per session in real sessions that loaded the rule's file, {WINDOW_DAYS:g} days (at "
              f"most) before vs after the apply time; at least {MIN_SESSIONS} sessions each side and {MIN_DAYS:g} "
              f"days; helped / worse need a one-sided exact test at p <= {ALPHA:g} and a {MIN_EFFECT:.0%} change. "
-             "Nothing is undone automatically.", ""]
+             "Nothing is undone automatically.", "",
+             "These are observational associations, not proof that a change caused the difference. "
+             "Feedback evidence records instruction-version and scan coverage separately.", ""]
     order = {"worse": 0, "no-change": 1, "helped": 2, "mixed": 3, "too-early": 4}
     for o in sorted(rep.outcomes, key=lambda o: (order[o.verdict], o.change.applied_at)):
         ch = o.change
@@ -351,6 +377,11 @@ def render_markdown(rep: Report) -> str:
                      f"{o.sessions_before} session(s), after {o.deviations_after} in {o.sessions_after}"
                      + (f"; p = {o.p_value:g}" if o.p_value is not None else ""))
         lines.append(f"- Why: {o.reason}")
+        if o.feedback:
+            cov = o.feedback.get("coverage") or {}
+            lines.append(f"- Feedback evidence: {o.feedback.get('evidence_ref', 'not recorded')}; "
+                         f"coverage {cov.get('status', 'incomplete')}"
+                         + (f" ({', '.join(cov.get('gaps') or [])})" if cov.get("gaps") else "") + ".")
         if o.suggest_undo:
             lines.append(f"- Suggested: Undo. {ch.undo_hint()}")
         lines.append("")
