@@ -144,13 +144,24 @@ def calibrate(parent_dir: Path, projects: Path, *, limit: int = 30,
         sensitivity.append({"skill": skill, "matched_sessions": len(pair["new"]),
                             "old_scored": n_old, "new_scored": n_new,
                             "old_cohort_score": before, "new_cohort_score": after})
+    session_evidence = {}
+    for row in rows:
+        sid = row.get("session_id")
+        if sid not in session_evidence:
+            session_evidence[sid] = {k: row[k] for k in (
+                "transcript_ref", "operation_evidence", "new_operation_signals", "skills_observed",
+                "copied_records_excluded") if k in row}
+        row["evidence_ref"] = "session:" + str(sid)
+        for key in ("transcript_ref", "operation_evidence", "new_operation_signals", "skills_observed",
+                    "copied_records_excluded"):
+            row.pop(key, None)
     return {"format": "outcome-calibration/1", "observed_at": now.isoformat(), "limit": limit,
             "selected_tasks": len(rows), "unique_sessions": len({r["session_id"] for r in rows}),
             "changed_tasks": sum(r["changed"] for r in rows),
             "transition_matrix": [{"old": a, "new": b, "tasks": n} for (a,b),n in sorted(matrix.items())],
             "acceptance_matrix": [{"truth": "unknown", "old": a, "new": b, "tasks": n}
                                   for (a,b),n in sorted(matrix.items())],
-            "skill_sensitivity": sensitivity, "rows": rows,
+            "skill_sensitivity": sensitivity, "rows": rows, "session_evidence": session_evidence,
             "limitations": ["Old outcomes are reconstructed v5 classifier outputs, not a fresh database snapshot",
                             "Transition matrix is not a human-ground-truth confusion matrix",
                             "Task DONE and integration_first_pass are reported claims, not independent acceptance",
