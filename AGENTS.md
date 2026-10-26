@@ -9,3 +9,9 @@
 - Preserve assertions, intentional timeout checks, environment isolation and cleanup. Do not add retries, skips or weaker expectations just to get a green result.
 
 See the Tests section of `README.md` for serial debugging and log details.
+
+The runner also saves a `.timings.json` batch beside each log. Under `parent-run`,
+the collector uploads per-test setup/call/teardown durations and outcomes to
+Supabase after the run. Use `amem timing tests --run '<printed-run-id>'` to find
+the slowest tests. Details expire after 30 days; summaries remain. See
+`docs/session-timing.md` for interpretation and retry behavior.

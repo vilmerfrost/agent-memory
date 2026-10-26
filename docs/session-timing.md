@@ -95,6 +95,60 @@ Measurements are best effort and do not change command exit codes, safety checks
 timeouts, cleanup, test selection or release receipts. Full logs remain in their
 existing files; Supabase receives small counters and redacted measurement metadata.
 
+## Individual test timings
+
+The integration runner saves one structured `.timings.json` batch beside its full
+pytest log. Each test has a stable key, name, outcome, worker ID, and separate
+setup, call and teardown durations in milliseconds. Missing phases stay NULL;
+setup failures and teardown failures remain errors. Incomplete tests are marked.
+Parameterized values are replaced by a stable hash so fixture data does not enter
+the database. Tracebacks, captured output and command arguments stay out of it.
+
+The batch has a unique run ID, repository, commit, dirty flag, worker count,
+session ID and parent command span ID where provided by `parent-run`. It records
+the actual pytest exit code, collection/worker error counts and time until
+collection is ready. That last value includes worker startup and collection.
+Default runs are marked `full`; runs with extra pytest arguments are
+conservatively marked `custom`.
+
+Under `parent-run`, the runner atomically queues one batch in
+`~/.claude/parent/<repo>/test-timing-queue`. It does not connect to a database.
+The existing collector imports each run in one transaction and only removes the
+queue file after commit. Replay does not duplicate rows. Database failures keep
+the batch queued and never change pytest's exit code. A direct runner invocation
+without parent context saves the local artifact but does not enqueue an upload.
+
+`test_timing_runs` keeps summaries and log filenames. `test_timing_cases` keeps
+individual results for 30 days. The collector checks retention hourly while it
+runs; cleanup resumes after downtime. Expired batches cannot recreate deleted
+details. Local full logs and timing artifacts follow the existing local log
+retention policy; database cleanup does not delete those files.
+
+Retrieve the slowest tests from the latest run, a particular run, or a session:
+
+```sh
+uv run --locked amem timing tests
+uv run --locked amem timing tests --run '<run-id>' --limit 10
+uv run --locked amem timing tests --session 'codex:<thread-id>'
+```
+
+To compare a test across recent runs, filter by repository, test key and comparable
+worker counts, selection and dirty flags. For example:
+
+```sql
+select r.run_id,r.head,r.ended_at,r.workers,r.selection,r.dirty,
+       c.nodeid,c.setup_ms,c.call_ms,c.teardown_ms,c.total_ms,c.outcome
+from public.test_timing_cases c join public.test_timing_runs r using(run_id)
+where r.repo = 'agent-memory' and c.test_key = '<test-key>'
+order by r.ended_at desc;
+```
+
+Per-test durations are cumulative work, not run wall time. Parallel tests overlap.
+Shared fixture setup is charged to the test that triggered it. Collection, worker
+startup and runner overhead do not belong to individual test bodies. Machine load
+can affect measurements. These results locate delays, but do not alone prove the
+cause of a regression. Access uses the existing owner-only read policy.
+
 ## Local installation
 
 After the new code and additive migration are deployed:

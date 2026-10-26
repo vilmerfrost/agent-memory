@@ -116,9 +116,11 @@ def serve(port: int, *, flush_seconds: float = 15, db_url: str | None = None) ->
 
     def flush() -> None:
         signatures: dict[Path, tuple[int, int]] = {}
+        last_pruned = 0.0
         while not stop.wait(flush_seconds):
             try:
                 from agent_memory.timing_sync import flush_queue
+                from agent_memory import test_timings
                 flush_queue(parent/'timing-sync-queue',db_url=db_url)
                 paths = timing_store.spool_paths(parent)
                 changed = []
@@ -131,6 +133,13 @@ def serve(port: int, *, flush_seconds: float = 15, db_url: str | None = None) ->
                 if changed:
                     timing_store.ingest_spools(changed, db_url=db_url, cursor_path=parent/'timing-cursors.json')
                 signatures = latest
+                # A test-batch failure must not prevent existing native span
+                # ingestion. Retry test batches after the original work commits.
+                for queue in parent.glob('*/test-timing-queue'):
+                    test_timings.flush_queue(queue, db_url=db_url)
+                if time.monotonic()-last_pruned >= 3600:
+                    test_timings.prune(db_url=db_url)
+                    last_pruned = time.monotonic()
                 with state.lock:
                     state.flushes += 1
                     state.database_error = None

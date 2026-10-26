@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import json
 import subprocess
 import sys
 import threading
@@ -53,6 +54,14 @@ def test_teardown(broken_teardown): pass
         assert text in log
     assert "captured failure details" not in result.stdout
     assert "Starting pytest" not in log  # progress stays separate from captured test output
+    batch, = list((tmp_path/"logs").glob("*.timings.json"))
+    data = json.loads(batch.read_text())
+    assert data["run"]["exit_code"] == 1 and data["run"]["tests_complete"] == 5
+    assert data["run"]["outcomes"] == {"passed": 1, "skipped": 1, "failed": 1, "error": 2}
+    assert all(t["teardown_ms"] is not None for t in data["tests"])
+    if workers:
+        assert all(t["worker_id"] is not None for t in data["tests"])
+    assert all(text not in batch.read_text() for text in ("captured failure details", "failure marker", "setup marker"))
 
 
 @pytest.mark.parametrize("capture", ["capsys", "capfd"])
@@ -109,3 +118,30 @@ def test_collection_errors_and_empty_runs_cannot_look_like_a_pass(
     assert f"FAIL (pytest exit {code})" in result.stdout
     assert "PASS (pytest exit 0)" not in result.stdout
     assert detail in (tmp_path / "logs" / "latest.log").read_text()
+    batch, = list((tmp_path/"logs").glob("*.timings.json"))
+    data = json.loads(batch.read_text())
+    assert data["run"]["exit_code"] == code and data["tests"] == []
+
+
+def test_runner_queues_one_batch_with_parent_identity_and_no_raw_payload(tmp_path):
+    source = '''
+import os
+import pytest
+@pytest.mark.parametrize("value", ["PRIVATE-VALUE"], ids=["PRIVATE-VALUE"])
+def test_value(value):
+    os.environ.pop("AMEM_TIMING_SESSION_ID", None)
+    assert value
+'''
+    parent = tmp_path/"parent"
+    env = base_env(PARENT_DIR=str(parent), AMEM_TIMING_SESSION_ID="codex:real-parent",
+                   AMEM_TIMING_PARENT_SPAN_ID="command-span")
+    result = subprocess.run(command(tmp_path, source, workers=2), cwd=tmp_path,
+                            env=env, capture_output=True, text=True, timeout=45)
+    assert result.returncode == 0, result.stdout+result.stderr
+    path, = list((parent/"test-timing-queue").glob("run-*.json"))
+    value = json.loads(path.read_text())
+    assert "PRIVATE-VALUE" not in path.read_text()
+    assert value["run"]["session_id"] == "codex:real-parent"
+    assert value["run"]["parent_span_id"] == "command-span"
+    assert value["run"]["tests_complete"] == 1
+    assert value["tests"][0]["call_ms"] is not None

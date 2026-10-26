@@ -28,6 +28,9 @@ def run(args: argparse.Namespace) -> int:
             return 3
         if args.timing_action == "coverage":
             result = timing_store.coverage()
+        elif args.timing_action == "tests":
+            from agent_memory import test_timings
+            result = test_timings.report(run_id=args.run, session_id=args.session, limit=args.limit)
         elif args.timing_action == "report":
             result = timing_store.summary(args.session)
             if result is None:
@@ -57,11 +60,15 @@ def run(args: argparse.Namespace) -> int:
 def register(sub: argparse._SubParsersAction) -> None:
     parser = sub.add_parser("timing", help="measured session timing and coverage")
     actions = parser.add_subparsers(dest="timing_action", required=True)
-    for name in ("coverage", "report", "ingest", "sync", "flush", "collect"):
+    for name in ("coverage", "report", "tests", "ingest", "sync", "flush", "collect"):
         p = actions.add_parser(name)
         p.set_defaults(func=run)
         if name == "report":
             p.add_argument("--session", required=True)
+        elif name == "tests":
+            p.add_argument("--run")
+            p.add_argument("--session")
+            p.add_argument("--limit", type=int, choices=range(1, 101), default=10)
         elif name == "ingest":
             p.add_argument("--path", type=Path)
         elif name == "sync":
