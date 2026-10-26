@@ -21,7 +21,8 @@ the exact artifact hash and baseline id). Only IMPROVES becomes the passing verd
 Never a passing record: refusals (artifact not exact, stale baseline, experiment mismatch), run errors or
 timeouts, missing arms, a budget stop. Evidence: `<root>/replays/<experiment_id>/` (replay.json, one JSON per
 run, the blinded judge prompts and answers, the Jev state, log.jsonl) plus the sandbox's own run logs and a
-`<run_id>.rsi.json` sidecar per agent run for the Langfuse sink. Run ids are deterministic:
+`<run_id>.rsi.json` sidecar per agent run for the Langfuse sink (a subscription attempt runs on the host, so the
+replay writes its run log itself: write_attempt_log). Run ids are deterministic:
 `<experiment_id>-<case>-<arm>-r<rep>` (checks: `...-chk`, live judge: `<experiment_id>-<case>-J-r<rep>`).
 
 No paid call by default: agent "stub" (sandbox/stub_agent/stub_agent.py, no network, no credentials),
@@ -71,6 +72,9 @@ AGENTS = ("stub", "claude", "codex")
 JUDGES = ("stub", "codex", "claude", "none")
 JEV_MODES = ("fixture", "live", "none")
 CASE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
+TOOL_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")       # a subscription bridge tool name (task_shell, ...)
+# Token counts a subscription attempt's log keeps (rsi_subscription normalizes Codex into the same names).
+SUBSCRIPTION_USAGE_KEYS = ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
 DEFAULT_LIMITS = {"memory": "1g", "cpus": "1", "pids": 256, "timeout_s": 300}
 CHECK_LIMITS = {"memory": "512m", "cpus": "1", "pids": 128}
 JUDGE_TIMEOUT_S = 300        # one live judge call (rsi_schedule's paid plan budgets the wall clock with it)
@@ -879,7 +883,10 @@ class _Replay:
         workspace.mkdir(parents=True, exist_ok=False)
         fixture = self.stage_dir / "cases" / case.id / "fixture"
         shutil.copytree(fixture, workspace, symlinks=True, dirs_exist_ok=True)
+        started_at = datetime.now(UTC)
         started = time.monotonic()
+        usage_raw: Mapping[str, Any] = {}
+        crashed: str | None = None
         try:
             targets = self.relevance.get("eligible_cases", {}).get(case.id, [])
             prompt = case.prompt + ("\n\nRead the applicable instruction files using task_read_arm before doing the task:\n" +
@@ -888,6 +895,7 @@ class _Replay:
                              workspace=workspace.resolve(), arm_home=self.sb.arm_home(self.exp, rec.arm).resolve(),
                              timeout_s=self._timeout(case.timeout_s), auth=auth_for(cfg.agent, cfg.auth, tools=True),
                              max_tool_calls=cfg.max_tool_calls)
+            usage_raw = result.usage if isinstance(result.usage, Mapping) else {}
             usage = usage_fields(result.usage)
             for key, value in usage.items():
                 setattr(rec, key, value)
@@ -897,13 +905,54 @@ class _Replay:
             rec.exit_code = 0
         except sub.SubscriptionError as exc:
             rec.error, rec.exit_code = str(exc), 1
+        except BaseException as exc:
+            crashed = f"not finished: {type(exc).__name__}"     # the log only; the runner records the exception
+            raise
         finally:
             rec.duration_s = round(time.monotonic() - started, 3)
             rec.cost_usd, rec.cost_basis = 0.0, "subscription"
             self.budget.record_call(cfg.model, stage="replay-agent", tokens_in=rec.tokens_in, tokens_out=rec.tokens_out,
                                     tokens_cached=rec.tokens_cached, tokens_cache_write=rec.tokens_cache_write,
                                     duration_s=rec.duration_s, ok=rec.error is None, error=rec.error)
+            self.write_attempt_log(rec, started_at, usage_raw, error=rec.error or crashed)
         return rec
+
+    def write_attempt_log(self, rec: RunRecord, started_at: datetime, usage: Mapping[str, Any], *,
+                          error: str | None) -> None:
+        """`logs/<run_id>.json` for a subscription attempt (no container, so rsi_sandbox writes no run log): the
+        Langfuse sink reads it (integrations/langfuse.py, SUBSCRIPTION_LOG_FORMAT) and _write_evidence adds the
+        `.rsi.json` sidecar beside it. Content: what a container run log and its stdout already carry, no more:
+        ids, exit, host-measured start and duration, token counts, tool NAMES and statuses (never commands or
+        outputs), and the final text, redacted (agent_memory.redact) and cut to 4000 characters. Never argv,
+        env, auth settings, the auth home or the client's runtime evidence."""
+        from agent_memory import redact as RD
+        from agent_memory.integrations import langfuse as LF
+        logs = self.sb.experiment_dir(self.exp) / "logs"
+        tools = []
+        for call in rec.tool_calls:                  # the bridge's tool-evidence records (sandbox/subscription_tools.py)
+            if not isinstance(call, Mapping):
+                continue
+            name, code = call.get("tool"), call.get("exit_code")
+            status = ("failed" if call.get("error") else "completed" if code == 0
+                      else "failed" if isinstance(code, int) and not isinstance(code, bool) else "unknown")
+            tools.append({"name": name if isinstance(name, str) and TOOL_NAME_RE.fullmatch(name) else "unknown",
+                          "status": status})
+        counts = {k: v for k, v in usage.items() if k in SUBSCRIPTION_USAGE_KEYS
+                  and isinstance(v, int) and not isinstance(v, bool) and v >= 0}
+        final = RD.redact(rec.final or "")
+        home = self.cfg.auth.get("home") if isinstance(self.cfg.auth, Mapping) else None
+        if isinstance(home, str) and home.strip():    # the auth home is never part of a log, even if the text names it
+            p = Path(home).expanduser()
+            for form in sorted({home, str(p), str(p.absolute()), str(p.resolve())}, key=len, reverse=True):
+                final = final.replace(form, RD.MARK)
+        _write_json(logs / f"{rec.run_id}.json", {
+            "format": LF.SUBSCRIPTION_LOG_FORMAT, "experiment": self.exp, "arm": rec.arm, "run_id": rec.run_id,
+            "agent": self.cfg.agent, "model": rec.model, "transport": "official-subscription-client",
+            "exit_code": rec.exit_code, "timed_out": error == "client_timeout", "error": error,
+            "duration_s": rec.duration_s, "started_at": started_at.isoformat(timespec="milliseconds"),
+            "timing": "host-measured", "usage": counts, "tools": tools,
+            "result": final[-4000:],
+            "run_dir": str(self.sb.experiment_dir(self.exp) / "runs" / rec.run_id), "log_dir": str(logs)})
 
     def billed_model(self, rec: RunRecord) -> str:
         """The model a run is priced and booked as. A live agent without --model runs its CLI's default model:

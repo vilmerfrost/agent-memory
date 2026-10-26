@@ -111,6 +111,19 @@ experiment id, Docker down) leaves an existing record alone.
 - `<root>/replays/<E>/jev.json`: the Jev state (numbers only) and answers. `log.jsonl`: the execution log.
 - `<root>/experiments/<E>/logs/`: the sandbox's own stdout, stderr and docker argv per run, plus
   `<run_id>.rsi.json` (case, rep, check, judge winner, eval verdict) for the Langfuse sink.
+- Subscription attempts (`auth_mode: subscription`, the night's provider profiles) run the official client on the
+  host, not in a container, so the sandbox writes no log for them. The replay writes `<run_id>.json` itself
+  (`format: rsi-subscription-run/1`, `rsi_replay.write_attempt_log`), also for a failed, timed-out or crashed
+  attempt, and the sidecar follows as for a container run. The log holds only what a container log and its stdout
+  already carry: ids, exit code, error code, a host-measured `started_at` and duration, token counts, tool names
+  and statuses (never commands or outputs) and the final text, redacted and cut to 4000 characters, with the auth
+  home's path removed. Never argv, env, auth settings or the client's runtime evidence; there is no `.stdout`.
+  The Langfuse sink reads that log directly (`langfuse.load_run_log`; one generation, no cost: a subscription bills
+  no USD). Every trace's root metadata says where its start came from (`timing`: `host-measured`, `run-id` or
+  `reconstructed` from the log's mtime) and tool span times are `ordinal`, so only a run's own duration is a
+  measured latency. Subscription judge calls still leave no run log (unchanged); checks keep their container log.
+  No backfill: nights before this change (up to 2026-10-25) never stored their attempts' agent output, so their
+  attempts stay untraced in Langfuse.
 
 Run ids: `<E>-<case>-<arm>-r<rep>`, checks `…-chk`, live judge `<E>-<case>-J-r<rep>`. A re-run of the same
 experiment replaces its evidence and its run dirs.
