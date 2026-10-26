@@ -484,19 +484,19 @@ def test_subscription_plan_has_room_for_three_experiments() -> None:
     plan = S.paid_plan(N.load_config(SUBSCRIPTION))
     one = plan["room"]["per_experiment"]
     # one shared-skill experiment: 3 pairs per provider, each agent run 8 tool + 1 check containers, judge on subscription
-    # the section writer (S6) adds one Opus call and its 90 s timeout per experiment
+    # the section writer (S6) adds one Opus call and its 300 s timeout per experiment
     assert one["calls"] == {"claude-opus-5-5": 8, "gpt-6.1-sol": 12, "jev-1.14.0": 2}
     assert (one["ab_pairs"], one["sandbox_runs"], one["case_timeout_s"]) == (6, 108, 240)
-    assert one["wall_clock_parts_s"] == {"hypothesize": 300, "implement": 90, "stage": 300,
+    assert one["wall_clock_parts_s"] == {"hypothesize": 300, "implement": 300, "stage": 300,
                                          "replay": 2 * (6 * (240 + S.CHECK_RUN_S) + 3 * 300 + S.JEV_CALL_S)}
-    assert one["wall_clock_s"] == 5550
+    assert one["wall_clock_s"] == 5760
     assert room_needs(plan) == {
         "calls claude-opus-5-5": (24, 26), "calls gpt-6.1-sol": (36, 40), "calls jev-1.14.0": (5 + 6, 12),
-        "A/B pairs per experiment": (6, 6), "sandbox runs": (324, 360), "wall clock": (600 + 3 * 5550, 17280),
+        "A/B pairs per experiment": (6, 6), "sandbox runs": (324, 360), "wall clock": (600 + 3 * 5760, 17880),
         "subscription tokens": (6_000_000, 6_000_000)}
     assert plan["room"]["fits"] and plan["max_experiments"] == 3 and plan["within_cap"]
     text = S.render_plan(plan)
-    assert "Room for 3 experiment(s) (every limit fits):" in text and "- wall clock: need 17,250s of 17,280s fits" in text
+    assert "Room for 3 experiment(s) (every limit fits):" in text and "- wall clock: need 17,880s of 17,880s fits" in text
     assert "- subscription tokens: need 6,000,000 of 6,000,000 fits" in text
 
 
@@ -517,14 +517,14 @@ def test_room_flags_caps_sized_for_one_experiment(tmp_path: Path) -> None:
     assert [c["limit"] for c in one["room"]["checks"] if not c["fits"]] == ["wall clock"]
 
 
-def test_three_experiment_night_ends_an_hour_before_the_brief() -> None:
+def test_three_experiment_night_ends_before_the_brief() -> None:
     night, brief = load_plist("com.vilmerfrost.amem-rsi-night.plist"), load_plist("com.vilmerfrost.amem-rsi-brief.plist")
     a = night["ProgramArguments"]
     assert Path(a[a.index("--config") + 1]).name == SUBSCRIPTION.name
     w = N.load_config(SUBSCRIPTION).budget.wall_clock_s
     start = night["StartCalendarInterval"]["Hour"] * 60 + night["StartCalendarInterval"]["Minute"]
     end = start + (w + S.HARD_GRACE_S + S.KILL_GRACE_S) / 60               # the watchdog's hard exit, at the latest
-    assert end <= brief["StartCalendarInterval"]["Hour"] * 60 + brief["StartCalendarInterval"]["Minute"] - 60
+    assert end <= brief["StartCalendarInterval"]["Hour"] * 60 + brief["StartCalendarInterval"]["Minute"] - 45   # brief-job also waits up to 90 min
 
 
 def test_cli_plan_prints_the_room(tmp_path: Path) -> None:

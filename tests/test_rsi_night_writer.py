@@ -224,4 +224,4 @@ def test_plan_counts_the_writer_and_keeps_room_for_three() -> None:
     room = plan["room"]
     assert room["fits"] and room["experiments"] == 3
     assert room["per_experiment"]["calls"][OPUS] == 8
-    assert room["per_experiment"]["wall_clock_parts_s"]["implement"] == 90
+    assert room["per_experiment"]["wall_clock_parts_s"]["implement"] == 300
