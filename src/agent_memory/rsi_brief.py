@@ -470,11 +470,24 @@ def coverage_verdict(rep: Mapping[str, Any], *, db_url: str | None = None) -> di
     return _verdict(v.conclusion, findings=v.findings, gaps=gaps, empty=empty)
 
 
+def gap_list(gaps: list[Mapping[str, Any]]) -> str:
+    """Gaps, short: one entry per dataset with its distinctions and the first specific reason."""
+    by: dict[str, list[Mapping[str, Any]]] = {}
+    for g in gaps:
+        by.setdefault(str(g.get("dataset")), []).append(g)
+    out = []
+    for ds, gs in list(by.items())[:MAX_GAPS]:
+        why = next((str(g["detail"]) for g in gs if g.get("detail")
+                    and not str(g["detail"]).startswith(("consumption status", "snapshot status"))), "")
+        out.append(f"{ds} {', '.join(dict.fromkeys(str(g.get('distinction')) for g in gs))}"
+                   + (f" ({text(why, 70)})" if why else ""))
+    return "; ".join(out) + (f"; and {len(by) - MAX_GAPS} more datasets" if len(by) > MAX_GAPS else "")
+
+
 def verdict_line(v: Mapping[str, Any]) -> str:
     """The verdict as one markdown line. Only all_clear says "No problem found"."""
     gaps = v.get("gaps") or []
-    listed = "; ".join(f"{g['dataset']} {g['distinction']}" + (f" ({g['detail']})" if g.get("detail") else "")
-                       for g in gaps[:MAX_GAPS]) + (f"; and {len(gaps) - MAX_GAPS} more" if len(gaps) > MAX_GAPS else "")
+    listed = gap_list(gaps)
     c = v.get("conclusion")
     if c == "all_clear":
         empty = f" Nothing new to check in: {', '.join(v['empty'])}." if v.get("empty") else ""

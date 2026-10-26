@@ -172,7 +172,7 @@ class Ledger:
         s.status, s.done = "analysis_not_run", True
         s.detail = "counted only: the night analyses sessions through their deviations"
         for st in _dget(delta, "steps") or []:
-            self._step(st)
+            self._step(st, "s1")
         self._owner_off(_dget(delta, "health"))
         self.delta_seen = True
 
@@ -224,7 +224,8 @@ class Ledger:
         u = self.uses[SKILLS]
         u.queried = rows
         if skipped_by:
-            u.skipped[skipped_by] += rows
+            if rows:
+                u.skipped[skipped_by] += rows
         else:
             u.considered = u.used = rows
             u.findings = len(sightings)
@@ -261,7 +262,7 @@ class Ledger:
         if dataset == EVIDENCE:                  # the live S1 findings were in the same analysis
             for p in self.providers.values():
                 if p.considered:
-                    p.step("s1.findings", "error", detail=why)
+                    p.step("s1:findings", "error", detail=why)
 
     # -- S4 ------------------------------------------------------------------------------------------
     @_safe
@@ -295,17 +296,17 @@ class Ledger:
             for prov, h in (_dget(pack, "health") or {}).items():
                 if prov in self.providers and h != "skipped":
                     ok = h in ("ok", "stale", "unlinked", "truncated", "partial")
-                    self.providers[prov].step(f"{prov}.pack", "ok" if ok else str(h), found=per.get(prov, 0),
+                    self.providers[prov].step(f"s4:{prov}.pack", "ok" if ok else str(h), found=per.get(prov, 0),
                                               detail="" if ok else f"evidence pack for {candidate}")
         else:
             for st in steps:
-                self._step(st)
+                self._step(st, "s4")
         self._owner_off(_dget(pack, "health"))
 
     @_safe
     def pack_failed(self, why: str) -> None:
         for p in self.providers.values():
-            p.step("s4.pack", "error", detail=why)
+            p.step("s4:pack", "error", detail=why)
 
     @staticmethod
     def _pack_provider(f: Any) -> str | None:
@@ -316,14 +317,14 @@ class Ledger:
             return RETRIEVER[via.split(".", 1)[0]]
         return _SOURCE_PROVIDER.get(str(_dget(f, "source") or ""))
 
-    def _step(self, st: Any) -> None:
+    def _step(self, st: Any, stage: str) -> None:
+        """One step record ({step, status, found, detail}). A health check of an idle provider is not a request for
+        data: a provider no step asked lost no evidence (a query step of an unhealthy one answers unavailable)."""
         name = str(_dget(st, "step") or "")
         prov = RETRIEVER.get(name.split(".", 1)[0])
-        if prov is None or name.endswith(".health"):      # health checks of idle providers: not asked for data
-            if prov is not None and _dget(st, "status") not in (None, "ok") and self.providers[prov].asked:
-                self.providers[prov].step(name, str(_dget(st, "status")), detail=_dget(st, "detail") or "")
+        if prov is None or name.endswith(".health"):
             return
-        self.providers[prov].step(name, str(_dget(st, "status") or "error"), _dget(st, "found", 0),
+        self.providers[prov].step(f"{stage}:{name}", str(_dget(st, "status") or "error"), _dget(st, "found", 0),
                                   _dget(st, "detail") or "")
 
     def _owner_off(self, health: Any) -> None:

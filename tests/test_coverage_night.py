@@ -166,7 +166,7 @@ def test_a_fixture_night_writes_rows_that_match_its_report(env: SimpleNamespace)
     ch, pd = u[NC.PROVIDER_DATASET["clickhouse"]], u[NC.PROVIDER_DATASET["pastdev"]]
     assert ch["status"] == "findings" and ch["used"] >= 1 and ch["evidence_refs"][0].startswith("ch:q.rule_gap/")
     assert s[NC.PROVIDER_DATASET["clickhouse"]]["status"] == "complete"
-    assert "ch.rule_gap" in s[NC.PROVIDER_DATASET["clickhouse"]]["measured_fields"]
+    assert "s4:ch.rule_gap" in s[NC.PROVIDER_DATASET["clickhouse"]]["measured_fields"]
     assert pd["used"] == 0 and pd["status"] == "read_excluded" and sum(pd["skipped"].values()) >= 1   # context only
     assert NC.PROVIDER_DATASET["langfuse"] not in u
     assert set(rep["coverage"]["required"]) == {*NC.BASE_REQUIRED, *(NC.PROVIDER_DATASET[p] for p in
@@ -241,12 +241,12 @@ def test_an_unavailable_provider_is_never_used_no_finding(env: SimpleNamespace, 
     ds = NC.PROVIDER_DATASET["clickhouse"]
     u, s = uses(env.url)[ds], snaps(env.url)[ds]
     assert u["status"] == status and u["used"] == 0 and "ch.rule_gap" in u["detail"]
-    assert s["status"] == "measurement_unavailable" and "ch.rule_gap" in s["unmeasured_fields"]
+    assert s["status"] == "measurement_unavailable" and "s1:ch.rule_gap" in s["unmeasured_fields"]
     assert ds in rep["coverage"]["required"]
     b, md = brief(env)
     assert b["verdict"]["conclusion"] == "incomplete"
-    assert any(g["dataset"] == ds for g in b["verdict"]["gaps"])
-    assert "**Verdict: Analysis incomplete.**" in md and f"{ds} measurement_unavailable" in md
+    assert {g["distinction"] for g in b["verdict"]["gaps"] if g["dataset"] == ds} == {"measurement_unavailable", status}
+    assert "**Verdict: Analysis incomplete.**" in md and f"{ds} measurement_unavailable, {status} (s1:ch.rule_gap" in md
     assert "No problem found" not in md
     _, body = BR.notification(b)
     assert "Verdict: Analysis incomplete" in body
