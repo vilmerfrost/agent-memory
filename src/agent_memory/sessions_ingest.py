@@ -464,6 +464,7 @@ class SessionRow:
     outcome: str | None = None   # the stored outcome (a row read back from the database), else None
     commits: list[dict[str, Any]] | None = None   # session_commits: {sha, message, repo, branch}; None: not read
     copy_only: bool = False   # a pure copy of an earlier transcript (session_resume): no row is stored
+    timing_spans: list[Any] = field(default_factory=list)  # sanitized operation facts, never transcript text
 
     def with_summary(self, s: session_tokens.Summary) -> SessionRow:
         """Title, profile and outcome signals from a full read."""
@@ -635,6 +636,8 @@ def session_row(path: Path, project_dir: str, *, parent_session: str | None = No
     row = SessionRow(sid, kind, repo, project_dir, start, end, size,
                      mine.skills, [], meta, path, tokens=tokens).with_summary(tokens)
     row.copy_only = resume.pure_copy(events, own)
+    from agent_memory.execution_timing import claude_spans
+    row.timing_spans = claude_spans(own_events, sid)
     row.commits = confirm_commits(row, session_commits.claude_commits(own_events, cwd=cwd, own_session=own,
                                                                       fallback=commit_fallback(row)))
     return _with_instructions(row)
@@ -737,6 +740,14 @@ def codex_row(path: Path, rel_dir: str, titles: dict[str, str] | None = None) ->
     title = (titles or {}).get(f.thread_id or path.stem)
     row = SessionRow(sid, kind, repo, rel_dir, f.start, f.end, size, f.skills, [], meta, path, tool="codex",
                      tokens=tokens, title=title).with_summary(tokens)
+    from agent_memory.execution_timing import codex_spans
+    row.timing_spans = codex_spans(events, sid)
+    durations = [s.elapsed_ms for s in row.timing_spans if s.category != "model_output" and s.elapsed_ms is not None]
+    if durations:
+        tokens.tool_ms = sum(durations)
+        row.profile = tokens.profile()
+    row.meta["timing_coverage"] = {"method": "codex_items_v1", "tool_spans": len(durations),
+                                   "api": "requires_otel", "model_output_is_api": False}
     row.commits = confirm_commits(row, session_commits.codex_commits(events, cwd=cwd, fallback=commit_fallback(row)))
     return _with_instructions(row)
 
@@ -1023,6 +1034,9 @@ def upsert(rows: list[SessionRow], *, db_url: str | None = None, now: datetime |
                 new += 1
             else:
                 updated += 1
+        from agent_memory import timing_store
+        timing_store.upsert_conn(conn, (span for r in rows for span in r.timing_spans))
+        timing_store.refresh_profiles(conn, (r.session_id for r in rows if r.tool=='codex'))
     return new, updated
 
 
@@ -1244,6 +1258,11 @@ def ingest(root: Path | None, *, days: int = DEFAULT_DAYS, now: datetime | None 
     # Pings spooled while the database was unreachable go first: the full read below wins.
     report.spool = session_live.flush_spool(db_url=db_url)
     report.new, report.updated = upsert(rows, db_url=db_url, now=now)
+    # Parent command measurements are locally spooled without credentials. Ingest
+    # them through this existing authorized writer, after session identities exist.
+    from agent_memory import timing_store
+    if os.environ.get("AMEM_TIMING_INGEST") == "1":
+        timing_store.ingest_spools(db_url=db_url)
     if "claude" in tools:  # cloud sessions (routines and chats) are Claude Code sessions
         cloud = ingest_cloud(db_url=db_url, now=now)
         rows = rows + cloud.rows

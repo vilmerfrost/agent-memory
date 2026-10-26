@@ -167,9 +167,9 @@ def apply(p: Plan, log: Path, *, db_url: str | None = None, now: datetime | None
 
 
 def _put(conn: Any, table: str, rec: dict[str, Any], key: str, *, replace: bool) -> None:
-    """Insert one logged row of `table` (all its logged columns); `replace`: overwrite a stored one."""
+    """Restore writable logged columns; Postgres recomputes generated columns."""
     types = dict(conn.execute("select column_name, data_type from information_schema.columns "
-                              "where table_schema = 'public' and table_name = %s", (table,)).fetchall())
+                              "where table_schema = 'public' and table_name = %s and is_generated='NEVER'", (table,)).fetchall())
     cols = [k for k in rec if k in types]
     vals = [Jsonb(rec[k]) if types[k] == "jsonb" and rec[k] is not None else rec[k] for k in cols]
     action = (sql.SQL("do update set {}").format(sql.SQL(", ").join(

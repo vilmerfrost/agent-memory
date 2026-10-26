@@ -158,7 +158,9 @@ where coalesce(started_at, created_at) >= %(since)s and coalesce(started_at, cre
 
 def _cost_bucket() -> dict[str, Any]:
     return {"sessions": 0, "tokens": {**{f: 0 for f in FIELDS}, "total": 0},
-            "active_seconds": 0.0, "api_seconds": 0.0, "tool_seconds": 0.0}
+            "active_seconds": 0.0, "api_seconds": 0.0, "tool_seconds": 0.0,
+            "timing": {"active_seconds": None, "api_seconds": None, "tool_seconds": None},
+            "timing_measured_sessions": {"active_seconds": 0, "api_seconds": 0, "tool_seconds": 0}}
 
 
 def _cost_add(b: dict[str, Any], rec: dict[str, Any]) -> None:
@@ -169,6 +171,9 @@ def _cost_add(b: dict[str, Any], rec: dict[str, Any]) -> None:
         b["tokens"]["total"] += n
     for k in ("active_seconds", "api_seconds", "tool_seconds"):
         b[k] = round(b[k] + float(rec.get(k) or 0), 3)
+        if (value := _num(rec.get(k))) is not None:
+            b["timing"][k] = round((b["timing"][k] or 0) + value, 3)
+            b["timing_measured_sessions"][k] += 1
 
 
 def cost(*, since: datetime, until: datetime | None = None, category: str | None = None,
@@ -179,7 +184,9 @@ def cost(*, since: datetime, until: datetime | None = None, category: str | None
     {"sessions": n, "tokens": {"input", "output", "cache_read", "cache_creation", "total"},
      "active_seconds", "api_seconds", "tool_seconds",
      "by_project": {project: the same keys without by_project}}
-    Nothing matches: zeros and an empty by_project. Unmeasured columns count as 0."""
+    Legacy numeric fields retain their old zero-filled contract for budget consumers.
+    `timing` preserves NULL for unmeasured fields; `timing_measured_sessions` gives
+    coverage. New displays must use these fields rather than the legacy totals."""
     until = until or now or datetime.now(UTC)
     with store.connect(db_url) as conn, conn.cursor(row_factory=dict_row) as cur:
         cur.execute(_COST_SQL, {"since": since, "until": until, "category": category, "project": project})
@@ -202,11 +209,12 @@ def cost_lines(doc: dict[str, Any], *, since: datetime, until: datetime, categor
     t = doc["tokens"]
     out = [f"cost: {', '.join(scope)}: {doc['sessions']} sessions, total {human(t['total'])}",
            f"  input {human(t['input'])}  output {human(t['output'])}  cache read {human(t['cache_read'])}  "
-           f"cache write {human(t['cache_creation'])}  active {hms(doc['active_seconds'])}  "
-           f"api {hms(doc['api_seconds'])}  tool {hms(doc['tool_seconds'])}"]
+           f"cache write {human(t['cache_creation'])}  active {hms(doc['timing']['active_seconds'])}  "
+           f"api {hms(doc['timing']['api_seconds'])}  tool {hms(doc['timing']['tool_seconds'])}",
+           f"  timing coverage: {doc['timing_measured_sessions']} of {doc['sessions']} sessions (missing is unmeasured)"]
     for name, b in doc["by_project"].items():
         out.append(f"  {name[:40]:<40}  {b['sessions']:>4} sessions  total {human(b['tokens']['total']):>7}  "
-                   f"active {hms(b['active_seconds'])}")
+                   f"active {hms(b['timing']['active_seconds'])}")
     return out
 
 
