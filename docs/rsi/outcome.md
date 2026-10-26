@@ -59,3 +59,9 @@ uv run amem rsi outcome                    # what launchd runs (needs a remote d
 
 Undo stays a human action: Night Desk's Undo button (or `amem rsi decide <proposal> undo`, `amem edits undo <edit>`
 in the terminal). The `undo_hint` column says which.
+
+## Mixed
+
+When the rule's own text changed again inside the before/after windows (a hand edit or another change, from the
+rule file's git history), the verdict is `mixed`: the counts are kept, the change is neither credited nor blamed,
+and no Undo is suggested. See [hand-edits.md](hand-edits.md).
