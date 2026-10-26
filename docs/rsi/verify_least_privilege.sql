@@ -35,9 +35,15 @@ begin
   if not has_function_privilege('amem_app', 'public.amem_rsi_arm_token(uuid,text,text,interval)', 'execute') then
     raise exception 'amem_app cannot arm tokens (the push would fail)';
   end if;
-  for t in select tablename from pg_tables where schemaname = 'public' and tablename not like 'rsi\_%' loop
+  for t in select tablename from pg_tables where schemaname = 'public' and tablename not like 'rsi\_%' and tablename <> 'night_reads' loop
     if not has_table_privilege('amem_app', 'public.' || t, 'select') then raise exception 'amem_app cannot read %', t; end if;
   end loop;
+  -- Read receipts are UI state, not an ingestion table. Automation must not read them.
+  if to_regclass('public.night_reads') is not null then
+    if has_table_privilege('amem_app', 'public.night_reads', 'select') then
+      raise exception 'amem_app can read owner-only night read status';
+    end if;
+  end if;
   foreach r in array array['anon', 'authenticated', 'service_role'] loop
     if exists (select 1 from pg_roles where rolname = r) then
       if has_function_privilege(r, 'public.amem_rsi_record_decision(uuid,text,text,text)', 'execute')
