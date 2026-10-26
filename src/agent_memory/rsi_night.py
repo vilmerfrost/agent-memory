@@ -826,13 +826,42 @@ Plain prose only: no commands, code, links, file paths other than the target, or
 Problem (structured, from the investigator's own database):
 {candidate}
 
-Current text of {target} (the production file, trusted):
+Current text of {target} (the production file, trusted). If it ends with a "[truncated: ...]" line, the rest of the
+file exists and is fine: do not judge or propose changes to what you were not shown.
 <<<FILE
 {target_text}
 FILE>>>
 
 {evidence}
 """
+
+
+TARGET_TEXT_MAX = 80_000   # the hypothesizer's share of a target file (2026-10-26: was a silent cut at 12,000)
+_HEADING = re.compile(r"(?m)^#{1,6} +\S")
+
+
+def fit_target_text(text: str, room: int) -> tuple[str, int]:
+    """The target text that fits `room` characters, and how many characters were left out (0 = all of it).
+
+    A file that does not fit is cut at the last heading that fits, never mid-section, and ends with an explicit
+    "[truncated: ...]" line naming the sections left out. A silent mid-file cut once made a skill's Return mode look
+    like an open, empty block, and the night proposed fixing a block that was complete (night 2026-10-25, pepe)."""
+    if len(text) <= room:
+        return text, 0
+    rest = [m.start() for m in _HEADING.finditer(text)]
+
+    def marker(cut: int) -> str:
+        names = [text[i:].split("\n", 1)[0].lstrip("#").strip() for i in rest if i >= cut]
+        shown = ", ".join(names[:12]) + (f" and {len(names) - 12} more" if len(names) > 12 else "")
+        return (f"\n[truncated: the file continues for {len(text) - cut} more characters"
+                + (f"; sections not shown: {shown}" if shown else "") + "]\n")
+
+    cut = max([i for i in rest if 0 < i and i + len(marker(i)) <= room] or [0])
+    if cut == 0:                                   # no heading fits: cut at the last line break that does
+        nl = text.rfind("\n", 0, max(0, room - 400))
+        cut = nl + 1 if nl > 0 else 0
+    out = text[:cut] + marker(cut)
+    return out[:room], len(text) - cut
 
 
 def _envelope_usage(stdout: str) -> Usage:
@@ -887,6 +916,7 @@ class ClaudeCliHypothesizer:
 
     def __init__(self, cfg: Mapping[str, Any]) -> None:
         self.cfg = dict(cfg)
+        self.last_left_out = 0    # characters of the last target text the prompt could not hold (0 = all shown)
 
     def reply(self, candidate: Mapping[str, Any], *, evidence_text: str, targets: Sequence[str], cap: int,
               target_text: str, budget: Budget) -> str:
@@ -903,7 +933,9 @@ class ClaudeCliHypothesizer:
         # The target text gives way first, so a long prompt never cuts the nonce-delimited evidence block (its END
         # line) or the reply-shape instructions; the final cut stays as a backstop only.
         room = limit - len(HYPOTHESIS_PROMPT.format(target_text="", **fields))
-        prompt = HYPOTHESIS_PROMPT.format(target_text=target_text[: max(0, min(12_000, room))], **fields)[:limit]
+        shown, self.last_left_out = fit_target_text(
+            target_text, max(0, min(int(self.cfg.get("max_target_chars") or TARGET_TEXT_MAX), room)))
+        prompt = HYPOTHESIS_PROMPT.format(target_text=shown, **fields)[:limit]
         timeout = float(self.cfg.get("timeout_s") or 600)
 
         def run() -> tuple[str, Usage]:
@@ -2131,6 +2163,10 @@ class Night:
                 self.notes.append(f"hypothesizer failed for {c['dedupe_key']}: {type(exc).__name__}: {str(exc)[:150]}")
                 self._update_candidate(c["id"], status="deferred", reason=f"hypothesizer failed: {type(exc).__name__}")
                 return
+            left_out = int(getattr(self.ad.hypothesizer, "last_left_out", 0) or 0)
+            if left_out:
+                self.notes.append(f"hypothesizer saw {c.get('target')} cut at a section boundary: {left_out} "
+                                  f"characters left out (raise max_prompt_chars / max_target_chars)"[:300])
         try:
             hyps, rejected = parse_hypotheses(reply, allowlist=self.allowlist, cap=cap)
         except HypothesisParseError as exc:
