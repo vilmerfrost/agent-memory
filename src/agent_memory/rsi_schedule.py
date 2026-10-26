@@ -839,7 +839,7 @@ def run_night_job(*, config_path: Path | None = None, night: str | None = None, 
             guard.__enter__()
         try:
             rep = N.run_night(night=night, config_path=config_path, db_url=db_url, adapters=adapters,
-                              prerequisite_warnings=gate.warnings)
+                              prerequisite_warnings=gate.warnings, routines_log=log)
         finally:
             if guard:
                 guard.__exit__(None, None, None)
@@ -857,6 +857,11 @@ def run_night_job(*, config_path: Path | None = None, night: str | None = None, 
                       reported_usd=float(costs.get("reported_usd") or 0.0),
                       estimated_usd=float(costs.get("estimated_usd") or 0.0),
                       checkpoint="advanced" if (rep.get("checkpoint") or {}).get("advanced") else "kept")
+    sr = (rep.get("prerequisites") or {}).get("skill_refresh")
+    if isinstance(sr, dict):            # which refresh the night used, and whether it was fresh (skill_refresh.py)
+        res.fields["skill_refresh"] = sr.get("status")
+        if sr.get("run"):
+            res.fields["skill_refresh_run"] = sr["run"]
     if guard and guard.fired:
         res.items.insert(0, f"hard timeout: watchdog sent SIGTERM after {cfg.budget.wall_clock_s + HARD_GRACE_S:g}s")
         res.status = "FAIL"

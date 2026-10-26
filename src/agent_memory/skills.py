@@ -253,30 +253,38 @@ def compute_scores(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return out
 
 
-_CALL_ROWS_SQL = """
+CALL_FILTER = "coalesce(s.env, 'prod') <> 'sandbox'"   # the calls a refresh scores (skill_refresh's window too)
+
+_CALL_ROWS_SQL = f"""
 select c.skill, c.project, c.session_id, s.project as session_project, s.category, s.outcome
 from skill_calls c left join sessions s on s.session_id = c.session_id
-where coalesce(s.env, 'prod') <> 'sandbox'
+where {CALL_FILTER}
 """
 
 
-def refresh_scores(*, db_url: str | None = None) -> tuple[int, int]:
-    """Match sessions, then rewrite skill_scores in one transaction. Returns (matched, score rows)."""
-    with store.connect(db_url) as conn:
-        matched = match_sessions(conn)
-        with conn.cursor(row_factory=dict_row) as cur:
-            cur.execute(_CALL_ROWS_SQL)
-            rows = cur.fetchall()
-        scores = compute_scores(rows)
-        conn.execute("delete from skill_scores")
-        with conn.cursor() as cur:
-            cur.executemany(
-                "insert into skill_scores (skill, bucket, n_calls, n_sessions, n_scored, outcomes, score)"
-                " values (%s, %s, %s, %s, %s, %s, %s)",
-                [(s["skill"], s["bucket"], s["n_calls"], s["n_sessions"], s["n_scored"],
-                  Jsonb(s["outcomes"]), s["score"]) for s in scores],
-            )
+def rewrite_scores(conn: Any) -> tuple[int, int]:
+    """Match sessions, then rewrite skill_scores, inside the caller's transaction. Returns (matched, score rows)."""
+    matched = match_sessions(conn)
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(_CALL_ROWS_SQL)
+        rows = cur.fetchall()
+    scores = compute_scores(rows)
+    conn.execute("delete from skill_scores")
+    with conn.cursor() as cur:
+        cur.executemany(
+            "insert into skill_scores (skill, bucket, n_calls, n_sessions, n_scored, outcomes, score)"
+            " values (%s, %s, %s, %s, %s, %s, %s)",
+            [(s["skill"], s["bucket"], s["n_calls"], s["n_sessions"], s["n_scored"],
+              Jsonb(s["outcomes"]), s["score"]) for s in scores],
+        )
     return matched, len(scores)
+
+
+def refresh_scores(*, db_url: str | None = None) -> tuple[int, int]:
+    """Match sessions, then rewrite skill_scores in one transaction. Returns (matched, score rows). Unrecorded:
+    `amem skills scores --refresh` uses skill_refresh.run_refresh, which records the run and its input window."""
+    with store.connect(db_url) as conn:
+        return rewrite_scores(conn)
 
 
 def load_scores(*, db_url: str | None = None) -> list[dict[str, Any]]:
