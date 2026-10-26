@@ -1216,9 +1216,8 @@ class _Recurrence:
 _UPSERT_SQL = """
 insert into deviations (source_key, session_id, instruction_source, instruction_ref, turn, what, why, how,
                         followed_grade, result_grade, jev_verdict, jev_confidence, jev_mode, jev_answers,
-                        writer_model, rule_id, rule_title, instruction_sha, meta, result_outcome, objective_result,
-                        instruction_authority)
-values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        writer_model, rule_id, rule_title, instruction_sha, meta, result_outcome, objective_result)
+values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
 on conflict (source_key) do update
     set what = excluded.what, why = excluded.why, how = excluded.how,
         followed_grade = excluded.followed_grade, result_grade = excluded.result_grade,
@@ -1226,8 +1225,13 @@ on conflict (source_key) do update
         jev_verdict = excluded.jev_verdict, jev_confidence = excluded.jev_confidence,
         jev_mode = excluded.jev_mode, jev_answers = excluded.jev_answers, writer_model = excluded.writer_model,
         rule_id = excluded.rule_id, rule_title = excluded.rule_title,
-        instruction_sha = excluded.instruction_sha, meta = deviations.meta || excluded.meta,
-        instruction_authority = excluded.instruction_authority
+        instruction_sha = excluded.instruction_sha, meta = deviations.meta || excluded.meta
+"""
+
+# A statement of its own, so the upsert above keeps its parameter shape (other code replays it).
+_AUTHORITY_SQL = """
+update deviations set instruction_authority = %s
+where source_key = %s and instruction_authority is distinct from %s
 """
 
 
@@ -1240,8 +1244,9 @@ def _store(o: Outcome, db_url: str | None) -> None:
                 f.what, f.why, f.how, f.followed_grade, f.result_grade, j.verdict, j.confidence, j.mode,
                 Jsonb(j.answers), f"claude-cli:{distill.WRITER_MODEL}",
                 f.rule_id, f.rule_title, f.instruction_sha, Jsonb(f.meta()), o.session_outcome, o.objective,
-                f.instruction_authority,
             ))
+            key = source_key(o.session_id, f)
+            conn.execute(_AUTHORITY_SQL, (f.instruction_authority, key, f.instruction_authority))
         meta: dict[str, Any] = {"scan_found": len(o.judged), "scan_instructions": o.instructions}
         if o.skipped:  # skipped writer items stay visible on the session
             meta.update(scan_skipped=o.skipped, scan_skipped_reasons=o.skipped_reasons)
