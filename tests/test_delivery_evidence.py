@@ -72,6 +72,20 @@ def test_live_process_result_is_not_confirmed_delivery():
     assert got["signals"] == {"unknown_push_main": 1, "report_done": 1}
 
 
+def test_terminal_wrapper_with_null_session_keeps_confirmed_success():
+    got = D.outcome_signals(events("git push origin main", output='{"session_id":null,"exit_code":0}'))
+    assert got["signals"] == {"push_main": 1, "report_done": 1}
+
+
+def test_duplicate_inflight_request_is_not_counted_twice():
+    tracker = D.SignalTracker()
+    call, response, _ = events("git push origin main")
+    tracker.feed(call)
+    tracker.feed(call)
+    tracker.feed(response)
+    assert tracker.signals == {"push_main": 1}
+
+
 def test_wrong_result_id_does_not_complete_delivery():
     tracker = D.SignalTracker()
     tracker.feed(assistant(tool("Bash", "push", command="git push origin main")))

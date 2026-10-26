@@ -765,7 +765,8 @@ def confirmed_operation_signals(calls: list[dict[str, str]], ok: bool | None,
     """
     codes = _EXIT_CODE_RE.findall(output or "")
     explicit_failure = any(int(code) != 0 for code in codes)
-    still_running = bool(re.search(r"(?:Script|Process) running|session_id[\"']?\s*[:=]", output or "", re.I))
+    still_running = bool(re.search(r"(?:Script|Process) running", output or "", re.I)) or (
+        not codes and bool(re.search(r"session_id[\"']?\s*[:=]\s*(?:[0-9]+|[\"'][^\"']+[\"'])", output or "", re.I)))
     out = []
     for call in calls:
         signal = call.get("signal")
@@ -848,6 +849,8 @@ class SignalTracker:
             self.signals[n] = self.signals.get(n, 0) + 1
 
     def tool_call(self, call_id: str | None, name: str, inp: Any) -> None:
+        if call_id and call_id in self.pending:
+            return  # a streamed/repeated request with the same ID is not another operation
         if name in EDIT_TOOLS:
             self.add(["edit"])
         command = _command_of(name, inp)

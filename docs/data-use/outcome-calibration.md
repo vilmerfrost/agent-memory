@@ -1,6 +1,6 @@
 # Outcome calibration pilot
 
-Observed: 2026-10-26T20:40:13.784016+00:00
+Observed: 2026-10-26T20:41:52.022720+00:00
 
 Selected 30 explicit tasks across 13 session IDs. Classifier outcome changed for 28 tasks.
 
@@ -114,10 +114,10 @@ Evidence refs use exact transcript paths and parsed record numbers; no transcrip
   "measurement": {
     "copied_history_excluded": true,
     "database_calls": 0,
-    "elapsed_seconds": 2.032,
+    "elapsed_seconds": 2.942,
     "new_model_calls": 0
   },
-  "observed_at": "2026-10-26T20:40:13.784016+00:00",
+  "observed_at": "2026-10-26T20:41:52.022720+00:00",
   "rows": [
     {
       "acceptance": "unknown",
