@@ -58,7 +58,7 @@
   "hypothesizer": {
     "model": "claude-opus-5-5",
     "timeout_s": 300,
-    "max_prompt_chars": 24000,
+    "max_prompt_chars": 96000,
     "effort": "high",
     "auth_mode": "subscription",
     "auth": {
