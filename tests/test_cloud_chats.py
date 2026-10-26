@@ -80,7 +80,9 @@ class FakeServer:
 
         self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.url = f"http://127.0.0.1:{self.httpd.server_address[1]}"
-        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+        # Poll shutdown promptly; deliberately slow responses still keep their delay.
+        threading.Thread(target=self.httpd.serve_forever,
+                         kwargs={"poll_interval": 0.01}, daemon=True).start()
 
     def close(self) -> None:
         self.httpd.shutdown()

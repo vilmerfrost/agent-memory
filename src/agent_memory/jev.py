@@ -27,11 +27,12 @@ import json
 import math
 import re
 from dataclasses import dataclass, field
-from typing import Any, Literal
-
-from pydantic import TypeAdapter
+from typing import TYPE_CHECKING, Any, Literal
 
 from agent_memory import config
+
+if TYPE_CHECKING:
+    from pydantic import TypeAdapter
 
 # Every live call names the model. The SDK's own default is "jev-latest", but the
 # TYPESAFE_DEFAULT_MODEL env var can replace it silently; an explicit argument wins over both.
@@ -141,6 +142,8 @@ _ANSWER_ADAPTER: TypeAdapter[Any] | None = None
 def _answer_adapter() -> TypeAdapter[Any]:
     global _ANSWER_ADAPTER
     if _ANSWER_ADAPTER is None:
+        # Commands that never validate an answer do not need Pydantic at startup.
+        from pydantic import TypeAdapter
         from typesafe_sdk import Answer
 
         _ANSWER_ADAPTER = TypeAdapter(Answer)
