@@ -325,6 +325,37 @@ class Db:
     candidates: dict[str, dict[str, Any]] = field(default_factory=dict)   # by id and by dedupe_key
     experiments: dict[str, dict[str, Any]] = field(default_factory=dict)
     backlog: int | None = None               # candidates kept for future nights (new | deferred)
+    watch: list[dict[str, Any]] = field(default_factory=list)   # deviations to look at by hand (_WATCH_SQL)
+
+
+# The watch list (folded in from the deviations-daily task, 2026-10-26): deviations of the last WATCH_HOURS
+# (72 on Mondays, so the weekend is covered) that need Vilmer's eyes rather than an experiment:
+# - first-step: a required first step (name the session, read the design system / lessons / SKILL.md) came after
+#   a write, build or eval;
+# - guard-bypass: a push-and-merge-policy deviation Jev left as Vilmer's own override, whose text reads like
+#   getting around a denied command or a guard.
+WATCH_HOURS, WATCH_MAX = 24, 8
+# One SQL literal: the old digest joined three literals as '…' '…', and SQL reads '' inside a literal as a quote
+# character, so its regex wanted a stray ' and almost never matched.
+_FIRST_STEP = ("(d.rule_id = 'design-system' or d.what ~* '("
+               "nam(e|ing) (this|the) session|session title|set(ting)? the title|step 0"
+               "|(read|load|nam)[a-z]* [^.]{0,60}(first|at the start|before (any|it|step))"
+               "|(first|at the start of [^.]{0,30}),? [^.]{0,30}(read|load|nam))')")
+_OVERRIDE = ("(d.rule_id = 'push-and-merge-policy' and d.jev_verdict = 'leave' "
+             "and coalesce(d.jev_confidence, 0) >= 0.5)")
+_BYPASS = "d.what ~* '(denied|deny|guard|blocked|bypass|get(ting)? around|work(ed)? around|split)'"
+_WATCH_SQL = f"""
+select d.created_at, d.session_id, s.title, d.rule_id, d.instruction_source, left(d.what, 200) as what,
+       case when {_FIRST_STEP} then 'first-step' else 'guard-bypass' end as kind
+from deviations d left join sessions s using (session_id)
+where d.created_at > now() - make_interval(hours => %s)
+  and ({_FIRST_STEP} or ({_OVERRIDE} and {_BYPASS}))
+order by d.created_at limit {WATCH_MAX}
+"""
+
+
+def watch_hours(now: datetime | None = None) -> int:
+    return WATCH_HOURS * 3 if (now or datetime.now()).astimezone().weekday() == 0 else WATCH_HOURS
 
 
 _PROPOSALS_SQL = """
@@ -377,6 +408,8 @@ def read_db(rep: Mapping[str, Any], *, db_url: str | None = None) -> Db:
                 db.backlog = int(cur.fetchone()["n"])
                 cur.execute("select id, night, status, verdict from rsi_experiments where id = any(%s)", (eids,))
                 db.experiments = {r["id"]: r for r in cur.fetchall()}
+                cur.execute(_WATCH_SQL, (watch_hours(),))
+                db.watch = cur.fetchall()
     except psycopg.Error as exc:
         return Db("unavailable", type(exc).__name__)
     return db
@@ -795,6 +828,11 @@ def build_brief(rep: Mapping[str, Any], db: Db, *, artifacts_root: Path, report:
         "notes": notes,
         "sessions": sessions,
         "patterns": {"total": len(rep["patterns"]), "items": patterns},
+        "watch": {"hours": watch_hours(now), "status": db.status,
+                  "items": [{"kind": w.get("kind"), "rule": text(w.get("rule_id"), 80),
+                             "source": text(w.get("instruction_source"), 60),
+                             "session": text(w.get("title") or w.get("session_id"), 80),
+                             "what": text(w.get("what"), 200)} for w in db.watch]},
         "candidates": {"total": len(cands), "selected": sum(x["selected"] for x in cands), "backlog": db.backlog,
                        "items": cands[:MAX_CANDIDATES]},
         "experiments": {"total": len(exps), "items": experiments},
@@ -981,6 +1019,13 @@ def render_markdown(b: dict[str, Any]) -> str:
         out.append(f"- {not_run[:1].upper()}{not_run[1:]}." if sk else "- None found.")
     elif pats["total"] > len(pats["items"]):
         out.append(f"- And {pats['total'] - len(pats['items'])} more (see the report).")
+    w = b.get("watch") or {}
+    if w.get("items"):
+        out.append(f"- Watch (last {w['hours']}h, check by hand): " + str(len(w["items"])) + " deviation(s).")
+        label = {"first-step": "first step skipped", "guard-bypass": "possible guard bypass"}
+        for it in w["items"]:
+            out.append(f"  - {label.get(it['kind'], it['kind'])}: {it['session'] or '?'} · {it['source']} "
+                       f"{it['rule']}: {_sentence(it['what']) or '-'}")
 
     out += ["", "## Candidates considered", ""]
     cd = b["candidates"]

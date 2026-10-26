@@ -29,7 +29,7 @@ BEFORE = b"# Global\n\n## Closing line\n\n- End with a short summary.\n"
 AFTER = b"# Global\n\n## Closing line\n\n- End with a section that lists the tools you used.\n"
 TOP_KEYS = {"format", "night", "status", "generated_at", "report", "started_at", "finished_at", "checkpoint", "headline",
             "summary", "notes", "sessions", "patterns", "candidates", "experiments", "passed", "failed", "costs", "health",
-            "pending_decisions", "sections", "skipped", "prerequisite_warnings"}
+            "pending_decisions", "sections", "skipped", "watch", "prerequisite_warnings"}
 BLOCK_KEYS = {"experiment_id", "candidate_key", "proposal_id", "title", "what", "target", "change", "why", "evidence_refs",
               "baseline_vs_candidate", "evaluation", "risk", "confidence", "artifact_hash", "proposal_status", "expires_at",
               "cost_usd", "actions", "apply_blocked", "warnings"}
@@ -710,3 +710,28 @@ def test_scrub_removes_paths_emails_and_secrets() -> None:
     for mark in (HOME_MARK, TILDE_MARK, EMAIL_MARK, SECRET_MARK, str(Path.home())):
         assert mark not in s
     assert s.count("[path]") == 3 and "[email]" in s and "[redacted]" in s
+
+
+def test_watch_list_shows_first_step_misses_and_possible_guard_bypasses(rdb: str, sandbox: Path) -> None:
+    """Folded in from the deviations-daily task: deviations that need a look by hand, not an experiment."""
+    with psycopg.connect(rdb) as conn:
+        conn.execute("insert into sessions (session_id, kind, project_dir, title) values ('w-1', 'chat', '/w', 'Watch Me')")
+        rows = [("first", "agent:worker", "rules", None, None, "It wrote files before it read the skill first."),
+                ("bypass", "parent-md", "push-and-merge-policy", "leave", 0.8,
+                 "The push was denied, so it split the command to get around the guard."),
+                ("override", "parent-md", "push-and-merge-policy", "leave", 0.8, "It opened the PR itself, as asked."),
+                ("plain", "agent:worker", "rules", "edit_instruction", 0.9, "It used a compound command.")]
+        for key, src, rule, verdict, conf, what in rows:
+            conn.execute("insert into deviations (source_key, session_id, instruction_source, instruction_ref, rule_id, what, "
+                         "why, how, followed_grade, result_grade, jev_verdict, jev_confidence) "
+                         "values (%s, 'w-1', %s, %s, %s, %s, 'y', 'h', 0.2, 0.5, %s, %s)",
+                         (f"watch:{key}", src, rule, rule, what, verdict, conf))
+    write_report(sandbox, night_report())
+    b = BR.make_brief(root=sandbox, db_url=rdb)
+    kinds = sorted((w["kind"], w["rule"]) for w in b["watch"]["items"])
+    assert kinds == [("first-step", "rules"), ("guard-bypass", "push-and-merge-policy")]   # override and plain left out
+    md = BR.render_markdown(b)
+    assert "- Watch (last " in md and "  - possible guard bypass: Watch Me · parent-md push-and-merge-policy:" in md
+    assert "  - first step skipped: Watch Me · agent:worker rules:" in md
+    assert "It opened the PR itself" not in md
+    sections_once(md)
