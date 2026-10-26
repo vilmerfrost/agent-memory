@@ -62,7 +62,7 @@ MAX_ITEMS = 8
 RSI_SECURITY_ENV = "AMEM_RSI_SECURITY"     # the `security` used for the sandbox items' presence check, if set
 SECURITY_ENV = "AMEM_ADMIN_SECURITY"        # else credentials.SECURITY_ENV (tests and demos: a tripwire)
 DEFAULT_REPORTS_DIR = Path.home() / ".claude" / "parent" / "reports"
-PAID_STAGE_MODES = {"triage": ("live",), "hypothesizer": ("claude-cli",), "implementer": ("claude", "codex"),
+PAID_STAGE_MODES = {"triage": ("live",), "hypothesizer": ("claude-cli",), "implementer": ("writer", "claude", "codex"),
                     "replay_agent": ("claude", "codex"), "judge": ("codex", "claude"), "replay_jev": ("live",)}
 
 # Gate G2b (2026-10-17, ~/sandbox-dev/sandbox/replays/g2b-result.json): measured booked cost per call or run.
@@ -305,7 +305,7 @@ def keychain_present(ref: str, *, runner: Callable[..., Any] | None = None) -> s
 
 
 def paid_stages(cfg: Any) -> list[str]:
-    settings = {"hypothesizer": (cfg.hypothesizer, "auth_mode"),
+    settings = {"hypothesizer": (cfg.hypothesizer, "auth_mode"), "implementer": (cfg.implementer, "auth_mode"),
                 "replay_agent": (cfg.replay, "auth_mode"), "judge": (cfg.replay, "judge_auth_mode")}
     return sorted(k for k, v in cfg.stages.items() if v in PAID_STAGE_MODES.get(k, ())
                   and (k not in settings or settings[k][0].get(settings[k][1], "api") != "subscription"))
@@ -438,6 +438,10 @@ def paid_plan(cfg: Any, *, cases: int | None = None) -> dict[str, Any]:
             note="host `claude -p`, no tools, hooks off; pending hypotheses from an earlier night need no call")
     if st["implementer"] in ("claude", "codex"):
         add("implement", str(cfg.implementer.get("model") or st["implementer"]), 1, note="sandbox arm I")
+    if st["implementer"] == "writer":
+        from agent_memory import rsi_night
+        add("implement", str(cfg.implementer.get("model") or rsi_night.WRITER_MODEL), 1,
+            note="host `claude -p` section writer, no tools, hooks off; the stub change when it falls back")
     if st["replay_agent"] in ("claude", "codex"):
         for provider, settings in (profiles or {st["replay_agent"]: rp}).items():
             model = str(settings.get("model") or provider)
@@ -485,7 +489,8 @@ def night_room(cfg: Any, *, pairs: int, per_exp: Mapping[str, int], per_night: M
     live_agent, live_judge = st["replay_agent"] in ("claude", "codex"), st["judge"] in ("codex", "claude")
     # one experiment: wall clock (each model stage at its timeout) and container runs
     secs = {"hypothesize": float(cfg.hypothesizer.get("timeout_s") or 600) if st["hypothesizer"] == "claude-cli" else 0.0,
-            "implement": float(cfg.implementer.get("timeout_s") or 900) if st["implementer"] in ("claude", "codex") else 0.0,
+            "implement": (float(cfg.implementer.get("timeout_s") or 900) if st["implementer"] in ("claude", "codex")
+                          else float(cfg.implementer.get("timeout_s") or 300) if st["implementer"] == "writer" else 0.0),
             "stage": float(cfg.staging.get("timeout_s") or 600), "replay": 0.0}
     runs = 0
     for settings in profiles.values():

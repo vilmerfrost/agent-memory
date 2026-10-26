@@ -102,7 +102,8 @@ own preflight failed (no `skipped`) keeps the old headline.
 
 Since 2026-10-23 (verify run of night 2026-10-23, partial, $0.14):
 
-- **Three experiments per night** (2026-10-25): one per candidate; the second hypothesis waits pending. `night-job --plan` prints "Room for N experiment(s)" with each per-night cap's need and cap. The wall clock is 4 h 45 min (see [Subscription migration](subscription-migration.md), "Limits and accounting").
+- **Three experiments per night** (2026-10-25): one per candidate; the second hypothesis waits pending. `night-job --plan` prints "Room for N experiment(s)" with each per-night cap's need and cap. The wall clock is 4 h 48 min (see [Subscription migration](subscription-migration.md), "Limits and accounting").
+- **S6 rewrites the rule section** (2026-10-26). Stage modes for `stages.implementer`: `stub` (the hypothesis appended as one rule line; the API profiles), `writer` (default in the subscription profiles: the morning edit loop's Opus writer rewrites the candidate's rule section, contract fix first, then rewording, added prose last; one section per edit, pins respected, evidence only in its envelope), `claude` / `codex` (the sandbox implementer: unverified, refused under subscription). The writer falls back to the stub change for that one experiment on a pin, no matching section, a writer or proposal error, a budget stop or an `improve stage` refusal (content guard). Each experiment carries `implementer` (`writer` / `stub-fallback` / `stub`), `implementer_fallback_reason` and `implementation` (`section_id`, `kind`, `diff`, `new_sha256`); a fallback is also a report note (`experiment <id>: the writer fell back to the stub change: <reason>`), which the brief prints. `rsi_experiments.meta` holds the same plus the exact `new_text`. No migration.
 - **Targets improve refuses leave the pool.** Allowlisted targets that improve refuses (a file in
   `improve/pins.json`, or a path outside `criteria.json` `allowed_targets` with the `fence.txt` nuance, read through
   `edits_targets.pinned_file` / `is_allowed` like the edits step) are removed from the night's allowlist, so their
@@ -330,8 +331,9 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.vilmerfrost.amem-rsi
 
 ## Known limits
 
-- The live hypothesizer (`claude -p` with hooks disabled), the live sandbox implementer and the hosted-database
-  night are unverified. The first night keeps the implementer as the stub.
+- The live sandbox implementer and the hosted-database night are unverified. The first-night (API) config keeps
+  the implementer as the stub; the subscription profiles use the section writer, tested with a fake `claude -p`
+  only (no live writer call has run yet).
 - `security find-generic-password` without `-w` is assumed not to show a dialog (it reads no secret). Gate 2 is the
   first run that uses it on the real Keychain.
 - The prices in `config/rsi-prices.json` are assumptions; no cost is verified billing (see above).
