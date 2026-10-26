@@ -17,7 +17,8 @@ Tests: `tests/test_rsi_schedule.py`, plus the Apply rule in `tests/test_rsi_brie
 | Job | launchd label | When | Command | Writes |
 |---|---|---|---|---|
 | Night | `com.vilmerfrost.amem-rsi-night` | 01:30 | `amem rsi night-job --config config/rsi-night.subscription.json` | `~/sandbox` (staged artifacts, replays, `nights/<night>/report.json`), RSI rows in the hosted DB (candidates, experiments, a staged proposal, the night's checkpoint), one `routines.log` line |
-| Brief | `com.vilmerfrost.amem-rsi-brief` | 07:30 | `amem rsi brief-job --wait-s 5400 --out ~/.claude/parent/reports` | `reports/rsi-brief-<night>.md` and `.json`, one `routines.log` line |
+| Brief | `com.vilmerfrost.amem-rsi-brief` | 07:30 | `amem rsi brief-job --wait-s 5400 --out ~/.claude/parent/reports` | `reports/rsi-brief-<night>.md` and `.json`, one `routines.log` line, and the one morning push (night result + amem-daily's new escalations, safety slips, last-day proposals; quiet only when all are quiet) |
+| Outcome | `com.vilmerfrost.amem-rsi-outcome` | 09:20 | `amem rsi outcome --out ~/.claude/parent/reports` | `rsi_outcomes` rows, `reports/rsi-outcome-<date>.md`/`.json`, one `routines.log` line ([outcome.md](outcome.md)) |
 
 Both plists set `AMEM_HOOK_OFF=1`, `AMEM_REQUIRE_REMOTE=1`, `RSI_SANDBOX_DIR=~/sandbox`, `StandardInPath`
 `/dev/null` and `RunAtLoad` false. The night also sets `AMEM_JEV_LIVE=1`. Neither sets an edits mode, a push flag,
@@ -27,7 +28,7 @@ a key or a database URL (the routines read the database URL from the repo's env 
 
 ```
 08:45 amem-archive ──PASS──┐
-09:20 amem-daily ───PASS───┼──▶ 01:30 night-job ──gate──▶ amem rsi night (S0-S9) ──▶ report.json
+00:40 amem-daily ───PASS───┼──▶ 01:30 night-job ──gate──▶ amem rsi night (S0-S9) ──▶ report.json
 every 15 min amem-ingest ──┘        │ not done: SKIP + reason          │ lock: one night at a time
                                      │ key missing: FAIL + reason       │ wall clock 4 h 45 min + watchdog
                                      ▼                                  ▼
@@ -41,7 +42,7 @@ The night key is the date the night belongs to: a run between 00:00 and 11:59 co
 
 | Routine | Rule | Why |
 |---|---|---|
-| `amem-daily` | its latest line is `PASS`, or a `FAIL` whose failed steps are all ones the night does not read (below), and is dated on the night's date | the night reads the sessions, deviations and runs amem-daily wrote that day |
+| `amem-daily` | its latest line is `PASS`, or a `FAIL` whose failed steps are all ones the night does not read (below), and carries the night's key (a run from the night's date 12:00 to the next day 11:59: the 00:40 run). While it still runs (marker `~/.claude/parent/amem-daily.running`, live pid), the gate re-reads every 60 s for up to 30 min, then skips with `prerequisite amem-daily: still running after 30 min (started …)` | the night reads the sessions, deviations and runs amem-daily wrote that evening |
 | `amem-archive` | its latest line is `PASS` and is dated on the night's date | transcripts are archived before anything else reads them |
 | `amem-ingest` | its latest line is `PASS` and younger than 25 h | routine results reached the database |
 
@@ -58,10 +59,10 @@ Which amem-daily steps the night reads (`DAILY_NONBLOCKING_STEPS` in `rsi_schedu
 | `tasks` | `runs` (dispatch tasks) | S1 delta: `routine_failures` | blocks |
 | `deviations` | `sessions`, `deviations` | S1 delta: `sessions`, `deviations`; S2 deviation candidates | blocks. Since 1ac4a74 only a systemic failure (2+ errors and at least half the sessions) is a FAIL; one bad session is an `amem-daily-warn` line and the day is a PASS |
 | `score` | `scores` | S4 evidence packs only (`sb.jev_for`), re-read live every night | warning |
-| `edits` | `edits` | S4 evidence packs only (`sb.attempts_for`) | warning |
+| `edits` (not run since 2026-10-26 unless AMEM_DAILY_EDITS=1) | `edits` | S4 evidence packs only (`sb.attempts_for`) | warning |
 | `distill` | `lessons` | nothing | warning |
-| `escalations` | a phone push, the state file | nothing | warning |
-| `rsi-push` | a phone push | nothing | warning |
+| `escalations` | counts + the state file (the 07:30 brief pushes) | nothing | warning |
+| `rsi-push` (not run since 2026-10-26 unless AMEM_DAILY_EDITS=1) | a phone push | nothing | warning |
 | `state` | `amem-daily-state.json` | nothing (the scan data is already in the database) | warning |
 
 The 2026-10-19..2026-10-22 nights were skipped because amem-daily logged `FAIL` for one or two deviation-session
@@ -69,7 +70,7 @@ errors. Those old lines name the `deviations` step, so the gate still skips them
 amem-daily writes the same situation as `PASS` plus an `amem-daily-warn` line, and the night runs. A missed 01:30
 start (Mac asleep) runs at wake; the gate still applies.
 
-The rules live in `schedule.prerequisites` of the night config. Each entry: `routine`, `same_night` (default true),
+The rules live in `schedule.prerequisites` of the night config. Each entry: `routine`, `same_night` (default true), `match` ("date" | "night_key"; default night_key for amem-daily, date for the others), `wait_running_s` (0..14400; default 1800 for amem-daily, 0 for the others),
 `max_age_h` (optional), `nonblocking_steps` (optional list of step names; omitted means the built-in default for that
 routine: `DAILY_NONBLOCKING_STEPS` for amem-daily, none for the others; `[]` restores the strict rule "any FAIL
 blocks"). Configs without the key keep working unchanged.
@@ -297,7 +298,7 @@ installed copy to be identical:
 
 ```
 cp deploy/launchd/com.vilmerfrost.amem-rsi-night.plist deploy/launchd/com.vilmerfrost.amem-rsi-brief.plist ~/agent-config/launchd/
-printf 'amem-rsi-night\t26\tlaunchd:com.vilmerfrost.amem-rsi-night\namem-rsi-brief\t26\tlaunchd:com.vilmerfrost.amem-rsi-brief\n' >> ~/agent-config/parent/routines.tsv
+printf 'amem-rsi-night\t26\tlaunchd:com.vilmerfrost.amem-rsi-night\namem-rsi-brief\t26\tlaunchd:com.vilmerfrost.amem-rsi-brief\namem-rsi-outcome\t26\tlaunchd:com.vilmerfrost.amem-rsi-outcome\n' >> ~/agent-config/parent/routines.tsv
 plutil -lint ~/agent-config/launchd/com.vilmerfrost.amem-rsi-*.plist
 cp ~/agent-config/launchd/com.vilmerfrost.amem-rsi-night.plist ~/agent-config/launchd/com.vilmerfrost.amem-rsi-brief.plist ~/Library/LaunchAgents/
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.vilmerfrost.amem-rsi-night.plist
