@@ -43,6 +43,8 @@ class ScoreReport:
     skipped: int = 0  # unscored runs whose routine has no question file
     missing: list[tuple[str, str, str]] = field(default_factory=list)  # (run_id, routine, message)
     failed: list[tuple[str, str, str]] = field(default_factory=list)  # other Jev errors
+    candidates: int = 0  # unscored runs read (the coverage funnel's `queried`)
+    over_limit: int = 0  # unscored runs with a question file left for the next run (`limit` reached)
 
 
 def candidate_runs(
@@ -120,11 +122,13 @@ def score_runs(
     attempts = 0
     mode = jev.mode()
     for run in candidate_runs(routine=routine, since=since, db_url=db_url):
+        report.candidates += 1
         qset = cache.get(run["routine"])
         if qset is None:
             report.skipped += 1
             continue
         if attempts >= limit:
+            report.over_limit += 1
             continue
         attempts += 1
         try:

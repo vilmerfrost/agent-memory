@@ -11,19 +11,37 @@ import argparse
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import psycopg
 
-from agent_memory import cli_deviations, config, evals_harvest, store
+from agent_memory import cli_deviations, config, coverage_daily, evals_harvest, store
 
 
 def _log_run(status: str, started: datetime, summary: str, *, source: str,
-             failure: str | None = None, meta: dict | None = None) -> None:
+             failure: str | None = None, meta: dict | None = None) -> Any:
+    """Insert the run row; its id, or None when the log failed."""
     try:
-        store.insert_run(evals_harvest.ROUTINE, status, source=source, started_at=started,
-                         finished_at=datetime.now(UTC), summary=summary, failure_reason=failure, meta=meta)
+        return store.insert_run(evals_harvest.ROUTINE, status, source=source, started_at=started,
+                                finished_at=datetime.now(UTC), summary=summary, failure_reason=failure, meta=meta)
     except (psycopg.Error, config.BackendError) as exc:
         print(f"amem: evals harvest: run log failed: {type(exc).__name__}: {exc}".strip(), file=sys.stderr)
+        return None
+
+
+def _coverage(args: argparse.Namespace, started: datetime, run_id: Any, report: Any = None,
+              error: str | None = None) -> None:
+    """Coverage records of this harvest (job rsi-harvest, coverage_daily). A problem is a stderr note only."""
+    if not coverage_daily.enabled():
+        return
+    try:
+        records = coverage_daily.harvest_records(report, now=started, days=args.days, limit=args.limit,
+                                                 run_id=run_id, error=error)
+        notes = coverage_daily.write(records)
+    except Exception as exc:  # noqa: BLE001 - coverage never fails the harvest
+        notes = [f"coverage: {type(exc).__name__}: {str(exc)[:160]}"]
+    for note in notes:
+        print(f"amem: evals harvest: {note}", file=sys.stderr)
 
 
 def cmd_evals_harvest(args: argparse.Namespace) -> int:
@@ -36,11 +54,12 @@ def cmd_evals_harvest(args: argparse.Namespace) -> int:
         return 1
     started = datetime.now(UTC)
     try:
-        report = evals_harvest.harvest(out, days=args.days, limit=args.limit, dry_run=args.dry_run)
+        report = evals_harvest.harvest(out, days=args.days, limit=args.limit, dry_run=args.dry_run, now=started)
     except (OSError, psycopg.Error) as exc:
         if not args.dry_run:
-            _log_run("error", started, "evals harvest failed", source=args.source,
-                     failure=f"{type(exc).__name__}: {exc}"[:500])
+            run_id = _log_run("error", started, "evals harvest failed", source=args.source,
+                              failure=f"{type(exc).__name__}: {exc}"[:500])
+            _coverage(args, started, run_id, error=f"evals harvest: {type(exc).__name__}: {exc}")
         return cli_deviations._err("evals harvest", exc)
     line = report.line(dry_run=args.dry_run)
     for name in report.drafted:
@@ -49,7 +68,8 @@ def cmd_evals_harvest(args: argparse.Namespace) -> int:
         print("note: no public.handoffs table yet; 0 handoffs read")
     print(line)
     if not args.dry_run:
-        _log_run("pass", started, line, source=args.source, meta=report.meta(out))
+        run_id = _log_run("pass", started, line, source=args.source, meta=report.meta(out))
+        _coverage(args, started, run_id, report)
     return 0
 
 

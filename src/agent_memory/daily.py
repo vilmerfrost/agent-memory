@@ -32,6 +32,10 @@ Steps, in order. A failed step is recorded and the next step still runs:
    kill switch is on, SYNC_BUDGET_S each, at most once per local day (state file `sync_last_day`). An unconfigured
    or switched-off sink is a skip. A sink that fails is a warning (an amem-daily-warn line), never a failure, so
    the night's prerequisite check is never blocked by it.
+3e. coverage: the deviations, score and sync steps' coverage snapshots and consumption records (coverage_daily;
+   job `amem-daily`, run key = the summary line's timestamp), written best effort. A step that was off or not due
+   records nothing. A write problem is a stderr line and `coverage_problems=N` on the summary line, never a failure.
+   AMEM_COVERAGE_WRITE=0 turns it off.
 4. log: one summary line plus one `amem-daily-fail <reason>` line per failed
    step, appended to the routines log in the house format.
 
@@ -60,6 +64,7 @@ from typing import Any
 import psycopg
 
 from agent_memory import cli_cloud, config, deviations, distill, jev, scoring, sessions_ingest, store, tasks_ingest
+from agent_memory import coverage_daily as COV
 from agent_memory import routines_log as RL
 from agent_memory.questions import QuestionCache
 
@@ -91,6 +96,8 @@ class DailyResult:
     edits: Any = None  # edits.Report; None: the edits step was off or failed early
     rsi_push: list[str] | None = None  # one result per pushed proposal; None: not stage mode, or failed early
     synced: list[Any] | None = None  # sync.SyncReport per sink run today; None: no sink due, configured and on
+    coverage: list[Any] = field(default_factory=list)  # coverage records of the steps that ran (step_coverage)
+    coverage_notes: list[str] = field(default_factory=list)  # coverage problems: stderr + one log-line field
     failures: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)  # logged as <name>-warn lines; the verdict stays PASS
     lines: list[str] = field(default_factory=list)  # what was appended to the routines log
@@ -353,7 +360,35 @@ def step_tasks(result: DailyResult, parent_dir: Path) -> None:
     _err(f"tasks: {tasks_ingest.report_line(parsed, report)}")
 
 
-def step_score(result: DailyResult, *, limit: int = SCORE_LIMIT) -> None:
+def run_key(now: datetime) -> str:
+    """The daily's run key in its coverage records (routine_consumption.run_key): its summary line's timestamp."""
+    return now.strftime(TS_FORMAT)
+
+
+def _cover(result: DailyResult, build: Any, **kwargs: Any) -> None:
+    """Collect one step's coverage records (written by step_coverage). A builder problem is a coverage note, never a
+    step failure. Nothing when AMEM_COVERAGE_WRITE is off."""
+    if not COV.enabled():
+        return
+    try:
+        result.coverage.extend(build(**kwargs))
+    except Exception as exc:  # noqa: BLE001 - coverage never fails the step it describes
+        result.coverage_notes.append(_reason(f"coverage: {getattr(build, '__name__', 'records')}: {_exc(exc)}"))
+
+
+def _cover_read(result: DailyResult, read: Any, *args: Any, **kwargs: Any) -> Any:
+    """A read that only feeds coverage records: None (and a coverage note) when it fails or coverage is off."""
+    if not COV.enabled():
+        return None
+    try:
+        return read(*args, **kwargs)
+    except Exception as exc:  # noqa: BLE001
+        result.coverage_notes.append(_reason(f"coverage: {getattr(read, '__name__', 'read')}: {_exc(exc)}"))
+        return None
+
+
+def step_score(result: DailyResult, *, limit: int = SCORE_LIMIT, now: datetime | None = None) -> None:
+    now = now or datetime.now().astimezone()
     if not _postgres_guard("score", result):
         return
     if config.jev_live_flag() and jev.mode() != "live":
@@ -363,13 +398,18 @@ def step_score(result: DailyResult, *, limit: int = SCORE_LIMIT) -> None:
         routines = cache.routines()
     except Exception as exc:
         result.fail(f"score: {_exc(exc)}")
+        _cover(result, COV.score_records, run_key=run_key(now), now=now, reports=[], error=_exc(exc))
         return
+    reports: list[scoring.ScoreReport] = []
+    errors: list[str] = []
     for routine in routines:
         try:
             report = scoring.score_runs(routine=routine, limit=limit, cache=cache)
         except Exception as exc:  # bad question file, DB or SDK error: this routine only
             result.fail(f"score {routine}: {_exc(exc)}")
+            errors.append(f"score {routine}: {_exc(exc)}")
             continue
+        reports.append(report)
         result.scored += report.scored
         result.missing += len(report.missing)
         if report.missing:  # fixture mode only; one line per routine keeps launchd.log readable
@@ -378,6 +418,8 @@ def step_score(result: DailyResult, *, limit: int = SCORE_LIMIT) -> None:
         if report.failed:
             n = len(report.failed)
             result.fail(f"score {routine}: {n} Jev error{'s' if n != 1 else ''}; first: {report.failed[0][2]}")
+    totals = _cover_read(result, COV.run_totals, routines)
+    _cover(result, COV.score_records, run_key=run_key(now), now=now, reports=reports, errors=errors, totals=totals)
 
 
 def step_distill(result: DailyResult, *, limit: int = distill.DEFAULT_LIMIT) -> None:
@@ -440,6 +482,9 @@ def step_deviations(result: DailyResult, *, state_file: Path, now: datetime) -> 
         return
     if not _postgres_guard("deviations", result):
         return
+    since = now - timedelta(days=deviations.DEFAULT_DAYS)   # deviations.scan's own window start
+    cover = {"run_key": run_key(now), "since": since, "now": now}
+    ingested = before = None
     for attempt in (1, 2):
         try:
             root = sessions_ingest.projects_dir()
@@ -447,6 +492,7 @@ def step_deviations(result: DailyResult, *, state_file: Path, now: datetime) -> 
                 raise FileNotFoundError(f"no projects folder at {root}")
             ingested = sessions_ingest.ingest(root, days=deviations.DEFAULT_DAYS, now=now)
             _err(f"deviations: {ingested.line()}")
+            before = _cover_read(result, COV.scan_states, since)
             report = deviations.scan(days=deviations.DEFAULT_DAYS, limit=DEVIATIONS_LIMIT, now=now)
             break
         except psycopg.OperationalError as exc:  # the database went away: one retry once it is back
@@ -454,11 +500,16 @@ def step_deviations(result: DailyResult, *, state_file: Path, now: datetime) -> 
                 _err(f"deviations: {_exc(exc)}; the database answers again, retrying once")
                 continue
             result.fail(f"deviations: {_exc(exc)}")
+            _cover(result, COV.deviations_records, **cover, ingest=ingested, error=f"deviations: {_exc(exc)}")
             return
         except Exception as exc:  # ingest, question file or DB error before the loop
             result.fail(f"deviations: {_exc(exc)}")
+            _cover(result, COV.deviations_records, **cover, ingest=ingested, error=f"deviations: {_exc(exc)}")
             return
     result.deviations = report
+    after = _cover_read(result, COV.scan_states, since)
+    _cover(result, COV.deviations_records, **cover, ingest=ingested, before=before, after=after, report=report,
+           evidence=_cover_read(result, COV.deviation_refs, report) or [])
     _err(report.summary())
     for o in report.outcomes:  # a counted warning (deviation_skipped=N), not a failure: see docs/daily.md
         for reason in o.skipped_reasons:
@@ -622,11 +673,13 @@ def step_sync(result: DailyResult, *, state_file: Path, now: datetime) -> None:
                 rep = sync.run(sink, conn, budget_s=SYNC_BUDGET_S)
         except Exception as exc:  # adapter, database or provider error: this sink only, never the day
             result.warn(f"sync {name}: {_exc(exc)}")
+            _cover(result, COV.sync_records, run_key=run_key(now), now=now, sink=name, error=f"sync {name}: {_exc(exc)}")
             continue
         reports.append(rep)
         _err(rep.line())
         if rep.status in SYNC_STOP or (rep.status == "capped" and rep.detail.startswith("provider cap")):
             result.warn(f"sync {name}: {rep.status} ({rep.detail})")
+        _cover(result, COV.sync_records, run_key=run_key(now), now=now, sink=name, report=rep)
     result.synced = reports
     data = _state_dict(state_file)
     data[SYNC_KEY] = day
@@ -635,6 +688,14 @@ def step_sync(result: DailyResult, *, state_file: Path, now: datetime) -> None:
         _write_state(state_file, data)
     except OSError as exc:
         result.warn(f"sync: cannot write {state_file.name}: {_exc(exc)}")
+
+
+def step_coverage(result: DailyResult) -> None:
+    """Write the steps' coverage records (coverage_daily.write: one savepoint each, never raises). Problems become
+    stderr lines and one `coverage_problems=N` field on the summary line; the verdict never changes."""
+    result.coverage_notes.extend(COV.write(result.coverage))
+    for note in result.coverage_notes:
+        _err(note)
 
 
 def log_lines(ts: str, result: DailyResult, secs: int) -> list[str]:
@@ -660,6 +721,8 @@ def log_lines(ts: str, result: DailyResult, secs: int) -> list[str]:
     if result.synced is not None:  # only when the sync step ran a sink, so other runs keep the same line
         head += (f"sync={','.join(f'{r.sink}:{r.status}' for r in result.synced) or 'none'} "
                  f"sync_rows={sum(r.rows for r in result.synced)} ")
+    if result.coverage_notes:  # a coverage problem is a note, never a failure; absent when there is none
+        head += f"coverage_problems={len(result.coverage_notes)} "
     head += f"{secs}s"
     return [head, *(f"{ts} {NAME}-fail {reason}" for reason in result.failures),
             *(f"{ts} {NAME}-warn {reason}" for reason in result.warnings)]
@@ -693,13 +756,14 @@ def run_daily(
         wait_for_db()
         step_ingest(result)
         step_tasks(result, (parent_dir or log_file.parent).expanduser())
-        step_score(result)
+        step_score(result, now=now)
         step_distill(result)
         step_escalations(result, push=push, state_file=state_path(state), now=now)
         step_deviations(result, state_file=state_path(state), now=now)
         step_edits(result, push=push, notify=notify)
         step_rsi_push(result, push=push, notify=notify)
         step_sync(result, state_file=state_path(state), now=now)  # last: it feeds nothing the steps above read
+        step_coverage(result)
         secs = int(time.monotonic() - start)
         result.lines = log_lines(now.strftime(TS_FORMAT), result, secs)
         log_file.parent.mkdir(parents=True, exist_ok=True)

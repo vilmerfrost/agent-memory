@@ -128,3 +128,15 @@ Every harvest without `--dry-run` logs one `runs` row through the `log-run` code
 (`store.insert_run`): routine `evals-harvest`, status `pass` (or `error` when the read
 failed), the summary line, and `meta` = `{drafted, already, skipped, by_kind, files, out,
 handoffs_table}`. `amem runs --routine evals-harvest` shows the history.
+
+## Coverage records
+
+After the run row, the harvest writes coverage records (data-use plan R4, `coverage_daily.harvest_records`;
+docs/data-use/coverage.md): job `rsi-harvest`, run key `harvest-<UTC time>`, `run_id` = the run row. One
+consumption record per source dataset, `deviations:deviations` and `coordination:handoffs`: sources read
+(`queried`), not drafted before (`considered`), drafted (`used` = `findings`, each citing its source as an
+`amem:deviation/<id>` or `amem:session/<id>` ref, at most 20) and the skip reasons above (`already_drafted`,
+`team-repo`, `incomplete-handoff`, `limit`). A handoffs snapshot counts the handoffs in the window; a missing
+handoffs table writes none (the guard reads that as `not_collected`). A failed harvest records
+`analysis_failed`. A write problem is one stderr line; the exit code and the summary line do not change.
+`--dry-run` and `AMEM_COVERAGE_WRITE=0` write nothing.
