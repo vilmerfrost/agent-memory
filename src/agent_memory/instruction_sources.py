@@ -526,7 +526,9 @@ class Resolver:
         return self._top[key]
 
     def tracked(self, path: Path) -> tuple[Path, str] | None:
-        """(repo top, path relative to it) for a file git tracks, else None."""
+        """(repo top, path relative to it) for a file git tracks, else None. A symlink counts as its
+        target (~/.claude/skills/x -> ~/agent-config/skills/x: the target's repo has the history)."""
+        path = Path(_real(path))
         top = self.top(path.parent)
         if top is None:
             return None

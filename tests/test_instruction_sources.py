@@ -270,6 +270,26 @@ def test_a_git_file_changed_after_the_start_reconstructs_the_old_text(setup_home
     assert e.version["repo"] == "~/work/demo-repo" and len(e.version["blob"]) == 40
 
 
+def test_a_skill_symlinked_into_a_git_repo_gets_that_repos_history(setup_home: Home) -> None:  # noqa: F811
+    """~/.claude/skills/<x> is a symlink into agent-config (a git repo), like the real setup."""
+    cfg = setup_home.agent_config
+    git(cfg, "init", "-q", "-b", "work")
+    target = cfg / "skills" / "recon" / "SKILL.md"
+    target.parent.mkdir(parents=True)
+    target.write_text("# Recon\n## Read only\nNever write.\n")
+    git(cfg, "add", "skills/recon/SKILL.md")
+    git(cfg, "commit", "-q", "-m", "v1", when="2026-10-13T09:00:00+00:00")
+    v1 = git(cfg, "rev-parse", "HEAD")
+    target.write_text("# Recon\n## Read only\nNever write, never fix.\n")
+    git(cfg, "commit", "-q", "-am", "v2", when="2026-10-21T09:00:00+00:00")
+    (setup_home.claude / "skills" / "recon").symlink_to(target.parent)
+    e = one(IS.capture(row(setup_home, skills=["recon"])), "skill:recon")
+    assert (e.authority, e.text, e.path) == ("reconstructed", "# Recon\n## Read only\nNever write.\n",
+                                             "~/.claude/skills/recon/SKILL.md")
+    assert e.version is not None and (e.version["id"], e.version["repo"], e.version["basis"]) == (
+        v1, "~/agent-config", "git-history")
+
+
 def test_a_non_git_file_changed_after_the_start_is_unresolved_not_todays_hash(setup_home: Home) -> None:  # noqa: F811
     e = one(IS.capture(row(setup_home)), "claude-md:global")
     today = IS.sha256((setup_home.claude / "CLAUDE.md").read_text())
