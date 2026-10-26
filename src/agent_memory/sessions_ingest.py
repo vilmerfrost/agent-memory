@@ -1261,9 +1261,8 @@ def ingest_cloud(*, db_url: str | None = None, now: datetime | None = None) -> C
 
 
 # ---------------------------------------------------------------- stored rows
-# Every ingest also fixes stored rows outside its window (docs/sessions-live.md, "Outcome"):
-# the outcome is recomputed from the stored evidence (signal names and counts plus `end`) with
-# today's rules and time, and a null category / project is filled from the stored kind and cwd.
+# Recompute only version-2 evidence outside the ingest window. Unversioned historical
+# outcomes retain their recorded semantics. Null category/project can still be filled.
 
 _STORED_SQL = """
 select session_id, kind, repo, project_dir, meta, category, project, outcome, outcome_evidence,

@@ -435,6 +435,11 @@ class Ledger:
                                    unmeasured_fields=unmeasured, status=st,
                                    checkpoints={"rsi-night": self.checkpoint or ""},
                                    detail=_line("; ".join(p.reasons), 500) or None))
+        if conn is not None:
+            from agent_memory import replay_evidence
+            out.extend(replay_evidence.night_records(conn, night=self.night,
+                                                    start=self.window[0], end=self.window[1]))
+            required.extend(REPLAY_REQUIRED)
         return out, required
 
     def write(self, conn: psycopg.Connection, *, status: str, reason: str,

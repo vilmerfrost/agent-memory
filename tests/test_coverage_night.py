@@ -169,7 +169,7 @@ def test_a_fixture_night_writes_rows_that_match_its_report(env: SimpleNamespace)
     assert "s4:ch.rule_gap" in s[NC.PROVIDER_DATASET["clickhouse"]]["measured_fields"]
     assert pd["used"] == 0 and pd["status"] == "read_excluded" and sum(pd["skipped"].values()) >= 1   # context only
     assert NC.PROVIDER_DATASET["langfuse"] not in u
-    assert set(rep["coverage"]["required"]) == {*NC.BASE_REQUIRED, *(NC.PROVIDER_DATASET[p] for p in
+    assert set(rep["coverage"]["required"]) == {*NC.BASE_REQUIRED, *NC.REPLAY_REQUIRED, *(NC.PROVIDER_DATASET[p] for p in
                                                                     ("supabase", "clickhouse", "pastdev"))}
     b, md = brief(env)
     assert b["verdict"]["conclusion"] == "findings" and b["verdict"]["findings"] >= 2

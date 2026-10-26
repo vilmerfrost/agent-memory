@@ -165,7 +165,10 @@ def test_an_empty_window_is_no_eligible_data(live: ScoringDb, daily_io: DailyIO,
     assert s[COV.SESSIONS][0]["status"] == "no_eligible_data" and s[COV.DEVIATIONS][0]["status"] == "no_eligible_data"
     assert s[COV.RUNS][0]["status"] == "no_eligible_data"     # no runs of a question routine either
     got = uses(live.url)
-    assert {k: v["status"] for k, v in got.items()} == {COV.SESSIONS: "analysis_not_run", COV.RUNS: "analysis_not_run"}
+    assert {k: v["status"] for k, v in got.items()} == {COV.SESSIONS: "analysis_not_run", COV.RUNS: "analysis_not_run",
+        "command_timings:execution_spans": "analysis_not_run",
+        "test_timings:test_timing_runs": "analysis_not_run",
+        "reports_checkpoints:rsi_checkpoints": "analysis_not_run"}
     statuses = {r["status"] for rows in s.values() for r in rows} | {v["status"] for v in got.values()}
     assert not statuses & {"not_collected", "analysis_failed", "used_no_finding"}
     with psycopg.connect(live.url) as conn:                     # the guard says incomplete, never all clear
@@ -255,8 +258,8 @@ def test_a_coverage_write_failure_is_a_note_only(sdb: ScoringDb, daily_io: Daily
     monkeypatch.setattr(CV, "record_snapshot", broken)
     assert cli.main(["daily", "--no-push"]) == 0                # the exit code does not change
     (line,) = daily_io.log_lines()
-    assert " amem-daily PASS scored=4 " in line and " coverage_problems=2 " in line
-    assert re.fullmatch(LOG_LINE_RE, line.replace("coverage_problems=2 ", ""))   # otherwise the house line
+    assert " amem-daily PASS scored=4 " in line and " coverage_problems=8 " in line
+    assert re.fullmatch(LOG_LINE_RE, line.replace("coverage_problems=8 ", ""))   # otherwise the house line
     assert "coverage routine_runs:runs: RuntimeError: coverage table gone" in capsys.readouterr().err
     assert counts(sdb.url) == (0, 0)
 

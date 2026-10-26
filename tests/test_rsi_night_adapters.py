@@ -27,7 +27,7 @@ def test_pack_evidence_delegates_to_rsi_evidence_pack(monkeypatch: pytest.Monkey
     fake = SimpleNamespace(
         delta_since=lambda since, *, conn, **kw: seen.setdefault("delta", (since, conn, kw)) and "DELTA",
         default_retrievers=lambda connect=None: {"supabase": "SB"},
-        build_pack=lambda cand: seen.setdefault("pack", dict(cand)) and "PACK",
+        build_pack=lambda cand, **kw: seen.setdefault("pack", (dict(cand), kw)) and "PACK",
         render_for_model=lambda pack: f"rendered:{pack}")
     monkeypatch.setitem(__import__("sys").modules, "agent_memory.rsi_evidence_pack", fake)
     monkeypatch.setattr(agent_memory, "rsi_evidence_pack", fake, raising=False)
@@ -35,6 +35,7 @@ def test_pack_evidence_delegates_to_rsi_evidence_pack(monkeypatch: pytest.Monkey
     assert ev.delta("2026-10-18T00:00:00+00:00", conn="CONN") == "DELTA"
     assert seen["delta"] == ("2026-10-18T00:00:00+00:00", "CONN", {"retrievers": {"supabase": "SB"}})
     assert ev.pack({"dedupe_key": "k"}) == "PACK" and ev.render("PACK") == "rendered:PACK"
+    assert seen["pack"] == ({"dedupe_key": "k"}, {"current_instruction_sha256": None})
 
 
 @dataclass

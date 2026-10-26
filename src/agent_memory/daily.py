@@ -726,10 +726,12 @@ def step_observations(result: DailyResult, *, now: datetime, reports_dir: Path) 
         result.telemetry = {"format": TA.FORMAT, "findings": len(report['findings']),
                             "stored_spans": report['span_coverage']['stored'],
                             "stored_test_runs": report['test_coverage']['stored'], "report_path": str(path)}
-        result.coverage.extend(TA.records(report, run_key=run_key(now)))
+        if CV.writes_enabled():
+            result.coverage.extend(TA.records(report, run_key=run_key(now)))
     except Exception as exc:
         result.coverage_notes.append(f"telemetry analysis: analysis_failed ({type(exc).__name__})")
-        for dataset in ("command_timings:execution_spans", "test_timings:test_timing_runs",'reports_checkpoints:rsi_checkpoints'):
+        for dataset in (("command_timings:execution_spans", "test_timings:test_timing_runs",'reports_checkpoints:rsi_checkpoints')
+                        if CV.writes_enabled() else ()):
             result.coverage += [CV.Snapshot(dataset, now-timedelta(days=7), now,
                                            "stored rows in explicit analysis window; query failed", None),
                                CV.Consumption(NAME, run_key(now), dataset, TA.FORMAT,

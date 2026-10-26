@@ -2710,23 +2710,6 @@ class Night:
         try:
             reason = self.notes[-1] if self.notes else status
             self.report["coverage"], problems = self._cov().write(self.conn, status=status, reason=reason)
-            summary = self.report['coverage']
-            if summary.get('enabled'):
-                from agent_memory import coverage as CV, replay_evidence
-                summary['required'] = list(dict.fromkeys([*summary.get('required',[]), *NC.REPLAY_REQUIRED]))
-                records = replay_evidence.night_records(self.conn,night=self.night,
-                    start=_parse_ts(self.report['started_at']),end=_parse_ts(self.report['finished_at']))
-                for record in records:
-                    errors = CV.record_best_effort(self.conn,[record])
-                    if errors:
-                        problems += errors
-                        summary['failed'] += len(errors)
-                        continue
-                    key = 'consumption' if isinstance(record,CV.Consumption) else 'snapshots'
-                    label = record.resolved_status()
-                    summary[key][label] = summary[key].get(label,0)+1
-                    if isinstance(record,CV.Consumption):
-                        summary['datasets'][record.dataset] = label
         except Exception as exc:  # noqa: BLE001 - coverage never fails the night it describes
             problems = [f"coverage not recorded: {type(exc).__name__}: {str(exc)[:160]}"]
         if problems:
