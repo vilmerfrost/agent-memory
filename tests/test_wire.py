@@ -255,9 +255,13 @@ def test_sessions_cost_window_filters_and_contract(sdb: ScoringDb) -> None:  # n
         "sessions": 2,
         "tokens": {"input": 11, "output": 22, "cache_read": 303, "cache_creation": 44, "total": 380},
         "active_seconds": 61.5, "api_seconds": 30.0, "tool_seconds": 5.0,
+        "timing": {"active_seconds": 61.5, "api_seconds": 30.0, "tool_seconds": 5.0},
+        "timing_measured_sessions": {"active_seconds": 2, "api_seconds": 1, "tool_seconds": 1},
         "by_project": {"evals": {"sessions": 2, "tokens": {"input": 11, "output": 22, "cache_read": 303,
                                                            "cache_creation": 44, "total": 380},
-                                 "active_seconds": 61.5, "api_seconds": 30.0, "tool_seconds": 5.0}},
+                                 "active_seconds": 61.5, "api_seconds": 30.0, "tool_seconds": 5.0,
+                                 "timing": {"active_seconds": 61.5, "api_seconds": 30.0, "tool_seconds": 5.0},
+                                 "timing_measured_sessions": {"active_seconds": 2, "api_seconds": 1, "tool_seconds": 1}}},
     }
     every = tokens_report.cost(since=lo, until=hi, db_url=sdb.url)
     assert every["sessions"] == 3 and set(every["by_project"]) == {"evals", "routine:nightly"}
@@ -279,7 +283,9 @@ def test_sessions_cost_nothing_matches_is_zeros(sdb: ScoringDb) -> None:  # noqa
     assert res.returncode == 0, res.stderr
     assert json.loads(res.stdout) == {
         "sessions": 0, "tokens": {"input": 0, "output": 0, "cache_read": 0, "cache_creation": 0, "total": 0},
-        "active_seconds": 0.0, "api_seconds": 0.0, "tool_seconds": 0.0, "by_project": {}}
+        "active_seconds": 0.0, "api_seconds": 0.0, "tool_seconds": 0.0, "by_project": {},
+        "timing": {"active_seconds": None, "api_seconds": None, "tool_seconds": None},
+        "timing_measured_sessions": {"active_seconds": 0, "api_seconds": 0, "tool_seconds": 0}}
     bad = run_amem("sessions", "cost", "--since", "yesterday", env=sdb.env)
     assert bad.returncode == 2 and "not an ISO timestamp" in bad.stderr
     rest = run_amem("sessions", "cost", "--since", "2030-01-01", env=base_env(

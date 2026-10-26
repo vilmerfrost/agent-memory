@@ -145,6 +145,9 @@ Scoring, lessons, A/B and deviation commands use the Postgres backend only; the 
 
 ## Tests
 
+Session/parent measurements, coverage, retrieval commands and collector installation:
+[Session timing](docs/session-timing.md).
+
 In the managed integration checkout, the full acceptance gate is:
 
 ```sh
