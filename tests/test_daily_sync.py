@@ -112,7 +112,8 @@ def test_a_sync_failure_is_a_warning_and_never_blocks_the_night(sinks: Sinks, tm
     assert all("amem-daily-fail" not in x for x in log.read_text().splitlines())
     daily_prereq = rsi_schedule.DEFAULT_PREREQS[0]
     assert daily_prereq.routine == "amem-daily" and "sync" not in daily_prereq.nonblocking_steps
-    gate = rsi_schedule.evaluate_prerequisites(log, "2026-10-24", NOW + timedelta(hours=1), [daily_prereq])
+    # a 09:20 run on 10-24 carries night key 2026-10-23 (amem-daily runs at 00:40 after its evening since 10-26)
+    gate = rsi_schedule.evaluate_prerequisites(log, "2026-10-23", NOW + timedelta(hours=1), [daily_prereq])
     assert gate.reasons == []                                                   # the night may run
 
 

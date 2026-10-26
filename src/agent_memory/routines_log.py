@@ -242,3 +242,65 @@ def parse_file(path: Path) -> ParseResult:
     result = parse_lines(lines)
     result.incomplete_tail = incomplete
     return result
+
+
+# ---------------------------------------------------------------- running markers
+#
+# A routine writes its summary line only when it ends. So that a dependent job (the 01:30 night waits for the 00:40
+# amem-daily) can tell "still running" from "did not run", the routine keeps `<log dir>/<routine>.running` (JSON:
+# pid, started_at) while it runs. A marker whose pid is gone, or older than RUNNING_MAX_AGE, is stale (a crash).
+
+RUNNING_SUFFIX = ".running"
+RUNNING_MAX_AGE_S = 6 * 3600
+_TS = "%Y-%m-%dT%H:%M:%S%z"
+
+
+def running_marker(log: Path, routine: str) -> Path:
+    return log.parent / f"{routine}{RUNNING_SUFFIX}"
+
+
+def mark_running(log: Path, routine: str, started_at: datetime, pid: int | None = None) -> Path:
+    import json
+    import os
+    path = running_marker(log, routine)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"pid": os.getpid() if pid is None else pid, "routine": routine,
+                                "started_at": started_at.strftime(_TS)}) + "\n", encoding="utf-8")
+    return path
+
+
+def clear_running(log: Path, routine: str) -> None:
+    try:
+        running_marker(log, routine).unlink()
+    except OSError:
+        pass
+
+
+def _pid_alive(pid: int) -> bool:
+    import os
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def running(log: Path, routine: str, now: datetime) -> dict[str, Any] | None:
+    """The live marker ({pid, started_at, ...}) when `routine` is running now, else None (no marker, unreadable,
+    its pid is gone, or it is older than RUNNING_MAX_AGE_S)."""
+    import json
+    try:
+        data = json.loads(running_marker(log, routine).read_text(encoding="utf-8"))
+        pid = int(data["pid"])
+        started = parse_ts(str(data["started_at"]))
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    if started is None or pid <= 0 or not _pid_alive(pid):
+        return None
+    if (now - started).total_seconds() > RUNNING_MAX_AGE_S:
+        return None
+    return {**data, "pid": pid}

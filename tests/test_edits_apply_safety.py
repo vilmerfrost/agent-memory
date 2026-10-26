@@ -115,6 +115,7 @@ def test_garbage_reply_after_write_restores_the_target(live: ScoringDb, ehome: E
 def test_failed_apply_fails_the_daily_step(sdb: ScoringDb, daily_io: DailyIO, ehome: EHome,  # noqa: F811
                                            ewriter: Any, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv(edits.LIVE_ENV, "1")
+    monkeypatch.setenv(daily.DAILY_EDITS_ENV, "1")      # the legacy morning edits step (off by default since 10-26)
     seed_spawn(sdb.url, ehome, n=3)
     ewriter(envelope(proposal(SPAWN_NEW)))
     ehome.improve.queue("apply", apply_answer("kept", "c-1", write=True))

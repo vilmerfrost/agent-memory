@@ -278,6 +278,10 @@ def register(sub: argparse._SubParsersAction) -> None:
     rsi_decide_job.register(s)
     from agent_memory import rsi_passkey               # `amem rsi passkey-enroll|list|revoke` (Night Desk Face ID)
     rsi_passkey.register(s)
+    from agent_memory import rsi_outcome               # `amem rsi outcome` (09:20: did applied changes help?)
+    rsi_outcome.register(s)
+    from agent_memory import rsi_supersede             # `amem rsi supersede-morning` (retired morning proposals)
+    rsi_supersede.register(s)
 
     p = s.add_parser("targets",help="production files the loop may target (sha256, git state); read-only")
     p.add_argument("--no-schedules", action="store_true")

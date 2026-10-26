@@ -84,15 +84,18 @@ def check_workdir(work: Path) -> None:
 
 
 def routines_lines(night: str, now: datetime, *, daily: bool) -> str:
-    """A synthetic routines.log for the gate: archive and ingest passed; amem-daily only when `daily`. Archive and
-    daily are dated on the night's date (08:45, 09:20: always before `now`, since a night key is never later than
-    today's morning); ingest 30 minutes before `now`, so the 25 h rule holds at any time of day."""
+    """A synthetic routines.log for the gate: archive and ingest passed; amem-daily only when `daily`. Archive is
+    dated on the night's date (08:45: always before `now`, since a night key is never later than today's morning);
+    amem-daily carries the night's key (00:40 the next day, or just before `now` when that is later: never before
+    the night's noon); ingest 30 minutes before `now`, so the 25 h rule holds at any time of day."""
     d = datetime.fromisoformat(night).replace(tzinfo=now.tzinfo)
     fmt = "%Y-%m-%dT%H:%M:%S%z"
     lines = [f"{d.replace(hour=8, minute=45, second=9).strftime(fmt)} amem-archive PASS heartbeat 5s",
              f"{(now - timedelta(minutes=30)).strftime(fmt)} amem-ingest PASS heartbeat 5s"]
     if daily:
-        lines.append(f"{d.replace(hour=9, minute=20, second=4).strftime(fmt)} amem-daily PASS scored=16 "
+        at = max(d.replace(hour=12, minute=0, second=4), min(d + timedelta(days=1, minutes=40, seconds=4),
+                                                             now - timedelta(minutes=1)))
+        lines.append(f"{at.strftime(fmt)} amem-daily PASS scored=16 "
                      "escalations=14 new=0 push=none tasks=10 deviations=8 707s")
     return "".join(x + "\n" for x in lines)
 

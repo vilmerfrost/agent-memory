@@ -145,7 +145,8 @@ def test_plist_content() -> None:
     assert env["AMEM_REQUIRE_REMOTE"] == "1" and env["AMEM_JEV_LIVE"] == "1"
     assert env["AMEM_DEVIATIONS_LIVE"] == "1"  # the weekly deviations step runs
     assert "/Users/vilmerfrost/.local/bin" in env["PATH"].split(":")  # gh lives there; launchd's PATH lacks it
-    assert data["StartCalendarInterval"] == {"Hour": 9, "Minute": 20}
+    assert data["StartCalendarInterval"] == {"Hour": 0, "Minute": 40}   # before the 01:30 night (2026-10-26)
+    assert not {"AMEM_EDITS_LIVE", "AMEM_EDITS_MODE", "AMEM_DAILY_EDITS"} & set(env)   # no morning edits step
     assert data["StandardOutPath"] == data["StandardErrorPath"] == "/Users/vilmerfrost/.claude/parent/reports/launchd.log"
     assert data["RunAtLoad"] is False
 
@@ -167,7 +168,9 @@ def _fake_push(monkeypatch: pytest.MonkeyPatch, result: list[str] | Exception) -
     return calls
 
 
-@pytest.mark.parametrize("env", [{}, {"AMEM_EDITS_LIVE": "1"}, {"AMEM_EDITS_MODE": "stage"}])
+@pytest.mark.parametrize("env", [{}, {"AMEM_EDITS_LIVE": "1"}, {"AMEM_EDITS_MODE": "stage"},
+                                 {"AMEM_EDITS_LIVE": "1", "AMEM_EDITS_MODE": "stage"},      # the old plist: off now
+                                 {"AMEM_DAILY_EDITS": "1", "AMEM_EDITS_LIVE": "1"}])
 def test_rsi_push_runs_only_in_stage_mode(monkeypatch: pytest.MonkeyPatch, env: dict[str, str]) -> None:
     for k, v in env.items():
         monkeypatch.setenv(k, v)
@@ -179,6 +182,7 @@ def test_rsi_push_runs_only_in_stage_mode(monkeypatch: pytest.MonkeyPatch, env: 
 
 
 def test_rsi_push_in_stage_mode_reaches_the_log_line(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("AMEM_DAILY_EDITS", "1")          # the legacy morning edits step, explicitly back on
     monkeypatch.setenv("AMEM_EDITS_LIVE", "1")
     monkeypatch.setenv("AMEM_EDITS_MODE", "stage")
     calls = _fake_push(monkeypatch, ["phone", "phone"])
@@ -192,6 +196,7 @@ def test_rsi_push_in_stage_mode_reaches_the_log_line(monkeypatch: pytest.MonkeyP
 
 
 def test_rsi_push_failure_fails_the_step_and_keeps_the_proposals(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("AMEM_DAILY_EDITS", "1")
     monkeypatch.setenv("AMEM_EDITS_LIVE", "1")
     monkeypatch.setenv("AMEM_EDITS_MODE", "stage")
     _fake_push(monkeypatch, RuntimeError("ntfy down"))

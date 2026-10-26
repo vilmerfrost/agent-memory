@@ -13,8 +13,9 @@ Steps, in order. A failed step is recorded and the next step still runs:
    lessons. Off unless AMEM_DISTILL_LIVE=1 (then not a failure, and the log line has no
    distill fields). Any run that ends as `error` fails the step.
 3. escalations: open escalations are compared with the ids already pushed
-   (state file). Only new ids trigger a push. Ids no longer open are pruned.
-   An id is marked pushed only after ntfy answered 200.
+   (state file) and counted (`new=`). Ids no longer open are pruned. No push since 2026-10-26: the job runs at
+   00:40, and the 07:30 brief job's one morning push carries the new ones (alerts.push_morning), marking an id
+   pushed only after ntfy answered 200 (`push=brief` here when there are new ones).
 3b. deviations (daily): `sessions ingest` + `deviations scan --limit 40` (docs/deviations.md) when
    the last scan in the state file is >= 20 hours old (AMEM_DEVIATIONS_EVERY_HOURS). Off unless AMEM_DEVIATIONS_LIVE=1 (then not
    a failure, and the log line has no deviation fields). A session error is a warning (an
@@ -22,9 +23,11 @@ Steps, in order. A failed step is recorded and the next step still runs:
    malformed writer item next to valid ones is a counted warning (`deviation_skipped=N`, one
    stderr line per item), not a failure. A lost database before the scan loop is retried once,
    after `wait_for_db`.
-3c. edits: `edits run` (docs/edits.md) after the deviations step. Off unless AMEM_EDITS_LIVE=1
-   (then not a failure, and the log line has no edit fields). Kept edits are pushed with an
-   Undo button (not with --no-push). Any candidate error fails the step; the others still run.
+3c. edits: `edits run` (docs/edits.md) after the deviations step. Off since 2026-10-26 (the RSI night has its
+   own writer and stages its own proposals) unless AMEM_DAILY_EDITS=1 and AMEM_EDITS_LIVE=1 (then not a failure
+   when off, and the log line has no edit fields). Legacy: kept edits are pushed with an Undo button (not with
+   --no-push). Any candidate error fails the step; the others still run. The stage-mode push (rsi-push) follows
+   the same switch. No alerts step any more: the safety-slip and last-day pushes joined the brief's push.
 3d. sync (daily, last): `sync run` for each sink (clickhouse, langfuse, pastdev) that has its settings and whose
    kill switch is on, SYNC_BUDGET_S each, at most once per local day (state file `sync_last_day`). An unconfigured
    or switched-off sink is a skip. A sink that fails is a warning (an amem-daily-warn line), never a failure, so
@@ -57,6 +60,7 @@ from typing import Any
 import psycopg
 
 from agent_memory import cli_cloud, config, deviations, distill, jev, scoring, sessions_ingest, store, tasks_ingest
+from agent_memory import routines_log as RL
 from agent_memory.questions import QuestionCache
 
 NAME = "amem-daily"
@@ -398,7 +402,7 @@ def step_distill(result: DailyResult, *, limit: int = distill.DEFAULT_LIMIT) -> 
 
 DEVIATIONS_KEY = "deviations_last_scan"
 DEVIATIONS_EVERY_ENV = "AMEM_DEVIATIONS_EVERY_HOURS"
-DEVIATIONS_EVERY_DEFAULT_HOURS = 20  # daily at 09:20, with slack so launchd jitter never skips a day
+DEVIATIONS_EVERY_DEFAULT_HOURS = 20  # daily at 00:40, with slack so launchd jitter never skips a day
 DEVIATIONS_LIMIT = 40  # sessions per daily scan (one writer call each); 15 left a growing backlog
 
 
@@ -478,12 +482,26 @@ def step_deviations(result: DailyResult, *, state_file: Path, now: datetime) -> 
         result.fail(f"state: cannot write {state_file.name}: {_exc(exc)}")
 
 
+DAILY_EDITS_ENV = "AMEM_DAILY_EDITS"
+
+
+def edits_in_daily(environ: Mapping[str, str] | None = None) -> bool:
+    """Since 2026-10-26 amem-daily runs no edits step: the RSI night has its own writer and stages its own
+    proposals. AMEM_DAILY_EDITS=1 brings the old morning edits step back (and with it the stage-mode push);
+    AMEM_EDITS_LIVE / AMEM_EDITS_MODE alone no longer do. `amem edits run|undo|undo-poll` are not affected."""
+    env = os.environ if environ is None else environ
+    return env.get(DAILY_EDITS_ENV, "").strip() == "1"
+
+
 def step_edits(result: DailyResult, *, push: bool, notify: Mapping[str, str] | None) -> None:
     """`amem edits run` (docs/edits.md): edit the rules Jev flagged, push each kept edit with
-    an Undo button. Off (not a failure) unless AMEM_EDITS_LIVE=1. One candidate's writer or
-    improve error never stops the others; any error fails the step."""
+    an Undo button. Off (not a failure) unless AMEM_DAILY_EDITS=1 and AMEM_EDITS_LIVE=1. One candidate's
+    writer or improve error never stops the others; any error fails the step."""
     from agent_memory import edits  # lazy: edits_push imports this module
 
+    if not edits_in_daily():
+        _err(f"edits: not run by amem-daily ({DAILY_EDITS_ENV} is not 1; the night writes and stages proposals)")
+        return
     if not edits.live():
         _err(f"edits: off ({edits.LIVE_ENV} is not 1)")
         return
@@ -509,7 +527,7 @@ def step_rsi_push(result: DailyResult, *, push: bool, notify: Mapping[str, str] 
     Reject and the terminal Apply line (`amem rsi push`, docs/rsi/approval.md). Nothing here changes production."""
     from agent_memory import edits, rsi_approval  # lazy, like step_edits
 
-    if not (edits.live() and edits.stage_mode()):
+    if not (edits_in_daily() and edits.live() and edits.stage_mode()):
         return
     if not _postgres_guard("rsi-push", result):
         return
@@ -521,33 +539,11 @@ def step_rsi_push(result: DailyResult, *, push: bool, notify: Mapping[str, str] 
     _err(f"rsi-push: {len(result.rsi_push)} proposal(s) {' '.join(result.rsi_push)}".rstrip())
 
 
-def step_alerts(result: DailyResult, *, push: bool, notify: Mapping[str, str] | None) -> None:
-    """Phone alerts the steps above do not send (alerts.py): a staged proposal on its last day (stage mode
-    only, like step_rsi_push), and slips of the safety rules (only when the deviations scan is live). A failure
-    here is a warning: an alert must never block amem-rsi-night."""
-    from agent_memory import alerts, edits  # lazy, like step_edits
-
-    remind = edits.live() and edits.stage_mode()   # proposals exist only in stage mode (step_rsi_push)
-    scan = deviations.live()                         # safety slips come from the deviations scan
-    if not (remind or scan):
-        return
-    if not _postgres_guard("alerts", result):
-        return
-    note = dict(notify) if notify is not None else None
-    try:
-        reminded = alerts.remind_proposals(push=push, notify=note) if remind else []
-        safety = alerts.push_safety_slips(push=push, notify=note) if scan else None
-    except Exception as exc:
-        _err(f"warning: alerts: {_exc(exc)}")
-        result.warn(f"alerts: {_exc(exc)}")
-        return
-    _err(f"alerts: {len(reminded)} expiry reminder(s){' ' + ' '.join(reminded) if reminded else ''}; "
-         f"safety {safety or 'none'}")
-
-
-def step_escalations(
-    result: DailyResult, *, push: bool, state_file: Path, now: datetime, notify: Mapping[str, str] | None
-) -> None:
+def step_escalations(result: DailyResult, *, push: bool = True, state_file: Path, now: datetime) -> None:
+    """Count the open escalations and the new ones (not pushed yet). Since 2026-10-26 amem-daily runs at 00:40 and
+    sends no phone push: the 07:30 brief job's single morning push carries the new escalations
+    (alerts.push_morning) and marks them pushed (`push=brief` on the log line; `none` with --no-push or nothing
+    new). Here the state only loses ids that are no longer open."""
     if not _postgres_guard("escalations", result):
         return
     try:
@@ -560,10 +556,7 @@ def step_escalations(
     result.escalations = len(rows)
     result.new = len(new_rows)
     if new_rows and push:
-        title, body = message(new_rows, len(rows))
-        result.push = send(title, body, notify)
-        if result.push == "phone":  # a fallback is retried next run: ids stay unmarked
-            pushed |= {str(r["run_id"]) for r in new_rows}
+        result.push = "brief"   # the morning brief's push carries them
     try:
         save_state(state_file, pushed, now)
     except OSError as exc:
@@ -690,20 +683,28 @@ def run_daily(
         now = now.astimezone()
     result = DailyResult()
     log_file = routines_log_path(routines_log)
-    wait_for_db()
-    step_ingest(result)
-    step_tasks(result, (parent_dir or log_file.parent).expanduser())
-    step_score(result)
-    step_distill(result)
-    step_escalations(result, push=push, state_file=state_path(state), now=now, notify=notify)
-    step_deviations(result, state_file=state_path(state), now=now)
-    step_edits(result, push=push, notify=notify)
-    step_rsi_push(result, push=push, notify=notify)
-    step_alerts(result, push=push, notify=notify)
-    step_sync(result, state_file=state_path(state), now=now)  # last: it feeds nothing the steps above read
-    secs = int(time.monotonic() - start)
-    result.lines = log_lines(now.strftime(TS_FORMAT), result, secs)
-    log_file.parent.mkdir(parents=True, exist_ok=True)
-    with open(log_file, "a", encoding="utf-8") as fh:
-        fh.write("".join(line + "\n" for line in result.lines))
+    # The 01:30 night waits while this marker is live (rsi_schedule.wait_for_prerequisites). It goes away only
+    # after the summary line is written, so the night never sees "not running" without the line.
+    try:
+        RL.mark_running(log_file, NAME, now)
+    except OSError as exc:
+        _err(f"running marker: {_exc(exc)} (the night will not wait for this run)")
+    try:
+        wait_for_db()
+        step_ingest(result)
+        step_tasks(result, (parent_dir or log_file.parent).expanduser())
+        step_score(result)
+        step_distill(result)
+        step_escalations(result, push=push, state_file=state_path(state), now=now)
+        step_deviations(result, state_file=state_path(state), now=now)
+        step_edits(result, push=push, notify=notify)
+        step_rsi_push(result, push=push, notify=notify)
+        step_sync(result, state_file=state_path(state), now=now)  # last: it feeds nothing the steps above read
+        secs = int(time.monotonic() - start)
+        result.lines = log_lines(now.strftime(TS_FORMAT), result, secs)
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        with open(log_file, "a", encoding="utf-8") as fh:
+            fh.write("".join(line + "\n" for line in result.lines))
+    finally:
+        RL.clear_running(log_file, NAME)
     return result

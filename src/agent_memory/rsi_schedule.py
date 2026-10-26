@@ -6,9 +6,11 @@
 
 Night job, in order:
 1. Completion checkpoints, not the clock: every prerequisite routine must have a PASS line in routines.log
-   (`schedule.prerequisites` in the night config, default DEFAULT_PREREQS): amem-daily and amem-archive passed on
-   the night's own date (the night key: 00:00-11:59 counts as the previous day), amem-ingest's latest line is a PASS
-   younger than 25 h. Otherwise the night is skipped (`SKIP`, one `-fail` line per reason). A FAIL whose every
+   (`schedule.prerequisites` in the night config, default DEFAULT_PREREQS): amem-daily passed for the night (its
+   00:40 run after the evening carries the night's key: 00:00-11:59 counts as the previous day), amem-archive passed
+   on the night's own date (08:45 that day), amem-ingest's latest line is a PASS younger than 25 h. While amem-daily
+   still runs (its running marker next to routines.log), the gate waits for it, up to 30 minutes, then skips with
+   "still running". Otherwise the night is skipped (`SKIP`, one `-fail` line per reason). A FAIL whose every
    `<routine>-fail <step>` line names a step in the prerequisite's `nonblocking_steps` (amem-daily default:
    DAILY_NONBLOCKING_STEPS, the steps the night does not read) counts as completed: the night runs and carries one
    warning per failed step (`-warn` lines, the report's `prerequisite_warnings`, the brief).
@@ -90,6 +92,21 @@ class Prereq:
     # of these counts as completed, and each failed step becomes a warning in the night report. Any other step, a
     # step name not listed here, or a FAIL with no step line still blocks (fail closed).
     nonblocking_steps: tuple[str, ...] = ()
+    # Which run is "the night's own" (same_night): "date" = dated on the night key's calendar date (amem-archive at
+    # 08:45 that day); "night_key" = a run whose own night key is the night (amem-daily at 00:40 after the evening:
+    # between the night's date 12:00 and the next day 11:59).
+    match: str = "date"
+    # While the routine's running marker is live (routines_log.running), the night waits up to this long for its
+    # line, then skips with "still running". 0: never wait.
+    wait_s: float = 0.0
+
+
+MATCHES = ("date", "night_key")
+# amem-daily runs at 00:40, after the evening it belongs to, so its line carries the night's key, and the 01:30
+# night waits up to 30 minutes while it still runs (a long deviations scan).
+DAILY_WAIT_S = 1800.0
+DEFAULT_MATCH = {"amem-daily": "night_key"}
+DEFAULT_WAIT_S = {"amem-daily": DAILY_WAIT_S}
 
 
 # amem-daily steps (daily.py) the night does not read. The night's S1 delta (rsi_evidence_pack.DELTA_SQL) reads
@@ -99,7 +116,8 @@ class Prereq:
 # (the daily state file) feed nothing the night reads. docs/rsi/night-ops.md has the table.
 DAILY_NONBLOCKING_STEPS = ("score", "distill", "escalations", "edits", "rsi-push", "state")
 DEFAULT_NONBLOCKING = {"amem-daily": DAILY_NONBLOCKING_STEPS}
-DEFAULT_PREREQS = (Prereq("amem-daily", same_night=True, nonblocking_steps=DAILY_NONBLOCKING_STEPS),
+DEFAULT_PREREQS = (Prereq("amem-daily", same_night=True, nonblocking_steps=DAILY_NONBLOCKING_STEPS,
+                          match="night_key", wait_s=DAILY_WAIT_S),
                    Prereq("amem-archive", same_night=True), Prereq("amem-ingest", same_night=False, max_age_h=25))
 _STEP_RE = re.compile(r"[a-z][a-z0-9_-]{0,31}")
 _STEP_AT = re.compile(r"([a-z][a-z0-9_-]{0,31})(?::|\s|$)")
@@ -154,9 +172,15 @@ def prerequisites(sched: Mapping[str, Any]) -> tuple[Prereq, ...]:
             if not isinstance(steps, (list, tuple)) or not all(isinstance(s, str) and _STEP_RE.fullmatch(s)
                                                                 for s in steps):
                 raise ValueError(f"schedule.prerequisites: bad nonblocking_steps in {p!r}")
+            match = p.get("match", DEFAULT_MATCH.get(p["routine"], "date"))
+            if match not in MATCHES:
+                raise ValueError(f"schedule.prerequisites: bad match in {p!r} (one of {', '.join(MATCHES)})")
+            wait = p.get("wait_running_s", DEFAULT_WAIT_S.get(p["routine"], 0.0))
+            if isinstance(wait, bool) or not isinstance(wait, (int, float)) or not 0 <= wait <= 4 * 3600:
+                raise ValueError(f"schedule.prerequisites: bad wait_running_s in {p!r} (0..14400 seconds)")
             out.append(Prereq(p["routine"], bool(p.get("same_night", True)),
                               float(age) if isinstance(age, (int, float)) and not isinstance(age, bool) else None,
-                              tuple(steps)))
+                              tuple(steps), match, float(wait)))
         else:
             raise ValueError(f"schedule.prerequisites: bad entry {p!r}")
     return tuple(out)
@@ -180,10 +204,19 @@ class Gate:
     reasons: list[str] = field(default_factory=list)
     causes: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    routines: list[str | None] = field(default_factory=list)   # the prerequisite each reason is about
+    waited_s: float = 0.0                                       # how long the night waited for a running routine
 
-    def block(self, reason: str, cause: str) -> None:
+    def block(self, reason: str, cause: str, routine: str | None = None) -> None:
         self.reasons.append(reason)
         self.causes.append(cause)
+        self.routines.append(routine)
+
+    def drop(self, routine: str) -> None:
+        keep = [i for i, r in enumerate(self.routines) if r != routine]
+        self.reasons = [self.reasons[i] for i in keep]
+        self.causes = [self.causes[i] for i in keep]
+        self.routines = [self.routines[i] for i in keep]
 
     def summary(self) -> str:
         if not self.causes:
@@ -208,7 +241,7 @@ def evaluate_prerequisites(log: Path, night: str, now: datetime, prereqs: Sequen
         r = p.routine
         mine = [x for x in runs if x.routine == r and x.started_at <= now]
         if not mine:
-            g.block(f"prerequisite {r}: no run in routines.log", f"prerequisite {r} has no run in routines.log")
+            g.block(f"prerequisite {r}: no run in routines.log", f"prerequisite {r} has no run in routines.log", r)
             continue
         last = max(mine, key=lambda x: (x.started_at, x.line_no))
         ts = last.started_at.strftime(TS_FORMAT)
@@ -225,16 +258,61 @@ def evaluate_prerequisites(log: Path, night: str, now: datetime, prereqs: Sequen
                 shown = blocking or fails
                 g.block(f"prerequisite {r}: last run {word} at {ts}" + (f" ({'; '.join(shown)})" if shown else ""),
                         f"prerequisite {r} failed (" + ("; ".join(shown) if shown
-                                                        else f"last run {word} at {ts}, no failed step named") + ")")
+                                                        else f"last run {word} at {ts}, no failed step named") + ")", r)
                 continue
         done = "PASS" if not tolerated else "completed run"
-        if p.same_night and last.started_at.date() != _night_date(night):
+        if p.same_night and p.match == "night_key" and run_night_key(last.started_at) != night:
+            g.block(f"prerequisite {r}: no PASS for night {night} (last {done} {ts})",
+                    f"prerequisite {r} did not complete for night {night} (last {done} {ts})", r)
+        elif p.same_night and p.match != "night_key" and last.started_at.date() != _night_date(night):
             g.block(f"prerequisite {r}: no PASS on {night} (last {done} {ts})",
-                    f"prerequisite {r} did not complete on {night} (last {done} {ts})")
+                    f"prerequisite {r} did not complete on {night} (last {done} {ts})", r)
         if p.max_age_h is not None and now - last.started_at > timedelta(hours=p.max_age_h):
             g.block(f"prerequisite {r}: last {done} {ts} is older than {p.max_age_h:g}h",
-                    f"prerequisite {r} last completed at {ts}, more than {p.max_age_h:g}h ago")
+                    f"prerequisite {r} last completed at {ts}, more than {p.max_age_h:g}h ago", r)
     return g
+
+
+def run_night_key(ts: datetime) -> str:
+    """The night a routine run belongs to, in the run's own UTC offset (as written in routines.log): 12:00 to
+    11:59 the next day (rsi_approval.night_key)."""
+    return (ts - timedelta(hours=12)).strftime("%Y-%m-%d")
+
+
+def wait_for_prerequisites(log: Path, night: str, now: datetime, prereqs: Sequence[Prereq], *,
+                           poll_s: float = 60.0, sleep: Callable[[float], None] = time.sleep,
+                           clock: Callable[[], float] = time.monotonic) -> Gate:
+    """evaluate_prerequisites, but while a blocked prerequisite with `wait_s` > 0 is still running (its live
+    routines_log running marker), wait for it: re-read routines.log every `poll_s`, up to its `wait_s`. A routine
+    that finishes in time is judged on its new line (PASS, a tolerated FAIL, or a blocking FAIL). One still running
+    after `wait_s` blocks with a "still running" reason instead of its stale line's reason. A routine that is not
+    running (no marker, a dead pid) is judged at once: nothing to wait for."""
+    start = clock()
+    while True:
+        elapsed = clock() - start
+        at = now + timedelta(seconds=elapsed)
+        g = evaluate_prerequisites(log, night, at, prereqs)
+        g.waited_s = elapsed
+        waiting = [(p, info) for p in prereqs if p.wait_s > 0 and p.routine in g.routines
+                   for info in [RL.running(log, p.routine, at)] if info]
+        if not waiting:
+            return g
+        due = [(p, info) for p, info in waiting if elapsed >= p.wait_s]
+        if due:
+            for p, info in due:
+                g.drop(p.routine)
+                mins = f"{p.wait_s / 60:g} min"
+                g.block(f"prerequisite {p.routine}: still running after {mins} (started {info['started_at']}, "
+                        f"pid {info['pid']}); the night waited and did not run",
+                        f"prerequisite {p.routine} was still running after the night waited {mins}", p.routine)
+            return g
+        _err_line(f"night-job: waiting for {', '.join(p.routine for p, _ in waiting)} (running since "
+                  f"{waiting[0][1]['started_at']}; waited {int(elapsed)}s)")
+        sleep(max(0.0, min(poll_s, min(p.wait_s for p, _ in waiting) - elapsed)) or 0.01)
+
+
+def _err_line(msg: str) -> None:
+    print(f"amem: rsi {msg}", file=sys.stderr, flush=True)
 
 
 def check_prerequisites(log: Path, night: str, now: datetime, prereqs: Sequence[Prereq]) -> list[str]:
@@ -702,9 +780,11 @@ class Watchdog:
 def run_night_job(*, config_path: Path | None = None, night: str | None = None, now: datetime | None = None,
                   routines_log: Path | None = None, db_url: str | None = None, adapters: Any = None,
                   runner: Callable[..., Any] | None = None, watchdog: bool = True,
-                  write_log: bool = True) -> JobResult:
+                  write_log: bool = True, sleep: Callable[[float], None] = time.sleep,
+                  clock: Callable[[], float] = time.monotonic, poll_s: float = 60.0) -> JobResult:
     """The scheduled night (module docstring). `now` (tests, rehearsals) fixes the gate's clock and the log
-    line's timestamp; by default both are the real time."""
+    line's timestamp; by default both are the real time. `sleep`, `clock` and `poll_s` drive the gate's wait for a
+    prerequisite that is still running (wait_for_prerequisites)."""
     from agent_memory import rsi_night as N
     t0 = time.monotonic()
     fixed = now is not None
@@ -726,7 +806,9 @@ def run_night_job(*, config_path: Path | None = None, night: str | None = None, 
         res.status, res.items = "FAIL", [f"config: {_one_line(exc, 200)}"]
         return finish()
     res.fields["config"] = cfg.sha256[:12]
-    gate = evaluate_prerequisites(log, night, now, prereqs)
+    gate = wait_for_prerequisites(log, night, now, prereqs, poll_s=poll_s, sleep=sleep, clock=clock)
+    if gate.waited_s >= 1:
+        res.fields["waited_s"] = int(gate.waited_s)
     res.warnings = list(gate.warnings)
     if gate.reasons:
         res.status, res.items = "SKIP", gate.reasons
@@ -805,11 +887,12 @@ def run_brief_job(*, root: Path | None = None, night: str | None = None, now: da
                   routines_log: Path | None = None, out_dir: Path | None = None, db_url: str | None = None,
                   write_log: bool = True, wait_s: float = 0.0, poll_s: float = 60.0,
                   sleep: Callable[[float], None] = time.sleep, push: bool = False,
-                  notify: dict[str, str] | None = None) -> JobResult:
+                  notify: dict[str, str] | None = None, state: Path | None = None) -> JobResult:
     """The morning brief for the night key (default: the night that just ended) as markdown + JSON files in
     `out_dir` (default ~/.claude/parent/reports). Waits up to `wait_s` for the night to finish (its lock released
     and its report written). Stores the completed snapshot for Night Desk. With `push` (the scheduled CLI run),
-    one short phone push of the night's result when there is something to say (alerts.push_night)."""
+    the one morning push (alerts.push_morning): the night's result plus amem-daily's new escalations, safety slips
+    and last-day proposals; nothing when all of them are quiet. `state`: amem-daily's state file (pushed ids)."""
     from agent_memory import rsi_brief as BR
     t0 = time.monotonic()
     fixed = now is not None
@@ -861,7 +944,12 @@ def run_brief_job(*, root: Path | None = None, night: str | None = None, now: da
     if push:
         from agent_memory import alerts
         try:
-            res.fields["push"] = alerts.push_night(b, notify=notify)
+            sent, extra, problems = alerts.push_morning(b, notify=notify, db_url=db_url, state_file=state)
+            res.fields["push"] = sent
+            res.fields["escalations_new"] = len(extra.new_rows)
+            res.fields["safety"] = len(extra.safety)
+            res.fields["expiring"] = len(extra.expiring)
+            res.warnings += [f"push {_one_line(p, 200)}" for p in problems]   # a part left out is a warning
         except Exception as exc:  # the brief is written; a failed push is a note, not a failed brief
             res.fields["push"] = "error"
             res.items.append(f"push: {_one_line(exc, 160)}")
@@ -904,7 +992,7 @@ def cmd_night_job(args: argparse.Namespace) -> int:
 def cmd_brief_job(args: argparse.Namespace) -> int:
     res = run_brief_job(root=args.root.expanduser() if args.root else None, night=args.night, now=_now_arg(args.now),
                         routines_log=args.routines_log, out_dir=args.out, wait_s=args.wait_s,
-                        push=not args.no_push)
+                        push=not args.no_push, state=args.state)
     if args.json:
         print(json.dumps({"status": res.status, "night": res.night, "items": res.items, "fields": res.fields,
                           "report": res.report, "lines": res.lines}, sort_keys=True, default=str))
@@ -924,7 +1012,8 @@ def register(sub: argparse._SubParsersAction) -> None:
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_night_job)
     p = sub.add_parser("brief-job", help="the scheduled morning brief: markdown + JSON in the reports dir, one "
-                                         "routines.log line, and a short phone push of the night's result")
+                                         "routines.log line, and the one morning push (the night's result, new "
+                                         "escalations, safety slips, last-day proposals)")
     p.add_argument("--root", type=Path, default=None, help="the RSI sandbox root (default RSI_SANDBOX_DIR or ~/sandbox)")
     p.add_argument("--night", default=None)
     p.add_argument("--now", default=None, help=argparse.SUPPRESS)
@@ -933,5 +1022,8 @@ def register(sub: argparse._SubParsersAction) -> None:
     p.add_argument("--wait-s", type=float, default=0.0,
                    help="wait up to this long for the night to finish (lock released, report written)")
     p.add_argument("--no-push", action="store_true", help="write the brief, send no phone push")
+    p.add_argument("--state", type=Path, default=None,
+                   help="amem-daily's state file, for the escalation ids already pushed (default AMEM_DAILY_STATE "
+                        "or ~/.claude/parent/amem-daily-state.json)")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_brief_job)
