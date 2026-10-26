@@ -1111,6 +1111,18 @@ def render_markdown(b: dict[str, Any]) -> str:
         out.append(f"- Warning: {w}")
     for w in b["health"]["warnings"]:
         out.append(f"- Warning: {w}")
+    review=b.get('telemetry_review')
+    if isinstance(review,dict):
+        out += ['', '## Deterministic daily telemetry', '',
+                f"Status: {text(review.get('status'))}. {text(review.get('detail'))}"]
+        if review.get('status')=='recorded':
+            out += [f"Stored window: {review.get('stored_spans')} spans and {review.get('stored_test_runs')} test runs. "
+                    "Captured rows are not all eligible source events. Cumulative work is not wall time.",
+                    f"Report: {text(review.get('report_ref'))}."]
+            for item in review.get('findings',[])[:5]:
+                out += ['- '+text(item.get('summary'),240),
+                        '  Evidence: '+', '.join(text(ref,140) for ref in item.get('evidence_refs',[])[:3]),
+                        '  Limit: '+text(item.get('limitation'),300)]
 
     s = b["sessions"]
     out += ["", "## Sessions analyzed", ""]

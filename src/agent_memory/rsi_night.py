@@ -777,6 +777,7 @@ class PackEvidence:
     def pack(self, candidate: Mapping[str, Any]) -> Any:
         mod = self._mod()
         kw = {"connect": self._connect} if self.db_url else {}     # no db_url: the store default, as the night
+        kw["current_instruction_sha256"] = current_target_sha(candidate)
         if self.retrievers is None:
             return mod.build_pack(candidate, **kw)
         rs = dict(self.retrievers)
@@ -791,6 +792,19 @@ class PackEvidence:
 
 def _sha16(s: str) -> str:
     return hashlib.sha256(s.encode()).hexdigest()[:16]
+
+
+def current_target_sha(candidate: Mapping[str, Any]) -> str | None:
+    target = candidate.get("target")
+    if not isinstance(target, str):
+        return None
+    try:
+        path = rsi_targets.untilde(target)
+        if path.name.startswith('.env') or not ET.is_allowed(path) or path.stat().st_size > NEW_TEXT_MAX:
+            return None
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except (OSError, ValueError):
+        return None
 
 
 class FixtureHypothesizer:
@@ -2094,6 +2108,8 @@ class Night:
         the last sighted: sources are sighted in a fixed order, so `last_seen_at` favoured whichever came last."""
         assert self.conn is not None
         if not self.dry_run:
+            self._reconsider_production()
+        if not self.dry_run:
             for s in sightings:
                 self._sight(s)
         limit = int(self.cfg.candidates["max_considered"])
@@ -2155,6 +2171,33 @@ class Night:
         uncovered = [c for c in pool if not self._test_cases(c.get("target"))]
         return covered[:limit] + uncovered[:limit]
 
+    def _reconsider_production(self) -> None:
+        """A bounded advisory reopening policy. Keep total attempts/history;
+        only a materially new verified generation gets a named per-generation
+        allowance. No edit, proposal, promotion or Undo authorization here.
+        """
+        from agent_memory import production_feedback as PF
+        assert self.conn is not None
+        with self.conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("select * from rsi_candidates where status in ('tested','rejected') "
+                        "and target=any(%s) order by last_considered_at desc nulls last,id limit 20",
+                        (list(self.allowlist),))
+            candidates = [dict(r) for r in cur.fetchall()]
+        for candidate in candidates:
+            if not self._test_cases(candidate.get('target')):
+                continue
+            sha = current_target_sha(candidate)
+            bound = {**candidate, "rule_key": (candidate.get('meta') or {}).get('last_tested_rule_key') or candidate.get('rule_key')}
+            for finding in PF.for_candidate(self.conn, bound, sha):
+                decision = PF.reconsider(bound, finding, sha)
+                if decision.allowed:
+                    self._update_candidate(candidate['id'], status='new', reason='advisory feedback: '+decision.reason,
+                        meta={"production_feedback_reopened_generation": decision.generation,
+                              "generation_attempts": 0, "attempt_limit_scope": "verified_feedback_generation"})
+                    self.notes.append(f"candidate {candidate['dedupe_key']}: advisory reconsideration {decision.reason}; "
+                                      f"evidence {finding['ref']}"[:300])
+                    break
+
     def _test_cases(self, target: str | None) -> list[str]:
         """Replay cases (the night's `replay.cases`, default all of bench/rsi-replay) that declare `target`. Path
         only: the artifact's kind is checked again by the replay. A bench that does not load covers nothing."""
@@ -2214,6 +2257,19 @@ class Night:
                     "update rsi_candidates set status = %s, rank = %s, jev = %s, decided_reason = %s, "
                     "last_considered_at = now() where id = %s",
                     ("selected" if selected else "deferred", r, Jsonb(c["jev"]), reason[:300], c["id"]))
+                from agent_memory import production_feedback as PF
+                sha = current_target_sha(c)
+                bound = {**c, 'rule_key': (c.get('meta') or {}).get('last_tested_rule_key') or c.get('rule_key')}
+                observations = PF.for_candidate(self.conn, bound, sha)
+                reopened = (c.get('meta') or {}).get('production_feedback_reopened_generation')
+                valid = next((x for x in observations if x['status']=='ok' and x['metrics'].get('generation')==reopened), None)
+                valid = valid or next((x for x in observations if x['status']=='ok'), None)
+                if valid:
+                    metrics = valid['metrics']
+                    extra = {'production_feedback_generation': metrics['generation'],
+                             'production_feedback_sessions_after': metrics['measurements']['sessions_after']}
+                    self._update_candidate(c['id'], meta=extra)
+                    c['meta'] = {**(c.get('meta') or {}), **extra}
             tests = self._test_cases(c.get("target"))
             self.report["candidates"].append({"id": str(c.get("id")) if c.get("id") else None, "key": c["dedupe_key"],
                                               "source": c["source"], "rank": r, "selected": selected, "reason": reason,
@@ -2232,6 +2288,7 @@ class Night:
         assert self.conn is not None
         cand = {k: c.get(k) for k in ("id", "dedupe_key", "source", "kind", "target", "rule_key", "evidence_refs",
                                       "metrics", "seen_count")}
+        cand['rule_key'] = (c.get('meta') or {}).get('last_tested_rule_key') or cand.get('rule_key')
         cand["id"] = str(c["id"]) if c.get("id") else None
         # S4: a bounded evidence pack (untrusted data; it only reaches the model inside its envelope)
         refs = list(c.get("evidence_refs") or [])[:20]
@@ -2297,11 +2354,13 @@ class Night:
         if not hyps:
             # Counted as an attempt: a candidate that never yields a usable hypothesis retires (it returns as
             # `new` when it is seen again) instead of costing a model call every night.
-            attempts = int(meta.get("attempts") or 0) + 1
+            generation = meta.get('attempt_limit_scope') == 'verified_feedback_generation'
+            attempts = int(meta.get('generation_attempts' if generation else 'attempts') or 0) + 1
             final = attempts >= int(self.cfg.candidates["max_attempts"])
             self._update_candidate(c["id"], status="retired" if final else "deferred",
                                    reason="no valid hypothesis" + (" (retired until seen again)" if final else ""),
-                                   meta={"pending_hypotheses": [], "attempts": attempts})
+                                   meta={"pending_hypotheses": [], "attempts": int(meta.get('attempts') or 0)+1,
+                                         **({'generation_attempts':attempts} if generation else {})})
             return
         for i, h in enumerate(hyps):
             later = hyps[i + 1:]
@@ -2400,6 +2459,17 @@ class Night:
             self.notes.append(f"experiment {exp_id}: attempt identities not recorded ({type(exc).__name__}); "
                               "amem coverage repair-links rebuilds them"[:300])
 
+    def _record_evaluations(self, exp_id: str, adir: Path, intended: bool) -> None:
+        from agent_memory import replay_evidence
+        assert self.conn is not None
+        try:
+            with self.conn.transaction():
+                result = replay_evidence.register_evaluations(self.conn, adir, exp_id)
+                self.conn.execute("update rsi_experiments set meta=meta || %s where id=%s",
+                                  (Jsonb({'replay_ingestion': result, 'intended_intervention': intended}), exp_id))
+        except (OSError, ValueError, psycopg.Error, RA.ArtifactError) as exc:
+            self.notes.append(f"experiment {exp_id}: replay evaluation evidence not ingested ({type(exc).__name__})"[:300])
+
     def _experiment(self, c: dict[str, Any], h: Hypothesis, refs: list[str], later: list[Hypothesis]) -> None:
         assert self.conn is not None
         exp_id = self._exp_id(c["dedupe_key"])
@@ -2411,7 +2481,9 @@ class Night:
         self.conn.execute("insert into rsi_experiments (id, night, kind, hypothesis, status, meta) "
                           "values (%s, %s, 'edit_instruction', %s, 'running', %s)",
                           (exp_id, self.night, Jsonb(h.as_dict()), Jsonb(base_meta)))
-        attempts = int((c.get("meta") or {}).get("attempts") or 0) + 1
+        previous_total = int((c.get("meta") or {}).get("attempts") or 0)
+        generation = (c.get("meta") or {}).get('attempt_limit_scope') == 'verified_feedback_generation'
+        attempts = int((c.get("meta") or {}).get('generation_attempts' if generation else 'attempts') or 0) + 1
         pending = [x.as_dict() for x in later]
         row: dict[str, Any] = {"status": "failed", "verdict": None, "meta": {}}
         cand_status, cand_reason = "deferred", "experiment failed"
@@ -2472,6 +2544,13 @@ class Night:
                 verdict = "INCONCLUSIVE"
                 reasons = ["fallback_intervention:not_the_intended_writer_change", *reasons]
             entry["implementation"].update(intended_intervention=intended, replay_verdict=replay_verdict)
+            self._record_evaluations(exp_id, Path(st.artifact_dir or RA.artifacts_dir()/st.artifact_hash), intended)
+            tested = {'last_tested_instruction_sha256': hashlib.sha256(old.encode()).hexdigest()}
+            if impl.section_id:
+                tested['last_tested_rule_key'] = (str(c.get('rule_key') or c.get('dedupe_key'))+':'+impl.section_id
+                    if c.get('source')=='skill_scores' else str(c.get('rule_key') or '').removeprefix('dev:'))
+            self._update_candidate(c['id'], meta=tested)
+            c['meta'] = {**(c.get('meta') or {}), **tested}
             entry.update(verdict=verdict, verdict_reasons=reasons[:20],
                          arms={"A": dict(rr.arms.get("A") or {}), "B": dict(rr.arms.get("B") or {})},
                          judge=_summary(getattr(rr, "judge", None), JUDGE_KEYS),
@@ -2544,10 +2623,12 @@ class Night:
             counted = attempts - 1 if stopped else attempts
             if stopped:
                 pending = [h.as_dict()] + pending
+            total = previous_total + (0 if stopped else 1)
+            generation_fields = {'generation_attempts': counted} if generation else {}
             self._update_candidate(c["id"], status=cand_status, reason=cand_reason,
-                                   meta={"attempts": counted, "history": hist, "pending_hypotheses": pending,
+                                   meta={"attempts": total, **generation_fields, "history": hist, "pending_hypotheses": pending,
                                          "last_experiment": exp_id})
-            c["meta"] = {**(c.get("meta") or {}), "attempts": counted, "history": hist}
+            c["meta"] = {**(c.get("meta") or {}), "attempts": total, **generation_fields, "history": hist}
 
     # -- unwinding, S9, the report ----------------------------------------------------------------------
     def _reap_tonight(self) -> None:
@@ -2629,6 +2710,23 @@ class Night:
         try:
             reason = self.notes[-1] if self.notes else status
             self.report["coverage"], problems = self._cov().write(self.conn, status=status, reason=reason)
+            summary = self.report['coverage']
+            if summary.get('enabled'):
+                from agent_memory import coverage as CV, replay_evidence
+                summary['required'] = list(dict.fromkeys([*summary.get('required',[]), *NC.REPLAY_REQUIRED]))
+                records = replay_evidence.night_records(self.conn,night=self.night,
+                    start=_parse_ts(self.report['started_at']),end=_parse_ts(self.report['finished_at']))
+                for record in records:
+                    errors = CV.record_best_effort(self.conn,[record])
+                    if errors:
+                        problems += errors
+                        summary['failed'] += len(errors)
+                        continue
+                    key = 'consumption' if isinstance(record,CV.Consumption) else 'snapshots'
+                    label = record.resolved_status()
+                    summary[key][label] = summary[key].get(label,0)+1
+                    if isinstance(record,CV.Consumption):
+                        summary['datasets'][record.dataset] = label
         except Exception as exc:  # noqa: BLE001 - coverage never fails the night it describes
             problems = [f"coverage not recorded: {type(exc).__name__}: {str(exc)[:160]}"]
         if problems:

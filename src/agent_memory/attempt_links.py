@@ -145,7 +145,9 @@ def record_native_session(conn: psycopg.Connection, attempt: Attempt, a: Mapping
     metadata = {"source": "rsi-native-session/1", "rsi_native_observation": True,
                 "env": "sandbox", "experiment_id": attempt.experiment_id,
                 "attempt_ref": attempt.key, "native_identity_source": "trusted_client_response",
-                "transcript_available": False, "acceptance": "unverified"}
+                "transcript_available": False, "acceptance": "unverified",
+                "execution_result": "failed" if a.get('error') else "completed",
+                "model_authority": "requested_configuration" if a.get('error') else "verified_client_response"}
     conn.execute("""insert into sessions(session_id,tool,kind,project_dir,env,experiment_id,
                     started_at,ended_at,duration_seconds,model,meta)
                     values(%s,%s,'headless','rsi-native-session','sandbox',%s,%s,%s,%s,%s,%s)
@@ -167,7 +169,8 @@ def record_runner(conn: psycopg.Connection, attempts: Iterable[Mapping[str, Any]
     n = 0
     for a in attempts:
         at = Attempt(str(a["experiment_id"]), str(a["arm"]), str(a["case"]), int(a["rep"]), a.get("profile") or None)
-        ev = {"replay_record": a.get("replay_record"), **({"run_error": True} if a.get("error") else {})}
+        ev = {"replay_record": a.get("replay_record"), **({"run_error": True} if a.get("error") else {}),
+              **({"provider": a['agent']} if a.get('agent') in ('claude','codex') else {})}
         native = native_session_id(a.get("agent"), a.get("native_session_id"))
         sid = None
         if native:

@@ -56,7 +56,7 @@ def test_nonempty_analysis_has_refs_limits_and_explicit_denominators(db):
         r.validate()
     with psycopg.connect(db) as c:
         assert CV.record_best_effort(c,records)==[]
-        assert c.execute("select count(*) from routine_consumption where run_key='nonempty'").fetchone()[0]==2
+        assert c.execute("select count(*) from routine_consumption where run_key='nonempty'").fetchone()[0]==3
         assert c.execute("select status from coverage_snapshots where dataset='command_timings:execution_spans'").fetchone()[0]=='collected_unlinked'
 
 
@@ -67,3 +67,13 @@ def test_report_save_contains_no_full_test_logs_or_commands(db,tmp_path):
     text=path.with_suffix('.md').read_text()
     assert 'cumulative' in text and 'not wall time' in text and 'Evidence:' in text
     assert 'unnecessary reruns' in text  # explicitly warns against that interpretation
+
+
+def test_morning_review_distinguishes_recent_stale_and_missing(db,tmp_path):
+    report=A.run(db_url=db,now=NOW)
+    A.save(report,tmp_path)
+    current=A.daily_review(tmp_path,now=NOW+timedelta(hours=1))
+    assert current['status']=='recorded' and current['scope']=='stored_rows_only'
+    assert current['stored_spans']==2 and all(f['evidence_refs'] for f in current['findings'])
+    assert A.daily_review(tmp_path,now=NOW+timedelta(hours=27))['status']=='stale'
+    assert A.daily_review(tmp_path/'missing',now=NOW)['status']=='unavailable'

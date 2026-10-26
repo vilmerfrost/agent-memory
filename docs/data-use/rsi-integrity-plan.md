@@ -1,6 +1,6 @@
 # RSI integrity implementation plan — 2026-10-26
 
-Authority: implement, test and commit locally; no push. Preserve the frozen/gated promotion loop, existing cash cap and stronger models. No full paid night/replay, provider write probe, production backfill or unrelated configuration change. New local commits are not active in tonight's installed main-checkout job until separately authorized publication/deployment.
+Authority: implement, test and commit. The initial no-push instruction was superseded by Vilmer: "push them to main when ready so your changes go live". Publish after the clean integration gate through the normal protected-branch workflow, update the live main checkout and reload the affected timing collector. Preserve the frozen/gated promotion loop, existing cash cap and stronger models. No full paid night/replay, provider write probe, manual production backfill or unrelated configuration change. Publication does not establish future scheduled success.
 
 Baseline: integration 7616f84, identical tree to main 1dd94a5 (PR #70 attempt logs). Existing unrelated main .gitignore/docs/ideas work is preserved. Inputs are the full source recon and live addendum under ~/.local/state/recon/runs/agent-memory-d623eb54/.
 

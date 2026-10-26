@@ -34,9 +34,17 @@ def register_evaluations(conn, adir: Path, experiment_id: str) -> dict[str, Any]
     """
     if adir.is_symlink() or (adir / "manifest.json").is_symlink():
         raise RA.ArtifactError("symlinked artifact metadata")
-    manifest, digest, _ = RA.load_artifact(adir)
-    if any((adir / "files" / f['after_sha256']).is_symlink() for f in manifest['files']):
+    if (adir/'files').is_symlink():
+        raise RA.ArtifactError("symlinked artifact content directory")
+    try:
+        header=json.loads((adir/'manifest.json').read_bytes())
+    except (OSError,ValueError):
+        raise RA.ArtifactError('unreadable artifact metadata') from None
+    files=header.get('files',[]) if isinstance(header,dict) else []
+    if any(isinstance(f,dict) and RA.HEX64.fullmatch(str(f.get('after_sha256','')))
+           and (adir/'files'/f['after_sha256']).is_symlink() for f in files):
         raise RA.ArtifactError("symlinked artifact content")
+    manifest, digest, _ = RA.load_artifact(adir)
     if manifest.get("experiment_id") != experiment_id:
         raise RA.ArtifactError("replay artifact belongs to another experiment")
     records = RA.eval_records(adir)
@@ -104,7 +112,8 @@ def ingest(conn, *, root: Path | None = None, limit: int = 100) -> Report:
                 with conn.transaction():
                     report.attempts += AL.record_runner(conn, [data], source="repair")
                 linked = conn.execute("select session_id from rsi_attempts where id=%s", (at.key,)).fetchone()
-                if linked and linked[0]:
+                native=AL.native_session_id(data['agent'],data['native_session_id'])
+                if linked and linked[0] and native and linked[0]==native:
                     report.native_sessions += 1
                 else:
                     report.unresolved_native += 1
@@ -117,3 +126,57 @@ def ingest(conn, *, root: Path | None = None, limit: int = 100) -> Report:
 def run(*, root: Path | None = None, db_url: str | None = None, limit: int = 100) -> Report:
     with store.connect(db_url) as conn:
         return ingest(conn, root=root, limit=limit)
+
+
+def night_records(conn, *, night: str, start, end):
+    """Expected completed replays, not just rows already in the eval table,
+    provide the denominator. An empty eval table is not automatically healthy.
+    """
+    from agent_memory import coverage as CV
+    from agent_memory.integrations import refs
+    experiments = conn.execute("select id,meta from rsi_experiments where night=%s and status='evaluated'", (night,)).fetchall()
+    good = 0
+    evidence = []
+    expected_clients = {}
+    for exp, meta in experiments:
+        suites = {r[0] for r in conn.execute("select suite from rsi_eval_results where experiment_id=%s "
+                                           "and suite like 'sandbox-replay%%'", (exp,))}
+        providers = [p.get('provider') for p in meta.get('provider_results', []) if isinstance(p, dict) and p.get('provider')]
+        count = 0
+        for provider in meta.get('provider_results', []):
+            if isinstance(provider, dict) and provider.get('provider') in ('claude','codex'):
+                for arm in (provider.get('arms') or {}).values():
+                    runs = arm.get('runs') if isinstance(arm, dict) else None
+                    count += runs if isinstance(runs,int) and not isinstance(runs,bool) and runs>=0 else 0
+        if not providers and (meta.get('test_setup') or {}).get('agent') in ('claude','codex'):
+            count = meta.get('replay_runs') if isinstance(meta.get('replay_runs'),int) else 0
+        expected_clients[exp] = count
+        expected = {'sandbox-replay-'+p for p in providers} if providers else {'sandbox-replay'}
+        good += expected <= suites
+        evidence.append(refs.amem('experiment',exp))
+    n = len(experiments)
+    attempts = conn.execute("""select e.id,count(*),count(s.session_id)
+        from rsi_attempts a join rsi_experiments e on e.id=a.experiment_id
+        left join sessions s on s.session_id=a.session_id and s.env='sandbox' and s.experiment_id=a.experiment_id
+          and a.evidence->>'native_identity_source'='trusted_client_response'
+        where e.night=%s and (a.profile in ('claude','codex') or a.evidence->>'provider' in ('claude','codex'))
+        group by e.id""", (night,)).fetchall()
+    captured = {exp:(int(n),int(linked)) for exp,n,linked in attempts}
+    native_total = sum(max(expected_clients.get(exp,0),captured.get(exp,(0,0))[0])
+                       for exp in set(expected_clients)|set(captured))
+    native_collected = sum(n for n,_ in captured.values())
+    native_linked = sum(linked for _,linked in captured.values())
+    records = []
+    for dataset,total,collected,linked,detail in (
+            ('experiments:replay-evidence',n,int(good),int(good),'completed replay experiments with all expected provider suites'),
+            ('experiments:native-attempt-sessions',native_total,native_collected,native_linked,
+             'real-client attempt observations with explicit native session identity; stub/eval harness excluded')):
+        gaps = total-linked
+        records += [CV.Snapshot(dataset,start,end,detail,total,collected,linked,collected-linked,
+                                measured_fields=('expected_population','exact_linkage'), last_analysed_at=end,
+                                source_versions={'collector':'replay-evidence/1'}),
+                    CV.Consumption('amem-rsi-night',night,dataset,'replay-evidence/1',start,end,
+                                   queried=total,considered=total,used=total,findings=gaps,
+                                   evidence_refs=evidence[:20] if total else (),
+                                   detail=f'{linked}/{total} expected observations linked; missing stays unknown')]
+    return records

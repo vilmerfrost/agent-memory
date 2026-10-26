@@ -114,11 +114,31 @@ def analyze(conn, *, now: datetime | None = None, days: int = 7, limit: int = 5)
                 "and later external checks may be unknown.", "coordination:sessions")
     freshness = _rows(conn, """select job,run_key,status,finished_at,meta->>'last_ok_at' as last_ok_at
         from rsi_checkpoints where job like 'sync:%%' or job='skills-refresh' order by job,finished_at desc limit 20""")
+    checkpoint_total = conn.execute("select count(*) from rsi_checkpoints where job like 'sync:%%' or job='skills-refresh'").fetchone()[0]
+    unknown_clock = 0
+    for checkpoint in freshness:
+        at = checkpoint['last_ok_at'] if checkpoint['job'].startswith('sync:') else checkpoint['finished_at']
+        try:
+            at = datetime.fromisoformat(at.replace('Z','+00:00')) if isinstance(at,str) else at
+            if at is None or at.tzinfo is None or at>now:
+                unknown_clock += 1
+                continue
+        except (ValueError,TypeError):
+            unknown_clock += 1
+            continue
+        age=(now-at).total_seconds()/3600
+        if checkpoint['status']=='failed' or age>26:
+            finding('collector_freshness_review',f"{checkpoint['job']} checkpoint is {age:.1f} hours old; recorded state {checkpoint['status']}",
+                    [f"rsi_checkpoints:{checkpoint['job']}/{checkpoint['run_key']}"],
+                    'A 26-hour daily-cadence review threshold, not proof the collector is broken. Acknowledged sync is not independent sink readback.',
+                    'reports_checkpoints:rsi_checkpoints')
     return {"format": FORMAT, "observed_at": now.isoformat(), "window_start": since.isoformat(),
             "window_end": now.isoformat(), "scope": "stored_rows_only", "days": days,
             "span_coverage": quality, "test_coverage": tests, "operations": operations, "slow_tests": slow,
             "repeat_groups": repeats, "parents": parents, "completion_review": contradictions,
             "collector_checkpoints": freshness, "findings": findings,
+            "checkpoint_coverage": {'stored':checkpoint_total,'captured':len(freshness),'session_resolved':len(freshness),
+                                    'unknown_clock':unknown_clock,'scope':'current_state_at_observed_at'},
             "limitations": ["No model calls", "No hidden reasoning", "No automatic promotion or Undo",
                             "Captured populations are not all eligible source events",
                             "Stored sync success is not independent external readback"]}
@@ -128,18 +148,25 @@ def records(report: dict[str, Any], *, run_key: str) -> list[Any]:
     start, end = datetime.fromisoformat(report['window_start']), datetime.fromisoformat(report['window_end'])
     result = []
     for dataset, group in (("command_timings:execution_spans", report['span_coverage']),
-                           ("test_timings:test_timing_runs", report['test_coverage'])):
+                           ("test_timings:test_timing_runs", report['test_coverage']),
+                           ('reports_checkpoints:rsi_checkpoints',report['checkpoint_coverage'])):
         n, linked = int(group['stored']), int(group['session_resolved'])
+        captured = int(group.get('captured',n))
         missing = (group.get('duration_known', n) != n or group.get('incomplete', 0) > 0
-                   or group.get('expired_details', 0) > 0)
+                   or group.get('expired_details', 0) > 0 or group.get('unknown_clock',0)>0)
         findings = [f for f in report['findings'] if f['dataset'] == dataset]
-        result += [CV.Snapshot(dataset, start, end, "stored rows in the explicit deterministic analysis window",
-                               n, n, linked, n-linked, measured_fields=("stored_count", "session_linkage"),
+        scope = ("stored current collector checkpoints; bounded capture, independent of the analysis window"
+                 if dataset == "reports_checkpoints:rsi_checkpoints" else
+                 "stored rows in the explicit deterministic analysis window")
+        fields = (("stored_count", "checkpoint_identity", "freshness")
+                  if dataset == "reports_checkpoints:rsi_checkpoints" else ("stored_count", "session_linkage"))
+        result += [CV.Snapshot(dataset, start, end, scope,
+                               n, captured, linked, captured-linked, measured_fields=fields,
                                unmeasured_fields=("some_required_measurements",) if missing else (),
                                last_collected_at=group.get('last_ingest'), last_analysed_at=end,
                                source_versions={"analysis": FORMAT}),
                    CV.Consumption("amem-daily", run_key, dataset, FORMAT, start, end,
-                                  queried=n, considered=n, used=n, findings=len(findings),
+                                  queried=captured, considered=captured, used=captured, findings=len(findings),
                                   detail="Bounded deterministic review; stored-row denominator, no causal verdict")]
     return result
 
@@ -168,3 +195,31 @@ def save(report: dict[str, Any], directory: Path) -> Path:
     data.write_text(json.dumps(report, sort_keys=True, default=str)+"\n")
     (directory/(stem+".md")).write_text(render(report))
     return data
+
+
+def daily_review(directory: Path, *, now: datetime) -> dict[str, Any]:
+    """Morning brief reads a bounded recent daily report; never promotes a
+    missing/stale/invalid file into an all-clear conclusion.
+    """
+    files = sorted(directory.glob('telemetry-analysis-*.json'))[-2:]
+    for path in reversed(files):
+        try:
+            if path.is_symlink() or path.stat().st_size > 2_000_000:
+                continue
+            report = json.loads(path.read_text())
+            observed = datetime.fromisoformat(report['observed_at'])
+            if report.get('format') != FORMAT or observed.tzinfo is None:
+                continue
+            if observed > now or now-observed > timedelta(hours=26):
+                return {'status':'stale','detail':'daily measurement window is stale or in the future','report_ref':path.name}
+            findings = []
+            for item in report.get('findings',[])[:5]:
+                if isinstance(item,dict) and item.get('evidence_refs') and item.get('limitation'):
+                    findings.append({k:item[k] for k in ('summary','evidence_refs','limitation')})
+            return {'status':'recorded','report_ref':path.name,'observed_at':observed.isoformat(),
+                    'scope':'stored_rows_only','stored_spans':report['span_coverage']['stored'],
+                    'stored_test_runs':report['test_coverage']['stored'],'findings':findings,
+                    'detail':'Bounded review leads, not causal or task-acceptance verdicts'}
+        except (OSError,ValueError,KeyError,TypeError):
+            continue
+    return {'status':'unavailable','detail':'daily telemetry report not recorded or unreadable; not an all clear'}

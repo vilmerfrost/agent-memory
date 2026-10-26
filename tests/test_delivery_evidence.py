@@ -7,6 +7,16 @@ from datetime import UTC, datetime
 import pytest
 
 from agent_memory import amem_digest as D
+
+
+@pytest.mark.parametrize('command',[
+    'cd /repo && git push -n', 'git push --delete origin feature',
+    'git push origin :feature', 'gh pr merge 12 --disable-auto',
+    'gh pr merge 12 --auto=true', 'railway up -d',
+])
+def test_successful_non_delivery_or_async_operations_are_not_delivery(command):
+    result=D.confirmed_operation_signals(D.operation_calls(command),True,'Exit code: 0')
+    assert result and all(r.startswith('unknown_') for r in result)
 from test_deviations_support import assistant, result, text, tool
 
 

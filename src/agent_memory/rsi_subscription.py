@@ -38,6 +38,10 @@ BRIDGE_PATH = Path(__file__).resolve().parents[2] / "sandbox" / "subscription_to
 class SubscriptionError(RuntimeError):
     """Fixed, secret-free error code; never include raw client errors."""
 
+    def __init__(self, code: str, *, native_session_id: str | None = None):
+        super().__init__(code)
+        self.native_session_id = native_session_id
+
 
 @dataclass(frozen=True)
 class SubscriptionAuth:
@@ -196,10 +200,12 @@ def _parse_claude(raw: str, *, model: str, tools_allowed: bool) -> tuple[str, di
             result = msg
             if isinstance(msg.get("session_id"), str):
                 native_ids.add(msg["session_id"])
+    from agent_memory.attempt_links import native_session_id
+    native = native_session_id("claude", next(iter(native_ids))) if len(native_ids) == 1 else None
     if not initialized or result is None:
-        raise SubscriptionError("client_completion_missing")
+        raise SubscriptionError("client_completion_missing",native_session_id=native if initialized else None)
     if result.get("is_error") or result.get("subtype") != "success":
-        raise SubscriptionError("client_run_failed")
+        raise SubscriptionError("client_run_failed",native_session_id=native)
     if result.get("permission_denials"):
         raise SubscriptionError("client_tool_permission_denied")
     models = result.get("modelUsage")
@@ -212,8 +218,6 @@ def _parse_claude(raw: str, *, model: str, tools_allowed: bool) -> tuple[str, di
     names = ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
     usage = {key: val for key, val in (result.get("usage") or {}).items()
              if key in names and isinstance(val, int) and not isinstance(val, bool) and val >= 0}
-    from agent_memory.attempt_links import native_session_id
-    native = native_session_id("claude", next(iter(native_ids))) if len(native_ids) == 1 else None
     return value, usage, {"model_verified": True, "reported_model": model,
                           "effort_verification": "explicit_client_option",
                           "tool_use_count": tool_count,
@@ -616,7 +620,7 @@ def _codex_session(rpc, *, model, effort, prompt, cwd, bridge_tools):
         elif method == "turn/completed":
             completed = params.get("turn") or {}
             if params.get("threadId") != thread_id or completed.get("id") != turn_id or completed.get("status") != "completed":
-                raise SubscriptionError("client_run_failed")
+                raise SubscriptionError("client_run_failed",native_session_id="codex:"+thread_id)
             if not text_parts:
                 raise SubscriptionError("client_result_missing")
             return "\n".join(text_parts), usage, {"auth_method": "chatgpt", "subscription_type": account.get("planType"),
@@ -626,4 +630,4 @@ def _codex_session(rpc, *, model, effort, prompt, cwd, bridge_tools):
                 "native_session_id": "codex:" + thread_id,
                 "native_identity_source": "thread_start_response", "native_turn_id": turn_id}
         elif method == "error":
-            raise SubscriptionError("client_run_failed")
+            raise SubscriptionError("client_run_failed",native_session_id="codex:"+thread_id)

@@ -327,8 +327,9 @@ def otlp_spans(payload: Any) -> list[Span]:
                 # legacy events keep the previous key contract.
                 request_id = identity(attrs.get("request.id") or attrs.get("request_id"))
                 trace, native_span = identity(rec.get("traceId")), identity(rec.get("spanId"))
-                span_id = (key("codex.otel.request/2", name, request_id, trace, native_span, clock_key,
-                               elapsed, attrs.get("attempt")) if request_id or (trace and native_span)
+                native_trace = bool(trace and native_span and trace.strip('0') and native_span.strip('0'))
+                span_id = (key("codex.otel.request/2", name, request_id, trace, native_span,
+                               attrs.get("attempt")) if request_id or native_trace
                            else key(session, name, clock_key, rec.get("traceId"), rec.get("spanId"), elapsed, meta))
                 success = attrs.get("success")
                 http = str(attrs.get("status") or "")

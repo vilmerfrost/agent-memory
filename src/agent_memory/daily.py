@@ -712,12 +712,16 @@ def step_observations(result: DailyResult, *, now: datetime, reports_dir: Path) 
     try:
         recovered = replay_evidence.run(limit=100)
         result.replay_observations = recovered.as_dict()
+        if recovered.missing_artifacts or recovered.unresolved_native:
+            result.warn(f"replay evidence: artifacts_missing={recovered.missing_artifacts} "
+                        f"native_sessions_unresolved={recovered.unresolved_native}; historical gaps are not guessed")
         for failure in recovered.failures[:5]:
             result.coverage_notes.append("replay evidence: " + failure)
     except Exception as exc:
         result.coverage_notes.append(f"replay evidence: analysis_failed ({type(exc).__name__})")
     try:
         report = TA.run(now=now, days=7, limit=5)
+        report['replay_evidence'] = result.replay_observations
         path = TA.save(report, reports_dir)
         result.telemetry = {"format": TA.FORMAT, "findings": len(report['findings']),
                             "stored_spans": report['span_coverage']['stored'],
@@ -725,7 +729,7 @@ def step_observations(result: DailyResult, *, now: datetime, reports_dir: Path) 
         result.coverage.extend(TA.records(report, run_key=run_key(now)))
     except Exception as exc:
         result.coverage_notes.append(f"telemetry analysis: analysis_failed ({type(exc).__name__})")
-        for dataset in ("command_timings:execution_spans", "test_timings:test_timing_runs"):
+        for dataset in ("command_timings:execution_spans", "test_timings:test_timing_runs",'reports_checkpoints:rsi_checkpoints'):
             result.coverage += [CV.Snapshot(dataset, now-timedelta(days=7), now,
                                            "stored rows in explicit analysis window; query failed", None),
                                CV.Consumption(NAME, run_key(now), dataset, TA.FORMAT,

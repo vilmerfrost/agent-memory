@@ -750,9 +750,12 @@ def operation_calls(command: str, *, background: bool = False) -> list[dict[str,
         return []
     segs = segments(command)
     certain = not background and all(op in (None, "&&") for _, op in segs)
-    asynchronous = bool(re.search(r"(?:^|\s)(?:--dry-run|--no-wait|--detach|--detached|--auto|--no-commit)(?:\s|$)", command))
-    if re.search(_PUSH_RE, command) and re.search(r"(?:^|\s)-n(?:\s|$)", command):
-        asynchronous = True
+    asynchronous = bool(re.search(r"(?:^|\s)(?:--dry-run|--no-wait|--detach|--detached|--auto|--no-commit|--disable-auto)(?:=(?:true|1))?(?:\s|$)", command))
+    for segment, _ in segs:
+        if _PUSH_RE.search(segment) and (re.search(r"(?:^|\s)-[A-Za-z]*[nd][A-Za-z]*(?:\s|$)|--delete\b|(?:^|[\s'\"]):[^\s]+", segment)):
+            asynchronous = True  # dry run or deletion, even after `cd ... &&`
+        if re.search(_START+r"railway\s+up\b", segment) and re.search(r"(?:^|\s)-d(?:\s|$)", segment):
+            asynchronous = True
     how = COMMIT_BACKGROUND if background else (COMMIT_CERTAIN if certain and not asynchronous else COMMIT_UNSURE)
     return [{"signal": n, "how": how} for n in names]
 

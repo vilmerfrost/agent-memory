@@ -5,6 +5,8 @@ import json
 from pathlib import Path
 
 import psycopg
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
 
 from agent_memory import tasks_ingest as T
 from test_scoring_support import ScoringDb, sdb  # noqa: F401
@@ -74,6 +76,23 @@ def test_worker_lifecycle_fields_are_preserved_not_reconstructed(tmp_path):
     assert first["completed_at"] is None  # a report is not an independently observed completion
     assert first["info_pushes"] == 2 and first["denials_by"] == {"hook": 1}
     assert unknown["spawned_at"] is None and unknown["reported_at"] is None
+
+
+def test_concurrent_first_insert_keeps_both_source_observations(sdb: ScoringDb,tmp_path):
+    repo=tmp_path/'r';repo.mkdir()
+    partial=T.task_run(task('concurrent'),repo,repo/'tasks.jsonl',1)
+    done=T.task_run(task('concurrent',final_status='DONE',recorded='2026-10-26T10:05:00Z'),repo,repo/'tasks.jsonl',2)
+    barrier=Barrier(2)
+    def ingest(row):
+        barrier.wait(timeout=10)
+        return T.ingest([row],db_url=sdb.url)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        list(pool.map(ingest,[partial,done]))
+    with psycopg.connect(sdb.url) as c:
+        records=c.execute("select status,meta from runs where source_key=%s",(partial.source_key,)).fetchall()
+    assert len(records)==1 and records[0][0]=='pass'
+    assert len(records[0][1]['observations'])==2
+    assert records[0][1]['acceptance']=='unknown'
 
 
 def test_ingest_preserves_attempt_history_and_is_idempotent(sdb: ScoringDb, tmp_path):  # noqa: F811

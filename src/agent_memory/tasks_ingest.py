@@ -354,12 +354,17 @@ def task_run(obj: Any, repo_dir: Path, path: Path, line_no: int) -> TaskRun | No
     meta["reported_result"] = final_status
     meta["acceptance"] = "unknown"
     observed = parse_ts(obj.get("recorded")) or parse_ts(obj.get("ended")) or parse_ts(obj.get("started"))
+    meta['observation_time_basis'] = ('recorded' if parse_ts(obj.get('recorded')) else
+                                     'ended_proxy' if parse_ts(obj.get('ended')) else
+                                     'started_proxy' if parse_ts(obj.get('started')) else 'unknown')
+    meta['projection_policy'] = 'source_time_then_status_priority_not_acceptance'
     meta["source_observed_at"] = observed.astimezone(UTC).isoformat() if observed else None
     meta["source_record_sha"] = _content_sha(obj)
     meta["observations"] = {meta["source_record_sha"]: {
         "reported_result": final_status, "status": status,
         "observed_at": meta["source_observed_at"],
-        "worker_results": [{"agent_id": w["agent_id"], "final_status": w["final_status"]} for w in workers]}}
+        "time_basis": meta['observation_time_basis'],
+        "worker_results": [{k:w.get(k) for k in (*WORKER_STRS,'spawned_at','reported_at','span_ids')} for w in workers]}}
 
     started, finished = parse_ts(obj.get("started")), parse_ts(obj.get("ended"))
     summary = summary_line(repo, final_status, meta, workers, reasons)
@@ -447,6 +452,10 @@ def ingest(runs: list[TaskRun], *, db_url: str | None = None) -> IngestReport:
     """Upsert task rows keyed by source_key, in one transaction (Postgres only)."""
     report = IngestReport()
     with store.connect(db_url) as conn:
+        # Serialize the one dispatch collector transaction, including the first
+        # insert (a missing row cannot be SELECT FOR UPDATE locked). This avoids
+        # concurrent daily/ingest runs dropping each other's observation maps.
+        conn.execute("select pg_advisory_xact_lock(hashtextextended('amem:dispatch-ingest/v2',0))")
         for r in runs:
             # Lock the current attempt, including an exact matching legacy row.
             # Keep a legacy run's UUID/source key so scores/labels/refs remain valid.

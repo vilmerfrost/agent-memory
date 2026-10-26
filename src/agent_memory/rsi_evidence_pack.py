@@ -740,6 +740,8 @@ def _finding(raw: _Raw, found: set[str] | None, lim: PackLimits, c: _Cand | None
         status, authority, detail = "unlinked", None, "about another rule or target: context only"
     if ev.kind == "production-outcome":
         status, authority, detail = "unlinked", None, "production observation needs current-version and coverage validation"
+    if ev.metrics.get("intended_intervention") is False:
+        status, authority, detail = "unlinked", None, "fallback tested other bytes; artifact evidence only"
     m = _measure(ev.metrics)
     return Finding(raw.source, ev.ref, ev.observed_at, m, _n(ev.metrics), status, ev.kind, authority, raw.step.name,
                    _free(ev.summary, lim.text_max), detail)

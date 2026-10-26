@@ -998,11 +998,14 @@ def profile_values(profile: dict[str, Any] | None) -> dict[str, Any]:
 
 def outcome_values(signals: dict[str, int] | None, end: str | None, last: datetime | None,
                    now: datetime | None, kind: str | None = None,
-                   commits: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+                   commits: list[dict[str, Any]] | None = None, method_version: int = 2) -> dict[str, Any]:
     """`outcome` and `outcome_evidence`. The evidence gets `commits` (session_commits) when the
     session made any; the signal keys and `end` stay as outcome_of builds them."""
     if signals is None:
         return {"outcome": None, "outcome_evidence": None}
+    if method_version != 2:
+        return {"outcome": None, "outcome_evidence": Jsonb({"method_version": 1,
+                "legacy_signals": signals, "end": end, "acceptance": "unverified"})}
     name, evidence = session_tokens.outcome_of(signals, end, last, now, kind)
     if commits:
         evidence["commits"] = commits
@@ -1048,7 +1051,8 @@ def _params(r: SessionRow, now: datetime | None = None,
             "last_activity_at": last, "category": category, "project": project, "title": r.title,
             "instruction_sources": Jsonb(sources) if sources is not None else None,
             **env_values(r),
-            **profile_values(r.profile), **outcome_values(r.signals, r.end, last, now, r.kind, r.commits)}
+            **profile_values(r.profile), **outcome_values(r.signals, r.end, last, now, r.kind, r.commits,
+                                                        r.meta.get("outcome_method_version", 2))}
 
 
 def instruction_params(conn: Any, rows: list[SessionRow]) -> dict[str, tuple[list[dict[str, Any]], list[Any]]]:
@@ -1162,6 +1166,7 @@ def cloud_row(rec: dict[str, Any]) -> SessionRow | None:
         row.profile = cloud_profile(prof)
     out = src.get("outcome") if isinstance(src.get("outcome"), dict) else None
     if out is not None and isinstance(out.get("signals"), dict):
+        row.meta["outcome_method_version"] = 2 if out.get("method_version") == 2 else 1
         row.signals = {str(k): v for k, v in out["signals"].items()
                        if isinstance(v, int) and not isinstance(v, bool) and v > 0 and re.fullmatch(r"[a-z_]{1,30}", str(k))}
         row.end = out.get("end") if out.get("end") in ("reply", "user", "tool", "result", "error", "interrupt") else None
@@ -1275,8 +1280,20 @@ def stored_outcome(evidence: Any, last_at: datetime | None, now: datetime | None
     no background commit, the ingest's commits list does)."""
     if not isinstance(evidence, dict):
         return None
+    if evidence.get("method_version") != 2:
+        # Preserve the existing independently captured commit contract, but
+        # never reinterpret old push/deploy invocation counters as success.
+        commits = evidence.get("commits")
+        if isinstance(commits, list) and any(isinstance(c, dict) and
+                re.fullmatch(r"[0-9a-f]{7,40}", str(c.get("sha", ""))) for c in commits):
+            return "committed"
+        if not any(evidence.get(k) for k in ("commit", "push", "push_main", "pr_create", "pr_merge", "deploy", "merge_main")):
+            neutral = {k:v for k,v in evidence.items() if k not in ("method_version", "end")
+                       and isinstance(v,int) and not isinstance(v,bool)}
+            return session_tokens.outcome_of(neutral, evidence.get("end"), last_at, now, kind)[0]
+        return None
     signals = {str(k): v for k, v in evidence.items()
-               if k != "end" and isinstance(v, int) and not isinstance(v, bool)}
+               if k not in ("end", "method_version") and isinstance(v, int) and not isinstance(v, bool)}
     if not signals.get("commit") and isinstance(evidence.get("commits"), list) and evidence["commits"]:
         signals["commit"] = 1
     end = evidence.get("end") if isinstance(evidence.get("end"), str) else None
@@ -1294,7 +1311,9 @@ def refresh_stored(*, db_url: str | None = None, now: datetime | None = None) ->
             cur.execute(_STORED_SQL)
             recs = cur.fetchall()
         for rec in recs:
-            name = stored_outcome(rec["outcome_evidence"], rec["last_at"], now, rec["kind"])
+            evidence = rec["outcome_evidence"]
+            name = (stored_outcome(evidence, rec["last_at"], now, rec["kind"])
+                    if isinstance(evidence, dict) and evidence.get("method_version") == 2 else None)
             if name is not None and name != rec["outcome"]:
                 conn.execute("update sessions set outcome = %s, outcome_at = now() where session_id = %s",
                              (name, rec["session_id"]))

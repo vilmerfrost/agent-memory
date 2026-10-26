@@ -53,6 +53,10 @@ def test_request_identity_is_stable_when_explicit_actor_arrives_later():
     assert before.session_id is None and after.session_id == "codex:thread"
     assert before.elapsed_ms == after.elapsed_ms
     assert "PRIVATE" not in str(after.record()) and "TOP-SECRET" not in str(after.record())
+    corrected = deepcopy(payload)
+    corrected['resourceLogs'][0]['scopeLogs'][0]['logRecords'][0]['attributes'] = [
+        attr('event.name','codex.api_request'),attr('duration_ms','200'),attr('request.id','native-request-1')]
+    assert T.otlp_spans(corrected)[0].span_id == after.span_id
 
 
 def test_exact_late_assignment_is_idempotent_and_cannot_reassign_actor(pg_url):

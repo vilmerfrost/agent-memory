@@ -543,11 +543,12 @@ def paid_plan(cfg: Any, *, cases: int | None = None) -> dict[str, Any]:
             "within_cap": worst_total <= b.max_usd + 1e-9, "prices": prices.describe(),
             "max_subscription_tokens": b.max_subscription_tokens,
             "subscription_models": list(b.subscription_models), "room": room,
-            "basis_note": "expected = G2b measured per call (Haiku CLI-reported, Codex tokens x price table, Jev flat); "
-                          "worst = the budget's pre-call estimate or the per-run CLI cap. The budget refuses a call "
-                          "whose estimate would pass max_usd and stops after any call that crossed it, so a night can "
-                          "pass max_usd by at most one call's real cost (Claude runs are capped by the CLI's "
-                          "--max-budget-usd; the Codex judge has no per-call cap: its sandbox key is spend-capped)."}
+            "currency": "USD", "invoice_cap_verified": False,
+            "accounting_scope": "api-only" if b.subscription_models else "all-recorded",
+            "basis_note": "Expected/worst figures are local API-cost estimates or configured CLI bounds, not invoices. "
+                          "New calls require room for booked spend plus in-flight reservations. "
+                          "Unknown paid usage is conservatively booked; actual provider charges can exceed an estimate. "
+                          "Subscription billing is separate and unknown. USD accounting is not proof of a EUR invoice cap."}
 
 
 def night_room(cfg: Any, *, pairs: int, per_exp: Mapping[str, int], per_night: Mapping[str, int]) -> dict[str, Any]:
@@ -631,8 +632,8 @@ def render_plan(plan: Mapping[str, Any]) -> str:
         out.append(f"- {r['stage']}: {r['count']} x {r['model']} -> expected {exp} ({r['expected_basis']}), "
                    f"worst ${r['worst_usd']:.4f}. {r['note']}")
     out.append(f"Total: expected ${plan['expected_usd']:.4f}" + (" + unmeasured calls" if plan["expected_incomplete"] else "")
-               + f", worst case ${plan['worst_case_usd']:.4f}, hard cap max_usd ${plan['max_usd']:.2f} "
-               + ("(the worst case fits)" if plan["within_cap"] else "(the budget stops the night at the cap)") + ".")
+               + f", planned API estimate ${plan['worst_case_usd']:.4f}, accounting cap max_usd ${plan['max_usd']:.2f} "
+               + ("(the API estimates fit)" if plan["within_cap"] else "(the accounting limit stops further calls)") + ".")
     out.append(plan["basis_note"])
     if plan.get("subscription_models"):
         out.append(f"Subscription token stop: {plan['max_subscription_tokens']} observed tokens. API totals exclude subscription usage. No API fallback.")
@@ -852,7 +853,7 @@ def run_night_job(*, config_path: Path | None = None, night: str | None = None, 
     staged = [e for e in rep.get("experiments") or [] if e.get("status") == "staged"]
     costs = rep.get("costs") or {}
     res.fields.update(status=rep.get("status"), candidates=len(rep.get("candidates") or []),
-                      experiments=len(rep.get("experiments") or []), staged=len(staged),
+                      experiments=sum(1 for e in rep.get("experiments") or [] if e.get("experiment_id")), staged=len(staged),
                       usd=float(costs.get("total_usd") or 0.0),
                       reported_usd=float(costs.get("reported_usd") or 0.0),
                       estimated_usd=float(costs.get("estimated_usd") or 0.0),
@@ -927,9 +928,11 @@ def run_brief_job(*, root: Path | None = None, night: str | None = None, now: da
     except BR.ReportError as exc:
         res.status, res.items = "FAIL", [f"report: {_one_line(exc, 240)}"]
         return finish()
-    md = BR.render_markdown(b)
     out = Path(out_dir or DEFAULT_REPORTS_DIR).expanduser()
     out.mkdir(parents=True, exist_ok=True)
+    from agent_memory import telemetry_analysis
+    b['telemetry_review'] = telemetry_analysis.daily_review(out,now=now)
+    md = BR.render_markdown(b)
     mdp, jsp = out / f"rsi-brief-{night}.md", out / f"rsi-brief-{night}.json"
     mdp.write_text(md, encoding="utf-8")
     jsp.write_text(json.dumps(b, sort_keys=True, default=str, indent=1) + "\n", encoding="utf-8")

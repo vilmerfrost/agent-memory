@@ -62,6 +62,7 @@ S1_DATASETS = (*(d for d, _ in DELTA.values()), SKILLS)
 # An empty window passes for each (allow_no_eligible): the night runs only after amem-daily passed for it
 # (rsi_schedule's prerequisite gate), so an empty window is "nothing new to check", and the brief names it.
 BASE_REQUIRED = (DEVIATIONS, ROUTINE_FAILURES, EVAL_FAILURES, EXPERIMENTS, EVIDENCE)
+REPLAY_REQUIRED = ('experiments:replay-evidence', 'experiments:native-attempt-sessions')
 
 STOPPED = ("preflight_failed", "aborted", "budget_exhausted")      # night statuses that stop work without a fault
 _COUNT_ALL = 2_147_483_647
@@ -69,7 +70,7 @@ _COUNT_ALL = 2_147_483_647
 
 def requirements(required: Sequence[str]) -> list[CV.Requirement]:
     """coverage.verdict requirements: BASE_REQUIRED always, plus the provider datasets the night says it asked."""
-    names = list(BASE_REQUIRED) + [d for d in required if d in PROVIDER_DATASET.values() and d not in BASE_REQUIRED]
+    names = list(BASE_REQUIRED) + [d for d in required if d in (*PROVIDER_DATASET.values(), *REPLAY_REQUIRED) and d not in BASE_REQUIRED]
     return [CV.Requirement(d, allow_no_eligible=True) for d in dict.fromkeys(names)]
 
 

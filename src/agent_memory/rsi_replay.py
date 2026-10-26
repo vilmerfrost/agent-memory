@@ -909,6 +909,7 @@ class _Replay:
             rec.exit_code = 0
         except sub.SubscriptionError as exc:
             rec.error, rec.exit_code = str(exc), 1
+            rec.native_session_id = AL.native_session_id(cfg.agent,getattr(exc,'native_session_id',None))
         except BaseException as exc:
             crashed = f"not finished: {type(exc).__name__}"     # the log only; the runner records the exception
             raise

@@ -12,6 +12,8 @@ Each attempt retains a map of source observations keyed by canonical source-reco
 
 Exact duplicate observations are idempotent. A new explicit attempt or changed source execution boundary makes another row; it does not overwrite the first attempt. Cross-repository and producer identities cannot collide merely because task IDs match.
 
+Observation history also retains each worker's source lifecycle fields and span references. `observation_time_basis` names recorded time or the explicit end/start proxy; `projection_policy` makes the tie-breaking rule visible. The current projection is not independently verified acceptance or an invented chronology. One transaction-scoped dispatch-ingest advisory lock serializes concurrent collector runs, including their first insert, so neither loses the other's observation map.
+
 An existing legacy `dispatch:<id>` row is adopted only when repository, task, session and start time match exactly. Its UUID and source key remain stable, preserving score/label/foreign references. Its metadata receives the canonical key for future lookup. Nonmatching legacy rows are not rewritten. This is collector compatibility logic, not a historical backfill performed by this change.
 
 No missing historical boundary, timestamp, human acceptance or retry relationship can be reconstructed from a later summary. Lost source lines remain lost. The collector continues to expose `routine=source=dispatch`, existing status values and metadata keys for dashboards and score consumers.

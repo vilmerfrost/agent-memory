@@ -7,6 +7,8 @@ import pytest
 from agent_memory import attempt_links as AL, replay_evidence as RE, rsi_artifact as RA, sessions_ingest as SI
 from synth_support import fresh_db
 from test_rsi_approval import make_artifact
+from test_rsi_subscription import response
+from agent_memory import rsi_subscription as S
 
 
 @pytest.fixture(scope="module")
@@ -43,6 +45,16 @@ def test_missing_native_id_does_not_fabricate_or_use_nearby_session(db):
         sid,ev=c.execute("select session_id,evidence from rsi_attempts where run_id=%s",(a['run_id'],)).fetchone()
         assert sid is None and ev['native_identity_unavailable']=='client_id_not_recorded'
         assert c.execute("select count(*) from sessions").fetchone()[0]==before
+
+
+def test_failed_client_keeps_only_its_explicit_native_identity():
+    events=[json.loads(line) for line in response().splitlines()]
+    for row in events:
+        row['session_id']='failed-native-session'
+    events[-1]['is_error']=True
+    with pytest.raises(S.SubscriptionError,match='client_run_failed') as err:
+        S._parse_claude('\n'.join(json.dumps(x) for x in events),model=S.MODELS['claude'],tools_allowed=False)
+    assert err.value.native_session_id=='failed-native-session'
 
 
 def test_native_collision_never_relabels_a_production_session(db):
