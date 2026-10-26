@@ -101,6 +101,43 @@ flowchart LR
   C -- findings --> FI[conclusion: findings]
 ```
 
+## The daily routines (amem-daily, rsi-skills, rsi-harvest)
+
+| Job | run_key | run_id |
+|---|---|---|
+| `amem-daily` | `daily.run_key(now)`, the summary line's timestamp | - |
+| `rsi-skills` | the refresh run id | - |
+| `rsi-harvest` | `harvest-<UTC time>` | its `runs` row |
+
+| Dataset | Step | Records |
+|---|---|---|
+| `sessions:sessions` | deviations scan | the scan funnel and its skip reasons |
+| `deviations:deviations` | deviations scan | snapshot: scan-eligible sessions in the window vs scanned; a backlog is `not_collected` with `pending` / `rejected` |
+| `routine_runs:runs` | score | scored runs |
+| `skills:skill_calls` | skill refresh | calls scored |
+| `coordination:handoffs` | eval harvest | handoffs drafted |
+| `<family>:<table>.<sink>` | sync | a synced copy, e.g. `sessions:sessions.clickhouse` |
+
+Synced copies keep `readback` in `unmeasured_fields`, so a complete delivery is `measurement_unavailable`: a
+delivery never claims readback. Sink cursor keys map to families: `research_runs` -> `evidence_links`,
+`sandbox_runs` -> `experiments`.
+
+Skip reasons:
+
+- deviations scan: `kind_eval`, `env_sandbox`, `tiny`, `released`, `already_scanned`, `scan_errors_cap`,
+  `covered_by_parent`, `over_limit`, `scan_error`
+- score: `no_question_file`, `over_limit`, `jev_fixture_missing`, `jev_error`
+- sync: `dead_letter`, `push_failed`, `backoff`, `stopped`
+- skill refresh: `env_sandbox`, `no_session`, `outcome_not_final`
+- harvest: `already_drafted`, `team-repo`, `incomplete-handoff`, `limit`
+
+A step that is off or not due records nothing: the guard reads a missing record as `analysis_not_run`.
+
+The night and the daily name the same tables the same way (`sessions:sessions`, `deviations:deviations`,
+`routine_runs:runs`). Their windows differ, so each writes its own snapshot rows; `coverage.verdict` judges the
+latest snapshot that covers the run's input window. The night's provider datasets (`evidence_links:clickhouse`)
+are not sync copies (`<family>:<table>.<sink>`): they count what the night's evidence queries got back.
+
 ## The night (amem-rsi-night)
 
 Code: `src/agent_memory/night_coverage.py`. The night feeds a `Ledger` while it runs and writes it once, at the
