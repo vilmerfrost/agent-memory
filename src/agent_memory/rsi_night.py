@@ -75,6 +75,8 @@ HEALTH_VALUES = ("ok", "unavailable", "error", "fixture", "live", "fixture-missi
                  "truncated", "unlinked")
 _SEVERITY = {"ok": 0, "fixture": 0, "live": 0, "skipped": 0, "stale": 1, "truncated": 1, "unlinked": 1,
              "fixture-missing": 1, "error": 2, "unavailable": 2}
+UNHEALTHY = ("error", "unavailable", "fixture-missing", "stale", "truncated")   # each gets a health_reasons line
+WRITER_NEVER_RAN = "writer never ran"     # the first note of a writer-mode night whose experiments all fell back
 
 # The investigator's own rules: never a hypothesis target, whatever the allowlist says.
 SELF_FILES = ("rsi-night.json", "rsi-night.first.json", "rsi-triage.toml", "rsi-verdict-policy.json", "rsi-prices.json",
@@ -944,10 +946,12 @@ class Implementation:
     section_id: str | None = None
     kind: str | None = None
     diff: str | None = None
+    section_from: str | None = None     # "rule_key" (the candidate's rule section) | "hypothesis" (the section it names)
 
     def record(self) -> dict[str, Any]:
         return {"implementer": self.implementer, "implementer_fallback_reason": self.fallback_reason,
-                "implementation": {"section_id": self.section_id, "kind": self.kind, "diff": self.diff,
+                "implementation": {"section_id": self.section_id, "section_from": self.section_from,
+                                   "kind": self.kind, "diff": self.diff,
                                    "new_sha256": hashlib.sha256(self.text.encode()).hexdigest()}}
 
 
@@ -1012,10 +1016,80 @@ def _section_for(text: str, rule_key: Any) -> Any:
     return None
 
 
+# The hypothesis names its section in words ("In the review-loop step", "Add to Phase 1", "Finish the Return mode
+# section"). Words that only say *that* something is a section, and short or stop words, never pick one.
+_PICK_WORD = re.compile(r"[a-z0-9]+")
+_PICK_META = {"rule", "section", "step", "phase", "stage", "part", "line", "file", "skill", "heading", "bullet",
+              "sentence", "text", "add", "adds", "new", "make", "say", "says", "must", "should", "more", "less",
+              "all", "but", "has", "have", "than", "them", "they", "what", "which", "who", "how", "why"}
+_PICK_NUM = re.compile(r"\b(?:step|phase|stage|part|section)\s+(\d{1,2})\b", re.I)
+_HEAD_NUM = re.compile(r"^\s*(\d{1,2})[.):]?(?:\s|$)")
+PICK_HEADING_WEIGHT = 3        # a hypothesis word in the section's own heading
+PICK_PARENT_WEIGHT = 1         # ... in its parent heading (a folded subsection)
+PICK_NUMBER_WEIGHT = 4         # "step 1" / "Phase 1" and a heading numbered 1
+PICK_BODY_MIN = 2              # no heading word matched: at least this many hypothesis words in the body
+PICK_ROOM = 200                # the writer needs this many characters below edits_writer.NEW_MAX
+
+
+def _pick_words(text: str) -> set[str]:
+    from agent_memory.edits_writer import STOP
+    out = set()
+    for w in _PICK_WORD.findall(text.lower()):
+        if w.isdigit() or len(w) < 3 or w in STOP or w in _PICK_META:
+            continue
+        out.add(w[:-1] if len(w) > 4 and w.endswith("s") and not w.endswith("ss") else w)
+    return out - _PICK_META
+
+
+def _heading_number(title: str, n: int) -> bool:
+    m = _HEAD_NUM.match(title)
+    return bool(m and int(m.group(1)) == n) or bool(
+        re.search(rf"\b(?:step|phase|stage|part|section)\s+{n}\b", title, re.I))
+
+
+def section_for_hypothesis(text: str, what: str) -> Any:
+    """The one section a hypothesis names, picked deterministically (no model call): a candidate without a rule
+    section of its own (skill_scores `skill:<name>`, routine failures `routine:<name>`, provider findings with no
+    rule key) still gets one section to rewrite. Each section scores its own heading words that the hypothesis
+    `what` uses (x3), its parent heading's (x1) and a "step N" / "Phase N" reference to a heading numbered N (+4);
+    the hypothesis words in its body break ties, then reading order. No heading word matches: the section whose
+    body shares the most hypothesis words (at least PICK_BODY_MIN). A section too large for the writer's reply
+    (edits_writer.NEW_MAX) is never picked. None when nothing qualifies."""
+    from agent_memory import edits_sections, edits_writer
+    try:
+        secs = edits_sections.sections(text)
+    except edits_sections.SectionError:
+        return None
+    lines = text.splitlines(keepends=True)
+    hyp = _pick_words(what)
+    nums = {int(n) for n in _PICK_NUM.findall(what)}
+    best: tuple[tuple[int, int, int], Any] | None = None
+    for i, s in enumerate(secs):
+        body = "".join(lines[s.start:s.end]).strip("\r\n")
+        if len(body) + PICK_ROOM > edits_writer.NEW_MAX:
+            continue
+        head = 0
+        if s.heading is not None:
+            parent, _, own = s.title.rpartition(" > ")
+            head = (PICK_HEADING_WEIGHT * len(hyp & _pick_words(own)) + PICK_PARENT_WEIGHT * len(hyp & _pick_words(parent))
+                    + PICK_NUMBER_WEIGHT * sum(_heading_number(own, n) for n in nums))
+            body = body.split("\n", 1)[1] if "\n" in body else ""
+        score = (head, len(hyp & _pick_words(body)), -i)
+        if best is None or score > best[0]:
+            best = (score, s)
+    if best is None:
+        return None
+    (head, body_hits, _), s = best
+    if head > 0 or body_hits >= PICK_BODY_MIN or len(secs) == 1:
+        return s
+    return None
+
+
 class WriterImplementer:
     """S6 by default under the subscription profile: the morning edit loop's writer (edits_writer: its strategy,
     policy, reply shape and `parse_proposal`, which splices exactly one section and refuses ids, code blocks,
-    secret-shaped text, ask-gates and text copied from the evidence) rewrites the candidate's rule section. The call
+    secret-shaped text, ask-gates and text copied from the evidence) rewrites the candidate's rule section, or, for a
+    candidate without one (skill scores, routine failures, findings), the section its hypothesis names. The call
     is the hypothesizer's: `claude -p` with no tools, hooks off, model pinned to claude-opus-5-5, through the
     subscription runner when the profile says so, counted in the night budget. The evidence reaches it only inside
     its untrusted-data envelope. Pinned files and rules get no writer call. On a pin, no matching section, a writer
@@ -1072,9 +1146,13 @@ class WriterImplementer:
             pin = None
         if pin is not None:
             return fallback("target file is pinned: no writer call")
-        sec = _section_for(old_text, ctx.get("rule_key"))
+        # The candidate's own rule section (a deviation's rule key names it); else the section the hypothesis names
+        # (skill scores, routine failures and findings carry no section id: the 2026-10-25 night fell back 3 of 3).
+        sec, picked_by = _section_for(old_text, ctx.get("rule_key")), "rule_key"
         if sec is None:
-            return fallback("no rule section matches the candidate: no writer call")
+            sec, picked_by = section_for_hypothesis(old_text, hyp.what), "hypothesis"
+        if sec is None:
+            return fallback("no section matches the candidate or the hypothesis: no writer call")
         section_text = edits_sections.section_text(old_text, sec.id)
         if ET.pinned_rule(f"rsi-night-{sec.id}", section_text) is not None:
             return fallback("the rule is pinned: no writer call")
@@ -1108,7 +1186,8 @@ class WriterImplementer:
             return fallback(f"writer proposal refused: {_one_line(exc, 200)}")
         diff = "\n".join(difflib.unified_diff(old_text.splitlines(), prop.new_text.splitlines(), "a" + hyp.target[1:],
                                               "b" + hyp.target[1:], lineterm="", n=1))
-        return Implementation(prop.new_text, "writer", None, sec.id, prop.kind, diff[:IMPLEMENTATION_DIFF_MAX])
+        return Implementation(prop.new_text, "writer", None, sec.id, prop.kind, diff[:IMPLEMENTATION_DIFF_MAX],
+                              picked_by)
 
 
 def sandbox_module() -> Any:
@@ -1473,6 +1552,7 @@ class Night:
         self.failed = False            # an experiment or stage failed: the checkpoint is not advanced
         self.degraded = False          # a provider was down or an experiment failed: partial, but S1-S8 finished
         self.health_reasons: dict[str, list[str]] = {}   # provider -> why it was not ok (redacted, one line each)
+        self.health_where: dict[str, str] = {}            # provider -> the stage that first reported it not ok
         self.pinned: list[str] = []    # allowlisted targets improve refuses (pins.json / fence.txt): never selected
         self.notes: list[str] = []
         self.health: dict[str, str] = {k: "skipped" for k in PROVIDERS}
@@ -1547,12 +1627,16 @@ class Night:
             self.interruptible = False
 
     # -- health --------------------------------------------------------------------------------------
-    def _merge_health(self, h: Mapping[str, Any] | None, steps: Any = None) -> None:
+    def _merge_health(self, h: Mapping[str, Any] | None, steps: Any = None, where: str = "evidence") -> None:
         for k, v in (h or {}).items():
             if k not in PROVIDERS or not isinstance(v, str):
                 continue
             if self.health.get(k) == "skipped" or _SEVERITY.get(v, 2) > _SEVERITY.get(self.health[k], 0):
                 self.health[k] = v if v in HEALTH_VALUES else "error"
+                if self.health[k] in UNHEALTHY:
+                    if not hasattr(self, "health_where"):
+                        self.health_where = {}
+                    self.health_where.setdefault(k, _one_line(where, 120))
         # Why a provider was not ok: the failing steps' own detail (the 2026-10-23 night logged only "error").
         for st in steps or []:
             if not isinstance(st, Mapping) or st.get("status") in (None, "ok"):
@@ -1616,6 +1700,7 @@ class Night:
             self.health["supabase"] = "ok"
         except psycopg.Error as exc:
             self.health["supabase"] = "unavailable"
+            self.health_reasons["supabase"] = [f"preflight: database unavailable ({type(exc).__name__})"]
             raise PreflightFailed(f"database unavailable ({type(exc).__name__})") from None
         row = self.conn.execute("select status from rsi_checkpoints where job = %s and run_key = %s",
                                 (JOB, self.night)).fetchone()
@@ -1655,8 +1740,9 @@ class Night:
             delta = self.ad.evidence.delta(before, conn=self.conn)
         except psycopg.Error as exc:
             self.health["supabase"] = "unavailable"
+            self.health_reasons["supabase"] = [f"S1 delta: database unavailable ({type(exc).__name__})"]
             raise PreflightFailed(f"delta: database unavailable ({type(exc).__name__})") from None
-        self._merge_health(_dget(delta, "health"), _dget(delta, "steps"))
+        self._merge_health(_dget(delta, "health"), _dget(delta, "steps"), "S1 delta")
         for src in PROVIDERS[1:]:
             if (_dget(delta, "health") or {}).get(src) in ("ok", "error", "stale", "truncated"):
                 self.budget.record_provider(src)
@@ -2008,7 +2094,7 @@ class Night:
             with self._interruptible():
                 pack = self.ad.evidence.pack(cand)
                 evidence_text = self.ad.evidence.render(pack)
-            self._merge_health(_dget(pack, "health"), _dget(pack, "steps"))
+            self._merge_health(_dget(pack, "health"), _dget(pack, "steps"), f"evidence pack for {c['dedupe_key']}")
             for f in _dget(pack, "findings") or []:
                 if _dget(f, "status") == "ok" and _dget(f, "ref"):        # supporting evidence: ok findings only
                     refs.append(str(_dget(f, "ref"))[:200])
@@ -2304,9 +2390,31 @@ class Night:
         except psycopg.Error as exc:
             self.notes.append(f"unwind failed: {type(exc).__name__}")
 
+    def _writer_summary(self) -> dict[str, Any] | None:
+        """report.writer (additive, 2026-10-26): in writer mode, how many experiments used the section writer's
+        change and why the others fell back to the stub, most common reason first. `all_fell_back` is a degraded
+        signal: the night ran, but it tested no writer change at all (2026-10-25: 3 of 3, unnoticed until morning)."""
+        if not isinstance(self.ad.implementer, WriterImplementer):
+            return None
+        done = [e for e in self.report["experiments"] if e.get("experiment_id") and e.get("implementer")]
+        if not done:
+            return None
+        counts: dict[str, int] = {}
+        for e in done:
+            if e["implementer"] != "writer":
+                why = _one_line(e.get("implementer_fallback_reason") or "no reason recorded", 200)
+                counts[why] = counts.get(why, 0) + 1
+        reasons = [{"reason": k, "n": v} for k, v in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))]
+        fell = sum(counts.values())
+        return {"mode": "writer", "experiments": len(done), "wrote": len(done) - fell, "fell_back": fell,
+                "all_fell_back": fell == len(done), "reasons": reasons[:5]}
+
     def _settle(self) -> str:
         if self.dry_run:
             return "partial" if self.degraded else "ok"
+        ws = self._writer_summary()
+        if ws and ws["all_fell_back"]:
+            self.degraded = True       # no writer change was tested tonight: partial, and the routines.log line says why
         if self.failed:
             return "partial"
         degraded = self.degraded or any(_SEVERITY.get(self.health.get(k, "ok"), 0) >= 2 for k in PROVIDERS)
@@ -2322,9 +2430,24 @@ class Night:
         r["budget"] = self.budget.caps()
         r["health"] = {k: self.health.get(k, "skipped") for k in HEALTH_KEYS}
         reasons = {k: v[:3] for k, v in self.health_reasons.items() if v and r["health"].get(k) not in ("ok", "skipped")}
+        # Every service that is not healthy has a reason (2026-10-25: langfuse "error" came from S1's delta, which
+        # carried no step detail, so the routines.log FAIL line said only "health langfuse: error").
+        for k, v in r["health"].items():
+            if k not in reasons and v in UNHEALTHY:
+                where = getattr(self, "health_where", {}).get(k) or {"jev": "S3 triage", "sandbox": "S0 preflight"}.get(
+                    k, "source unknown")
+                reasons[k] = [f"{where}: {v}, no step detail"]
         if reasons:
             r["health_reasons"] = reasons
-        r["notes"] = self.notes[-30:]
+        ws = self._writer_summary()
+        notes = list(self.notes)
+        if ws is not None:
+            r["writer"] = ws
+            if ws["all_fell_back"]:
+                top = ws["reasons"][0]["reason"] if ws["reasons"] else "no reason recorded"
+                notes.insert(0, _one_line(f"{WRITER_NEVER_RAN}: {ws['fell_back']}/{ws['experiments']} experiments fell "
+                                          f"back to the stub ({top})", 300))
+        r["notes"] = notes[:1] + notes[1:][-29:] if ws and ws["all_fell_back"] else notes[-30:]
         if advance:
             r["checkpoint"]["after"] = self.next_checkpoint
             r["checkpoint"]["advanced"] = True
@@ -2416,7 +2539,8 @@ def validate_report(obj: Any) -> list[str]:
                "skipped", "prerequisite_warnings",            # both optional (rsi_schedule's night job)
                "health_reasons",                               # optional: provider -> why it was not ok
                "budget",                                       # optional: the budget caps (_finish, since 1df19d2)
-               "blocked"}                                      # optional: ideas no experiment can use (2026-10-25)
+               "blocked",                                      # optional: ideas no experiment can use (2026-10-25)
+               "writer"}                                       # optional: the section writer's tally (2026-10-26)
     errs += [f"unknown key {k}" for k in sorted(set(obj) - allowed)]
     if obj.get("format") != FORMAT:
         errs.append("format is not rsi-night/1")
@@ -2572,6 +2696,25 @@ def validate_report(obj: Any) -> list[str]:
         errs.append("prerequisite_warnings must be a list of strings")
     if "blocked" in obj:
         errs += _blocked_problems(obj["blocked"])
+    if "writer" in obj:
+        errs += _writer_problems(obj["writer"])
+    return errs
+
+
+def _writer_problems(w: Any) -> list[str]:
+    def count(x: Any) -> bool:
+        return isinstance(x, int) and not isinstance(x, bool) and x >= 0
+    if not isinstance(w, dict):
+        return ["writer must be an object"]
+    errs = [f"writer.{k} must be a count" for k in ("experiments", "wrote", "fell_back") if not count(w.get(k))]
+    if not errs and w["wrote"] + w["fell_back"] != w["experiments"]:
+        errs.append("writer.wrote + writer.fell_back must equal writer.experiments")
+    if not isinstance(w.get("all_fell_back"), bool):
+        errs.append("writer.all_fell_back must be a bool")
+    rs = w.get("reasons")
+    if not (isinstance(rs, list) and all(isinstance(x, dict) and isinstance(x.get("reason"), str) and count(x.get("n"))
+                                         for x in rs)):
+        errs.append("writer.reasons must be a list of objects with a reason and a count")
     return errs
 
 

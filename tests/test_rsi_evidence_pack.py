@@ -627,6 +627,40 @@ def test_delta_rejects_a_bad_checkpoint(delta_db: str) -> None:
         P.delta_since("not a time", conn=conn)
 
 
+class SlowHealth(Stub):
+    """A retriever whose health check hangs until the gate opens: its steps and health run past the budget."""
+
+    def health(self) -> E.Health:
+        assert self.gate is not None
+        self.gate.wait(10)
+        return super().health()
+
+
+def test_delta_steps_carry_why_a_provider_is_not_ok(delta_db: str) -> None:
+    # 2026-10-25: S1's delta said langfuse "error" but carried no steps, so the night report had no reason for it.
+    from agent_memory import rsi_night as N
+    gate = threading.Event()
+    lf = SlowHealth("lf", LF.LangfuseRetriever._QUERIES, gate=gate)
+    pd = Stub("pd", PD.PastDevRetriever._QUERIES, healthy=False)
+    try:
+        with psycopg.connect(delta_db) as conn:
+            d = P.delta_since(None, conn=conn, now=MIDNIGHT + timedelta(hours=1), limits=P.DeltaLimits(timeout_s=1),
+                              retrievers={"ch": stubs()["ch"], "lf": lf, "pd": pd})
+    finally:
+        gate.set()
+    assert d.health["langfuse"] == "error" and d.health["pastdev"] == "unavailable"
+    lf_steps = [s for s in d.steps if s["step"].startswith("lf.")]
+    assert lf_steps and all(s["status"] == "error" and s["detail"] == "timeout after 1s" for s in lf_steps)
+    assert {"step": "pd.health", "status": "unavailable", "found": 0, "detail": "not configured"} in d.steps
+    assert json.dumps(d.to_json(), default=str)
+    night = N.Night.__new__(N.Night)
+    night.health = {k: "skipped" for k in N.PROVIDERS}
+    night.health_reasons = {}
+    night._merge_health(d.health, d.steps, "S1 delta")
+    assert night.health_reasons["langfuse"][0].endswith(": error (timeout after 1s)")
+    assert night.health_reasons["pastdev"] == ["pd.health: unavailable (not configured)"]
+
+
 # ---------------------------------------------------------------- the read-only CLI
 
 
