@@ -185,6 +185,23 @@ def test_ancestor_memory_and_import_chains_resolve(setup_home: Home, tmp_path: P
     assert "import:~/work/demo-repo/docs/a.md" in names and "parent-md" in names
 
 
+def test_one_candidates_call_resolves_each_path_once(setup_home: Home, monkeypatch: pytest.MonkeyPatch) -> None:  # noqa: F811
+    repo = setup_home.repo
+    (setup_home.root / "work" / "CLAUDE.md").write_text("# Work\n")
+    (repo / "CLAUDE.md").write_text("# Demo repo\n@docs/a.md\n")
+    (repo / "docs").mkdir()
+    (repo / "docs" / "a.md").write_text("# A\n@b.md\n")
+    (repo / "docs" / "b.md").write_text("# B\n@a.md\n")
+    uncached = IS._candidates(row(setup_home))        # the same pass without the per-call cache
+    seen: list[str] = []
+    real = os.path.realpath
+    monkeypatch.setattr(IS.os.path, "realpath", lambda p, *a, **k: (seen.append(os.fspath(p)), real(p, *a, **k))[1])
+    cands = IS.candidates(row(setup_home))
+    assert cands == uncached                           # caching changes no answer
+    assert seen and len(seen) == len(set(seen))        # each path resolved at most once in the call
+    assert IS._REALPATHS.get() is None                 # the cache ends with the call
+
+
 # --------------------------------------------------------------------------- authority labels
 
 
