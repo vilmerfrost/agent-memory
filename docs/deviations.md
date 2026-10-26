@@ -33,6 +33,7 @@ cloud_digests (cloud routines) ─┴─sessions ingest──▶ sessions (tool 
 | `amem sessions tokens [--days 7] [--repo R] [--tool claude\|codex] [--json]` | Token totals per repo / tool / kind / model and the top sessions (docs/sessions-live.md). Read only. |
 | `amem sessions cost --since ISO [--until ISO] [--category C] [--project P] [--json]` | Tokens and active / api / tool time of the sessions that started in a window, per project (docs/sessions-live.md, "Cost of a window"). Read only. |
 | `amem sessions find --agent-id ID [--ingest] [--projects-dir DIR] [--json]` | The sessions row of a subagent transcript `agent-<ID>.jsonl`: prints `session_id`, `category`, `project` (tab-separated). Exit 1 when not ingested; `--ingest` ingests that transcript first. See "Incident scans". |
+| `amem sessions instruction-sources [--apply] [--limit 200] [--days N] [--json]` | Backfills `sessions.instruction_sources` (authority and version of every instruction file in force) for rows that have none, newest first. Dry run unless `--apply`; bounded, resumable, idempotent (docs/data-use/instruction-sources.md). |
 | `amem sessions ping` | Claude Code hook (SessionStart / Stop): the live row of the running session (docs/sessions-live.md). Always exits 0. |
 | `amem deviations scan [--days 7] [--limit 15] [--session ID] [--dry-run] [--timeout 300]` | Scans unscanned sessions. Prints one line per session and `deviations: sessions=N found=D edit=E enforce=F leave=L errors=X`. Exit 1 when a session failed. |
 | `amem deviations report [--days 7] [--json]` | Groups deviations by instruction source + rule id, most recurring first. `--json` prints the candidates file. |
@@ -40,7 +41,8 @@ cloud_digests (cloud routines) ─┴─sessions ingest──▶ sessions (tool 
 | `amem deviations rules FILE...` | Prints the rule catalog (`N. id — title`) of instruction files. Read only, no database. |
 
 All but `rules` need the Postgres backend (V1). The write commands (`sessions ingest`,
-`sessions find --ingest`, `deviations scan`, `deviations reref`) honour `AMEM_REQUIRE_REMOTE=1` (exit 3).
+`sessions find --ingest`, `sessions instruction-sources --apply`, `deviations scan`, `deviations reref`)
+honour `AMEM_REQUIRE_REMOTE=1` (exit 3).
 
 - `scan` calls the Claude Code CLI. It needs `AMEM_DEVIATIONS_LIVE=1`; without it, it exits 2
   and calls nothing. `AMEM_DEVIATIONS_CLAUDE` may point at another executable (tests, demos).
@@ -68,6 +70,9 @@ id `<parent session>/agent-<id>`.
   scratch workspace.
 - `skills`: `Skill` tool calls plus slash commands, without Claude Code built-ins.
 - `instructions`: the instruction sources in force whose file exists (see below).
+- `instruction_sources`: one entry per instruction file with authority, version and reason
+  (docs/data-use/instruction-sources.md). A re-ingest merges: a stronger authority wins, a tie keeps
+  the earliest capture.
 - `tool`: `claude` or `codex` (see Codex below).
 - Cloud routine sessions come from the `cloud_digests` table, not a transcript file: id
   `cloud:<session id>`, kind `routine`, `project_dir` `cloud`, `meta.cloud` true (docs/cloud.md).
@@ -134,9 +139,16 @@ when the evidence came from team sessions (`team_sessions` counts those).
 | `agent:<type>` | `~/.claude/agents/<type>.md` (subagents) |
 | `routine:<name>` | `~/.claude/scheduled-tasks/<name>/SKILL.md`, else the tag's `file=` when it is a `SKILL.md` under `~/.claude` |
 | `parent-md` | `~/agent-config/parent/PARENT.md` (parent sessions) |
-| `skill:<name>` | `~/.claude/skills/<name>/SKILL.md` (symlinks are fine). Plugin skills (`ns:name`) have no local file and are left out. |
-| `claude-md:<repo>` | `CLAUDE.md` and `CLAUDE.local.md` in the cwd, and in the main checkout when the cwd is a git worktree |
+| `skill:<name>` | `~/.claude/skills/<name>/SKILL.md` (symlinks are fine), else `<repo>/.claude/skills/<name>/SKILL.md` |
+| `skill:<plugin>:<name>` | the plugin's `<installPath>/skills/<name>/SKILL.md` from `~/.claude/plugins/installed_plugins.json` (version and commit recorded). `anthropic-skills:*` are built into the app: unresolved. |
+| `claude-md:<repo>` | `CLAUDE.md`, `.claude/CLAUDE.md` and `CLAUDE.local.md` in the cwd, and in the main checkout when the cwd is a git worktree |
 | `agents-md:<repo>` | `AGENTS.md` in the cwd and the main checkout (Claude Code and Codex sessions) |
+| `claude-md:~/<dir>` | the same memory files in every ancestor directory of the cwd, up to (not including) `/` |
+| `import:~/<path>` | an `@import` target of a memory file (five hops at most; a target that is another source keeps that source's name, e.g. `parent-md`, `agents-md:<repo>`) |
+
+Resolution, authority (observed / reconstructed / declared / unresolved) and versions are described in
+[data-use/instruction-sources.md](data-use/instruction-sources.md). Names that resolve to no file are not
+offered to the writer; `sessions.instruction_sources` records them with a reason.
 
 Codex sessions have their own sources (Codex reads no CLAUDE.md):
 
@@ -158,6 +170,18 @@ A file that two sources name (a `CLAUDE.md` symlinked to `AGENTS.md`) is read on
 first. The rule catalog treats AGENTS.md like any other markdown source.
 
 `.env*` files are never read. Each source is capped at 24k characters, all sources at 70k.
+
+### Version in force
+
+A session with `instruction_sources` entries is graded against the versions recorded for it
+(`deviations.load_versioned`): per file, the text of its observed or reconstructed version
+(`instruction_texts`, a git blob, today's file when its sha matches, or the transcript itself). A file
+without a recoverable version is read from today's file. The deviation's `instruction_authority` says
+which: `observed` or `reconstructed` (the weaker of the source's files), or `unverified` when any file of
+the source came from today's file. Sessions ingested before versions were recorded have no entries: all
+their sources are `unverified` (until `amem sessions instruction-sources --apply` backfills them). A file
+the transcript shows was not loaded is not offered. `instruction_sha` is the recorded version's sha for a
+single-file source, else the hash of the texts read. Later stages discount `unverified` deviations.
 
 ## Rule catalog
 
