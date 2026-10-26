@@ -229,6 +229,9 @@ def validate_report(rep: Any) -> list[str]:
     pw = rep.get("prerequisite_warnings")
     if pw is not None and not (isinstance(pw, list) and all(isinstance(w, str) for w in pw)):
         p.append("prerequisite_warnings: not a list of strings")
+    pr = rep.get("prerequisites")                         # optional (R2): the night's own prerequisite checks
+    if pr is not None and not (isinstance(pr, dict) and isinstance(pr.get("skill_refresh", {}), dict)):
+        p.append("prerequisites: not an object with a skill_refresh object")
     _check_map(rep["delta"], "delta", COUNTS, p)
     for name in ("patterns", "candidates"):
         p += [f"{name}[{i}]: not a JSON object" for i, x in enumerate(rep[name]) if not isinstance(x, dict)]
@@ -754,6 +757,15 @@ def headline(rep: Mapping[str, Any]) -> str:
     return HEADLINES[rep["status"]]
 
 
+def skill_refresh_warning(rep: Mapping[str, Any]) -> list[str]:
+    """A stale, failed or missing skill refresh (report.prerequisites.skill_refresh, data-use plan R2) as one
+    prerequisite warning. Fresh, or a report without the field: none."""
+    from agent_memory import skill_refresh as SR
+    pr = rep.get("prerequisites")
+    w = SR.warning(pr.get("skill_refresh")) if isinstance(pr, Mapping) else None
+    return [text(w, 300)] if w else []
+
+
 def build_brief(rep: Mapping[str, Any], db: Db, *, artifacts_root: Path, report: dict[str, str] | None = None,
                 warnings: list[str] | None = None, now: datetime | None = None) -> dict[str, Any]:
     exps = rep["experiments"]
@@ -819,7 +831,8 @@ def build_brief(rep: Mapping[str, Any], db: Db, *, artifacts_root: Path, report:
         "checkpoint": {"before": text(ck.get("before"), 40) or None, "after": text(ck.get("after"), 40) or None,
                        "advanced": ck.get("advanced") is True},
         "headline": headline(rep), "skipped": skipped,
-        "prerequisite_warnings": [text(w, 300) for w in (rep.get("prerequisite_warnings") or [])[:MAX_NOTES]],
+        "prerequisite_warnings": [text(w, 300) for w in (rep.get("prerequisite_warnings") or [])[:MAX_NOTES]]
+                                 + skill_refresh_warning(rep),
         "summary": (f"{_plural(sum(1 for x in passed if x['actions']['apply']), 'improvement')} ready to apply"
                     + (f" ({len(passed) - sum(1 for x in passed if x['actions']['apply'])} more staged but not "
                        "ready)" if any(not x["actions"]["apply"] for x in passed) else "")

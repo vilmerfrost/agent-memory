@@ -19,6 +19,7 @@ from typing import Any
 
 import psycopg
 import pytest
+from psycopg.types.json import Jsonb
 
 from agent_memory import rsi_approval as AP, rsi_artifact as RA, rsi_night as N, rsi_targets as T
 from agent_memory.rsi_budget import Budget, BudgetExhausted
@@ -81,6 +82,22 @@ def seed_rule(url: str, rule: tuple[str, str, int, float], tag: str, *, sessions
                          (f"dev:{sid}:{rid}", sid, ref, grade, rid, ref))
             ids.append(sid)
     return ids
+
+
+def record_refresh(url: str, run: str = "sr-test-fresh", *, status: str = "done", window_end_ago_h: float | None = 0.25,
+                   started_ago_h: float = 0.25) -> str:
+    """A recorded skill-score refresh (skill_refresh.py): the night's skill_refresh prerequisite reads it. The
+    default is fresh: its input window ends 15 minutes before the database's now()."""
+    with psycopg.connect(url) as conn:
+        now = conn.execute("select now()").fetchone()[0]
+        end = None if window_end_ago_h is None else now - timedelta(hours=window_end_ago_h)
+        meta = {"window_start": (now - timedelta(days=30)).isoformat(), "scored": 3,
+                **({"window_end": end.isoformat()} if end is not None and status == "done" else {})}
+        conn.execute("insert into rsi_checkpoints (job, run_key, status, started_at, finished_at, meta) "
+                     "values ('skills-refresh', %s, %s, %s, case when %s = 'running' then null else %s end, %s)",
+                     (run, status, now - timedelta(hours=started_ago_h), status, now - timedelta(hours=started_ago_h),
+                      Jsonb(meta)))
+    return run
 
 
 def write_config(tmp_path: Path, name: str = "night.json", *, candidates: dict[str, Any] | None = None,

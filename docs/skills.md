@@ -23,9 +23,9 @@ All commands need the Postgres backend. On the REST backend they exit 1 and touc
 
 | Command | Does |
 |---|---|
-| `amem ingest skills PATH` | Ingests the skill-usage log into `skill_calls`. Idempotent: prints `ingested N new, M already present, K unparsed`. Then links unmatched calls to sessions. |
-| `amem skills scores [--refresh] [--skill S] [--all-buckets]` | Prints scores (tab separated). `--refresh` first links unmatched calls to sessions, then rewrites `skill_scores`. Without `--skill` or `--all-buckets` it prints the `*` bucket only. |
-| `amem skills cache PATH [--refresh]` | Writes `skill_scores` as JSON to PATH (atomic: temp file, then rename). |
+| `amem ingest skills PATH` | Ingests the skill-usage log into `skill_calls`. Idempotent: prints `ingested N new, M already present, K unparsed`. Then links unmatched calls to sessions. Records the time it read the whole log (`rsi_checkpoints` job `skills-ingest`, run_key `latest`): the next refresh's input window ends there. |
+| `amem skills scores [--refresh] [--skill S] [--all-buckets]` | Prints scores (tab separated). `--refresh` first links unmatched calls to sessions, then rewrites `skill_scores`, as one recorded run (below). Without `--skill` or `--all-buckets` it prints the `*` bucket only. |
+| `amem skills cache PATH [--refresh]` | Writes `skill_scores` as JSON to PATH (atomic: temp file, then rename). Its `--refresh` is not a recorded run. |
 | `amem skills suggest [--days 30] [--min 10]` | Lists skills run by hand (`by == "me"`) at least `--min` times in the last `--days` days, e.g. `handoff: 69 manual runs in 30 days`. |
 
 ## Log format
@@ -101,6 +101,25 @@ One row per skill and bucket. `scores --refresh` deletes and rewrites the whole 
 
 A call's project bucket uses the session's `project` when matched, else the call's own `project`.
 The category bucket exists only for matched calls.
+
+### Recorded refresh run
+
+`amem skills scores --refresh` records itself (`src/agent_memory/skill_refresh.py`), so the nightly investigator
+can check which refresh it reads and how far its input reached:
+
+- `rsi_checkpoints` row: job `skills-refresh`, run_key = the run id `sr-<UTC>-<6 hex>`. Status `running` first,
+  then `done` in the same transaction as the new scores, or `failed` with the error.
+- meta: `window_start` (the earliest skill call scored), `window_end` (the last complete log read recorded by
+  `amem ingest skills`; without one, the newest `skill_calls.created_at`, basis `latest_insert`), `scored`
+  (score rows), `calls`, `matched`, `basis`, `snapshot_at`.
+- The last stdout line is fixed (the agent-config wrapper copies `run=` and `window_end=` into routines.log):
+
+```
+skills-refresh run=sr-20261026T011002Z-3fa9c1 window_start=2026-04-06T19:34:40+00:00 window_end=2026-10-26T01:10:00+00:00 status=ok scored=212
+```
+
+  A failed run prints `window_start=- window_end=- status=failed scored=0` and exits 1. The night's
+  `skill_refresh` prerequisite reads these rows: docs/rsi/night-ops.md.
 
 ### Score
 

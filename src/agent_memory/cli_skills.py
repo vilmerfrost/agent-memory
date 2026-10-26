@@ -8,12 +8,13 @@ from __future__ import annotations
 
 import argparse
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import psycopg
 
-from agent_memory import config, skills
+from agent_memory import config, skill_refresh, skills
 
 REMOTE_REQUIRED_EXIT = 3
 
@@ -47,12 +48,19 @@ def cmd_ingest_skills(args: argparse.Namespace) -> int:
     if not path.is_file():
         _err(f"ingest skills failed: no such file: {path}")
         return 1
+    read_at = datetime.now(UTC)          # every call logged before this is in the file we read
     try:
         parsed = skills.parse_file(path)
         report = skills.ingest(parsed.calls)
     except (OSError, psycopg.Error) as exc:
         _err(f"ingest skills failed: {type(exc).__name__}: {exc}".strip())
         return 1
+    try:                                 # the refresh's input window ends at this read (skill_refresh)
+        skill_refresh.record_ingest(path=path.resolve(), read_at=read_at, new=report.new, present=report.present,
+                                    unparsed=len(parsed.unparsed))
+    except psycopg.Error as exc:
+        _err(f"ingest skills: the read time was not recorded ({type(exc).__name__}); the next score refresh "
+             "dates its window by the newest ingested row")
     if parsed.unparsed:
         shown = ", ".join(str(n) for n in parsed.unparsed[:20])
         more = " ..." if len(parsed.unparsed) > 20 else ""
@@ -77,20 +85,44 @@ def _print_scores(rows: list[dict[str, Any]]) -> None:
 def cmd_scores(args: argparse.Namespace) -> int:
     if (code := _postgres_gate("skills scores", write=args.refresh)) is not None:
         return code
+    if args.refresh:
+        return _refresh_and_print(args)
     try:
-        if args.refresh:
-            matched, n = skills.refresh_scores()
-            _err(f"refreshed {n} score row(s); matched {matched} more call(s) to a session")
         rows = skills.load_scores()
     except psycopg.Error as exc:
         _err(f"skills scores failed: {type(exc).__name__}: {exc}".strip())
         return 1
+    _print_selected(rows, args)
+    return 0
+
+
+def _print_selected(rows: list[dict[str, Any]], args: argparse.Namespace) -> None:
     if args.skill:
         rows = [r for r in rows if r["skill"] == args.skill]
     if not args.all_buckets:
         rows = [r for r in rows if r["bucket"] == skills.ALL_BUCKET or args.skill]
     _print_scores(rows)
-    return 0
+
+
+def _refresh_and_print(args: argparse.Namespace) -> int:
+    """A recorded refresh (skill_refresh.run_refresh). The last stdout line is always the run's
+    `skills-refresh run=... window_end=... status=...` line: the routines.log wrapper parses it."""
+    res = skill_refresh.run_refresh()
+    code = 0
+    if res.status == "ok":
+        start, end = (t.isoformat(timespec="seconds") if t else "-" for t in (res.window_start, res.window_end))
+        _err(f"refreshed {res.scored} score row(s); matched {res.matched} more call(s) to a session; "
+             f"input window {start} .. {end} (end from: {res.basis})")
+        try:
+            _print_selected(skills.load_scores(), args)
+        except psycopg.Error as exc:
+            _err(f"skills scores: refreshed, but printing failed: {type(exc).__name__}")
+            code = 1
+    else:
+        _err(f"skills scores failed: {res.error}" + ("" if res.recorded else " (the run could not be recorded)"))
+        code = 1
+    print(res.line(), flush=True)
+    return code
 
 
 def cmd_cache(args: argparse.Namespace) -> int:

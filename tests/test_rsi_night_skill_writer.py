@@ -22,7 +22,7 @@ from agent_memory import (config, distill, edits_sections, rsi_artifact as RA, r
                           rsi_schedule as S)
 from agent_memory.rsi_budget import Budget, BudgetConfig, Usage
 from rsi_night_support import (CLAUDE_MD, RULE_A, FakeEvidence, FakeReplayer, FakeStager, adapters, clean_db,
-                               make_home, rows, seed_rule, strip_agent_env)
+                               make_home, record_refresh, rows, seed_rule, strip_agent_env)
 
 NIGHT = "2026-10-25"
 PROFILE = config.REPO_ROOT / "config" / "rsi-night.subscription.json"
@@ -269,6 +269,7 @@ def seed_skill(env: SimpleNamespace, key: str = "skill:pepe") -> dict[str, Any]:
         conn.execute("insert into skill_scores (skill, bucket, n_calls, n_sessions, n_scored, score) "
                      "values (%s, '*', %s, %s, %s, %s)", (name, c["metrics"]["n_scored"], c["metrics"]["sessions"],
                                                          c["metrics"]["n_scored"], c["metrics"]["score"]))
+    record_refresh(env.url)          # skill candidates need a fresh recorded refresh (skill_refresh prerequisite)
     return c
 
 
