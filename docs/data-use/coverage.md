@@ -1,10 +1,25 @@
 # Coverage and consumption contract
 
-Stage B of the data-use plan (plan section 4). Contracts and fixtures only: no routine records anything yet.
-Stages D to F wire the routines in.
+Stage B of the data-use plan (plan section 4) defined the contract. Stage D2 (plan R4) wires routines in:
+amem-rsi-night and the morning brief are described below ("The night", "The brief").
 
-Code: `src/agent_memory/coverage.py`. Schema: `supabase/migrations/20261026150000_data_use_coverage.sql`.
-Tests: `tests/test_data_use_coverage.py`.
+Code: `src/agent_memory/coverage.py`, `src/agent_memory/night_coverage.py`. Schema:
+`supabase/migrations/20261026150000_data_use_coverage.sql`. Tests: `tests/test_data_use_coverage.py`,
+`tests/test_coverage_write.py`, `tests/test_coverage_night.py`, `tests/test_coverage_night_realistic.py`.
+
+## Dataset names
+
+A dataset is `<family>:<table>`, built with `coverage.dataset_key(family, part)`: the family key from
+`data_families.py` and the table name as the part (`deviations:deviations`, `sessions:sessions`,
+`routine_runs:runs`). Every routine names the same table the same way, so rows from different jobs line up. The
+family must exist in `data_families.py`, so every dataset maps to its owner. A part that is not a table names the
+provider an evidence query asked: `evidence_links:clickhouse`.
+
+## Writing from a routine
+
+Routines write through `coverage.record_best_effort`: one savepoint per record, never raises, and nothing at all
+when `AMEM_COVERAGE_WRITE` is `0`, `off`, `false` or `no`. A record that fails is one problem line for the job's
+notes. Coverage never changes the status or exit code of the job it describes.
 
 ## Two records
 
@@ -85,6 +100,136 @@ flowchart LR
   C -- used_no_finding --> OK[counts toward all clear]
   C -- findings --> FI[conclusion: findings]
 ```
+
+## The daily routines (amem-daily, rsi-skills, rsi-harvest)
+
+| Job | run_key | run_id |
+|---|---|---|
+| `amem-daily` | `daily.run_key(now)`, the summary line's timestamp | - |
+| `rsi-skills` | the refresh run id | - |
+| `rsi-harvest` | `harvest-<UTC time>` | its `runs` row |
+
+| Dataset | Step | Records |
+|---|---|---|
+| `sessions:sessions` | deviations scan | the scan funnel and its skip reasons |
+| `deviations:deviations` | deviations scan | snapshot: scan-eligible sessions in the window vs scanned; a backlog is `not_collected` with `pending` / `rejected` |
+| `routine_runs:runs` | score | scored runs |
+| `skills:skill_calls` | skill refresh | calls scored |
+| `coordination:handoffs` | eval harvest | handoffs drafted |
+| `<family>:<table>.<sink>` | sync | a synced copy, e.g. `sessions:sessions.clickhouse` |
+
+Synced copies keep `readback` in `unmeasured_fields`, so a complete delivery is `measurement_unavailable`: a
+delivery never claims readback. Sink cursor keys map to families: `research_runs` -> `evidence_links`,
+`sandbox_runs` -> `experiments`.
+
+Skip reasons:
+
+- deviations scan: `kind_eval`, `env_sandbox`, `tiny`, `released`, `already_scanned`, `scan_errors_cap`,
+  `covered_by_parent`, `over_limit`, `scan_error`
+- score: `no_question_file`, `over_limit`, `jev_fixture_missing`, `jev_error`
+- sync: `dead_letter`, `push_failed`, `backoff`, `stopped`
+- skill refresh: `env_sandbox`, `no_session`, `outcome_not_final`
+- harvest: `already_drafted`, `team-repo`, `incomplete-handoff`, `limit`
+
+A step that is off or not due records nothing: the guard reads a missing record as `analysis_not_run`.
+
+The night and the daily name the same tables the same way (`sessions:sessions`, `deviations:deviations`,
+`routine_runs:runs`). Their windows differ, so each writes its own snapshot rows; `coverage.verdict` judges the
+latest snapshot that covers the run's input window. The night's provider datasets (`evidence_links:clickhouse`)
+are not sync copies (`<family>:<table>.<sink>`): they count what the night's evidence queries got back.
+
+## The night (amem-rsi-night)
+
+Code: `src/agent_memory/night_coverage.py`. The night feeds a `Ledger` while it runs and writes it once, at the
+end (`Night._finish`). Key: job `amem-rsi-night` (the routine name; `rsi_checkpoints` keeps its own job
+`rsi-night`), run key = the night (`2026-10-26`). `analysis_version` = `rsi-night/1 config <sha12>` (the night
+config's hash). The input window is the S1 delta window `(since, until]`; `source_checkpoint` names the checkpoint
+it started from and the one it advances to.
+
+It writes only for a night this run owns: never for a dry run, never when a done night is run again (preflight
+refuses before the night owns it), so a rerun of a done night adds no rows. A failed night's rerun updates its
+consumption rows in place; a new input window is a new snapshot row.
+
+### Datasets and their counts
+
+| Dataset | From | queried / considered / used | skipped | findings |
+|---|---|---|---|---|
+| `sessions:sessions` | S1 | rows read / 0 / 0 | - | always `analysis_not_run`: the night counts sessions and analyses them through their deviations |
+| `deviations:deviations` | S1, S2 | new deviations / all / those in a current-rule candidate group | `team_rule`, `not_a_current_rule_in_lookback` | deviation sightings |
+| `routine_runs:runs` | S1, S2 | failed runs / all / those with a routine name | `no_routine_name` | routine sightings |
+| `experiments:rsi_eval_results` | S1, history | eval failures / with an experiment id / attached to a candidate | `no_candidate`, `no_experiment_id` | attached failures |
+| `experiments:rsi_experiments` | S1, history | experiments / with an id / attached to a candidate | `no_candidate` | 0 (history, not a problem) |
+| `evidence_links:rsi_evidence` | S1, S2 | stored evidence links / all / ok links checked against `finding_min_n` | link status (`unlinked`, `stale`), `over_cap` | finding sightings |
+| `skills:skill_scores` | S2 | low scores / all / all | `skill_refresh_<status>` when the prerequisite skips skills | skill sightings |
+| `evidence_links:<provider>` | S1 provider steps + every S4 pack | rows the provider returned / rows that reached the night / ok rows | link status, `pack_limit`, `over_cap` | S1 sightings + S4 ok rows (supporting evidence for a candidate under investigation) |
+
+`<provider>` is `supabase`, `clickhouse`, `langfuse` or `pastdev`, one row per night for every provider a step
+asked for data (a health check of an idle provider does not count). A row below its threshold (`below_min_n`) is
+used without a finding: the night measured it and found it too small.
+
+Snapshots: one per S1 dataset for the night window (the night is the job that knows these denominators: the
+stored rows its delta query selects), and one per asked provider. An S1 snapshot whose delta read hit the page
+limit counts the full window and is `not_collected` ("the delta read 3 of 5 rows"); the rest is read next night.
+A provider snapshot counts rows; its `measured_fields` / `unmeasured_fields` are the steps that answered and the
+steps that did not (`s1:ch.rule_gap`, `s4:pd.recall`). No snapshot for `skills:skill_scores` (rsi-nightly's
+refresh owns it).
+
+### Statuses
+
+- Empty window: snapshot `no_eligible_data`, consumption `analysis_not_run` with nothing queried.
+- Rows read, not analysed: `analysis_not_run` (sessions) or `read_excluded` (every row skipped). Never
+  `used_no_finding`.
+- A sighting source that raised: that dataset is `analysis_failed` with the error; the other sources go on.
+- The night stopped before a dataset was analysed: `analysis_not_run` (preflight, abort, budget) or
+  `analysis_failed` (an error), with the night's last note.
+- A provider that answered no step: `analysis_not_run` when every step was `unavailable`, `analysis_failed` on an
+  error or timeout, with the step reasons the report's `health_reasons` carry. Its snapshot is
+  `measurement_unavailable`. Some steps answered: the counts decide the status, and the snapshot is still
+  `measurement_unavailable`.
+- A provider the owner switched off (health `skipped`): `analysis_not_run` ("switched off by the owner"), no
+  snapshot, and not required.
+
+### Report and failures
+
+`report.coverage` (optional, validated by `rsi_night.validate_report` and `rsi_brief.validate_report`):
+
+```json
+{"job": "amem-rsi-night", "run_key": "2026-10-26", "enabled": true, "analysis_version": "rsi-night/1 config 3f2a…",
+ "consumption": {"findings": 2, "analysis_not_run": 5}, "snapshots": {"complete": 4, "no_eligible_data": 3},
+ "datasets": {"deviations:deviations": "findings", "...": "..."}, "required": ["deviations:deviations", "..."],
+ "failed": 0}
+```
+
+`consumption` and `snapshots` count the rows written per status; `datasets` maps each written consumption row to
+its status; `failed` counts records not written. Each record is written in its own savepoint; a failed one is a
+night note (`coverage consumption <dataset>: <error>`). A bug in the ledger itself writes nothing (a note says
+why) rather than rows with wrong counts. With `AMEM_COVERAGE_WRITE=0` nothing is written and `enabled` is false.
+None of this changes the night's status, checkpoint or exit code.
+
+## The brief (amem-rsi-brief)
+
+`rsi_brief.coverage_verdict` calls `coverage.verdict(conn, job="amem-rsi-night", run_key=<night>, required=...)`
+read-only. `required` is `night_coverage.requirements(report.coverage.required)`:
+
+- always: `deviations:deviations`, `routine_runs:runs`, `experiments:rsi_eval_results`,
+  `experiments:rsi_experiments`, `evidence_links:rsi_evidence` (what candidate discovery and triage history read);
+- plus every provider dataset the night asked and the owner did not switch off.
+
+Every requirement allows an empty window (`allow_no_eligible`): the night runs only after amem-daily passed for it
+(rsi_schedule's prerequisite gate), so an empty window means nothing new to check. The brief names those datasets.
+Sessions are not required (only counted); skills are not required (the refresh owns their snapshot).
+
+| Verdict | Brief line |
+|---|---|
+| `all_clear` | **Verdict: No problem found.** ... Nothing new to check in: <datasets with an empty window>. |
+| `findings` | **Verdict: Findings (N).** ... Coverage gaps: <dataset distinctions (reason)>. |
+| `incomplete` | **Verdict: Analysis incomplete.** Missing evidence, so this is not an all clear: <gaps>. |
+| no `report.coverage`, or `enabled: false` | **Verdict not recorded:** <why>. This is not an all clear. |
+| coverage tables unreadable | **Verdict unknown:** coverage not read (<error>). This is not an all clear. |
+
+Only `all_clear` prints "No problem found". An unavailable provider is a gap, so it shows as incomplete for that
+dataset. The verdict is the brief's `verdict` key and the markdown line right after the run line; the phone
+summary has one `Verdict: ...` line.
 
 ## Access
 

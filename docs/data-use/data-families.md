@@ -279,13 +279,14 @@ Learning families with no automatic analysis consumer:
 
 - Key: `coverage`
 - Purpose: Record what each routine read, used and skipped, and what evidence was missing
-- Producers: coverage.record_snapshot / record_consumption (Stage B contract; no routine wired yet)
-- Owner job: each consuming routine (wired in Stages D-F)
+- Producers: amem-daily: deviations scan, score, sync (coverage_daily.py); rsi-skills: amem skills scores --refresh (coverage_daily.py); rsi-harvest: amem evals harvest (coverage_daily.py); amem-rsi-night: S1 delta and S4 evidence pack (night_coverage.py)
+- Owner job: each consuming routine, through coverage.record_best_effort (R4)
 - Tables: `coverage_snapshots`; `routine_consumption`
 - Views: none
 - Local files: none
 - External sinks: none
 - Consumers:
+  - report: amem-rsi-brief coverage verdict (`src/agent_memory/rsi_brief.py`)
   - manual: amem coverage (contract checks) (`src/agent_memory/cli_coverage.py`)
 - Retention: One row per dataset and window, and per job run and dataset (natural keys, upserts). No per-row audit trail.
 - Exclusion: Counts, checkpoints and at most 20 evidence refs per row; never row contents. Reporting input (Stage F), not a learning input.

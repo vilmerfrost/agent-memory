@@ -119,6 +119,7 @@ class RefreshResult:
     basis: str | None = None                     # what window_end rests on: ingest | latest_insert | none
     error: str | None = None
     recorded: bool = False                       # the run row reached the database
+    coverage_notes: list[str] = field(default_factory=list)   # coverage write problems (stderr, never the line)
 
     def line(self) -> str:
         return (f"{LINE_PREFIX} run={self.run} window_start={_iso(self.window_start) or '-'} "
@@ -145,18 +146,33 @@ def _upsert(conn: psycopg.Connection, run: str, status: str, meta: dict[str, Any
 def run_refresh(*, db_url: str | None = None, now: datetime | None = None, run_id: str | None = None
                 ) -> RefreshResult:
     """One recorded refresh: match sessions, rewrite skill_scores and record the run with its input window. Never
-    raises on a database error: the result says `failed` and why (the caller prints its line)."""
+    raises on a database error: the result says `failed` and why (the caller prints its line).
+
+    Coverage (coverage_daily, job `rsi-skills`, run key = the run id): the skills:skill_calls snapshot and
+    consumption record, from counts read in the refresh's own transaction, written after it commits. A failed
+    refresh records `analysis_failed`. Write problems land in `coverage_notes`, never in the result."""
+    from agent_memory import coverage_daily as COV
+
+    started = now or datetime.now(UTC)
     res = RefreshResult(run_id or new_run_id(now))
     try:
         with store.connect(db_url, autocommit=True) as conn:
-            _upsert(conn, res.run, "running", {"started_at": _iso(now or datetime.now(UTC))})
+            _upsert(conn, res.run, "running", {"started_at": _iso(started)})
             res.recorded = True
     except psycopg.Error as exc:
         res.error = f"database unavailable ({type(exc).__name__})"
+        res.coverage_notes = COV.write(COV.refresh_records(res, now=started, stats=None), db_url=db_url)
         return res
+    stats: dict[str, int | None] | None = None
     try:
         with store.connect(db_url) as conn:      # one transaction: the scores and the `done` row commit together
             res.matched, res.scored = skills.rewrite_scores(conn)
+            if COV.enabled():
+                try:
+                    with conn.transaction():     # a savepoint: a failed count never fails the refresh
+                        stats = COV.refresh_stats(conn)
+                except psycopg.Error as exc:
+                    res.coverage_notes.append(f"coverage: counts not read ({type(exc).__name__})")
             first, newest_insert, calls, snapshot, read_at = conn.execute(_WINDOW_SQL).fetchone()
             res.calls, res.window_start = int(calls), (first if calls else None)
             read = _ts(read_at)
@@ -178,6 +194,7 @@ def run_refresh(*, db_url: str | None = None, now: datetime | None = None, run_i
                 _upsert(conn, res.run, "failed", {"error": res.error})
         except psycopg.Error:
             res.recorded = False
+    res.coverage_notes += COV.write(COV.refresh_records(res, now=started, stats=stats), db_url=db_url)
     return res
 
 

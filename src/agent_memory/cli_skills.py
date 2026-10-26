@@ -121,6 +121,8 @@ def _refresh_and_print(args: argparse.Namespace) -> int:
     else:
         _err(f"skills scores failed: {res.error}" + ("" if res.recorded else " (the run could not be recorded)"))
         code = 1
+    for note in res.coverage_notes:                 # a note on stderr; the exit code and the last line stay
+        _err(f"skills scores: {note}")
     print(res.line(), flush=True)
     return code
 

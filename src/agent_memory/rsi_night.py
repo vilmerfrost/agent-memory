@@ -52,7 +52,8 @@ import psycopg
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
-from agent_memory import config, edits_targets as ET, rsi_approval as AP, rsi_artifact as RA, rsi_targets
+from agent_memory import config, edits_targets as ET, night_coverage as NC, rsi_approval as AP, rsi_artifact as RA
+from agent_memory import rsi_targets
 from agent_memory.rsi_budget import Budget, BudgetConfig, BudgetConfigError, BudgetExhausted, Usage
 
 FORMAT = "rsi-night/1"
@@ -665,6 +666,9 @@ def _dget(obj: Any, name: str, default: Any = None) -> Any:
 
 _RETRIEVER = {"sb": "supabase", "ch": "clickhouse", "lf": "langfuse", "pd": "pastdev"}   # evidence step prefix
 MEASURED_SOURCES = ("clickhouse",)     # ok findings whose numbers the report keeps next to their ref
+# Night._sightings source -> the coverage dataset it analyses (night_coverage.py, data-use R4)
+_SIGHTING_DATASET = {"_deviation_sightings": NC.DEVIATIONS, "_skill_sightings": NC.SKILLS,
+                     "_routine_sightings": NC.ROUTINE_FAILURES, "_finding_sightings": NC.EVIDENCE}
 EVIDENCE_DETAIL_MAX = 10
 
 
@@ -1628,6 +1632,15 @@ class Night:
         self._evidence: dict[str, dict[str, list[dict[str, Any]]]] = {}   # candidate key -> its pack's details
         self._evidence_text: dict[str, str] = {}      # candidate key -> its rendered (enveloped) evidence pack
         self._advance = False
+        # data-use R4: what S1 and S4 read, used and skipped, written once in _finish (night_coverage.py)
+        self.cov = NC.Ledger(night, f"{FORMAT} config {cfg.sha256[:12]}")
+
+    def _cov(self) -> NC.Ledger:
+        """The coverage ledger (a night built without __init__, as some tests do, gets an unwritten one)."""
+        cov = getattr(self, "cov", None)
+        if cov is None:
+            cov = self.cov = NC.Ledger(str(getattr(self, "night", "unknown")), FORMAT)
+        return cov
 
     # -- signals, interruption ----------------------------------------------------------------------
     @contextlib.contextmanager
@@ -1821,6 +1834,9 @@ class Night:
         counts = counts() if callable(counts) else {}
         self.report["delta"] = {"since": since, **{k: int(counts.get(k, len(_dget(delta, k) or [])))
                                                    for k in ("sessions", "deviations", "eval_failures", "routine_failures")}}
+        until = _parse_ts(_dget(delta, "until")) or datetime.now(UTC)
+        self._cov().delta(delta, since=_parse_ts(since) or until, until=until, before=before,
+                          next_checkpoint=self.next_checkpoint)
         self._check_skill_refresh(_parse_ts(_dget(delta, "until")) or datetime.now(UTC))
         self._poll()
         sightings = self._sightings(delta)
@@ -1840,6 +1856,8 @@ class Night:
             except Exception as exc:  # noqa: BLE001 - one source failing must not hide the others
                 self.degraded = True
                 self.notes.append(f"candidates: {fn.__name__.strip('_')} failed: {type(exc).__name__}")
+                if (ds := _SIGHTING_DATASET.get(getattr(fn, "__name__", ""))) is not None:
+                    self._cov().failed(ds, f"{fn.__name__.strip('_')} failed: {type(exc).__name__}: {str(exc)[:150]}")
         return out
 
     def _in_scope(self, target: str | None) -> bool:
@@ -1906,17 +1924,23 @@ class Night:
         session, and an earlier session's deviation outside the delta is still an occurrence (`recurrence`)."""
         new = set(_ids(_dget(delta, "deviations")))
         if not new:
+            self._cov().deviations(used=0, team=0, other=0, sightings=[])
             return []
         from agent_memory import deviations, rule_versions
         out = []
+        used: set[str] = set()
+        team: set[str] = set()
         # Only deviations against the rule's current wording count: a rule rewritten by hand (or by the loop)
         # starts clean, so the night never "fixes" what was already fixed (docs/rsi/hand-edits.md).
         for g in deviations.candidates(days=int(self.cfg.candidates["window_days_max"]), db_url=self.db_url,
                                        rule_since=rule_versions.since):
             ids = [str(i) for i in g.get("deviation_ids") or []]
             fresh = [i for i in ids if i in new]
+            if fresh and g.get("team"):
+                team.update(fresh)
             if not fresh or g.get("team"):
                 continue
+            used.update(fresh)
             known = fresh + [i for i in ids if i not in fresh]
             rule = g.get("rule_id") or g.get("instruction_ref")
             key = f"dev:{g['instruction_source']}:{rule}"
@@ -1936,6 +1960,8 @@ class Night:
                  "n": int(g.get("count") or 0), "sessions": int(g.get("sessions") or 0),
                  "refs": [f"amem:deviation/{i}" for i in fresh][:5]},
                 file=(g.get("target_paths") or [None])[0]))
+        team -= used
+        self._cov().deviations(used=len(used), team=len(team), other=len(new - used - team), sightings=out)
         return out
 
     def _skill_sightings(self, _delta: Any) -> list[Sighting]:
@@ -1949,6 +1975,7 @@ class Night:
             rows = cur.fetchall()
         if self._skip_skill_candidates():      # the skill_refresh prerequisite failed: no skill candidate tonight
             self.skill_refresh.skipped.update(f"skill:{r['skill']}" for r in rows)
+            self._cov().skills(rows=len(rows), skipped_by=f"skill_refresh_{self.skill_refresh.status}", sightings=[])
             return []
         out = []
         for r in rows:
@@ -1960,11 +1987,13 @@ class Night:
                                 {"summary": f"skill {_token(r['skill'], 60)} scores {float(r['score']):.2f} over "
                                             f"{r['n_scored']} scored sessions", "n": int(r["n_calls"]),
                                  "sessions": int(r["n_scored"]), "refs": [f"amem:skill/{r['skill']}"]}, file=target))
+        self._cov().skills(rows=len(rows), skipped_by=None, sightings=out)
         return out
 
     def _routine_sightings(self, delta: Any) -> list[Sighting]:
         groups: dict[str, list[Mapping[str, Any]]] = {}
-        for f in _dget(delta, "routine_failures") or []:
+        all_fails = list(_dget(delta, "routine_failures") or [])
+        for f in all_fails:
             if isinstance(f, Mapping) and f.get("routine"):
                 groups.setdefault(str(f["routine"]), []).append(f)
         out = []
@@ -1977,20 +2006,32 @@ class Night:
                                 {"failures": len(fails), "count": len(fails), "sessions": len(fails)},
                                 {"summary": f"routine {r} failed {len(fails)} time(s)", "n": len(fails),
                                  "sessions": 0, "refs": refs[:5]}, file=target))
+        grouped = sum(len(v) for v in groups.values())
+        self._cov().routine_failures(used=grouped, no_routine=len(all_fails) - grouped, sightings=out)
         return out
 
     def _finding_sightings(self, delta: Any) -> list[Sighting]:
         c = self.cfg.candidates
+        cov = self._cov()
         out = []
         for f in _dget(delta, "findings") or []:
-            if _dget(f, "status") != "ok" or (_dget(f, "n") or 0) < int(c["finding_min_n"]):
+            # each finding's outcome is coverage (night_coverage.py): excluded by status, measured below the
+            # threshold (used, no finding), past the cap (not analysed tonight) or sighted (a finding)
+            if _dget(f, "status") != "ok":
+                cov.finding(f, str(_dget(f, "status") or "unknown"))
+                continue
+            if (_dget(f, "n") or 0) < int(c["finding_min_n"]):
+                cov.finding(f, "below_min_n")
+                continue
+            if len(out) >= int(c["max_finding_candidates"]):
+                cov.finding(f, "over_cap")
                 continue
             src, ref = _token(_dget(f, "source"), 30), _token(_dget(f, "ref"), 160)
             meas = {k: v for k, v in (_dget(f, "measurements") or {}).items() if _num(v) is not None}
             out.append(Sighting(f"finding:{src}:{ref}", f"provider:{src}", "investigate", None, None, [ref],
                                 {**dict(list(meas.items())[:10]), "n": _dget(f, "n")}))
-            if len(out) >= int(c["max_finding_candidates"]):
-                break
+            cov.finding(f, "sighted")
+        cov.finished(NC.EVIDENCE)
         return out
 
     def _attach_history(self, delta: Any) -> None:
@@ -1999,16 +2040,24 @@ class Night:
         if self.dry_run:
             return
         assert self.conn is not None
-        for item in list(_dget(delta, "eval_failures") or []) + list(_dget(delta, "experiments") or []):
+        cov = self._cov()
+        items = [("eval_failures", x) for x in _dget(delta, "eval_failures") or []]
+        items += [("experiments", x) for x in _dget(delta, "experiments") or []]
+        for kind, item in items:
             if not isinstance(item, Mapping):
+                cov.history(kind, ref=None, outcome="malformed")
                 continue
             exp = item.get("experiment_id") or (item.get("id") if "suite" not in item else None)
             if not exp:
+                cov.history(kind, ref=item.get("ref"), outcome="no_experiment_id")
                 continue
             ref = str(item.get("ref") or f"amem:experiment/{exp}")
-            self.conn.execute(
+            n = self.conn.execute(
                 "update rsi_candidates set evidence_refs = (select array(select distinct unnest(evidence_refs || %s::text[]))) "
-                "where dedupe_key = (select meta->>'candidate_key' from rsi_experiments where id = %s)", ([ref], str(exp)))
+                "where dedupe_key = (select meta->>'candidate_key' from rsi_experiments where id = %s)",
+                ([ref], str(exp))).rowcount
+            cov.history(kind, ref=ref, outcome="attached" if n else "no_candidate")
+        cov.history_done()
 
     def _sight(self, s: Sighting) -> None:
         """Upsert one sighting. Idempotent per delta window: re-reading the same window after a failed night adds
@@ -2172,6 +2221,7 @@ class Night:
                 pack = self.ad.evidence.pack(cand)
                 evidence_text = self.ad.evidence.render(pack)
             self._merge_health(_dget(pack, "health"), _dget(pack, "steps"), f"evidence pack for {c['dedupe_key']}")
+            self._cov().pack(pack, candidate=str(c["dedupe_key"]))
             for f in _dget(pack, "findings") or []:
                 if _dget(f, "status") == "ok" and _dget(f, "ref"):        # supporting evidence: ok findings only
                     refs.append(str(_dget(f, "ref"))[:200])
@@ -2184,6 +2234,7 @@ class Night:
         except Exception as exc:  # noqa: BLE001 - no evidence pack: hypotheses from the candidate's own data
             self.degraded = True
             self.notes.append(f"evidence pack for {c['dedupe_key']}: {type(exc).__name__}")
+            self._cov().pack_failed(f"evidence pack for {c['dedupe_key']}: {type(exc).__name__}")
         refs = list(dict.fromkeys(refs))[:20]
         self._evidence_text[str(c["dedupe_key"])] = evidence_text     # S6's writer sees it only in its envelope
         # S5: typed hypotheses (pending ones from an earlier night first: no new model call)
@@ -2518,6 +2569,21 @@ class Night:
         self._advance = True
         return "partial" if degraded else "ok"
 
+    def _record_coverage(self, status: str) -> None:
+        """data-use R4: the night's coverage and consumption rows (night_coverage.py), written only for a night this
+        run owns (never for a done night's rerun or a dry run). Best effort: nothing here changes the night's
+        status or exit code; a problem is a note, and report.coverage says what was written."""
+        if not self.owns_night or self.dry_run or self.conn is None:
+            return
+        try:
+            reason = self.notes[-1] if self.notes else status
+            self.report["coverage"], problems = self._cov().write(self.conn, status=status, reason=reason)
+        except Exception as exc:  # noqa: BLE001 - coverage never fails the night it describes
+            problems = [f"coverage not recorded: {type(exc).__name__}: {str(exc)[:160]}"]
+        if problems:
+            self.notes += [_one_line(p, 300) for p in problems[:3]] + (
+                [f"coverage: {len(problems) - 3} more record(s) not written"] if len(problems) > 3 else [])
+
     def _finish(self, status: str) -> None:
         advance = self._advance and status in ("ok", "partial") and not self.failed and not self.dry_run
         r = self.report
@@ -2538,6 +2604,7 @@ class Night:
             r["health_reasons"] = reasons
         if self.skill_refresh is not None:       # final: the skipped skill candidates are known only after S2
             r.setdefault("prerequisites", {})["skill_refresh"] = self.skill_refresh.as_report()
+        self._record_coverage(status)
         ws = self._writer_summary()
         notes = list(self.notes)
         if ws is not None:
@@ -2643,7 +2710,8 @@ def validate_report(obj: Any) -> list[str]:
                "budget",                                       # optional: the budget caps (_finish, since 1df19d2)
                "blocked",                                      # optional: ideas no experiment can use (2026-10-25)
                "writer",                                       # optional: the section writer's tally (2026-10-26)
-               "prerequisites"}                                # optional: the night's own prerequisite checks (R2)
+               "prerequisites",                                # optional: the night's own prerequisite checks (R2)
+               "coverage"}                                     # optional: coverage rows written (R4, night_coverage)
     errs += [f"unknown key {k}" for k in sorted(set(obj) - allowed)]
     if obj.get("format") != FORMAT:
         errs.append("format is not rsi-night/1")
@@ -2808,6 +2876,10 @@ def validate_report(obj: Any) -> list[str]:
         elif "skill_refresh" in pr:
             from agent_memory import skill_refresh as SR
             errs += SR.report_problems(pr["skill_refresh"])
+    if "coverage" in obj:
+        errs += NC.report_problems(obj["coverage"])
+        if isinstance(obj["coverage"], dict) and obj["coverage"].get("run_key") != obj.get("night"):
+            errs.append("coverage.run_key must be the night")
     return errs
 
 
