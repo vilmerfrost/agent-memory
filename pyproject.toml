@@ -15,7 +15,10 @@ dependencies = [
 amem = "agent_memory.cli:main"
 
 [dependency-groups]
-dev = ["pytest>=8"]
+dev = [
+    "pytest>=8",
+    "pytest-xdist>=3.8,<4",
+]
 
 [build-system]
 requires = ["hatchling"]
