@@ -102,8 +102,31 @@ def unlabel(text: str) -> Path | None:
     return Path(text) if text.startswith("/") else None
 
 
+_REALPATHS: ContextVar[dict[str, str] | None] = ContextVar("instruction_sources_realpaths", default=None)
+
+
 def _real(p: Path) -> str:
-    return os.path.realpath(p)
+    cache = _REALPATHS.get()
+    if cache is None:
+        return os.path.realpath(p)
+    key = os.fspath(p)
+    if key not in cache:
+        cache[key] = os.path.realpath(p)
+    return cache[key]
+
+
+@contextmanager
+def _realpaths() -> Iterator[None]:
+    """Hold realpath answers for one candidates() call. Each realpath costs one lstat per path part, and one
+    call asks for the same ancestors and memory dirs many times; the files do not move during one call."""
+    if _REALPATHS.get() is not None:
+        yield   # nested: the outer call's cache already covers it
+        return
+    token = _REALPATHS.set({})
+    try:
+        yield
+    finally:
+        _REALPATHS.reset(token)
 
 
 def _env_file(p: Path) -> bool:
@@ -272,12 +295,21 @@ def allowed_roots(row: SessionRow) -> list[Path]:
 
 
 def _under(path: Path, roots: list[Path]) -> bool:
+    return _under_real(path, [_real(r) for r in roots])
+
+
+def _under_real(path: Path, real_roots: list[str]) -> bool:
     real = _real(path)
-    return any(real == _real(r) or real.startswith(_real(r) + os.sep) for r in roots)
+    return any(real == r or real.startswith(r + os.sep) for r in real_roots)
 
 
 def candidates(row: SessionRow) -> list[Candidate]:
     """Every instruction source in force by name, in reading order. Reads only names and imports."""
+    with _realpaths():
+        return _candidates(row)
+
+
+def _candidates(row: SessionRow) -> list[Candidate]:
     from agent_memory.deviations import is_cloud  # local import: deviations imports this module
 
     if is_cloud(row):
@@ -286,7 +318,7 @@ def candidates(row: SessionRow) -> list[Candidate]:
     out: list[Candidate] = []
     seen: set[str] = set()
     dirs = repo_dirs(row)
-    roots = allowed_roots(row)
+    roots = [_real(r) for r in allowed_roots(row)]   # resolved once per call, not per @import check
 
     def take(c: Candidate) -> bool:
         if c.path is None:
@@ -302,6 +334,8 @@ def candidates(row: SessionRow) -> list[Candidate]:
         return True
 
     def memory(path: Path, kind: str, memory_dir: Path) -> None:
+        if not path.is_file():
+            return   # take() would drop it; naming it first costs two realpaths (most ancestors have none)
         c = Candidate(names.of(path, memory_dir), kind, path, memory=True)
         if take(c) and row.tool != "codex":
             follow(path, 1)
@@ -325,9 +359,9 @@ def candidates(row: SessionRow) -> list[Candidate]:
                 out.append(Candidate(name, "import", label=label(target), imported_by=importer,
                                      reason="env file: never read"))
                 continue
-            if not _under(target, roots) or target.suffix.lower() not in IMPORT_SUFFIXES:
+            if not _under_real(target, roots) or target.suffix.lower() not in IMPORT_SUFFIXES:
                 seen.add(_real(target))
-                why = ("outside the allowed roots" if not _under(target, roots) else "not a text instruction file")
+                why = ("outside the allowed roots" if not _under_real(target, roots) else "not a text instruction file")
                 out.append(Candidate(name, "import", label=label(target), imported_by=importer,
                                      reason=f"import {why}: not read"))
                 continue
@@ -407,7 +441,7 @@ def candidates(row: SessionRow) -> list[Candidate]:
     for chain in dirs:
         for d in _ancestors(chain):
             for fn in MEMORY_FILES:
-                if _real(d / fn) not in user_files:   # <home>/.claude/CLAUDE.md is the user memory, read above
+                if (d / fn).is_file() and _real(d / fn) not in user_files:   # <home>/.claude/CLAUDE.md is the user memory, read above
                     memory(d / fn, "ancestor", d)
     return out[:ENTRIES_MAX]
 
