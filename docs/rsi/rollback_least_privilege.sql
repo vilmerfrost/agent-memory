@@ -30,7 +30,10 @@ begin
 end $$;
 drop policy if exists amem_app_read on public.schema_migrations;
 delete from public.schema_migrations
- where filename in ('20261023020000_rsi_totp.sql', '20261023010000_amem_app_role.sql');
+ where filename in ('20261023020000_rsi_totp.sql', '20261023010000_amem_app_role.sql',
+                    '20261026160937_night_desk_reads.sql');
+-- Reapply receipt ACLs after the older migration's blanket automation grants.
+-- The receipt migration is idempotent and preserves every existing read flag.
 
 -- The role is cluster-wide: revoke everything here, then drop it unless another database still uses it.
 do $$
