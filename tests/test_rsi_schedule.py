@@ -492,11 +492,11 @@ def test_subscription_plan_has_room_for_three_experiments() -> None:
     assert one["wall_clock_s"] == 5760
     assert room_needs(plan) == {
         "calls claude-opus-5-5": (24, 26), "calls gpt-6.1-sol": (36, 40), "calls jev-1.14.0": (5 + 6, 12),
-        "A/B pairs per experiment": (6, 6), "sandbox runs": (324, 360), "wall clock": (600 + 3 * 5760, 17880),
+        "A/B pairs per experiment": (6, 6), "sandbox runs": (324, 360), "wall clock": (600 + 3 * 5760, 17940),
         "subscription tokens": (6_000_000, 6_000_000)}
     assert plan["room"]["fits"] and plan["max_experiments"] == 3 and plan["within_cap"]
     text = S.render_plan(plan)
-    assert "Room for 3 experiment(s) (every limit fits):" in text and "- wall clock: need 17,880s of 17,880s fits" in text
+    assert "Room for 3 experiment(s) (every limit fits):" in text and "- wall clock: need 17,880s of 17,940s fits" in text
     assert "- subscription tokens: need 6,000,000 of 6,000,000 fits" in text
 
 

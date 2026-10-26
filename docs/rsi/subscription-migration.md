@@ -133,10 +133,10 @@ One shared-skill experiment at its worst case: 1 Opus hypothesis, 1 Opus section
 | Jev calls | 5 triage + 3 × 2 = 11 | 12 |
 | Sandbox runs | 3 × 108 = 324 | 360 |
 | Observed subscription tokens | 3 × 2,000,000 | 6,000,000 |
-| Wall clock | 600 + 3 × 5,760 = 17,880 s | 17,880 s (4 h 58 min) |
+| Wall clock | 600 + 3 × 5,760 = 17,880 s | 17,940 s (4 h 59 min) |
 | API dollars (Jev only) | 11 × $0.01 = $0.11 | $1.00 |
 
-**Why 17,880 s** (was 17,100 s before the section writer, 17,280 s with its first 90 s timeout). The bound counts every model stage at its
+**Why 17,940 s** (60 s slack over the 17,880 s need) (was 17,100 s before the section writer, 17,280 s with its first 90 s timeout). The bound counts every model stage at its
 own timeout: hypothesizer 300 s, section writer 300 s, `improve stage` 300 s, each agent run at its
 case's `timeout_s` (240 s for the skill cases),
 each judge call at `rsi_replay.JUDGE_TIMEOUT_S` (300 s). Steps that wait on no model get an
