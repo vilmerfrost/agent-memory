@@ -1416,7 +1416,7 @@ class SandboxReplayer:
                                     "tasks": [{"id": c.id, "title": c.title or c.id} for c in cases]},
                              relevance=dict(_dget(r, "relevance") or {}),
                              judge_pairs=list(getattr(_dget(r, "judge"), "pairs", ()) or ()),
-                             attempts=_attempts(experiment_id, _dget(r, "runs") or [], rc.profile))
+                             attempts=_attempts(experiment_id, _dget(r, "runs") or [], getattr(rc, "profile", None)))
 
 
 class ApprovalProposer:
