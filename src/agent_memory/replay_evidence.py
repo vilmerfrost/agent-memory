@@ -8,7 +8,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-from agent_memory import attempt_links as AL, rsi_artifact as RA, rsi_approval as AP, store
+from agent_memory import attempt_links as AL, rsi_artifact as RA, rsi_approval as AP, store, redact as RD
 
 
 @dataclass
@@ -17,13 +17,33 @@ class Report:
     artifacts: int = 0
     evaluations: int = 0
     attempts: int = 0
+    attempt_records: int = 0
+    recovered_profiles: int = 0
+    legacy_logical_ids: int = 0
+    excluded_records: int = 0
+    missing_start: int = 0
     native_sessions: int = 0
     unresolved_native: int = 0
     missing_artifacts: int = 0
     failures: list[str] = field(default_factory=list)
+    failures_total: int = 0
+    failure_counts: dict[str, int] = field(default_factory=dict)
+    unresolved_native_reasons: dict[str, int] = field(default_factory=dict)
+
+    def failure(self, code: str, exp: str, path: str, exc: Exception) -> None:
+        """Bounded details with complete aggregate counts; no raw run output."""
+        self.failures_total += 1
+        self.failure_counts[code] = self.failure_counts.get(code, 0) + 1
+        if len(self.failures) < 50:
+            reason = RD.redact(str(exc)).replace("\n", " ")[:160]
+            self.failures.append(RD.redact(f"{exp}: {code} {type(exc).__name__}: {reason} [{path[:240]}]")[:600])
+
+    def unresolved(self, reason: str) -> None:
+        self.unresolved_native += 1
+        self.unresolved_native_reasons[reason] = self.unresolved_native_reasons.get(reason, 0) + 1
 
     def as_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        return {**asdict(self), "failure_details_omitted": max(0, self.failures_total - len(self.failures))}
 
 
 def register_evaluations(conn, adir: Path, experiment_id: str) -> dict[str, Any]:
@@ -60,6 +80,86 @@ def register_evaluations(conn, adir: Path, experiment_id: str) -> dict[str, Any]
     return {"artifact_hash": digest, "evaluations_added": after - before, "evaluations_available": len(records)}
 
 
+class RecoveryError(ValueError):
+    """A saved record lacks a consistent exact identity; code is bounded vocabulary."""
+    def __init__(self, code: str, detail: str) -> None:
+        super().__init__(detail)
+        self.code = code
+
+
+def _read_record(path: Path, root: Path) -> dict[str, Any]:
+    if path.is_symlink() or not path.resolve().is_relative_to(root):
+        raise RecoveryError("unsafe_replay_path", "replay metadata symlink or sandbox escape")
+    if path.stat().st_size > 2_000_000:
+        raise RecoveryError("oversized_replay_record", "replay metadata exceeds 2000000 bytes")
+    try:
+        row = json.loads(path.read_text())
+    except (OSError, ValueError) as exc:
+        raise RecoveryError("unreadable_replay_record", "replay metadata is not a readable JSON object") from exc
+    if not isinstance(row, dict):
+        raise RecoveryError("unreadable_replay_record", "replay metadata is not a JSON object")
+    return row
+
+
+def attempt_record(path: Path, *, root: Path, experiment_id: str) -> tuple[AL.Attempt, dict[str, Any], bool, bool]:
+    """Validate current and historical run records using exact producer evidence.
+
+    Old provider runs omitted row.profile but recorded it in the directory,
+    replay config and run ID. Recover that explicit profile, not a native actor
+    ID. Historical session_id is a logical UUID and never a native fallback.
+    """
+    base = root / "replays" / experiment_id
+    directory = path.parent.parent
+    if path.parent.name != "runs" or directory not in (base, base / directory.name):
+        raise RecoveryError("replay_directory_mismatch", "run record is outside its experiment replay directory")
+    profile = None if directory == base else directory.name
+    if any(p.is_symlink() for p in (base, directory, path.parent)):
+        raise RecoveryError("unsafe_replay_path", "symlinked replay directory")
+    row = _read_record(path, root)
+    if row.get("arm") in AL.NOT_ATTEMPT_ARMS:
+        raise RecoveryError("non_attempt_record", "judge/check/implementer record is excluded from A/B attempts")
+    if row.get("arm") not in AL.ATTEMPT_ARMS:
+        raise RecoveryError("invalid_attempt_arm", "run record is not an A/B attempt")
+    stated = row.get("profile")
+    if stated is not None and stated != profile:
+        raise RecoveryError("replay_profile_mismatch", "run profile differs from its exact replay directory")
+    recovered = stated is None and profile is not None
+    meta_path = directory / "replay.json"
+    metadata = _read_record(meta_path, root) if meta_path.exists() else None
+    if metadata is not None:
+        if metadata.get("experiment_id") != experiment_id:
+            raise RecoveryError("replay_experiment_mismatch", "replay metadata names another experiment")
+        cfg = metadata.get("config")
+        if isinstance(cfg, dict):
+            if cfg.get("profile") is not None and cfg["profile"] != profile:
+                raise RecoveryError("replay_config_profile_mismatch", "replay config profile differs from its directory")
+            if cfg.get("agent") is not None and row.get("agent") is not None and cfg["agent"] != row["agent"]:
+                raise RecoveryError("replay_provider_mismatch", "run provider differs from its replay config")
+    if recovered and (metadata is None or not isinstance(metadata.get("config"), dict)
+                      or metadata["config"].get("profile") != profile):
+        raise RecoveryError("legacy_profile_unconfirmed", "missing run profile needs matching replay config and directory")
+    try:
+        if not isinstance(row.get("rep"), int) or isinstance(row["rep"], bool) or row["rep"] < 0:
+            raise ValueError("repetition must be a non-negative integer, not a boolean")
+        at = AL.Attempt(experiment_id, row["arm"], row["case"], row["rep"], profile)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RecoveryError("invalid_attempt_identity", "case, repetition or profile is not a valid attempt identity") from exc
+    expected_run = AL._run_id_for(experiment_id + (f"-{profile}" if profile else ""), at.case, at.arm, at.rep)
+    if row.get("run_id") != expected_run or path.stem != expected_run:
+        raise RecoveryError("replay_run_identity_mismatch", "filename and run ID must match experiment/profile/case/arm/repetition")
+    logical = row.get("session_id")
+    legacy = logical is not None and profile is not None and logical == AL.session_id_for(
+        experiment_id, at.arm, at.case, at.rep, None)
+    if logical is not None and logical != at.session_id and not legacy:
+        raise RecoveryError("logical_attempt_id_mismatch", "recorded logical session ID matches neither canonical nor known legacy attempt UUID")
+    data = {"experiment_id": experiment_id, "profile": profile, "arm": at.arm, "case": at.case,
+            "rep": at.rep, "run_id": expected_run, "replay_record": path.relative_to(root).as_posix(),
+            "agent": row.get("agent"), "native_session_id": row.get("native_session_id"),
+            "model": row.get("model"), "started_at": row.get("started_at"),
+            "duration_s": row.get("duration_s"), "error": bool(row.get("error"))}
+    return at, data, recovered, legacy
+
+
 def ingest(conn, *, root: Path | None = None, limit: int = 100) -> Report:
     """Existing daily owner recovers committed experiments' evidence from disk.
     Each experiment has its own savepoint. Missing/invalid files are explicit
@@ -84,41 +184,44 @@ def ingest(conn, *, root: Path | None = None, limit: int = 100) -> Report:
                     report.artifacts += 1
                     report.evaluations += result["evaluations_added"]
                 except Exception as exc:
-                    report.failures.append(f"{exp}: evaluation ingestion {type(exc).__name__}")
+                    report.failure("evaluation_ingestion", exp, adir.relative_to(root).as_posix(), exc)
         # Only known replay run records beneath this experiment are read. The
         # model's workspace and stdout are not an identity authority.
         base = root / "replays" / exp
         files = sorted(base.glob("runs/*.json")) + sorted(base.glob("*/runs/*.json"))
+        if len(files) > 1000:
+            report.failure("replay_file_limit", exp, base.relative_to(root).as_posix(),
+                           ValueError(f"{len(files) - 1000} records beyond the 1000-file experiment bound"))
         for path in files[:1000]:
-            if path.is_symlink() or not path.resolve().is_relative_to(root) or path.stat().st_size > 2_000_000:
-                continue
             try:
-                row = json.loads(path.read_text())
-                if not isinstance(row, dict) or row.get("arm") not in AL.ATTEMPT_ARMS:
-                    continue
-                at = AL.Attempt(exp, row["arm"], row["case"], row["rep"], row.get("profile") or None)
-                directory_profile = None if path.parent.parent == base else path.parent.parent.name
-                if directory_profile != at.profile:
-                    raise ValueError("replay profile directory mismatch")
-                expected_run = AL._run_id_for(exp + (f"-{at.profile}" if at.profile else ""), at.case, at.arm, at.rep)
-                if row.get("run_id") != expected_run or path.stem != expected_run:
-                    raise ValueError("run identity mismatch")
-                # Older records have no native id. Preserve that uncertainty.
-                data = {"experiment_id": exp, "profile": at.profile, "arm": at.arm, "case": at.case,
-                        "rep": at.rep, "run_id": expected_run, "replay_record": path.relative_to(root).as_posix(),
-                        "agent": row.get("agent"), "native_session_id": row.get("native_session_id"),
-                        "model": row.get("model"), "started_at": row.get("started_at"),
-                        "duration_s": row.get("duration_s"), "error": bool(row.get("error"))}
+                at, data, recovered, legacy = attempt_record(path, root=root, experiment_id=exp)
                 with conn.transaction():
                     report.attempts += AL.record_runner(conn, [data], source="repair")
-                linked = conn.execute("select session_id from rsi_attempts where id=%s", (at.key,)).fetchone()
-                native=AL.native_session_id(data['agent'],data['native_session_id'])
-                if linked and linked[0] and native and linked[0]==native:
+                report.attempt_records += 1
+                report.recovered_profiles += int(recovered)
+                report.legacy_logical_ids += int(legacy)
+                if data.get("started_at") is None:
+                    report.missing_start += 1
+                linked = conn.execute("select a.session_id,a.evidence,s.env,s.experiment_id,s.meta "
+                    "from rsi_attempts a left join sessions s on s.session_id=a.session_id where a.id=%s",
+                    (at.key,)).fetchone()
+                evidence = linked[1] if linked and isinstance(linked[1], dict) else {}
+                native = AL.native_session_id(evidence.get('provider'), evidence.get('native_session_id'))
+                if linked and native and linked[0] == native and evidence.get('native_identity_source') == 'trusted_client_response' \
+                        and linked[2] == 'sandbox' and linked[3] == exp and isinstance(linked[4], dict) \
+                        and linked[4].get('attempt_ref') in (None, at.key):
                     report.native_sessions += 1
                 else:
-                    report.unresolved_native += 1
+                    reason = ("native_session_scope_or_attempt_conflict" if native
+                              else "client_id_not_recorded" if data['native_session_id'] is None
+                              else "invalid_native_identity")
+                    report.unresolved(reason)
             except Exception as exc:
-                report.failures.append(f"{exp}: attempt ingestion {type(exc).__name__}")
+                code = exc.code if isinstance(exc, RecoveryError) else "attempt_ingestion"
+                if code == "non_attempt_record":
+                    report.excluded_records += 1
+                else:
+                    report.failure(code, exp, path.relative_to(root).as_posix(), exc)
     AL.reconcile_native_sessions(conn)
     return report
 
