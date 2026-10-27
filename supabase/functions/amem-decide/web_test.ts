@@ -389,3 +389,32 @@ Deno.test("the phone path is unchanged next to the web routes", async () => {
   const none = await handle(post("challenge", { kind: "proposal", id: PID, action: "reject" }), { ...fake.deps(), web: undefined });
   eq(none.status, 501);
 });
+
+Deno.test("health verifies owner and reads decision dependencies without creating challenges or decisions", async () => {
+  const fake = new Fake();
+  const reads: string[] = [];
+  const deps = fake.deps({ fetch: async (url, init) => {
+    if (url.endsWith("/auth/v1/user")) return fake.fetch(url, init);
+    eq(init?.method ?? "GET", "GET");
+    reads.push(url);
+    return new Response(JSON.stringify(url.includes("rsi_passkeys?") ? [{ id: "enrolled" }] : []));
+  } });
+  const req = new Request(`${URL_}/health`, { headers: { origin: ORIGIN, authorization: `Bearer ${GOOD}` } });
+  const response = await handle(req, deps);
+  eq(response.status, 200);
+  eq(await response.json(), { result: "ok", passkey_enrolled: true });
+  eq(reads.length, 3);
+  eq(fake.calls.length, 0);
+  eq(fake.challenges.size, 0);
+});
+
+Deno.test("health denies missing login and reports dependency failures", async () => {
+  const fake = new Fake();
+  const denied = await handle(new Request(`${URL_}/health`, { headers: { origin: ORIGIN } }), fake.deps());
+  eq(denied.status, 403);
+  eq(fake.authCalls, 0);
+  const deps = fake.deps({ fetch: (url, init) => url.endsWith("/auth/v1/user") ? fake.fetch(url, init) : Promise.resolve(new Response("unavailable", { status: 503 })) });
+  const failed = await handle(new Request(`${URL_}/health`, { headers: { origin: ORIGIN, authorization: `Bearer ${GOOD}` } }), deps);
+  eq(failed.status, 502);
+  eq(fake.calls.length, 0);
+});
