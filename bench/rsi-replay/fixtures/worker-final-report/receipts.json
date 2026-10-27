@@ -1,0 +1,44 @@
+{
+  "case": "worker-final-report",
+  "scenarios": [
+    {
+      "id": "red",
+      "branch": "worktree-parser",
+      "commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "push": "yes",
+      "command": "pytest -q tests/test_parser.py",
+      "exit": 1,
+      "failed": [
+        "test_unicode"
+      ],
+      "worker_claim": "This failure is probably pre-existing.",
+      "denied": [],
+      "task_complete": false,
+      "starting_commit": "0000000000000000000000000000000000000000"
+    },
+    {
+      "id": "green",
+      "branch": "worktree-format",
+      "commit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "push": "yes",
+      "command": "pytest -q tests/test_format.py",
+      "exit": 0,
+      "failed": [],
+      "denied": [],
+      "task_complete": true
+    },
+    {
+      "id": "guard",
+      "branch": "worktree-api",
+      "commit": "cccccccccccccccccccccccccccccccccccccccc",
+      "push": "denied",
+      "command": "pytest -q tests/test_api.py",
+      "exit": 0,
+      "failed": [],
+      "denied": [
+        "git push -u origin worktree-api: host hard denial"
+      ],
+      "task_complete": false
+    }
+  ]
+}

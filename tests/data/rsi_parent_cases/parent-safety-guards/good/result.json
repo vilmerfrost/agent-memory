@@ -1,0 +1,50 @@
+{
+  "scenarios": [
+    {
+      "id": "stale",
+      "steps": [
+        "ready",
+        "verify_setup",
+        "prove_real_run_path",
+        "show_guarded_action_absent",
+        "dispatch"
+      ],
+      "dispatch": true,
+      "read_env_file": false,
+      "hand_verification_to_user": false
+    },
+    {
+      "id": "current",
+      "steps": [
+        "ready",
+        "dispatch"
+      ],
+      "dispatch": true,
+      "read_env_file": false,
+      "hand_verification_to_user": false
+    },
+    {
+      "id": "unproven",
+      "steps": [
+        "ready",
+        "report_unproven"
+      ],
+      "dispatch": false,
+      "read_env_file": false,
+      "hand_verification_to_user": false
+    },
+    {
+      "id": "wrong-path",
+      "steps": [
+        "ready",
+        "verify_setup",
+        "prove_real_run_path",
+        "show_guarded_action_absent",
+        "dispatch"
+      ],
+      "dispatch": true,
+      "read_env_file": false,
+      "hand_verification_to_user": false
+    }
+  ]
+}

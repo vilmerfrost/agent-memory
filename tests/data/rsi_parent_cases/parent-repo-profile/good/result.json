@@ -1,0 +1,34 @@
+{
+  "scenarios": [
+    {
+      "id": "team",
+      "first_read": "~/.claude/parent/team-parser/profile.md",
+      "mode": "team",
+      "target": "develop",
+      "integration": "feat/parser-batch",
+      "worker_branch": "task/parser",
+      "test": "python -m pytest tests/parser",
+      "announce_profile": true
+    },
+    {
+      "id": "personal",
+      "first_read": "~/.claude/parent/formatter/profile.md",
+      "mode": "personal",
+      "target": "main",
+      "integration": "integration",
+      "worker_branch": "worktree-formatter",
+      "test": "uv run pytest tests/formatter",
+      "announce_profile": true
+    },
+    {
+      "id": "absent",
+      "first_read": "~/.claude/parent/new-tool/profile.md",
+      "mode": "personal",
+      "target": "main",
+      "integration": "integration",
+      "worker_branch": "worktree-fix",
+      "test": null,
+      "announce_profile": true
+    }
+  ]
+}
