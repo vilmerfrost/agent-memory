@@ -237,6 +237,9 @@ def validate_report(rep: Any) -> list[str]:
         if isinstance(rep["coverage"], dict) and rep["coverage"].get("run_key") != rep["night"]:
             p.append("coverage.run_key: not the report's night")
     _check_map(rep["delta"], "delta", COUNTS, p)
+    if "experiment_goal" in rep:
+        from agent_memory.rsi_night import experiment_goal_problems
+        p += experiment_goal_problems(rep["experiment_goal"], rep.get("experiments"))
     for name in ("patterns", "candidates"):
         p += [f"{name}[{i}]: not a JSON object" for i, x in enumerate(rep[name]) if not isinstance(x, dict)]
     for i, c in enumerate(rep["candidates"]):             # optional (2026-10-25): why each idea was thrown out
@@ -910,6 +913,10 @@ def build_brief(rep: Mapping[str, Any], db: Db, *, artifacts_root: Path, report:
         cands.append({"id": text(c.get("id"), 60) or None, "key": text(c.get("key"), 120), "source": text(c.get("source"), 40),
                       "rank": c.get("rank") if _num(c.get("rank")) else None, "selected": c.get("selected") is True,
                       "reason": text(c.get("reason"), 200), "status": row.get("status"), "seen_count": row.get("seen_count")})
+        if isinstance(c.get("triage"), dict):
+            t = c["triage"]
+            cands[-1]["triage"] = {"action": text(t.get("action"), 20), "mode": text(t.get("mode"), 20),
+                                   "reason": text(t.get("reason"), 40), "explanation": text(t.get("explanation"), 200)}
     cands.sort(key=lambda c: (not c["selected"], -(c["rank"] or 0.0)))
     experiments = [{"experiment_id": e.get("experiment_id"), "candidate_key": text(e.get("candidate_key"), 120) or None,
                     "verdict": e.get("verdict"), "status": e["status"], "cost_usd": e.get("cost_usd"),
@@ -1201,6 +1208,11 @@ def render_markdown(b: dict[str, Any]) -> str:
         out += ["", *_table(["rank", "candidate", "source", "selected", "status", "reason"],
                             [[_fmt(x["rank"]), x["key"], x["source"], "yes" if x["selected"] else "no",
                               text(x["status"], 20) or "-", x["reason"] or "-"] for x in cd["items"]])]
+        for candidate in cd["items"]:
+            triage = _obj(candidate.get("triage"))
+            if triage:
+                out.append(f"\n{candidate['key']}: triage {text(triage.get('action'), 20)} "
+                           f"({text(triage.get('mode'), 20)}). {text(triage.get('explanation'), 200)}")
         if cd["total"] > len(cd["items"]):
             out.append(f"\nAnd {cd['total'] - len(cd['items'])} more (see the report).")
 

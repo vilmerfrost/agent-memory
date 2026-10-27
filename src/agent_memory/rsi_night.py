@@ -143,6 +143,7 @@ class NightConfig:
     sha256: str
     # The skill_refresh prerequisite (skill_refresh.py): `mode` report | enforce, `max_lag_h` (default 2).
     skill_refresh: tuple[str, float] = ("report", 2.0)
+    experiment_goal: tuple[int, int] = (0, 0)  # minimum and target; zero minimum keeps legacy veto behavior
 
 
 _STAGE_MODES = {"triage": ("fixture", "live"), "hypothesizer": ("fixture", "claude-cli"),
@@ -189,6 +190,11 @@ def load_config(path: Path | None = None) -> NightConfig:
     min_rank = tri.get("min_rank", 0.0)
     if isinstance(min_rank, bool) or not isinstance(min_rank, (int, float)):
         raise ConfigError(f"{p}: triage.min_rank must be a number")
+    minimum = tri.get("minimum_experiments", 0)
+    target = tri.get("target_experiments", budget.max_experiments)
+    if (any(isinstance(v, bool) or not isinstance(v, int) for v in (minimum, target))
+            or not 0 <= minimum <= target <= budget.max_experiments):
+        raise ConfigError(f"{p}: triage experiment goal must satisfy 0 <= minimum <= target <= max_experiments")
 
     def section(name: str) -> dict[str, Any]:
         v = d.get(name) or {}
@@ -204,7 +210,8 @@ def load_config(path: Path | None = None) -> NightConfig:
     result = NightConfig(budget=budget, stages=stages, candidates=cands, weights=weights, min_rank=float(min_rank),
                          hypothesizer=section("hypothesizer"), implementer=section("implementer"),
                          replay=section("replay"), staging=section("staging"), path=str(p),
-                         sha256=hashlib.sha256(raw).hexdigest(), skill_refresh=skill_refresh)
+                         sha256=hashlib.sha256(raw).hexdigest(), skill_refresh=skill_refresh,
+                         experiment_goal=(minimum, target))
     from agent_memory.rsi_subscription_config import validate_role
     roles = [("claude", result.hypothesizer, "") ] if stages["hypothesizer"] == "claude-cli" else []
     if stages["implementer"] == "writer":
@@ -421,9 +428,30 @@ class TriageAnswers:
     risk: float            # 0..2
     testability: float     # 0..2
     mode: str              # fixture | live | heuristic
+    reason: str | None = None  # Jev's typed reason code; never infer a missing rationale from scores
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+TRIAGE_REASONS = {
+    "worth_testing": "A replay can test a plausible improvement.",
+    "rare_evidence": "The problem has too little recurring evidence.",
+    "low_impact": "The expected benefit is low.",
+    "hard_to_test": "A short replay may not measure this problem well.",
+    "prior_no_effect": "Earlier experiments did not improve the result.",
+    "prior_worse": "An earlier experiment made the result worse.",
+    "instruction_unlikely": "Changing instruction text is unlikely to fix this problem.",
+    "risk": "Changing this instruction may harm other behavior.",
+    "out_of_scope": "The target is outside the permitted edit scope.",
+    "other": "Jev chose another concern; a more specific reason was not provided.",
+}
+
+
+def triage_explanation(a: TriageAnswers) -> str:
+    if a.mode == "heuristic":
+        return "No Jev assessment was available; deterministic ranking was used."
+    return TRIAGE_REASONS.get(a.reason, "Jev did not provide a reason.")
 
 
 def _bucket(n: Any) -> str:
@@ -538,9 +566,17 @@ class JevTriage:
             self.health = "error"
             return None
         act = res["action"]
+        if act.value not in ("experiment", "wait"):
+            self.health = "error"
+            return None
+        reason = str(res["reason"].value) if "reason" in res else None
+        if reason is not None and reason not in TRIAGE_REASONS:
+            self.health = "error"
+            reason = None
         return TriageAnswers(action=str(act.value), p_experiment=float(act.probabilities.get("experiment", 0.0)),
                              impact=float(res["impact"].value), risk=float(res["risk"].value),
-                             testability=float(res["testability"].value), mode="live" if live else "fixture")
+                             testability=float(res["testability"].value), mode="live" if live else "fixture",
+                             reason=reason)
 
 
 # =========================================================================== adapters (protocols + defaults)
@@ -1647,6 +1683,7 @@ class Night:
         self.since: str | None = None
         self.next_checkpoint: str | None = None
         self.selected_ids: list[str] = []
+        self.standby_ids: list[str] = []
         self._pool_rows: dict[str, dict[str, Any]] = {}
         self._evidence: dict[str, dict[str, list[dict[str, Any]]]] = {}   # candidate key -> its pack's details
         self._evidence_text: dict[str, str] = {}      # candidate key -> its rendered (enveloped) evidence pack
@@ -2235,13 +2272,14 @@ class Night:
             if ans is None:
                 ans = heuristic_answers(c, hist, in_scope)
             r = rank(ans, recurrence(c), hist, self.cfg.weights)
-            eligible = ans.action == "experiment" and in_scope and bool(tests) and r >= self.cfg.min_rank
+            explore = self.cfg.experiment_goal[0] > 0
+            eligible = in_scope and bool(tests) and (explore or (ans.action == "experiment" and r >= self.cfg.min_rank))
             why = ("eligible" if eligible else "no in-scope target" if not in_scope else NO_TEST_CASE if not tests
                    else "triage: wait" if ans.action != "experiment" else "rank below the minimum")
             results.append((c, ans, r, eligible, why, hist))
         self.health["jev"] = getattr(self.ad.triage, "health", self.health["jev"])
-        order = sorted(results, key=lambda x: (not x[3], -x[2], x[0]["dedupe_key"]))
-        slots = self.budget.experiments_left()
+        order = sorted(results, key=lambda x: (not x[3], x[1].action != "experiment", -x[2], x[0]["dedupe_key"]))
+        slots = min(self.budget.experiments_left(), self.cfg.experiment_goal[1])
         for c, ans, r, eligible, why, hist in order:
             selected = eligible and slots > 0
             if selected:
@@ -2250,8 +2288,12 @@ class Night:
             else:
                 reason = f"deferred: {why}" if not eligible else f"deferred: rank {r:.3f} below tonight's experiment slots"
             c["rank"], c["jev"] = r, {**ans.as_dict(), "history": hist}
+            if selected and ans.action == "wait":
+                reason += "; scheduled exploration despite wait: " + triage_explanation(ans)
             if selected:
                 self.selected_ids.append(str(c.get("id") or c["dedupe_key"]))
+            elif eligible:
+                self.standby_ids.append(str(c.get("id") or c["dedupe_key"]))
             if not self.dry_run:
                 self.conn.execute(
                     "update rsi_candidates set status = %s, rank = %s, jev = %s, decided_reason = %s, "
@@ -2275,13 +2317,30 @@ class Night:
                                               "source": c["source"], "rank": r, "selected": selected, "reason": reason,
                                               # additive (Night Desk): the file, the cases that use it, or why not
                                               "target": c.get("target"), "test_cases": tests,
+                                              "triage": {**ans.as_dict(), "explanation": triage_explanation(ans)},
                                               "skip_reason": None if tests else NO_TEST_CASE})
         self._pool_rows = {str(c.get("id") or c["dedupe_key"]): c for c, *_ in results}
 
     # -- S4-S8 -----------------------------------------------------------------------------------------
     def _experiments(self) -> None:
-        for cid in list(self.selected_ids):
+        target = self.cfg.experiment_goal[1]
+        standby = self.standby_ids if self.cfg.experiment_goal[0] > 0 else []
+        for cid in [*self.selected_ids, *standby]:
+            if self.budget.experiments_left() <= self.cfg.budget.max_experiments - target:
+                break
             self._poll()
+            if cid not in self.selected_ids:
+                # A prior candidate yielded no usable hypothesis: fill its unused slot, within the same caps.
+                c = self._pool_rows[cid]
+                reason = "selected: backfill unused daily experiment slot"
+                if c["jev"]["action"] == "wait":
+                    reason += "; scheduled exploration despite wait: " + triage_explanation(
+                        TriageAnswers(**{k: c["jev"][k] for k in TriageAnswers.__dataclass_fields__}))
+                self._update_candidate(c.get("id"), status="selected", reason=reason)
+                self.selected_ids.append(cid)
+                for entry in self.report["candidates"]:
+                    if entry["key"] == c["dedupe_key"]:
+                        entry.update(selected=True, reason=reason)
             self._investigate(self._pool_rows[cid])
 
     def _investigate(self, c: dict[str, Any]) -> None:
@@ -2533,6 +2592,7 @@ class Night:
             with self._interruptible():
                 rr = self.ad.replayer.replay(artifact_hash=st.artifact_hash, experiment_id=exp_id, baseline_id=bid,
                                              budget=self.budget)
+            entry["replay_runs"] = rr.runs
             self._record_attempts(exp_id, rr)
             verdict = rr.verdict if rr.verdict in VERDICTS else "INCONCLUSIVE"
             reasons = list(rr.reasons)
@@ -2697,7 +2757,9 @@ class Night:
             self.degraded = True       # no writer change was tested tonight: partial, and the routines.log line says why
         if self.failed:
             return "partial"
-        degraded = self.degraded or any(_SEVERITY.get(self.health.get(k, "ok"), 0) >= 2 for k in PROVIDERS)
+        minimum, _ = self.cfg.experiment_goal
+        missed_minimum = minimum > sum(bool(e.get("replay_runs")) for e in self.report["experiments"])
+        degraded = self.degraded or missed_minimum or any(_SEVERITY.get(self.health.get(k, "ok"), 0) >= 2 for k in PROVIDERS)
         self._advance = True
         return "partial" if degraded else "ok"
 
@@ -2739,6 +2801,28 @@ class Night:
         self._record_coverage(status)
         ws = self._writer_summary()
         notes = list(self.notes)
+        minimum, target = self.cfg.experiment_goal
+        if minimum and not self.dry_run:
+            attempted = sum(bool(e.get("experiment_id")) for e in r["experiments"])
+            replayed = sum(bool(e.get("replay_runs")) for e in r["experiments"])
+            shortfall = []
+            if replayed < target:
+                if status in ("preflight_failed", "budget_exhausted", "aborted"):
+                    shortfall.append(status)
+                if attempted > replayed:
+                    shortfall.append("an experiment did not produce any replay runs")
+                if not self.selected_ids:
+                    shortfall.append("no permitted candidate with applicable replay cases")
+                elif len(self.selected_ids) < target:
+                    shortfall.append("fewer permitted candidates than the daily target")
+                if any(c.get("hypotheses_accepted") == 0 for c in r["candidates"]):
+                    shortfall.append("a candidate produced no valid hypothesis")
+                shortfall = shortfall or ["candidate preparation did not fill the remaining slots"]
+            r["experiment_goal"] = {"minimum": minimum, "target": target, "attempted": attempted,
+                                    "replayed": replayed, "minimum_met": replayed >= minimum,
+                                    "target_met": replayed >= target, "shortfall_reasons": shortfall}
+            notes.insert(0, f"Daily experiments: {replayed} with replay runs; minimum {minimum}, target {target}. "
+                         + ("; ".join(shortfall) if shortfall else "Daily target met."))
         if ws is not None:
             r["writer"] = ws
             if ws["all_fell_back"]:
@@ -2816,6 +2900,30 @@ _EXP_ID = re.compile(r"[a-z0-9][a-z0-9-]{2,60}")
 _UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 
 
+def experiment_goal_problems(goal: Any, experiments: Any = None) -> list[str]:
+    """Validate optional daily counts without treating skipped/preparation attempts as replay evidence."""
+    counts = ("minimum", "target", "attempted", "replayed")
+    if not isinstance(goal, dict) or any(
+            isinstance(goal.get(k), bool) or not isinstance(goal.get(k), int) or goal[k] < 0 for k in counts):
+        return ["experiment_goal counts must be nonnegative integers"]
+    errors = []
+    if not 1 <= goal["minimum"] <= goal["target"] <= 3 or not goal["replayed"] <= goal["attempted"] <= 3:
+        errors.append("experiment_goal counts are inconsistent with the daily limits")
+    for key, threshold in (("minimum_met", "minimum"), ("target_met", "target")):
+        if not isinstance(goal.get(key), bool) or goal[key] != (goal["replayed"] >= goal[threshold]):
+            errors.append(f"experiment_goal.{key} does not match the replay count")
+    reasons = goal.get("shortfall_reasons")
+    if (not isinstance(reasons, list) or not all(isinstance(x, str) and x.strip() for x in reasons)
+            or bool(reasons) != (goal["replayed"] < goal["target"])):
+        errors.append("experiment_goal shortfall reasons do not match the daily result")
+    if isinstance(experiments, list) and all(isinstance(e, dict) for e in experiments):
+        attempted = sum(bool(e.get("experiment_id")) for e in experiments)
+        replayed = sum(type(e.get("replay_runs")) is int and e["replay_runs"] > 0 for e in experiments)
+        if (goal["attempted"], goal["replayed"]) != (attempted, replayed):
+            errors.append("experiment_goal counts do not match the experiment evidence")
+    return errors
+
+
 def validate_report(obj: Any) -> list[str]:
     """Problems with a night report against contract 2.5 (rsi-night/1). Empty list: valid."""
     errs: list[str] = []
@@ -2843,7 +2951,7 @@ def validate_report(obj: Any) -> list[str]:
                "blocked",                                      # optional: ideas no experiment can use (2026-10-25)
                "writer",                                       # optional: the section writer's tally (2026-10-26)
                "prerequisites",                                # optional: the night's own prerequisite checks (R2)
-               "coverage"}                                     # optional: coverage rows written (R4, night_coverage)
+               "coverage", "experiment_goal"}                  # optional: coverage ledger and daily cadence
     errs += [f"unknown key {k}" for k in sorted(set(obj) - allowed)]
     if obj.get("format") != FORMAT:
         errs.append("format is not rsi-night/1")
@@ -2855,6 +2963,8 @@ def validate_report(obj: Any) -> list[str]:
             errs.append(f"{k} is not an ISO timestamp")
     if obj.get("status") not in STATUSES:
         errs.append(f"status {obj.get('status')!r} not in {STATUSES}")
+    if "experiment_goal" in obj:
+        errs += experiment_goal_problems(obj["experiment_goal"], obj.get("experiments"))
     cp = need(obj, "checkpoint", dict, "report")
     if isinstance(cp, dict):
         need(cp, "before", str, "checkpoint", True)
@@ -2885,6 +2995,12 @@ def validate_report(obj: Any) -> list[str]:
         need(c, "rank", (int, float), w, True)
         need(c, "selected", bool, w)
         need(c, "reason", str, w)
+        if isinstance(c, dict) and "triage" in c:
+            triage = c["triage"]
+            if (not isinstance(triage, dict) or triage.get("action") not in ("experiment", "wait")
+                    or not isinstance(triage.get("explanation"), str)
+                    or triage.get("reason") not in (None, *TRIAGE_REASONS)):
+                errs.append(f"{w}.triage has an invalid action, reason or explanation")
         if isinstance(c, dict) and "hypotheses_rejected" in c:     # optional (2026-10-25): why ideas were dropped
             hr = c["hypotheses_rejected"]
             if not (isinstance(hr, list) and all(isinstance(x, dict) and x.get("code") in REJECT_REASONS

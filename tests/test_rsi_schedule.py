@@ -529,6 +529,7 @@ def test_room_flags_caps_sized_for_one_experiment(tmp_path: Path) -> None:
                        "subscription tokens", "wall clock"]
     assert not plan["room"]["fits"] and "DOES NOT FIT" in S.render_plan(plan)
     d["budget"]["max_experiments"] = 1                   # the same caps did fit one experiment, except the wall clock
+    d["triage"]["target_experiments"] = 1                # keep this one-experiment calibration profile consistent
     p.write_text(json.dumps(d))
     one = S.paid_plan(N.load_config(p))
     assert [c["limit"] for c in one["room"]["checks"] if not c["fits"]] == ["wall clock"]
