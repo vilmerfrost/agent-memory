@@ -5,6 +5,7 @@
 # grades, whether the target is in scope, and the verdicts of earlier experiments on the same candidate.
 # Never transcript text, never retrieved provider content, never model output. The final rank is computed by
 # deterministic code (rsi_night.rank) from these answers; Jev never selects or approves anything by itself.
+# Under a configured daily minimum, wait is advisory: scope, replay coverage and hard budgets still control runs.
 
 threshold = 0.6
 pass_question = "action"
@@ -13,15 +14,17 @@ pass_options = ["experiment"]
 [[questions]]
 name = "action"
 kind = "choice"
-prompt = """A nightly investigator can run one sandbox experiment that edits one instruction file for AI coding
-agents and compares it with the unchanged file. Decide whether this candidate deserves tonight's experiment.
+prompt = """A nightly investigator aims for three sandbox experiments, each editing one instruction file for AI coding
+agents and comparing it with the unchanged file. Recommend whether this candidate should be prioritized.
+Your answer is priority advice, not authorization or a veto: the scheduler may explore a lower-priority
+candidate to meet its daily minimum, within the same safety checks and hard budgets.
 recurrence counts how often the problem was seen; sessions counts the distinct sessions. followed_grade is how
 well agents followed the rule (1 = fully, 0 = ignored); objective_result is how good the sessions' results were.
 prior_experiments lists earlier experiments on the same candidate and their verdicts.
 target_in_scope says whether the file may be edited by the investigator at all."""
 [questions.options]
 experiment = "Worth an experiment now: the problem recurs, the target is in scope, and a change to the instruction text can plausibly fix it."
-wait = "Keep it for a later night: too rare, out of scope, already tested without effect, or not fixable by editing instruction text."
+wait = "Lower priority: too rare, out of scope, already tested without effect, or unlikely to improve through instruction text."
 
 [[questions]]
 name = "impact"
@@ -40,3 +43,19 @@ name = "testability"
 kind = "score"
 prompt = "How well can a short sandbox replay of agent tasks show whether a change helps?"
 levels = ["Poor: needs long real sessions or human judgment", "Fair: some replay tasks can show it", "Good: a short replay clearly shows the difference"]
+
+[[questions]]
+name = "reason"
+kind = "choice"
+prompt = "Choose the single main reason for your action recommendation. This is an explanation of your recommendation, not permission to edit, experiment or promote. Use other when none of these reasons fits."
+[questions.options]
+worth_testing = "A replay can test a plausible improvement."
+rare_evidence = "The problem has too little recurring evidence."
+low_impact = "The expected benefit is low."
+hard_to_test = "A short replay may not measure this problem well."
+prior_no_effect = "Earlier experiments did not improve the result."
+prior_worse = "An earlier experiment made the result worse."
+instruction_unlikely = "Changing instruction text is unlikely to fix this problem."
+risk = "Changing this instruction may harm other behavior."
+out_of_scope = "The target is outside the permitted edit scope."
+other = "Another concern not described by these choices."

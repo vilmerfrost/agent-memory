@@ -46,6 +46,8 @@
     "max_finding_candidates": 5
   },
   "triage": {
+    "minimum_experiments": 1,
+    "target_experiments": 3,
     "weights": {
       "impact": 0.35,
       "recurrence": 0.25,

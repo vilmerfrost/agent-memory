@@ -8,6 +8,7 @@ no Docker, no hosted database.
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -92,6 +93,7 @@ class WorstCaseReplayer(FakeReplayer):
 
     def book(self, budget: Budget) -> None:
         exp = len(self.calls)
+        self.agent_runs = 0
         for model in (OPUS, SOL):
             for i in range(6):
                 budget.take_call(model, "replay-agent")
@@ -100,12 +102,19 @@ class WorstCaseReplayer(FakeReplayer):
                     budget.take_sandbox_run(rid)
                     budget.record_run(rid, duration_s=1.0)
                 budget.record_call(model, stage="replay-agent", tokens_in=self.tokens - 500, tokens_out=500)
+                self.agent_runs += 1
             for _ in range(3):
                 budget.take_call(SOL, "replay-judge")
                 budget.record_call(SOL, stage="replay-judge", tokens_in=self.tokens - 500, tokens_out=500)
             budget.take_call(JEV, "replay-jev")
             budget.record_call(JEV, stage="replay-jev")
         self.clock.t += self.room["per_experiment"]["wall_clock_s"]
+
+    def replay(self, **kw):
+        # book() accounts for all containers directly, so the base double runs no extra containers.
+        # Still report the agent attempts it booked, as the real provider adapters do.
+        result = super().replay(**kw)
+        return replace(result, runs=self.agent_runs)
 
 
 def seed_four(url: str) -> None:
