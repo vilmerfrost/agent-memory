@@ -11,12 +11,13 @@ from __future__ import annotations
 
 import json
 import sys
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from agent_memory import deviations, distill
+from agent_memory import deviations, distill, rule_catalog
 from test_deviations_support import FakeWriter, envelope, finding, setup_home  # noqa: F401
 
 OFFERED = {"claude-md:global"}
@@ -72,7 +73,10 @@ def test_writer_argv_passes_the_reply_schema(monkeypatch: pytest.MonkeyPatch) ->
 def test_schema_requires_both_grades_as_numbers_never_null() -> None:
     item = deviations.REPLY_SCHEMA["properties"]["deviations"]["items"]
     assert {"followed_grade", "result_grade", "instruction_source", "instruction_ref", "turn",
-            "what", "why", "how"} <= set(item["required"])
+            "what", "why", "why_category", "how"} <= set(item["required"])
+    assert item["properties"]["why_category"] == {"type": "string", "enum": list(deviations.WHY_CATEGORIES)}
+    assert list(deviations.WHY_CATEGORIES) == ["unclear", "wrong", "conflict", "missing_context",
+                                               "tool_blocked", "ignored"]
     for grade in ("followed_grade", "result_grade"):
         assert item["properties"][grade] == {"type": "number", "minimum": 0, "maximum": 1}
     assert item["properties"]["turn"]["type"] == ["integer", "null"]
@@ -198,6 +202,48 @@ def test_call_writer_sends_the_schema_and_reads_structured_output(tmp_path: Path
     argv = json.loads((tmp_path / "argv.json").read_text())
     assert json.loads(argv[argv.index("--json-schema") + 1]) == deviations.REPLY_SCHEMA
     assert (tmp_path / "stdin.txt").read_text() == "PROMPT"
+
+
+# Two realistic writer items: an agent that skipped a clear rule (ignored) and one that misread a
+# vague one (unclear). Also the items of the evidence run in the worker report.
+REALISTIC = {"deviations": [
+    {"instruction_source": "claude-md:global", "instruction_ref": "verify-before-done", "turn": 14,
+     "what": "The agent called the UI fix done after the unit tests passed, without opening the page.",
+     "why": "The rule is clear and applied; the agent skipped the browser check to finish faster.",
+     "why_category": "ignored",
+     "how": "Near the end of the session; the broken layout on the narrow width shipped and needed a second fix.",
+     "followed_grade": 0.1, "result_grade": 0.3},
+    {"instruction_source": "skill:dispatch", "instruction_ref": "brief", "turn": 3,
+     "what": "The parent sent workers briefs without a done-when line.",
+     "why": "The skill says a brief needs a DoD but never says what one looks like for a docs-only task.",
+     "why_category": "unclear",
+     "how": "Early in the session; one worker asked back and lost about ten minutes, the result was fine.",
+     "followed_grade": 0.5, "result_grade": 0.8},
+]}
+REALISTIC_SOURCES = [
+    deviations.LoadedSource("claude-md:global", "", [rule_catalog.Rule("verify-before-done", "Verify Before Done")],
+                            "a" * 64),
+    deviations.LoadedSource("skill:dispatch", "", [rule_catalog.Rule("brief", "Brief")], "b" * 64),
+]
+
+
+def test_realistic_reply_end_to_end_reaches_jev_as_labels(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # The real call path with a fake CLI: envelope -> parse -> resolve -> Jev state.
+    monkeypatch.setenv(deviations.CLAUDE_ENV, str(_fake_cli(tmp_path, cli_envelope(REALISTIC))))
+    findings, reasons = deviations.write("PROMPT", {s.name for s in REALISTIC_SOURCES}, timeout=30)
+    assert reasons == []
+    ignored, unclear = deviations.resolve(findings, REALISTIC_SOURCES)
+    assert (ignored.rule_id, ignored.why_category, unclear.rule_id, unclear.why_category) == \
+        ("verify-before-done", "ignored", "brief", "unclear")
+    state_i = deviations.jev_state(ignored, "worker", 2, "pushed", "worker")
+    state_u = deviations.jev_state(unclear, "parent", 0, "shipped")
+    assert "why_category: ignored (the writer's view of why: the agent ignored a clear instruction)" in state_i
+    assert "why_category: unclear (the writer's view of why: the instruction is unclear)" in state_u
+    for state, item in ((state_i, REALISTIC["deviations"][0]), (state_u, REALISTIC["deviations"][1])):
+        for text in (item["what"], item["why"], item["how"]):
+            assert text not in state and text[:30] not in state
+    # Same labels, different category: a different Jev state (a different fixture key).
+    assert state_i != deviations.jev_state(replace(ignored, why_category="unclear"), "worker", 2, "pushed", "worker")
 
 
 def test_call_writer_keeps_the_error_envelope_of_exit_1(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

@@ -205,7 +205,7 @@ def finding(source: str = "claude-md:global", ref: str = "Explaining", turn: int
             followed: float = 0.3, result_: float = 0.8, **over: Any) -> dict[str, Any]:
     body = {"instruction_source": source, "instruction_ref": ref, "turn": turn,
             "what": "The agent wrote a long recap instead of a short answer.",
-            "why": "The rule competes with a habit of summarising every step.",
+            "why": "The rule competes with a habit of summarising every step.", "why_category": "conflict",
             "how": "It showed at the end of the session and made the answer harder to read.",
             "followed_grade": followed, "result_grade": result_}
     body.update(over)
