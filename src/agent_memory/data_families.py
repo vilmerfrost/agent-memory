@@ -81,6 +81,23 @@ NO_RAW = "No transcript text, secrets or raw private content: only redacted, cap
 
 FAMILIES: tuple[Family, ...] = (
     Family(
+        key="connection_diagnostics",
+        title="Manual subscription connection diagnostics",
+        purpose="Verify one owner-requested real subscription call without automatic inference retries",
+        producers=("Night Desk owner-authenticated amem-health model-start", "Night Desk management/model-probe.py"),
+        owner_job="com.vilmerfrost.night-desk-model-probe (manual requests only)",
+        tables=("amem_private.model_connection_tests", "amem_private.model_connection_receipts"),
+        consumers=(_c("Night Desk Connections (fixed status function)",
+                      "supabase/migrations/20261027200215_model_connection.sql", "report"),
+                   _c("exclusive claims and request replay prevention",
+                      "supabase/migrations/20261027200215_model_connection.sql", "operational")),
+        retention="Latest result per provider; request-ID replay receipts kept indefinitely. "
+                  "Requests expire after 3 minutes; verification after 15 minutes; cooldown is 5 minutes.",
+        exclusion="Never a learning input. Private records expose only fixed status, model, time, latency "
+                  "and token totals through owner-authenticated status. No prompts, replies, secrets or native session IDs.",
+        learning_input=False,
+    ),
+    Family(
         key="sessions",
         title="Sessions, outcomes and summaries",
         purpose="Find recurring problems and assess task results",
