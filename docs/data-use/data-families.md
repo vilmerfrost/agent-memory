@@ -12,6 +12,23 @@ Learning families with no automatic analysis consumer:
 - **Lessons and lesson-use history** (`lessons`)
 - **Evaluation drafts** (`eval_drafts`)
 
+## Manual subscription connection diagnostics
+
+- Key: `connection_diagnostics`
+- Purpose: Verify one owner-requested real subscription call without automatic inference retries
+- Producers: Night Desk owner-authenticated amem-health model-start; Night Desk management/model-probe.py
+- Owner job: com.vilmerfrost.night-desk-model-probe (manual requests only)
+- Tables: `amem_private.model_connection_tests`; `amem_private.model_connection_receipts`
+- Views: none
+- Local files: none
+- External sinks: none
+- Consumers:
+  - report: Night Desk Connections (fixed status function) (`supabase/migrations/20261027200215_model_connection.sql`)
+  - operational: exclusive claims and request replay prevention (`supabase/migrations/20261027200215_model_connection.sql`)
+- Retention: Latest result per provider; request-ID replay receipts kept indefinitely. Requests expire after 3 minutes; verification after 15 minutes; cooldown is 5 minutes.
+- Exclusion: Never a learning input. Private records expose only fixed status, model, time, latency and token totals through owner-authenticated status. No prompts, replies, secrets or native session IDs.
+- Learning input: no
+
 ## Sessions, outcomes and summaries
 
 - Key: `sessions`
