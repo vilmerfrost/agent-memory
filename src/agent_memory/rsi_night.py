@@ -566,10 +566,17 @@ class JevTriage:
             self.health = "error"
             return None
         act = res["action"]
+        if act.value not in ("experiment", "wait"):
+            self.health = "error"
+            return None
+        reason = str(res["reason"].value) if "reason" in res else None
+        if reason is not None and reason not in TRIAGE_REASONS:
+            self.health = "error"
+            reason = None
         return TriageAnswers(action=str(act.value), p_experiment=float(act.probabilities.get("experiment", 0.0)),
                              impact=float(res["impact"].value), risk=float(res["risk"].value),
                              testability=float(res["testability"].value), mode="live" if live else "fixture",
-                             reason=str(res["reason"].value) if "reason" in res else None)
+                             reason=reason)
 
 
 # =========================================================================== adapters (protocols + defaults)
