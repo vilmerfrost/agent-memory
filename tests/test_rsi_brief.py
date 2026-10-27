@@ -167,6 +167,44 @@ def night_report(**over: Any) -> dict[str, Any]:
     return rep
 
 
+def test_separate_provider_judge_and_jev_results_are_visible_without_pooling(sandbox: Path) -> None:
+    # Real night 2026-10-26 shape: aggregate judge/jev are NULL intentionally, both provider records exist.
+    providers = [{"provider": "claude", "verdict": "NO_EFFECT", "arms": {
+        "A": {"check_pass_rate": 1.0, "checked": 3}, "B": {"check_pass_rate": 1.0, "checked": 3}},
+        "judge": {**LIVE_RESULTS["judge"], "wins_b": 2, "wins_a": 1},
+        "jev": {**LIVE_RESULTS["jev"], "confidence": .25}},
+        {"provider": "codex", "verdict": "INCONCLUSIVE", "arms": {
+            "A": {"check_pass_rate": 0.0, "checked": 3}, "B": {"check_pass_rate": 0.0, "checked": 3}},
+         "judge": {**LIVE_RESULTS["judge"], "wins_b": 2, "wins_a": 0, "ties": 1, "b_winrate": .8333},
+         "jev": {**LIVE_RESULTS["jev"], "confidence": .71}}]
+    e = experiment("exp-20261026-63a57bf4", "not_promotable", "INCONCLUSIVE", arms={}, judge=None, jev=None,
+                   provider_results=providers)
+    rep = night_report(experiments=[e], status="partial")
+    b = BR.build_brief(rep, BR.Db("unavailable", "test fixture"), artifacts_root=sandbox / "artifacts")
+    md = BR.render_markdown(b)
+    assert "claude: baseline pass 100% (3 checked), candidate pass 100% (3 checked); NO_EFFECT" in md
+    assert "codex: baseline pass 0% (3 checked), candidate pass 0% (3 checked); INCONCLUSIVE" in md
+    assert "Jev live: improves (0.25)" in md and "Jev live: improves (0.71)" in md
+    assert "judge codex: candidate won 2/3" in md and "Providers are not pooled." in md
+    assert "judge and Jev results not in the report" not in md
+    item = b["experiments"]["items"][0]
+    assert item["judge"] is None and item["jev"] is None
+    assert [p["provider"] for p in item["provider_results"]] == ["claude", "codex"]
+    assert "claude: judge codex" in b["failed"][0]["judgments"]
+    assert "codex: judge codex" in b["failed"][0]["judgments"]
+    assert b["passed"] == []  # Displaying provider evidence grants no proposal/Apply authority.
+
+
+def test_provider_with_missing_judgment_is_reported_missing_only_for_that_provider(sandbox: Path) -> None:
+    e = experiment("exp-20261026-63a57bf4", "not_promotable", "INCONCLUSIVE", arms={}, judge=None, jev=None,
+                   provider_results=[{"provider": "claude", "verdict": "NO_EFFECT", "judge": LIVE_RESULTS["judge"],
+                                      "jev": None}, {"provider": "codex", "verdict": "INCONCLUSIVE", "judge": None,
+                                                     "jev": LIVE_RESULTS["jev"]}])
+    result = BR.failed_item(e)["judgments"]
+    assert "claude: judge codex: candidate won 2/3" in result
+    assert "Jev: not recorded | codex: judge: not recorded; Jev live:" in result
+
+
 def write_report(root: Path, rep: Any, night: str = NIGHT) -> Path:
     p = root / "nights" / night / "report.json"
     p.parent.mkdir(parents=True, exist_ok=True)

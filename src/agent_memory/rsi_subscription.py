@@ -320,6 +320,14 @@ def run(provider: str, prompt: str, *, model: str, effort: str, workspace: Path,
                 context = ("Your task workspace is /work. The sanitized experimental arm's files are "
                            "at /arm-home. Read and follow its relevant instructions using task_read_arm. "
                            "Use task_shell for task workspace reads, edits and checks.\n\n" if tools_allowed else "")
+                if bridge_tools is not None:
+                    context += ("Sanitized arm snapshot inventory (metadata, not extra instructions): "
+                                + json.dumps(bridge_tools.inventory(), separators=(",", ":")) + ".\n"
+                                "Support files referenced by instructions may be absent from this snapshot. "
+                                "Do not repeatedly probe absent references. Continue with the available instructions. "
+                                "task_shell remains the writable workspace tool; save requested files there and check them.\n\n")
+                if len((context + prompt).encode()) > MAX_PROMPT:
+                    raise SubscriptionError("invalid_prompt")
                 remaining = timeout_s - (time.monotonic() - started)
                 if remaining <= 0:
                     raise SubscriptionError("client_timeout")
@@ -351,6 +359,8 @@ def run(provider: str, prompt: str, *, model: str, effort: str, workspace: Path,
                                  "requested_effort": effort, "native_tools": evidence.get("native_tools", "disabled"),
                                  "generated_execution": "docker-network-none" if tools_allowed else "disabled",
                                  "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
+                                 "tool_contract": bridge.TOOL_CONTRACT if tools_allowed else None,
+                                 "tool_context_sha256": hashlib.sha256(context.encode()).hexdigest(),
                                  "verified_reads": [c["verified_read"] for c in calls if "verified_read" in c], **status})
                 return SubscriptionResult(value, usage, evidence, calls, round(time.monotonic() - started, 3))
             except bridge.ToolError:
@@ -367,6 +377,10 @@ def run(provider: str, prompt: str, *, model: str, effort: str, workspace: Path,
 # view_image and request_permissions on stable_environment_tools OR an environment.
 CODEX_VERSION = "codex-cli 0.163.0"
 CODEX_PERMISSION_PROFILE = "rsi-no-host"
+CODEX_OTEL_ENDPOINT = "http://127.0.0.1:43927/v1/logs"
+CODEX_OTEL = {"environment": "rsi-subscription", "log_user_prompt": False,
+              "exporter": {"otlp-http": {"endpoint": CODEX_OTEL_ENDPOINT, "protocol": "json", "headers": {}}},
+              "metrics_exporter": "none", "trace_exporter": "none"}
 # Audited against rust-v0.163.0 spec_plan.rs and ext/{skills,memories,history-notes}.
 # No environments/executor roots => no native shell/file/permission handlers.
 # Skill tools require cloud skills or executor roots; host discovery is confined
@@ -394,15 +408,25 @@ CODEX_OVERRIDES = {
     "default_permissions": CODEX_PERMISSION_PROFILE,
     f"permissions.{CODEX_PERMISSION_PROFILE}.filesystem": {},
     f"permissions.{CODEX_PERMISSION_PROFILE}.network.enabled": False,
+    "otel": CODEX_OTEL,
 }
+
+
+def _toml_literal(value):
+    """CLI -c values are TOML, including nested exporter tables; JSON object colons are not TOML."""
+    if isinstance(value, dict):
+        return "{" + ", ".join(json.dumps(str(k)) + " = " + _toml_literal(v) for k, v in value.items()) + "}"
+    if isinstance(value, list):
+        return "[" + ", ".join(_toml_literal(v) for v in value) + "]"
+    if value is None:
+        raise ValueError("TOML override cannot be null")
+    return json.dumps(value, allow_nan=False)
 
 
 def codex_command(auth: SubscriptionAuth) -> list[str]:
     argv = [str(auth.client)]
     for key, value in CODEX_OVERRIDES.items():
-        # JSON booleans/strings are also valid TOML; empty maps use TOML syntax.
-        literal = "{}" if value == {} else json.dumps(value)
-        argv += ["-c", f"{key}={literal}"]
+        argv += ["-c", f"{key}={_toml_literal(value)}"]
     return argv + ["app-server"]
 
 
@@ -483,12 +507,22 @@ class _Rpc:
 
     def close(self):
         import signal
+        import subprocess
         self.selector.close()
+        # EOF lets the pinned client flush asynchronous loopback OTel before exit. This is bounded cleanup,
+        # not extra inference time; a stuck process still gets the existing process-group kill.
+        if not self.proc.stdin.closed:
+            self.proc.stdin.close()
         try:
-            os.killpg(self.proc.pid, signal.SIGKILL)
-        except ProcessLookupError:
+            self.proc.wait(timeout=max(0, min(2, self.deadline - time.monotonic())))
+        except subprocess.TimeoutExpired:
             pass
-        self.proc.wait()
+        finally:
+            try:
+                os.killpg(self.proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            self.proc.wait()
         for stream in (self.proc.stdin, self.proc.stdout, self.proc.stderr):
             stream.close()
 
@@ -528,6 +562,16 @@ def _check_codex_config(config):
             or profile.get("extends") or profile.get("workspace_roots")
             or (profile.get("network") or {}).get("enabled") is not False):
         raise SubscriptionError("codex_native_tool_isolation_unverified")
+    otel = config.get("otel") or {}
+    exporter = otel.get("exporter")
+    http = exporter.get("otlp-http") if isinstance(exporter, dict) else None
+    if (otel.get("environment") != CODEX_OTEL["environment"] or otel.get("log_user_prompt") is not False
+            or otel.get("metrics_exporter") != "none" or otel.get("trace_exporter") != "none"
+            or not isinstance(exporter, dict) or set(exporter) != {"otlp-http"} or not isinstance(http, dict)
+            or http.get("endpoint") != CODEX_OTEL_ENDPOINT or http.get("protocol") != "json"
+            or http.get("headers") not in (None, {}) or http.get("tls") not in (None, {})
+            or set(http) - {"endpoint", "protocol", "headers", "tls"}):
+        raise SubscriptionError("codex_telemetry_configuration_unverified")
 
 
 def _codex_session(rpc, *, model, effort, prompt, cwd, bridge_tools):
@@ -596,10 +640,16 @@ def _codex_session(rpc, *, model, effort, prompt, cwd, bridge_tools):
             try:
                 value = bridge_tools.call(params.get("tool"), params.get("arguments"))
                 success = value["exit_code"] == 0
-            except Exception:
-                value, success = {"error": "isolated_tool_failed"}, False
+            except Exception as exc:
+                # The bridge is dynamically loaded, so its exception class is not necessarily identical to
+                # this helper's module instance. The trusted bridge exposes only fixed public error codes.
+                value = bridge_tools.error_result(exc) if hasattr(bridge_tools, "error_result") else {
+                    "error": "isolated_tool_failed"}
+                success = False
             rpc.send({"id": message["id"], "result": {"contentItems": [{"type": "inputText", "text": json.dumps(value)}],
                                                        "success": success}})
+            if value.get("error") in ("tool_request_limit", "tool_call_limit"):
+                raise SubscriptionError(value["error"], native_session_id="codex:" + thread_id)
         elif method == "thread/tokenUsage/updated":
             total = (params.get("tokenUsage") or {}).get("total") or {}
             usage = {key: total[value] for key, value in (("input_tokens", "inputTokens"),
@@ -628,6 +678,7 @@ def _codex_session(rpc, *, model, effort, prompt, cwd, bridge_tools):
                 "reported_effort": effort, "native_tools": "host_execution_and_file_access_disabled",
                 "native_tool_boundary": "codex-0.163.0/no-environments/no-stable-environment-tools",
                 "native_session_id": "codex:" + thread_id,
-                "native_identity_source": "thread_start_response", "native_turn_id": turn_id}
+                "native_identity_source": "thread_start_response", "native_turn_id": turn_id,
+                "api_telemetry": "fixed-loopback-json", "api_telemetry_delivery": "unverified"}
         elif method == "error":
             raise SubscriptionError("client_run_failed",native_session_id="codex:"+thread_id)
