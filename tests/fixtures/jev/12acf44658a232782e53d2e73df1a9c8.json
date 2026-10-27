@@ -1,5 +1,5 @@
 {
-  "_note": "Hand-written rsi-triage fixture (questions/rsi-triage.toml) in the System One response shape. Not a live response. Synthetic candidate A (claude-md:global closing line, 3 sessions) of tests/test_rsi_night.py. Synthetic typed reason added for the daily-goal question; not a live Jev response. Synthetic typed reason added for the daily-goal question; not a live Jev response.",
+  "_note": "Hand-written rsi-triage fixture (questions/rsi-triage.toml) in the System One response shape. Not a live response. Synthetic candidate A (claude-md:global closing line, 3 sessions) of tests/test_rsi_night.py. Synthetic typed reason added for the daily-goal question; not a live Jev response.",
   "_triage_state": "rsi candidate for a nightly sandbox experiment\nsource: deviations\nkind: edit_instruction\ntarget: ~/.claude/CLAUDE.md\ntarget_in_scope: yes\nrule: claude-md:global:claude-md-global--closing-line\nrecurrence: 1\nsessions: 2-4\nfollowed_grade: 0.2\nobjective_result: unknown\nprior_experiments: none",
   "model": "jev-1.14.0",
   "usage": {

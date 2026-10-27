@@ -148,6 +148,23 @@ def test_missing_legacy_reason_stays_unknown_instead_of_being_inferred_from_scor
     assert N.triage_explanation(answer) == "Jev did not provide a reason."
 
 
+@pytest.mark.parametrize("field", ["action", "reason"])
+def test_unrecognized_jev_labels_do_not_become_valid_report_evidence(field, monkeypatch):
+    from agent_memory.rsi_budget import Budget
+    answers = {"action": jev.JevResult("action", "choice", "wait", 0.9, {"experiment": 0.1}),
+               **{k: jev.JevResult(k, "score", 1, 0.9) for k in ("impact", "risk", "testability")},
+               "reason": jev.JevResult("reason", "choice", "prior_worse", 0.9)}
+    answers[field] = jev.JevResult(field, "choice", "unknown-label", 0.9)
+    monkeypatch.setattr(jev, "_ask_fixture", lambda *_: answers)
+    triage = N.JevTriage("fixture")
+    answer = triage.assess({}, state="synthetic candidate", budget=Budget(N.load_config().budget))
+    assert triage.health == "error"
+    if field == "action":
+        assert answer is None
+    else:
+        assert answer.reason is None and N.triage_explanation(answer) == "Jev did not provide a reason."
+
+
 def test_morning_brief_preserves_both_advice_and_actual_exploration_decision(env):
     seed_rule(env.url, RULE_A, "a")
     rep, _ = run(env)

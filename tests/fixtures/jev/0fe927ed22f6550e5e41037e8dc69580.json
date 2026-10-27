@@ -1,5 +1,5 @@
 {
-  "_note": "Hand-written rsi-triage fixture for the M005 demo (src/agent_memory/rsi_demo.py, synth --rsi-demo): the Claude candidate, global CLAUDE.md closing-line rule, no prior experiment. Not a live response. Synthetic typed reason added for the daily-goal question; not a live Jev response. Synthetic typed reason added for the daily-goal question; not a live Jev response.",
+  "_note": "Hand-written rsi-triage fixture for the M005 demo (src/agent_memory/rsi_demo.py, synth --rsi-demo): the Claude candidate, global CLAUDE.md closing-line rule, no prior experiment. Not a live response. Synthetic typed reason added for the daily-goal question; not a live Jev response.",
   "_triage_state": "rsi candidate for a nightly sandbox experiment\nsource: deviations\nkind: edit_instruction\ntarget: ~/.claude/CLAUDE.md\ntarget_in_scope: yes\nrule: claude-md:global:synth-m005-closing-line\nrecurrence: 1\nsessions: 2-4\nfollowed_grade: 0.2\nobjective_result: 0.8\nprior_experiments: none",
   "model": "jev-1.14.0",
   "usage": {
