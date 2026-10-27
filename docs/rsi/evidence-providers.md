@@ -129,8 +129,12 @@ the data's own `week_start`.
 - **ClickHouse cold start.** An idle Cloud service wakes on the first request (about 15-17 s in C1). The night
   gives each provider 20 s per stage, so a cold first query can time out (`error: timeout`). The next stage starts
   warm.
-- **Langfuse Hobby rate limit.** Calls are spaced 2.1 s apart. `experiment_scores` without a dataset makes one
-  scores call per trace, so an experiment with many traces can run past the 20 s budget (`error: timeout`).
+- **Langfuse Hobby rate limit.** Calls remain spaced 2.1 s apart. Dataset-less `experiment_scores` now uses
+  one paged score query over at most 25 exact root trace IDs, rather than one score query per trace.
+  Throttling and pages share the caller's remaining read budget; a read request is not retried inside it.
+  Unread/repeated cursors fail as `IncompleteRead`; expired deadlines fail as `ReadDeadline`. The outer 20 s
+  limit is unchanged. A selected trace cap is explicit as `truncated=true`, `population_complete=false`.
+  Missing check scores remain unknown, not a zero pass rate. See [Langfuse read budget](langfuse-read-budget.md).
 - **S1 reads Supabase only in the night today.** `delta_since` accepts providers, but `rsi_night.PackEvidence.delta`
   does not pass them yet (that file belongs to the night-ops worker). The probe already runs the S1 provider
   queries, so it shows what the night would get once that edit lands.
