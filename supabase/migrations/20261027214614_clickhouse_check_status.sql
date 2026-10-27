@@ -1,18 +1,26 @@
 -- One bounded, nonce-matched ClickHouse request. No user SQL or model prompts.
-create or replace function public.amem_connection_probe_start() returns jsonb
+create function public.amem_connection_diagnostic_start() returns jsonb
 language plpgsql security definer set search_path=pg_catalog,public,pg_temp as $$
 declare r public.rsi_checkpoints%rowtype; nonce uuid; requested timestamptz;
 begin
   perform pg_advisory_xact_lock(723914210);
   select * into r from public.rsi_checkpoints where job='connections:clickhouse-probe' and run_key='live' for update;
-  if found and (r.status='running' or (r.meta->>'claimed'='true' and not(r.meta ? 'langfuse'))) and r.started_at > now()-interval '90 seconds' then
+  if found and r.meta->>'format'='night-desk-integrations/2' and (r.status='running' or (r.meta->>'claimed'='true' and not(r.meta ? 'langfuse'))) and r.started_at > now()-interval '90 seconds' then
     return jsonb_build_object('request_id',r.meta->>'request_id','requested_at',r.started_at);
   end if;
   nonce:=gen_random_uuid(); requested:=clock_timestamp();
   insert into public.rsi_checkpoints(job,run_key,status,started_at,finished_at,meta)
-    values('connections:clickhouse-probe','live','running',requested,null,jsonb_build_object('request_id',nonce))
+    values('connections:clickhouse-probe','live','running',requested,null,jsonb_build_object('request_id',nonce,'format','night-desk-integrations/2'))
     on conflict(job,run_key) do update set status='running',started_at=excluded.started_at,finished_at=null,meta=excluded.meta;
   return jsonb_build_object('request_id',nonce,'requested_at',requested);
+end $$;
+
+revoke all on function public.amem_connection_diagnostic_start() from public;
+do $$ declare r text; begin
+ foreach r in array array['anon','authenticated','amem_app','rsi_reader','rsi_writer','service_role'] loop
+  if exists(select 1 from pg_roles where rolname=r) then execute format('revoke all on function public.amem_connection_diagnostic_start() from %I',r); end if;
+ end loop;
+ if exists(select 1 from pg_roles where rolname='service_role') then grant execute on function public.amem_connection_diagnostic_start() to service_role; end if;
 end $$;
 
 -- Read-only status never queues another ClickHouse request. Failed outcomes remain visible.
@@ -23,6 +31,11 @@ declare r public.rsi_checkpoints%rowtype; pending boolean:=false; state text:='u
  checked timestamptz:=now(); duration integer:=0; requested timestamptz; code text;
 begin
  select * into r from public.rsi_checkpoints where job='connections:clickhouse-probe' and run_key='live' and meta->>'request_id'=p_request_id::text;
+ if found and coalesce(r.meta->>'format','')<>'night-desk-integrations/2' then
+  return jsonb_build_object('request_id',p_request_id,'requested_at',r.started_at,'pending',false,'check',
+    jsonb_build_object('id','clickhouse','status','unknown','checked_at',coalesce(r.finished_at,r.started_at),'latency_ms',0,
+      'message','The previous test checked basic query access only. Press Check now to verify the nightly tables and read/write permissions.'));
+ end if;
  if found then
    requested:=r.started_at; checked:=r.started_at;
    if r.status='running' and r.started_at > now()-interval '90 seconds' then
@@ -85,7 +98,8 @@ language plpgsql security definer set search_path=pg_catalog,public,pg_temp as $
 declare changed integer;
 begin
  if p_request_id is null or p_healthy is null or p_latency_ms is null or p_latency_ms not between 0 and 120000
-  or p_failure_code is null or p_failure_code not in ('ok','auth','http','connection','configuration','unexpected','unknown','timeout','permissions','schema','rate') then return false; end if;
+  or p_failure_code is null or p_failure_code not in ('ready','ok','auth','http','connection','configuration','unexpected','unknown','timeout','permissions','schema','rate') then return false; end if;
+ if p_healthy and p_failure_code<>'ready' then return false; end if;
  update public.rsi_checkpoints set status=case when p_healthy then 'done' else 'failed' end,
   finished_at=clock_timestamp(),meta=meta||jsonb_build_object('healthy',p_healthy,'latency_ms',p_latency_ms,'failure_code',p_failure_code)
   where job='connections:clickhouse-probe' and run_key='live' and status='running'
@@ -99,7 +113,7 @@ create function public.amem_connection_probe_claim() returns uuid
 language sql security definer set search_path=pg_catalog,public,pg_temp as $$
  update public.rsi_checkpoints set meta=meta||'{"claimed":true}'::jsonb
  where job='connections:clickhouse-probe' and run_key='live' and status='running'
- and started_at>now()-interval '90 seconds' and coalesce(meta->>'claimed','false')='false'
+ and meta->>'format'='night-desk-integrations/2' and started_at>now()-interval '90 seconds' and coalesce(meta->>'claimed','false')='false'
  returning (meta->>'request_id')::uuid;
 $$;
 create function public.amem_connection_langfuse_finish(p_request_id uuid,p_code text,p_latency_ms integer) returns boolean
@@ -118,7 +132,7 @@ language plpgsql stable security definer set search_path=pg_catalog,public,pg_te
 declare r public.rsi_checkpoints%rowtype; result jsonb; code text; state text:='unknown'; pending boolean:=false;
  checked timestamptz:=now(); latency integer:=0; msg text:='Not tested. Press Check now to send a labelled diagnostic trace and score; no model call is made.';
 begin
- select * into r from public.rsi_checkpoints where job='connections:clickhouse-probe' and run_key='live' and meta->>'request_id'=p_request_id::text;
+ select * into r from public.rsi_checkpoints where job='connections:clickhouse-probe' and run_key='live' and meta->>'request_id'=p_request_id::text and meta->>'format'='night-desk-integrations/2';
  if found then
   checked:=r.started_at; result:=r.meta->'langfuse';
   if result is null then
