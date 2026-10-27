@@ -147,3 +147,25 @@ def test_method_two_anonymous_identity_survives_scope_and_native_status_enrichme
             rows=conn.execute('select category,method_version,started_at,meta from execution_spans').fetchall()
             assert len(rows)==1 and rows[0][:3]==('unclassified',3,current.started_at)
             assert rows[0][3]['api_scope']=='client_control'
+
+
+def test_api_arriving_before_native_session_registration_refreshes_exact_profile(pg_url):
+    from datetime import UTC,datetime,timedelta
+    from agent_memory import attempt_links as AL
+    with fresh_db(pg_url) as db:
+        now=datetime(2026,10,27,tzinfo=UTC)
+        span=T.Span('native-before-session','codex:late-native-client','codex','api','codex.api_request',
+                    now,now+timedelta(seconds=.25),250,'passed','provider_reported','codex.otel',method_version=3)
+        assert timing_store.upsert([span],db_url=db)==(1,0)
+        a={'experiment_id':'exp-20261027-late-profile','profile':'codex','arm':'A','case':'late-profile','rep':0,
+           'agent':'codex','run_id':'late-profile-run','native_session_id':'codex:late-native-client',
+           'started_at':now.isoformat(),'duration_s':1}
+        with psycopg.connect(db) as conn:
+            AL.record_runner(conn,[a])
+            assert conn.execute('select api_seconds from sessions where session_id=%s',(span.session_id,)).fetchone()==(.25,)
+            assert AL.record_runner(conn,[a])==0
+            assert conn.execute('select count(*) from execution_spans').fetchone()[0]==1
+        b={**a,'native_session_id':'codex:no-api-observation','rep':1,'run_id':'no-api-profile-run'}
+        with psycopg.connect(db) as conn:
+            AL.record_runner(conn,[b])
+            assert conn.execute('select api_seconds from sessions where session_id=%s',(b['native_session_id'],)).fetchone()==(None,)

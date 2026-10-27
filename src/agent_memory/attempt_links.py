@@ -158,6 +158,11 @@ def record_native_session(conn: psycopg.Connection, attempt: Attempt, a: Mapping
     if got and got[0] == "sandbox" and got[1] == attempt.experiment_id:
         previous_attempt = got[2].get("attempt_ref") if isinstance(got[2], dict) else None
         if previous_attempt in (None, attempt.key):
+            # Native API spans can arrive before the async session observation.
+            # Reuse exact-ID profiling; absent API measurements remain NULL.
+            if provider == "codex":
+                from agent_memory import timing_store
+                timing_store.refresh_profiles(conn, [native])
             return native
     return None  # A real actor collision stays visible; never relabel a prod session.
 
