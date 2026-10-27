@@ -187,3 +187,6 @@ arrive. The installer does not start a separate CLI agent or make paid model cal
 Timing method 3 also recognizes native `http.response.status_code` and timezone-qualified `event.timestamp`, retains explicit conversation IDs, and reports separate accepted/session/unattributed/control counters in health. The legacy `accepted_api_spans` counter counts API observations; `accepted_spans` counts all accepted timing records, including control traffic. No raw payload, prompt, auth field or unknown URL is persisted.
 
 The isolated nightly Codex client must explicitly route its native OTel logs to the existing loopback receiver; its dedicated auth home does not inherit the interactive user's exporter settings. Prompts remain disabled. Do not substitute client wall time or generated-token timing for missing API measurements. Natural inference capture still needs the next scheduled run; tests and a metadata-only `model/list` request are not a paid inference run.
+
+
+Anonymous event IDs retain the exact method2 hash seed. New scope/status fields do not create a second event when the same raw event is redelivered after an upgrade. Exact redelivery can enrich category, interval and method version in place; an older spool cannot downgrade the stronger semantics. This is evidence-backed redelivery, not a historical endpoint guess or backfill.

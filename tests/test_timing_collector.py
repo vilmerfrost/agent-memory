@@ -74,7 +74,9 @@ def test_health_distinguishes_control_unknown_and_session_events(tmp_path):
         row=payload['resourceLogs'][0]
         import copy
         unknown=copy.deepcopy(row);unknown['resource']['attributes']=[]
+        unknown['scopeLogs'][0]['logRecords'][0]['timeUnixNano']='1793059200000000001'
         control=copy.deepcopy(unknown)
+        control['scopeLogs'][0]['logRecords'][0]['timeUnixNano']='1793059200000000002'
         control['scopeLogs'][0]['logRecords'][0]['attributes'].append({'key':'endpoint','value':{'stringValue':'/models'}})
         payload['resourceLogs'] += [unknown,control]
         with urlopen(Request(url+'/v1/logs',json.dumps(payload).encode(),{'Content-Type':'application/json'}),timeout=5):pass

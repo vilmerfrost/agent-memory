@@ -123,3 +123,27 @@ def test_unknown_endpoint_and_no_metadata_remains_a_real_gap():
     span,=T.otlp_spans(payload)
     assert span.category=='api' and span.meta['api_scope']=='unknown' and span.session_id is None
     assert 'SECRET-TOKEN' not in str(span.record())
+
+
+def test_method_two_anonymous_identity_survives_scope_and_native_status_enrichment(pg_url):
+    from datetime import timedelta
+    payload=otlp();resource=payload['resourceLogs'][0];resource['resource']['attributes']=[]
+    rec=resource['scopeLogs'][0]['logRecords'][0]
+    rec['attributes'] += [attr('endpoint','/models'),attr('http.response.status_code','200')]
+    current,=T.otlp_spans(payload)
+    # Exact original method-2 anonymous key contract, not a timestamp-nearness match.
+    expected=T.key(None,'codex.api_request',rec['timeUnixNano'],None,None,125.5,{})
+    assert current.span_id==expected
+    old=deepcopy(current);old.category='api';old.method_version=2
+    old.meta={'duration_source':'otel_duration_ms','clock':'provider_event_end',
+              'identity_unavailable':'explicit_thread_id_missing'}
+    old.started_at-=timedelta(milliseconds=1)
+    with fresh_db(pg_url) as db:
+        assert timing_store.upsert([old],db_url=db)==(1,0)
+        assert timing_store.upsert([current],db_url=db)==(0,1)
+        assert timing_store.upsert([current],db_url=db)==(0,0)
+        assert timing_store.upsert([old],db_url=db)==(0,0)  # old spools cannot downgrade stronger semantics
+        with psycopg.connect(db) as conn:
+            rows=conn.execute('select category,method_version,started_at,meta from execution_spans').fetchall()
+            assert len(rows)==1 and rows[0][:3]==('unclassified',3,current.started_at)
+            assert rows[0][3]['api_scope']=='client_control'

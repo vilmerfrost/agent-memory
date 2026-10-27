@@ -868,7 +868,8 @@ class LangfuseClient:
         remaining = self._read_remaining(path)
         response = http.request(method, url, headers=self._headers(), body=body,
                                 timeout=min(timeout or self.timeout, remaining),
-                                retries=0 if bounded else self.retries if retries is None else retries, sleep=self.sleep)
+                                retries=0 if bounded else self.retries if retries is None else retries, sleep=self.sleep,
+                                **({"total_timeout": remaining} if bounded else {}))
         self._read_remaining(path)  # a late response is not complete on-time evidence
         return response
 

@@ -95,3 +95,10 @@ and the final shared-runner integration are parent verification steps.
 The existing read-only provider meter increments before the client call. A
 deadline refusal before HTTP can therefore count as a logical request attempt.
 Those counters must not be described as exact wire-level requests or charges.
+
+
+## Streaming transport deadline
+
+A review reproduced a slow-body loophole: urllib's socket timeout measures inactivity, so six body chunks40msapart kept a100msread alive for234ms. The optional HTTP total deadline now shuts down active sockets, including TLS sockets, during headers or response bodies. Late or truncated data cannot become successful evidence. Focused loopback fixtures cover dripping normal/error bodies, chunked transfer and headers, no retries after the deadline, and prompt handler completion. The old non-budgeted upload path is unchanged.
+
+The OS DNS resolver can block before an active socket exists; it is not cancellable by this stdlib socket watchdog. When it returns, an expired connection is refused before request transmission. The existing outer provider deadline still bounds caller waiting. This limit is explicit rather than a claim of universal OS-operation cancellation.

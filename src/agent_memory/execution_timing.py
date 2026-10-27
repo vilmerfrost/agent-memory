@@ -337,9 +337,10 @@ def otlp_spans(payload: Any) -> list[Span]:
                 http_status = attrs.get("http.response.status_code", attrs.get("status"))
                 meta = clean_meta({"model": attrs.get("model"), "attempt": attrs.get("attempt"),
                                    "http_status": http_status, "request_id": attrs.get("request.id")})
-                meta['api_scope'] = api_scope
-                if catalog:
-                    meta['endpoint'] = 'models'
+                # Keep the method-2 anonymous key seed unchanged on redelivery.
+                # New scope/status metadata enriches evidence, not source identity.
+                legacy_meta = clean_meta({"model": attrs.get("model"), "attempt": attrs.get("attempt"),
+                                          "http_status": attrs.get("status"), "request_id": attrs.get("request.id")})
                 # A native request/trace identity permits a later exact actor
                 # assignment without creating a second measurement. Anonymous
                 # legacy events keep the previous key contract.
@@ -348,13 +349,15 @@ def otlp_spans(payload: Any) -> list[Span]:
                 native_trace = bool(trace and native_span and trace.strip('0') and native_span.strip('0'))
                 span_id = (key("codex.otel.request/2", name, request_id, trace, native_span,
                                attrs.get("attempt")) if request_id or native_trace
-                           else key(session, name, clock_key, rec.get("traceId"), rec.get("spanId"), elapsed, meta))
+                           else key(session, name, clock_key, rec.get("traceId"), rec.get("spanId"), elapsed, legacy_meta))
                 success = attrs.get("success")
                 http = str(http_status or "")
                 status = ("failed" if success is False or success == "false" or (http.isdigit() and int(http)>=400)
                           else "passed" if success is True or success == "true" or (http.isdigit() and 200<=int(http)<400)
                           else "unknown")
-                meta.update(duration_source='otel_duration_ms', clock=clock)
+                meta.update(duration_source='otel_duration_ms', clock=clock, api_scope=api_scope)
+                if catalog:
+                    meta['endpoint'] = 'models'
                 meta["identity_source" if session else "identity_unavailable"] = identity_basis
                 found[span_id] = Span(span_id, session, "codex", "unclassified" if catalog else "api", name, end-timedelta(milliseconds=elapsed) if end else None,
                                       end, elapsed, status, "provider_reported", "codex.otel", method_version=3, meta=meta)
