@@ -121,6 +121,8 @@ def run_query(r: Retriever, name: str, params: Mapping[str, str]) -> QueryResult
         return QueryResult(r.source, "ok", r.query(name, checked))
     except Unavailable as exc:
         return QueryResult(r.source, "unavailable", detail=str(exc)[:200])
+    except TimeoutError as exc:
+        return QueryResult(r.source, "error", detail=f"timeout ({type(exc).__name__})")
     except Exception as exc:  # noqa: BLE001 - one retriever's failure never blocks the others
         return QueryResult(r.source, "error", detail=type(exc).__name__)
 

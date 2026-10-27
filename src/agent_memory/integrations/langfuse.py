@@ -176,7 +176,7 @@ class LangfuseError(Exception):
     pass
 
 
-class ReadDeadline(LangfuseError):
+class ReadDeadline(LangfuseError, TimeoutError):
     """The end-to-end read budget expired; no further page/request may start."""
 
 
@@ -866,10 +866,14 @@ class LangfuseClient:
             self._throttle()
         url = f"{self.host}{path}" + (f"?{urlencode(params)}" if params else "")
         remaining = self._read_remaining(path)
-        response = http.request(method, url, headers=self._headers(), body=body,
-                                timeout=min(timeout or self.timeout, remaining),
-                                retries=0 if bounded else self.retries if retries is None else retries, sleep=self.sleep,
-                                **({"total_timeout": remaining} if bounded else {}))
+        try:
+            response = http.request(method, url, headers=self._headers(), body=body,
+                                    timeout=min(timeout or self.timeout, remaining),
+                                    retries=0 if bounded else self.retries if retries is None else retries, sleep=self.sleep,
+                                    **({"total_timeout": remaining} if bounded else {}))
+        except http.HttpError:
+            self._read_remaining(path)  # retain a typed timeout when the transport stopped on our deadline
+            raise
         self._read_remaining(path)  # a late response is not complete on-time evidence
         return response
 

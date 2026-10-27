@@ -106,18 +106,43 @@ def _read_attempt(req, *, context, timeout: float, deadline: float | None) -> Re
             except OSError: pass
             raise TimeoutError("total HTTP read deadline exhausted")
 
+    def connect_socket(address, connection_timeout=None, source_address=None):
+        # Register before connect/tunnel/TLS, so an active connection cannot
+        # escape the watchdog during proxy setup or multiple address attempts.
+        error = None
+        addresses = socket.getaddrinfo(address[0], address[1], 0, socket.SOCK_STREAM)
+        for family, kind, proto, _, target in addresses:
+            remaining()
+            sock = socket.socket(family, kind, proto)
+            try:
+                remember(sock)
+                sock.settimeout(min(timeout, remaining()))
+                if source_address:
+                    sock.bind(source_address)
+                sock.connect(target)
+                remaining()
+                return sock
+            except OSError as exc:
+                sock.close()
+                error = exc
+        raise error or OSError("no connection addresses")
+
     class Connection(http_client.HTTPConnection):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self._create_connection = connect_socket
         def connect(self):
             self.timeout = min(timeout, remaining())
             super().connect()
-            remember(self.sock)
             self.sock.settimeout(min(timeout, remaining()))
 
     class SecureConnection(http_client.HTTPSConnection):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self._create_connection = connect_socket
         def connect(self):
             self.timeout = min(timeout, remaining())
             http_client.HTTPConnection.connect(self)
-            remember(self.sock)
             self.sock.settimeout(min(timeout, remaining()))
             self.sock = self._context.wrap_socket(self.sock,
                 server_hostname=self._tunnel_host or self.host, do_handshake_on_connect=False)
@@ -191,7 +216,11 @@ def request(method: str, url: str, *, headers: Mapping[str, str] | None = None, 
         try:
             ctx = tls_context() if url.startswith("https://") else None
             resp = _read_attempt(req, context=ctx, timeout=timeout, deadline=deadline)
-        except (urllib.error.URLError, TimeoutError, ConnectionError, OSError, http_client.HTTPException) as e:
+        except http_client.HTTPException as exc:
+            if deadline is None:
+                raise  # preserve the non-budgeted retry contract, especially billed POST reads
+            raise HttpError(None, f"{type(exc).__name__}: bounded response interrupted") from None
+        except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as e:
             if attempt >= retries or deadline is not None:
                 raise HttpError(None, f"{type(e).__name__}: {getattr(e, 'reason', e)!s}"[:300]) from None
             attempt += 1

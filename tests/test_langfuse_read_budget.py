@@ -161,7 +161,7 @@ def test_shared_read_deadline_includes_health_throttle_and_pages(monkeypatch):
     start = clock()
     with r.read_budget(5):
         result = E.run_query(r, "experiment_scores", {"experiment_id": EXP})
-    assert result.status == "error" and result.detail == "ReadDeadline" and not result.refs
+    assert result.status == "error" and result.detail == "timeout (ReadDeadline)" and not result.refs
     assert clock()-start < 5
     assert len(api.calls) == 3
     assert not any(x["path"] == L.SCORES_PATH for x in api.calls)
