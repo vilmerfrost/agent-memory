@@ -25,21 +25,27 @@ values (%(span_id)s,%(session_id)s,%(parent_span_id)s,%(tool)s,%(category)s,%(op
  %(source)s,%(method_version)s,%(meta)s)
 on conflict(span_id) do update set
  session_id=coalesce(execution_spans.session_id,excluded.session_id),
+ started_at=coalesce(excluded.started_at,execution_spans.started_at),
+ category=excluded.category,method_version=excluded.method_version,
  ended_at=excluded.ended_at,elapsed_ms=excluded.elapsed_ms,status=excluded.status,
  exit_code=excluded.exit_code,measurement_kind=excluded.measurement_kind,
  meta=(execution_spans.meta || excluded.meta) -
       case when coalesce(execution_spans.session_id,excluded.session_id) is not null
            then 'identity_unavailable' else '__no_key__' end,updated_at=now()
-where (excluded.ended_at is not null or execution_spans.ended_at is null)
+where excluded.method_version >= execution_spans.method_version
+  and not (coalesce(excluded.meta->>'api_scope','')='client_control' and execution_spans.session_id is not null)
+  and (excluded.ended_at is not null or execution_spans.ended_at is null)
   and (execution_spans.session_id is null or excluded.session_id is null
        or execution_spans.session_id=excluded.session_id)
   and (execution_spans.session_id,execution_spans.ended_at,execution_spans.elapsed_ms,execution_spans.status,
-       execution_spans.exit_code,execution_spans.measurement_kind,execution_spans.meta)
+       execution_spans.exit_code,execution_spans.measurement_kind,execution_spans.meta,
+       execution_spans.started_at,execution_spans.category,execution_spans.method_version)
       is distinct from
       (coalesce(execution_spans.session_id,excluded.session_id),excluded.ended_at,excluded.elapsed_ms,excluded.status,excluded.exit_code,
        excluded.measurement_kind,(execution_spans.meta || excluded.meta) -
        case when coalesce(execution_spans.session_id,excluded.session_id) is not null
-            then 'identity_unavailable' else '__no_key__' end)
+            then 'identity_unavailable' else '__no_key__' end,
+       coalesce(excluded.started_at,execution_spans.started_at),excluded.category,excluded.method_version)
 returning (xmax=0) as inserted
 """
 

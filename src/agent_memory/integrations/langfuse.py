@@ -41,7 +41,12 @@ API path (checked against the official docs on 2026-10-16, plain HTTP through in
   the Cloud spec says "To update an existing score, send it again with the same id and timestamp."
   The legacy ingestion endpoint is not in the Cloud OpenAPI spec, so it is no longer used.
 - Reads: `GET /api/public/v2/observations` (filter traceId or sessionId, always inside a start-time window)
-  and `GET /api/public/v3/scores`. `GET /api/public/traces/{id}` is removed on 2026-11-16.
+  and `GET /api/public/v3/scores`. Scores v3 accepts comma-separated traceId OR values; fields=subject
+  adds the trace/observation subject while retaining core score fields. Dataset-less experiment reads
+  use one paged bulk score query over exact selected roots, not a query per trace. Reads share a
+  bounded deadline (including throttle); no retry inside that read budget. Unread/repeated cursors
+  raise IncompleteRead rather than claiming a complete aggregate.
+  `GET /api/public/traces/{id}` is removed on 2026-11-16.
 - Experiments (when datasets are on): `GET /api/public/experiment-items?datasetId=..&fields=core,scores`
   returns each item's trace scores in one paged call (fromStartTime is required).
 - Datasets: `GET`/`POST /api/public/v2/datasets` and `POST /api/public/dataset-items` (upsert on id).
@@ -101,10 +106,13 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import math
 import os
 import re
+import threading
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -141,7 +149,8 @@ DATASET_ITEMS_PATH = "/api/public/dataset-items"
 HEALTH_PATH = "/api/public/projects"
 READ_WINDOW_DAYS = 30                  # Hobby shows 30 days; every observation read is bounded by it
 CLOUD_MIN_INTERVAL_S = 2.1             # Hobby: general API 30 requests/min, shared by the organization
-MAX_SCORED_TRACES = 25                 # experiment_scores without a dataset: one scores call per trace
+MAX_SCORED_TRACES = 25                 # exact selected root trace ids per bounded bulk scores query
+READ_QUERY_BUDGET_S = 20.0            # standalone query; a caller's shorter end-to-end budget wins
 
 _NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:@/-]{0,99}")     # model and tool names
 _PART_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")          # mcp server / tool parts
@@ -165,6 +174,14 @@ REDACTED = "redacted"                  # what a sensitive model or tool name bec
 
 class LangfuseError(Exception):
     pass
+
+
+class ReadDeadline(LangfuseError, TimeoutError):
+    """The end-to-end read budget expired; no further page/request may start."""
+
+
+class IncompleteRead(LangfuseError):
+    """The bounded read cannot establish a complete response population."""
 
 
 class Refused(LangfuseError):
@@ -764,6 +781,7 @@ class LangfuseClient:
     min_interval: float | None = None      # None: CLOUD_MIN_INTERVAL_S on Cloud, 0 elsewhere
     clock: Callable[[], float] = time.monotonic
     _last: float | None = field(default=None, init=False, repr=False)
+    _read_state: Any = field(default_factory=threading.local, init=False, repr=False)
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None, **kw: Any) -> LangfuseClient:
@@ -792,8 +810,39 @@ class LangfuseClient:
         if self.interval and self._last is not None:
             wait = self.interval - (self.clock() - self._last)
             if wait > 0:
+                if wait >= self._read_remaining("throttle"):
+                    raise ReadDeadline("read budget cannot cover the next rate-limit interval")
                 self.sleep(wait)
+                self._read_remaining("throttle")
         self._last = self.clock()
+
+    def _read_remaining(self, stage: str) -> float:
+        deadline = getattr(self._read_state, "deadline", None)
+        if deadline is None:
+            return math.inf
+        remaining = deadline-self.clock()
+        if remaining <= 0:
+            raise ReadDeadline(f"read budget exhausted before {stage}")
+        return remaining
+
+    @contextmanager
+    def read_budget(self, seconds: float = READ_QUERY_BUDGET_S) -> Iterator[None]:
+        """Thread-local, nested minimum deadline, including throttle and all pages.
+
+        Evidence callers can put health plus several queries inside one budget.
+        Socket attempts are bounded by remaining time and never retried here.
+        Ordinary upload calls outside this read context keep their old behavior.
+        """
+        seconds = float(seconds)
+        if not math.isfinite(seconds) or seconds < 0:
+            raise LangfuseError("read budget must be finite and nonnegative")
+        old = getattr(self._read_state, "deadline", None)
+        deadline = self.clock()+seconds
+        self._read_state.deadline = min(old, deadline) if old is not None else deadline
+        try:
+            yield
+        finally:
+            self._read_state.deadline = old
 
     @property
     def problem(self) -> str | None:
@@ -809,11 +858,24 @@ class LangfuseClient:
               retries: int | None = None, timeout: float | None = None) -> http.Response:
         if self.problem:
             raise LangfuseError(self.problem)
+        remaining = self._read_remaining(path)
+        bounded = not math.isinf(remaining)
+        if bounded and (method != "GET" or body is not None):
+            raise LangfuseError("read budget refuses non-GET operations")
         if path != OTLP_PATH:              # the OTLP export has its own, much higher ingestion limit
             self._throttle()
         url = f"{self.host}{path}" + (f"?{urlencode(params)}" if params else "")
-        return http.request(method, url, headers=self._headers(), body=body, timeout=timeout or self.timeout,
-                            retries=self.retries if retries is None else retries, sleep=self.sleep)
+        remaining = self._read_remaining(path)
+        try:
+            response = http.request(method, url, headers=self._headers(), body=body,
+                                    timeout=min(timeout or self.timeout, remaining),
+                                    retries=0 if bounded else self.retries if retries is None else retries, sleep=self.sleep,
+                                    **({"total_timeout": remaining} if bounded else {}))
+        except http.HttpError:
+            self._read_remaining(path)  # retain a typed timeout when the transport stopped on our deadline
+            raise
+        self._read_remaining(path)  # a late response is not complete on-time evidence
+        return response
 
     @staticmethod
     def _json(r: http.Response) -> Any:
@@ -849,21 +911,33 @@ class LangfuseClient:
             msgs = "; ".join(str(e.get("message"))[:80] for e in (data.get("errors") or [])[:3] if isinstance(e, dict))
             raise Rejected(f"scores rejected {rejected} of {len(items)}: {msgs}"[:300])
 
-    def _pages(self, path: str, params: Mapping[str, Any], max_pages: int) -> list[dict[str, Any]]:
+    def _pages(self, path: str, params: Mapping[str, Any], max_pages: int, *,
+               allow_partial: bool = False) -> list[dict[str, Any]]:
         out: list[dict[str, Any]] = []
         cursor = None
+        seen: set[str] = set()
+        if max_pages < 1:
+            raise IncompleteRead("page budget is empty")
         for _ in range(max_pages):
             data = self._json(self._call("GET", path, params={**params, **({"cursor": cursor} if cursor else {})}))
-            if not isinstance(data, dict):
-                break
-            out.extend(x for x in data.get("data") or [] if isinstance(x, dict))
+            if not isinstance(data, dict) or not isinstance(data.get("data"), list):
+                raise IncompleteRead("invalid paged response")
+            if any(not isinstance(x, dict) for x in data["data"]):
+                raise IncompleteRead("invalid row in paged response")
+            out.extend(data["data"])
             cursor = (data.get("meta") or {}).get("cursor") if isinstance(data.get("meta"), dict) else None
             if not cursor:
-                break
-        return out
+                return out
+            if not isinstance(cursor, str) or cursor in seen:
+                raise IncompleteRead("invalid or repeated pagination cursor")
+            seen.add(cursor)
+        if allow_partial:
+            return out
+        raise IncompleteRead("page cap reached with an unread cursor")
 
-    def observations(self, max_pages: int = 10, **params: Any) -> list[dict[str, Any]]:
-        return self._pages(OBSERVATIONS_PATH, params, max_pages)
+    def observations(self, max_pages: int = 10, *, require_complete: bool = True, **params: Any) -> list[dict[str, Any]]:
+        return self._pages(OBSERVATIONS_PATH, params, max_pages) if require_complete else \
+               self._pages(OBSERVATIONS_PATH, params, max_pages, allow_partial=True)
 
     def scores(self, max_pages: int = 5, **params: Any) -> list[dict[str, Any]]:
         return self._pages(SCORES_PATH, params, max_pages)
@@ -878,7 +952,8 @@ class LangfuseClient:
             window["fromStartTime"] = _iso(start - timedelta(days=1))
         if end is not None:
             window["toStartTime"] = _iso(end + timedelta(days=1))
-        return bool(self.observations(max_pages=1, traceId=trace, fields="core", limit=1, **window))
+        # An existence probe intentionally needs one row, not a complete trace.
+        return bool(self.observations(max_pages=1, require_complete=False, traceId=trace, fields="core", limit=1, **window))
 
     def dataset_id(self, name: str) -> str | None:
         try:
@@ -887,7 +962,9 @@ class LangfuseClient:
             if exc.status == 404:
                 return None
             raise
-        return data["id"] if isinstance(data, dict) and isinstance(data.get("id"), str) else None
+        if not isinstance(data, dict) or not isinstance(data.get("id"), str):
+            raise IncompleteRead("dataset lookup returned no id without a not-found response")
+        return data["id"]
 
     def ensure_dataset(self, name: str) -> str:
         """The dataset's Langfuse id (created once; v4 needs Dataset.id on experiment spans)."""
@@ -1112,13 +1189,17 @@ class LangfuseRetriever:
     def named_queries(self) -> Mapping[str, NamedQuery]:
         return self._QUERIES
 
+    def read_budget(self, seconds: float = READ_QUERY_BUDGET_S) -> Any:
+        return self.client.read_budget(seconds)
+
     def _since(self) -> str:
         return _iso(self._now() - timedelta(days=READ_WINDOW_DAYS))
 
     def query(self, name: str, params: Mapping[str, str]) -> list[EvidenceRef]:
-        if name == "trace":
-            return self._trace(params["trace_id"])
-        return self._experiment(params["experiment_id"])
+        with self.read_budget():
+            if name == "trace":
+                return self._trace(params["trace_id"])
+            return self._experiment(params["experiment_id"])
 
     def _trace(self, tid: str) -> list[EvidenceRef]:
         rows = self.client.observations(traceId=tid, fields="core,basic,model,usage,metadata,trace_context", limit=100,
@@ -1155,8 +1236,9 @@ class LangfuseRetriever:
 
     def _experiment(self, exp: str) -> list[EvidenceRef]:
         """With a dataset: one paged experiment-items call carries every item's trace scores (rep 0 only,
-        as linked). Without one: root observations, then one scores call per trace, at most MAX_SCORED_TRACES
-        (the Hobby limit is 30 calls a minute), and `truncated` says when more were left out."""
+        as linked). Without one: bounded root observations followed by one paged
+        scores query over explicit traceId OR values. No per-trace HTTP fanout.
+        The same MAX_SCORED_TRACES selection cap remains explicit as truncated."""
         ds = self.client.dataset_id(dataset_name(exp))
         per_trace: list[tuple[str, dict[str, Any]]] = []          # (arm, score values)
         truncated, via = False, "experiment-items"
@@ -1176,6 +1258,7 @@ class LangfuseRetriever:
                                              fields="core,basic,metadata,trace_context", limit=1000,
                                              fromStartTime=self._since())
             seen: set[str] = set()
+            selected: dict[str, str] = {}
             for r in roots:
                 tid = r.get("traceId")
                 if not isinstance(tid, str) or not refs.TRACE_RE.fullmatch(tid) or tid in seen or r.get("parentObservationId"):
@@ -1187,7 +1270,28 @@ class LangfuseRetriever:
                     truncated = True
                     break
                 seen.add(tid)
-                per_trace.append((arm, _score_values(self.client.scores(traceId=tid, limit=100))))
+                selected[tid] = arm
+            scores: dict[str, list[dict[str, Any]]] = {tid: [] for tid in selected}
+            if selected:
+                # Scores v3 core fields always accompany fields=subject. TraceId
+                # accepts comma-separated OR values. Bind returned trace or
+                # observation subjects to the selected roots; do not assume a
+                # session-level score represents a trace's check result.
+                rows = self.client.scores(traceId=",".join(selected), fields="subject", limit=100,
+                                          fromTimestamp=self._since(), toTimestamp=_iso(self._now()))
+                for score in rows:
+                    if score.get("name") not in SCORES:
+                        continue
+                    subject = score.get("subject")
+                    if isinstance(subject, dict):
+                        tid = subject.get("id") if subject.get("kind") == "trace" else \
+                              subject.get("traceId") if subject.get("kind") == "observation" else None
+                    else:
+                        tid = score.get("traceId")  # older v3/local response compatibility
+                    if not isinstance(tid, str) or tid not in selected:
+                        raise IncompleteRead("score subject does not resolve to a selected root trace")
+                    scores[tid].append(score)
+            per_trace = [(arm, _score_values(scores[tid])) for tid, arm in selected.items()]
         arms: dict[str, dict[str, Any]] = {}
         for arm, vals in per_trace:
             a = arms.setdefault(arm, {"traces": 0, "check_passed_n": 0, "check_passed_true": 0,
@@ -1203,6 +1307,7 @@ class LangfuseRetriever:
         for arm, a in sorted(arms.items()):
             n = a["check_passed_n"]
             metrics = {"experiment_id": exp, "arm": arm, **a, "via": via, "truncated": truncated or None,
+                       "population_complete": not truncated,
                        "check_passed_rate": round(a["check_passed_true"] / n, 4) if n else None}
             out.append(EvidenceRef(refs.lf("dataset_run", experiment_run_id(exp, arm)), SOURCE, "score",
                                    [refs.amem("experiment", exp)], {k: v for k, v in metrics.items() if v is not None}))

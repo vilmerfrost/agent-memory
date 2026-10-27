@@ -15,7 +15,7 @@ from psycopg.rows import dict_row
 
 from agent_memory import coverage as CV, store
 
-FORMAT = "telemetry-analysis/1"
+FORMAT = "telemetry-analysis/2"
 
 
 def _rows(conn, sql, params=()):
@@ -37,7 +37,11 @@ def analyze(conn, *, now: datetime | None = None, days: int = 7, limit: int = 5)
                          "limitation": limitation, "dataset": dataset, "advisory_only": True})
 
     quality = _rows(conn, """select count(*) as stored,count(e.elapsed_ms) as duration_known,
-        count(s.session_id) as session_resolved,count(*) filter(where e.category='api') as api_events,
+        count(s.session_id) filter(where coalesce(e.meta->>'api_scope','')<>'client_control') as session_resolved,
+        count(*) filter(where e.meta->>'api_scope'='client_control') as client_control,
+        count(*) filter(where coalesce(e.meta->>'api_scope','')<>'client_control') as session_expected,
+        count(e.elapsed_ms) filter(where coalesce(e.meta->>'api_scope','')<>'client_control') as scoped_duration_known,
+        count(*) filter(where e.category='api') as api_events,
         count(*) filter(where e.category='api' and s.session_id is null) as api_unassigned,
         count(*) filter(where e.status='running') as unfinished,max(e.created_at) as last_ingest
         from execution_spans e left join sessions s on s.session_id=e.session_id
@@ -56,9 +60,9 @@ def analyze(conn, *, now: datetime | None = None, days: int = 7, limit: int = 5)
                     ["execution_spans:"+s for s in op['span_ids']],
                     "Captured source window only; nested/parallel intervals overlap and provider boundaries differ. "
                     "This is cumulative work, not wall time or a proof of waste.", "command_timings:execution_spans")
-    if quality['stored'] and (quality['session_resolved'] < quality['stored'] or quality['duration_known'] < quality['stored']):
-        finding("measurement_gap", f"{quality['session_resolved']}/{quality['stored']} stored spans resolve a session; "
-                f"{quality['duration_known']}/{quality['stored']} have duration; {quality['api_unassigned']} API events unassigned",
+    if quality['session_expected'] and (quality['session_resolved'] < quality['session_expected'] or quality['scoped_duration_known'] < quality['session_expected']):
+        finding("measurement_gap", f"{quality['session_resolved']}/{quality['session_expected']} task-scoped stored spans resolve a session; "
+                f"{quality['scoped_duration_known']}/{quality['session_expected']} have duration; {quality['api_unassigned']} API events unassigned; {quality['client_control']} known client-control events excluded from session eligibility",
                 ["query:execution_spans.session_id->sessions.session_id"],
                 "Missing identity/duration is unknown. No actor is inferred from nearby timestamps.",
                 "command_timings:execution_spans")
@@ -150,14 +154,15 @@ def records(report: dict[str, Any], *, run_key: str) -> list[Any]:
     for dataset, group in (("command_timings:execution_spans", report['span_coverage']),
                            ("test_timings:test_timing_runs", report['test_coverage']),
                            ('reports_checkpoints:rsi_checkpoints',report['checkpoint_coverage'])):
-        n, linked = int(group['stored']), int(group['session_resolved'])
+        n, linked = int(group.get('session_expected',group['stored'])), int(group['session_resolved'])
         captured = int(group.get('captured',n))
-        missing = (group.get('duration_known', n) != n or group.get('incomplete', 0) > 0
+        missing = (group.get('scoped_duration_known',group.get('duration_known', n)) != n or group.get('incomplete', 0) > 0
                    or group.get('expired_details', 0) > 0 or group.get('unknown_clock',0)>0)
         findings = [f for f in report['findings'] if f['dataset'] == dataset]
         scope = ("stored current collector checkpoints; bounded capture, independent of the analysis window"
                  if dataset == "reports_checkpoints:rsi_checkpoints" else
-                 "stored rows in the explicit deterministic analysis window")
+                 "stored task-scoped rows in explicit analysis window; known client-control traffic excluded"
+                 if "session_expected" in group else "stored rows in the explicit deterministic analysis window")
         fields = (("stored_count", "checkpoint_identity", "freshness")
                   if dataset == "reports_checkpoints:rsi_checkpoints" else ("stored_count", "session_linkage"))
         result += [CV.Snapshot(dataset, start, end, scope,
@@ -208,7 +213,7 @@ def daily_review(directory: Path, *, now: datetime) -> dict[str, Any]:
                 continue
             report = json.loads(path.read_text())
             observed = datetime.fromisoformat(report['observed_at'])
-            if report.get('format') != FORMAT or observed.tzinfo is None:
+            if report.get('format') not in ('telemetry-analysis/1', FORMAT) or observed.tzinfo is None:
                 continue
             if observed > now or now-observed > timedelta(hours=26):
                 return {'status':'stale','detail':'daily measurement window is stale or in the future','report_ref':path.name}

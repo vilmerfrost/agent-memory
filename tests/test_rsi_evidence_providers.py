@@ -86,8 +86,7 @@ class Mocks:
         self.lf.route("GET", "/api/public/projects", lambda r: (200, {"data": [{"id": "p1"}]}))
         self.lf.route("GET", "/api/public/v2/datasets/", lambda r: (404, {"message": "not found"}))
         self.lf.route("GET", "/api/public/v2/observations", self._lf_obs)
-        self.lf.route("GET", "/api/public/v3/scores", lambda r: (200, {"data": [
-            {"name": "check_passed", "value": 0}, {"name": "eval_verdict", "stringValue": "worse"}], "meta": {}}))
+        self.lf.route("GET", "/api/public/v3/scores", self._lf_scores)
         self.pd.route("GET", f"/api/v1/ingest/{PD.NIL_INGESTION}", lambda r: (404, {"code": "not-found"}))
         self.pd.route("POST", "/api/v1/recall", lambda r: (200, {"results": [{"rank": 1, "sources": [
             {"sourceId": f"amem:proposal/{PROPOSAL}", "occurredAt": "2026-10-14T08:00:00Z", "label": "proposal"}]}]}))
@@ -112,6 +111,20 @@ class Mocks:
         return {"id": f"o-{tid[:8]}", "traceId": tid, "type": "AGENT", "parentObservationId": None, "sessionId": EXP,
                 "startTime": "2026-10-16T10:00:00.000Z", "level": "ERROR", "tags": [arm, "sandbox"],
                 "metadata": {"arm": arm, "amem_session_id": TRACES[arm]["session_id"]}}
+
+    @staticmethod
+    def _lf_scores(req: Request) -> tuple[int, dict[str, Any]]:
+        # Scores API v3 OR-filters explicit trace IDs and carries subject
+        # identity when requested, including for the new bulk path.
+        tids = req.q("traceId").split(",")
+        rows = []
+        for tid in tids:
+            if tid not in {t["trace_id"] for t in TRACES.values()}:
+                continue
+            subject = {"subject": {"kind": "trace", "id": tid}} if req.q("fields") == "subject" else {}
+            rows += [{"name": "check_passed", "value": 0, "dataType": "BOOLEAN", **subject},
+                     {"name": "eval_verdict", "value": "worse", "dataType": "CATEGORICAL", **subject}]
+        return 200, {"data": rows, "meta": {}}
 
     def _lf_obs(self, req: Request) -> tuple[int, dict[str, Any]]:
         tid = req.q("traceId")
@@ -592,7 +605,7 @@ def test_no_write_method_is_reachable(db: str, m: Mocks) -> None:
     # the gated retriever offers reads only
     g = P.default_retrievers(provider_env(db, m))["ch"]
     assert {n for n in dir(g) if not n.startswith("_") and callable(getattr(g, n))} == {
-        "health", "named_queries", "query"}
+        "health", "named_queries", "query", "read_budget"}
 
 
 # ---------------------------------------------------------------- untrusted text stays inert

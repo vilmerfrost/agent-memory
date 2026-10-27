@@ -560,6 +560,32 @@ def judgment_text(judge: Any, jev: Any) -> str:
     return "; ".join(parts)
 
 
+def provider_summaries(value: Any) -> list[dict[str, Any]]:
+    """Separate provider evidence for display only. Never manufacture pooled judge/Jev statistics."""
+    if not isinstance(value, list):
+        return []
+    out = []
+    for p in value[:4]:
+        if not isinstance(p, dict):
+            continue
+        arms = _obj(p.get("arms"))
+        a, b = _obj(arms.get("A")), _obj(arms.get("B"))
+        out.append({"provider": text(p.get("provider"), 40) or "unknown",
+                    "verdict": text(p.get("verdict"), 30) or None,
+                    "baseline_pass": arm_rate(arms, "A"), "candidate_pass": arm_rate(arms, "B"),
+                    "baseline_checked": a.get("checked") if _count(a.get("checked")) else None,
+                    "candidate_checked": b.get("checked") if _count(b.get("checked")) else None,
+                    "judge": _small(p.get("judge"), JUDGE_FIELDS), "jev": _small(p.get("jev"), JEV_FIELDS)})
+    return out
+
+
+def experiment_judgments(e: Mapping[str, Any]) -> str | None:
+    providers = provider_summaries(e.get("provider_results"))
+    if providers:
+        return " | ".join(f"{p['provider']}: {judgment_text(p['judge'], p['jev'])}" for p in providers)
+    return judgment_text(e.get("judge"), e.get("jev")) if e.get("judge") or e.get("jev") else None
+
+
 def apply_blockers(*, verdict: Any, change: Mapping[str, Any], ev: Mapping[str, Any], db: Db, proposal: Mapping[str, Any],
                    h: str, missing_suites: list[str]) -> list[str]:
     """Why Apply is not offered for one staged artifact; empty = Apply may be shown. Apply needs all of: verdict
@@ -750,6 +776,9 @@ def proposal_block(e: Mapping[str, Any], db: Db, artifacts_root: Path, suites: l
     ev = evaluation(adir, h)
     if not ev["recorded"]:           # shown from the report; without the bound record it never counts as independent
         ev.update(judge=_small(e.get("judge"), JUDGE_FIELDS), jev=_small(e.get("jev"), JEV_FIELDS))
+    providers = provider_summaries(e.get("provider_results"))
+    if providers:
+        ev["provider_results"] = providers  # display from report; does not change independent/apply blockers
     blockers = apply_blockers(verdict=e.get("verdict"), change=change, ev=ev, db=db, proposal=p, h=h,
                               missing_suites=missing)
     risk = e.get("risk") or _obj(p.get("risk")).get("level")
@@ -795,7 +824,7 @@ def failed_item(e: Mapping[str, Any]) -> dict[str, Any]:
             "skip_reason": text(e.get("skip_reason"), 120) or None,
             "budget_decision": e.get("budget_decision") if isinstance(e.get("budget_decision"), dict) else None,
             "what": text(hyp.get("what"), 300), "artifact_hash": e.get("artifact_hash"), "cost_usd": e.get("cost_usd"),
-            "judgments": judgment_text(e.get("judge"), e.get("jev")) if e.get("judge") or e.get("jev") else None}
+            "judgments": experiment_judgments(e)}
 
 
 def arm_rate(arms: Any, arm: str) -> float | None:
@@ -886,7 +915,9 @@ def build_brief(rep: Mapping[str, Any], db: Db, *, artifacts_root: Path, report:
                     "verdict": e.get("verdict"), "status": e["status"], "cost_usd": e.get("cost_usd"),
                     "db_status": (db.experiments.get(e.get("experiment_id") or "") or {}).get("status"),
                     "baseline_pass": arm_rate(e.get("arms"), "A"), "candidate_pass": arm_rate(e.get("arms"), "B"),
-                    "judge": _small(e.get("judge"), JUDGE_FIELDS), "jev": _small(e.get("jev"), JEV_FIELDS)}
+                    "judge": _small(e.get("judge"), JUDGE_FIELDS), "jev": _small(e.get("jev"), JEV_FIELDS),
+                    **({"provider_results": provider_summaries(e["provider_results"])}
+                       if provider_summaries(e.get("provider_results")) else {})}
                    for e in exps]
     c = rep["costs"]
     mb = _obj(c.get("model_bases"))
@@ -1069,8 +1100,14 @@ def _proposal_md(i: int, b: dict[str, Any]) -> list[str]:
     out.append(f"- **Artifact hash:** `{b['artifact_hash']}` ({state}; {ch['dir']}).")
     ev = b.get("evaluation") or {}
     src = "the bound sandbox-replay record" if ev.get("recorded") else "the night report (no bound record)"
-    out.append(f"- **Codex and Jev judgments:** {judgment_text(ev.get('judge'), ev.get('jev'))} (from {src}; "
-               + ("independent" if ev.get("independent") else "NOT independent") + ").")
+    if ev.get("provider_results"):
+        for p in ev["provider_results"]:
+            out.append(f"- **{p['provider']} provider judgments:** {judgment_text(p['judge'], p['jev'])} "
+                       "(night report; providers are not pooled).")
+        out.append("- Provider display does not replace a bound independent evaluation or authorize Apply.")
+    else:
+        out.append(f"- **Codex and Jev judgments:** {judgment_text(ev.get('judge'), ev.get('jev'))} (from {src}; "
+                   + ("independent" if ev.get("independent") else "NOT independent") + ").")
     out.append(f"- **Proposal:** `{b['proposal_id']}`, {b['proposal_status'] or 'status unknown'}"
                + (f", expires {_when(b['expires_at'])} UTC" if b["expires_at"] else "") + ".")
     a = b["actions"]
@@ -1176,7 +1213,15 @@ def render_markdown(b: dict[str, Any]) -> str:
                         usd(x["cost_usd"]) if x["cost_usd"] is not None else "-"] for x in ex])
         out.append("")
         for x in ex:
-            if x["experiment_id"] and (x["judge"] or x["jev"]):
+            if x["experiment_id"] and x.get("provider_results"):
+                for p in x["provider_results"]:
+                    rate_a = f"{100 * p['baseline_pass']:.0f}%" if _num(p["baseline_pass"]) else "unknown"
+                    rate_b = f"{100 * p['candidate_pass']:.0f}%" if _num(p["candidate_pass"]) else "unknown"
+                    out.append(f"- {x['experiment_id']}, {p['provider']}: baseline pass {rate_a} "
+                               f"({_fmt(p['baseline_checked'])} checked), candidate pass {rate_b} "
+                               f"({_fmt(p['candidate_checked'])} checked); {p['verdict'] or 'verdict unknown'}; "
+                               f"{judgment_text(p['judge'], p['jev'])}. Providers are not pooled.")
+            elif x["experiment_id"] and (x["judge"] or x["jev"]):
                 out.append(f"- {x['experiment_id']}: {judgment_text(x['judge'], x['jev'])}.")
             elif x["experiment_id"] and x["verdict"]:
                 out.append(f"- {x['experiment_id']}: judge and Jev results not in the report.")

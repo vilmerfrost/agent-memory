@@ -693,3 +693,32 @@ def test_proposed_indexes_are_not_applied(pack_db: str) -> None:
         names = {r[0] for r in conn.execute("select indexname from pg_indexes where schemaname = 'public'")}
     proposed = {ddl.split(" exists ")[1].split()[0] for ddl in P.PROPOSED_INDEXES}
     assert proposed and not proposed & names
+
+
+def test_provider_budget_context_covers_health_and_all_phase_calls():
+    from contextlib import contextmanager
+    class Bounded(Stub):
+        active=False
+        budgets=[]
+        @contextmanager
+        def read_budget(self,seconds):
+            assert seconds>0 and not self.active
+            self.budgets.append(seconds);self.active=True
+            try:yield
+            finally:self.active=False
+        def health(self):
+            assert self.active
+            return super().health()
+        def query(self,name,params):
+            assert self.active
+            return super().query(name,params)
+    lf=Bounded('lf',LF.LangfuseRetriever._QUERIES)
+    from agent_memory import rsi_evidence_providers as providers
+    gated=providers.GatedRetriever('langfuse',lf,providers.ProviderPolicy(True,('*',)))
+    runner=P._Runner({'lf':gated},timeout_s=20)
+    wrapped=runner.r['lf']
+    assert runner.call('lf',wrapped.health)[0]=='ok'
+    steps=[P._Step('lf','experiment_scores',{'experiment_id':EXP},'langfuse')]
+    result=runner.phase(steps)
+    assert result[0][1].status=='ok' and not lf.active
+    assert len(lf.budgets)==2 and 0<lf.budgets[1]<=lf.budgets[0]<=20
