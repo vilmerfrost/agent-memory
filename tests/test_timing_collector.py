@@ -66,3 +66,19 @@ def test_cursor_only_advances_after_complete_records(db,tmp_path:Path):
 
 
 from test_execution_timing import db  # noqa: E402,F401
+
+
+def test_health_distinguishes_control_unknown_and_session_events(tmp_path):
+    with collector(tmp_path) as (state,url):
+        payload=otlp()
+        row=payload['resourceLogs'][0]
+        import copy
+        unknown=copy.deepcopy(row);unknown['resource']['attributes']=[]
+        control=copy.deepcopy(unknown)
+        control['scopeLogs'][0]['logRecords'][0]['attributes'].append({'key':'endpoint','value':{'stringValue':'/models'}})
+        payload['resourceLogs'] += [unknown,control]
+        with urlopen(Request(url+'/v1/logs',json.dumps(payload).encode(),{'Content-Type':'application/json'}),timeout=5):pass
+        health=state.health()
+        assert health['session_api_spans']==1 and health['unattributed_api_spans']==1
+        assert health['client_control_spans']==1 and health['accepted_api_spans']==2 and health['accepted_spans']==3
+        assert 'TOP-SECRET' not in str(health)

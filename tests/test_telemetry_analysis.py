@@ -77,3 +77,21 @@ def test_morning_review_distinguishes_recent_stale_and_missing(db,tmp_path):
     assert current['stored_spans']==2 and all(f['evidence_refs'] for f in current['findings'])
     assert A.daily_review(tmp_path,now=NOW+timedelta(hours=27))['status']=='stale'
     assert A.daily_review(tmp_path/'missing',now=NOW)['status']=='unavailable'
+
+
+def test_catalog_traffic_is_not_a_fake_session_link_or_inference_time(pg_url):
+    from agent_memory.execution_timing import Span
+    from agent_memory import timing_store
+    with fresh_db(pg_url) as url:
+        one=Span('catalog-control',None,'codex','unclassified','codex.api_request',
+                 NOW-timedelta(seconds=1),NOW-timedelta(milliseconds=1),999,'passed','provider_reported','codex.otel',
+                 meta={'api_scope':'client_control','endpoint':'models'})
+        timing_store.upsert([one],db_url=url)
+        report=A.run(db_url=url,now=NOW)
+        q=report['span_coverage']
+        assert q['stored']==1 and q['client_control']==1 and q['session_expected']==0
+        assert q['session_resolved']==0 and q['api_events']==0 and q['api_unassigned']==0
+        assert not any(f['kind']=='measurement_gap' for f in report['findings'])
+        snap=next(r for r in A.records(report,run_key='control') if isinstance(r,CV.Snapshot) and r.dataset=='command_timings:execution_spans')
+        assert snap.eligible==0 and snap.linked==0 and snap.resolved_status()=='no_eligible_data'
+        assert 'client-control' in snap.denominator

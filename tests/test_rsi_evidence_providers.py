@@ -592,7 +592,7 @@ def test_no_write_method_is_reachable(db: str, m: Mocks) -> None:
     # the gated retriever offers reads only
     g = P.default_retrievers(provider_env(db, m))["ch"]
     assert {n for n in dir(g) if not n.startswith("_") and callable(getattr(g, n))} == {
-        "health", "named_queries", "query"}
+        "health", "named_queries", "query", "read_budget"}
 
 
 # ---------------------------------------------------------------- untrusted text stays inert

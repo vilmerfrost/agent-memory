@@ -45,6 +45,7 @@ it never prints row contents.
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
 import hashlib
 import json
 import os
@@ -382,6 +383,10 @@ class GatedRetriever:
         self.gate, self.subject_rule = gate, subject_rule
         self.meter = meter or Meter()
         self.source = RETRIEVER_OF[service]
+
+    def read_budget(self, seconds: float):
+        budget = getattr(self.inner, "read_budget", None) if not self.block else None
+        return budget(seconds) if callable(budget) else nullcontext()
 
     @property
     def owner_off(self) -> bool:

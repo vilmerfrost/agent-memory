@@ -20,7 +20,7 @@ def test_scope_identity_is_observed_without_inheriting_collector_actor():
     one, = T.otlp_spans(payload)
     assert one.session_id == "codex:scope-thread"
     assert one.meta["identity_source"] == "otel_attribute:thread.id"
-    assert one.method_version == 2
+    assert one.method_version == 3
 
 
 @pytest.mark.parametrize("attributes,reason", [
@@ -82,3 +82,44 @@ def test_exact_late_assignment_is_idempotent_and_cannot_reassign_actor(pg_url):
             assert "identity_unavailable" not in meta
             assert conn.execute("select count(*) from execution_spans").fetchone()[0] == 1
             assert conn.execute("select api_seconds from sessions where session_id=%s", (sid,)).fetchone()[0] == pytest.approx(.1255)
+
+
+@pytest.mark.parametrize('endpoint',['/models','models'])
+def test_native_catalog_request_is_control_traffic_not_missing_inference_identity(endpoint):
+    payload=otlp()
+    payload['resourceLogs'][0]['resource']['attributes']=[]
+    rec=payload['resourceLogs'][0]['scopeLogs'][0]['logRecords'][0]
+    # Field shape observed from codex-cli0.163.0 initialize + model/list,
+    # without thread/start or turn/start and without a model generation.
+    rec['attributes']=[attr('event.name','codex.api_request'),attr('duration_ms','17'),
+                       attr('endpoint',endpoint),attr('http.response.status_code','200'),attr('attempt','0'),
+                       attr('authorization','TOP-SECRET'),attr('auth.agent_id','PRIVATE-ACTOR')]
+    span,=T.otlp_spans(payload)
+    assert span.session_id is None and span.category=='unclassified'
+    assert span.meta['api_scope']=='client_control' and span.meta['endpoint']=='models'
+    assert span.meta['identity_unavailable']=='session_not_applicable'
+    assert span.status=='passed' and span.meta['http_status']=='200'
+    assert 'TOP-SECRET' not in str(span.record()) and 'PRIVATE-ACTOR' not in str(span.record())
+
+
+def test_actual_inference_event_metadata_uses_native_identity_and_clock():
+    payload=otlp();r=payload['resourceLogs'][0]
+    r['resource']['attributes']=[]
+    rec=r['scopeLogs'][0]['logRecords'][0]
+    rec['timeUnixNano']='0'
+    rec['attributes'] += [attr('conversation.id','native-conversation'),attr('model','gpt-6.1-sol'),
+                          attr('event.timestamp','2026-10-27T00:30:00Z'),attr('http.response.status_code','429')]
+    span,=T.otlp_spans(payload)
+    assert span.session_id=='codex:native-conversation' and span.category=='api'
+    assert span.meta['api_scope']=='session' and span.status=='failed'
+    assert span.ended_at.isoformat()=='2026-10-27T00:30:00+00:00'
+    assert span.meta['clock']=='provider_event_timestamp'
+
+
+def test_unknown_endpoint_and_no_metadata_remains_a_real_gap():
+    payload=otlp();payload['resourceLogs'][0]['resource']['attributes']=[]
+    rec=payload['resourceLogs'][0]['scopeLogs'][0]['logRecords'][0]
+    rec['attributes'].append(attr('endpoint','https://private.invalid/SECRET-TOKEN'))
+    span,=T.otlp_spans(payload)
+    assert span.category=='api' and span.meta['api_scope']=='unknown' and span.session_id is None
+    assert 'SECRET-TOKEN' not in str(span.record())

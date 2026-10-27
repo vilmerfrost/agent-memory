@@ -78,6 +78,8 @@ apply (a hosted schema change: it needs Vilmer); nothing here applies it.
 
 from __future__ import annotations
 
+from contextlib import nullcontext
+
 import argparse
 import hashlib
 import json
@@ -436,6 +438,10 @@ class _HealthOnce:
             raise self._h
         return self._h
 
+    def read_budget(self, seconds: float):
+        budget = getattr(self._r, "read_budget", None)
+        return budget(seconds) if callable(budget) else nullcontext()
+
     def named_queries(self) -> Mapping[str, Any]:
         return self._r.named_queries()
 
@@ -489,9 +495,13 @@ class _Runner:
             return "timeout", None
         box: list[Any] = []
 
+        remaining = self._left(retr)
+
         def body() -> None:
             try:
-                box.append(("ok", fn()))
+                r = self.r.get(retr)
+                with r.read_budget(remaining) if r is not None else nullcontext():
+                    box.append(("ok", fn()))
             except Exception as exc:  # noqa: BLE001 - reported, never raised
                 box.append(("error", exc))
 
@@ -522,11 +532,12 @@ class _Runner:
             stop = threading.Event()
 
             def body(r: Any = r, sts: list[_Step] = sts, box: list[tuple[_Step, QueryResult]] = box,
-                     stop: threading.Event = stop) -> None:
-                for st in sts:
-                    if stop.is_set():
-                        return
-                    box.append((st, run_query(r, st.query, st.params)))
+                     stop: threading.Event = stop, remaining: float = self._left(retr)) -> None:
+                with r.read_budget(remaining):
+                    for st in sts:
+                        if stop.is_set():
+                            return
+                        box.append((st, run_query(r, st.query, st.params)))
 
             deadline = self.clock() + self._left(retr)
             t, spent = self._start(retr, body)

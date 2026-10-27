@@ -18,7 +18,7 @@ IDENTITY = re.compile(r"[A-Za-z0-9_.:/@+-]{1,200}\Z")
 META_KEYS = frozenset({"head", "config", "repo", "turn_id", "request_id", "attempt", "model",
                        "clock", "duration_source", "tests", "passed", "failed", "skipped", "errors",
                        "workers", "log_hash", "log_ref", "worktree", "operation_id", "http_status", "timing_unavailable",
-                       "identity_source", "identity_unavailable", "actor_scope"})
+                       "identity_source", "identity_unavailable", "actor_scope", "api_scope", "endpoint"})
 
 
 def number(value: Any) -> float | None:
@@ -320,8 +320,26 @@ def otlp_spans(payload: Any) -> list[Span]:
                     clock, clock_key = clock_name, raw_clock
                     break
                 session, identity_basis = otlp_session([common, scoped, record_attrs])
+                # Native model-catalog requests are process-wide control traffic.
+                # They carry no conversation identity and are not inference time.
+                catalog = attrs.get("endpoint") in ("/models", "models")
+                if catalog:
+                    session, identity_basis = None, "session_not_applicable"
+                api_scope = "client_control" if catalog else "session" if session else "unknown"
+                if clock != "provider_event_end":
+                    event_clock = attrs.get("event.timestamp")
+                    try:
+                        observed = datetime.fromisoformat(event_clock.replace("Z", "+00:00")) if isinstance(event_clock,str) else None
+                    except ValueError:
+                        observed = None
+                    if observed is not None and observed.tzinfo is not None:
+                        end, clock = observed.astimezone(UTC), "provider_event_timestamp"
+                http_status = attrs.get("http.response.status_code", attrs.get("status"))
                 meta = clean_meta({"model": attrs.get("model"), "attempt": attrs.get("attempt"),
-                                   "http_status": attrs.get("status"), "request_id": attrs.get("request.id")})
+                                   "http_status": http_status, "request_id": attrs.get("request.id")})
+                meta['api_scope'] = api_scope
+                if catalog:
+                    meta['endpoint'] = 'models'
                 # A native request/trace identity permits a later exact actor
                 # assignment without creating a second measurement. Anonymous
                 # legacy events keep the previous key contract.
@@ -332,14 +350,14 @@ def otlp_spans(payload: Any) -> list[Span]:
                                attrs.get("attempt")) if request_id or native_trace
                            else key(session, name, clock_key, rec.get("traceId"), rec.get("spanId"), elapsed, meta))
                 success = attrs.get("success")
-                http = str(attrs.get("status") or "")
+                http = str(http_status or "")
                 status = ("failed" if success is False or success == "false" or (http.isdigit() and int(http)>=400)
                           else "passed" if success is True or success == "true" or (http.isdigit() and 200<=int(http)<400)
                           else "unknown")
                 meta.update(duration_source='otel_duration_ms', clock=clock)
                 meta["identity_source" if session else "identity_unavailable"] = identity_basis
-                found[span_id] = Span(span_id, session, "codex", "api", name, end-timedelta(milliseconds=elapsed) if end else None,
-                                      end, elapsed, status, "provider_reported", "codex.otel", method_version=2, meta=meta)
+                found[span_id] = Span(span_id, session, "codex", "unclassified" if catalog else "api", name, end-timedelta(milliseconds=elapsed) if end else None,
+                                      end, elapsed, status, "provider_reported", "codex.otel", method_version=3, meta=meta)
     return list(found.values())
 
 
