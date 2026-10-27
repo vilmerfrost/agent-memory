@@ -173,14 +173,34 @@ def record_runner(conn: psycopg.Connection, attempts: Iterable[Mapping[str, Any]
               **({"provider": a['agent']} if a.get('agent') in ('claude','codex') else {})}
         native = native_session_id(a.get("agent"), a.get("native_session_id"))
         sid = None
+        previous = conn.execute("select evidence,session_id from rsi_attempts where id=%s", (at.key,)).fetchone()
+        previous_ev = previous[0] if previous and isinstance(previous[0], dict) else {}
+        previous_native = native_session_id(previous_ev.get("provider"), previous_ev.get("native_session_id"))
         if native:
-            previous = conn.execute("select evidence->>'native_session_id' from rsi_attempts where id=%s", (at.key,)).fetchone()
-            if previous and previous[0] not in (None, native):
+            if previous and previous_ev.get("native_session_id") not in (None, native):
                 raise refs.RefError("conflicting native identity for the same attempt")
+            if previous and previous[1] not in (None, native):
+                raise refs.RefError("existing attempt session link conflicts with native identity")
             ev["native_session_id"] = native
             ev["native_identity_source"] = "trusted_client_response"
             sid = record_native_session(conn, at, a)
             if sid is None:
+                ev["native_identity_unavailable"] = "existing_session_scope_or_attempt_conflict"
+        elif previous_native and previous_ev.get("native_identity_source") == "trusted_client_response":
+            # A late historical record has weaker evidence than the already
+            # captured client response. Preserve the exact existing identity;
+            # do not synthesize a native observation from its old logical UUID.
+            if a.get("agent") in ("claude", "codex") and a["agent"] != previous_ev.get("provider"):
+                raise refs.RefError("conflicting provider identity for the same attempt")
+            ev.update(provider=previous_ev["provider"], native_session_id=previous_native,
+                      native_identity_source="trusted_client_response")
+            target = conn.execute("select env,experiment_id,meta from sessions where session_id=%s",
+                                  (previous_native,)).fetchone()
+            if target and target[0] == "sandbox" and target[1] == at.experiment_id \
+                    and isinstance(target[2], dict) and target[2].get("attempt_ref") in (None, at.key) \
+                    and previous[1] in (None, previous_native):
+                sid = previous_native
+            else:
                 ev["native_identity_unavailable"] = "existing_session_scope_or_attempt_conflict"
         else:
             ev["native_identity_unavailable"] = "client_id_not_recorded"
@@ -195,11 +215,15 @@ def record_runner(conn: psycopg.Connection, attempts: Iterable[Mapping[str, Any]
             "attempt_session_id = excluded.attempt_session_id, run_id = excluded.run_id, "
             "session_id = coalesce(rsi_attempts.session_id, excluded.session_id), "
             "source = case when rsi_attempts.source='runner' then 'runner' else excluded.source end, "
-            "evidence = rsi_attempts.evidence || excluded.evidence, reason = null, updated_at = now() "
+            "evidence = case when excluded.session_id is not null "
+            "and excluded.evidence->>'native_identity_source'='trusted_client_response' "
+            "then (rsi_attempts.evidence || excluded.evidence) - 'native_identity_unavailable' "
+            "else rsi_attempts.evidence || excluded.evidence end, reason = null, updated_at = now() "
             "where (rsi_attempts.status, rsi_attempts.run_id, rsi_attempts.attempt_session_id) "
             "is distinct from (excluded.status, excluded.run_id, excluded.attempt_session_id) "
             "or (rsi_attempts.source<>'runner' and excluded.source='runner') "
             "or (rsi_attempts.session_id is null and excluded.session_id is not null) "
+            "or (excluded.session_id is not null and rsi_attempts.evidence ? 'native_identity_unavailable') "
             "or not (rsi_attempts.evidence @> excluded.evidence)",
             _params(row))
         n += cur.rowcount
@@ -211,11 +235,13 @@ def reconcile_native_sessions(conn: psycopg.Connection) -> int:
     This never creates sessions, reassigns an existing link, or matches by time.
     """
     cur = conn.execute("""
-        update rsi_attempts a set session_id=s.session_id, updated_at=now()
+        update rsi_attempts a set session_id=s.session_id,
+          evidence=a.evidence - 'native_identity_unavailable', updated_at=now()
         from sessions s where a.status='linked' and a.session_id is null
           and a.evidence->>'native_identity_source'='trusted_client_response'
           and a.evidence->>'native_session_id'=s.session_id
           and s.env='sandbox' and s.experiment_id=a.experiment_id
+          and coalesce(s.meta->>'attempt_ref',a.id)=a.id
         """)
     return cur.rowcount
 
