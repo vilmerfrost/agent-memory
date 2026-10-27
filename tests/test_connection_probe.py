@@ -20,7 +20,7 @@ def test_request_coalesces_and_only_current_completed_nonce_can_succeed(pg_url):
         assert conn.execute("select public.amem_connection_probe_finish(%s,true,74,'ready')",(first['request_id'],)).fetchone()[0] is False
         assert result(first['request_id'])['check']['status']=='unknown'
         assert result(second['request_id'])['pending'] is True
-        conn.execute("update public.rsi_checkpoints set started_at=now()-interval '91 seconds' where job='connections:clickhouse-probe' and run_key='live'")
+        conn.execute("update public.rsi_checkpoints set started_at=now()-interval '241 seconds' where job='connections:clickhouse-probe' and run_key='live'")
         assert result(second['request_id'])['pending'] is False
         assert result(second['request_id'])['check']['status']=='unknown'
         for role in ('amem_app','rsi_reader','rsi_writer'):
@@ -52,7 +52,7 @@ def test_saved_status_preserves_time_failure_and_never_starts_queries(pg_url):
         expired=current()
         assert expired['pending'] is False
         assert expired['check']['status']=='unknown'
-        assert '90 seconds' in expired['check']['message']
+        assert '240 seconds' in expired['check']['message']
         assert expired['check']['checked_at']==expired['requested_at']
         for role in ('amem_app','rsi_reader','rsi_writer'):
             assert not c.execute("select has_function_privilege(%s,'public.amem_connection_probe_current()','execute')",(role,)).fetchone()[0]
