@@ -488,7 +488,8 @@ def _session_params(conn: psycopg.Connection, sid: str) -> dict[str, Any]:
 def _deviation_params(conn: psycopg.Connection, did: str) -> tuple[Any, ...]:
     cols = ("source_key", "session_id", "instruction_source", "instruction_ref", "turn", "what", "why", "how",
             "followed_grade", "result_grade", "jev_verdict", "jev_confidence", "jev_mode", "jev_answers",
-            "writer_model", "rule_id", "rule_title", "instruction_sha", "meta", "result_outcome", "objective_result")
+            "writer_model", "rule_id", "rule_title", "instruction_sha", "meta", "result_outcome", "objective_result",
+            "why_category")
     row = conn.execute(sql.SQL("select {} from deviations where id = %s").format(
         sql.SQL(", ").join(map(sql.Identifier, cols))), (did,)).fetchone()
     return tuple(Jsonb(v) if isinstance(v, dict | list) else v for v in row)
