@@ -190,3 +190,6 @@ The isolated nightly Codex client must explicitly route its native OTel logs to 
 
 
 Anonymous event IDs retain the exact method2 hash seed. New scope/status fields do not create a second event when the same raw event is redelivered after an upgrade. Exact redelivery can enrich category, interval and method version in place; an older spool cannot downgrade the stronger semantics. This is evidence-backed redelivery, not a historical endpoint guess or backfill.
+
+
+Native Codex session registration also refreshes the existing exact-ID timing profile. If an API span arrived first, creating its verified sandbox session now populates api_seconds from that stored measurement. With no API observation the field remains NULL. Registration retries do not create another span or infer a duration from the client run's wall time.
