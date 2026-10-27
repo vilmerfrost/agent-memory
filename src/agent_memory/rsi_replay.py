@@ -509,12 +509,45 @@ def tally(pairs: Sequence[Mapping[str, Any]], mode: str) -> V.JudgeResult:
 # ---------------------------------------------------------------- Jev layer
 
 
+def checks_line(a_pass: int, b_pass: int, pairs: int) -> str:
+    """The plain reading of one case's (or all cases') check counts, so Jev does not have to count."""
+    if pairs <= 0:
+        return "no complete pairs"
+    if a_pass == 0 and b_pass == 0:
+        return "both arms failed every check"
+    if a_pass == pairs and b_pass == pairs:
+        return "both arms passed every check"
+    if b_pass > a_pass:
+        return "B passed more"
+    if a_pass > b_pass:
+        return "A passed more"
+    return "both arms passed the same number"
+
+
+def checks_overall(cases: Sequence[V.CaseStats]) -> str:
+    """checks_line over all cases: B (or A) passed more only when no case went the other way."""
+    each = [checks_line(c.a_pass, c.b_pass, c.pairs) for c in cases]
+    if not each:
+        return "no complete pairs"
+    if len(set(each)) == 1 and each[0] in ("both arms failed every check", "both arms passed every check",
+                                           "no complete pairs"):
+        return each[0]
+    b_more, a_more = "B passed more" in each, "A passed more" in each
+    if b_more and a_more:
+        return "mixed: B passed more on some cases, A on others"
+    return "B passed more" if b_more else "A passed more" if a_more else "both arms passed the same number"
+
+
 def jev_state(machine: V.ArmPair, judge: V.JudgeResult | None, cfg: ReplayConfig) -> str:
-    """The Jev state: numbers and labels only, deterministic (no time, no hash, no agent text)."""
+    """The Jev state: numbers and labels only, deterministic (no time, no hash, no agent text). Each case and the
+    whole replay also get a derived `checks:` line (checks_line)."""
     lines = [f"suite: {SUITE}/{SUITE_VERSION}", f"agent: {cfg.agent}", f"model: {cfg.model or 'default'}",
              f"reps: {cfg.reps}", "cases:"]
     for c in machine.cases:
-        lines.append(f"- {c.case}: pairs={c.pairs} A_pass={c.a_pass} B_pass={c.b_pass}")
+        lines.append(f"- {c.case}: pairs={c.pairs} A_pass={c.a_pass} B_pass={c.b_pass} "
+                     f"checks: {checks_line(c.a_pass, c.b_pass, c.pairs)}")
+    if machine.cases:
+        lines.append(f"checks overall: {checks_overall(machine.cases)}")
     if judge is None:
         lines.append("judge: none")
     else:
@@ -539,16 +572,18 @@ def run_jev(state: str, mode: str, budget: Any = None) -> V.JevResult:
                                    error="jev live needs TYPESAFE_API_KEY and AMEM_JEV_LIVE=1")
             if budget is not None and hasattr(budget, "take_call"):
                 budget.take_call(J.MODEL, stage="replay-jev")
-            t0, ok = time.monotonic(), False
+            t0, ok, answers = time.monotonic(), False, None
             try:
                 answers = J.ask(state, qs)
                 ok = True
             finally:            # booked even when the call failed: it may have been billed (fail-closed)
                 if budget is not None and hasattr(budget, "record_call"):
-                    # The wrapper reports no usage or cost: usd 0 makes the budget book the price table's flat
-                    # per-call Jev price (config/rsi-prices.json), never $0.
+                    # Jev reports tokens but no cost: usd 0 makes the budget book the price table's flat
+                    # per-call Jev price (config/rsi-prices.json), never $0. The tokens are recorded as reported.
+                    u = getattr(answers, "usage", None)
                     budget.record_call(J.MODEL, stage="replay-jev", duration_s=round(time.monotonic() - t0, 2),
-                                       ok=ok, error=None if ok else "jev call failed")
+                                       ok=ok, error=None if ok else "jev call failed",
+                                       tokens_in=u.input_tokens if u else 0, tokens_out=u.output_tokens if u else 0)
         else:
             J._validate(state, qs)            # fixture mode by construction: never J.ask (it may be live)
             answers = J._ask_fixture(state, qs)
@@ -557,9 +592,13 @@ def run_jev(state: str, mode: str, budget: Any = None) -> V.JevResult:
     except J.JevError as exc:
         return V.JevResult(mode=mode, status="error", state_key=key, error=str(exc)[:300])
     eff = answers["effect"]
+    usage = getattr(answers, "usage", None)
     return V.JevResult(mode=mode, status="ok", effect=str(eff.value), confidence=eff.confidence,
                        harness_problem=float(answers["harness_problem"].value),
-                       evidence_strength=float(answers["evidence_strength"].value), state_key=key)
+                       evidence_strength=float(answers["evidence_strength"].value), state_key=key,
+                       model=getattr(answers, "model", None),
+                       tokens_in=usage.input_tokens if usage else None,
+                       tokens_out=usage.output_tokens if usage else None)
 
 
 # ---------------------------------------------------------------- agent output

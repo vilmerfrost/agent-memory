@@ -711,9 +711,12 @@ def test_jev_fixture_triage_ranks_with_the_typed_answers(env: SimpleNamespace) -
     assert "rsi-triage" not in questions.QuestionCache().routines()               # not a routine for `amem score`
     seed_ab(env)
     for key, (rid, _ref, n, grade) in ((KEY_A, RULE_A), (KEY_B, RULE_B)):         # the committed fixtures match
+        # as the night builds it: recurrence(c) from the sessions, the deviations' result grade (seed_rule: 0.5), the
+        # generic cases that use CLAUDE.md, no replay history yet (baselines unknown)
         c = {"source": "deviations", "kind": "edit_instruction", "target": "~/.claude/CLAUDE.md",
-             "rule_key": f"claude-md:global:{rid}", "seen_count": 1, "metrics": {"sessions": n, "followed_grade_mean": grade}}
-        state = N.triage_state(c, [], True)
+             "rule_key": f"claude-md:global:{rid}", "seen_count": 1,
+             "metrics": {"sessions": n, "followed_grade_mean": grade, "result_grade_mean": 0.5}}
+        state = N.triage_state(c, [], True, ["docs-typo", "fix-add", "report-todos"], {})
         k = jev.fixture_key(state, qset.jev_questions())
         assert (config.JEV_FIXTURES_DIR / f"{k}.json").is_file(), (key, k)
         fx = json.loads((config.JEV_FIXTURES_DIR / f"{k}.json").read_text())

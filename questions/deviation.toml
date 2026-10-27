@@ -2,8 +2,9 @@
 # Not a routine: `amem score` and `amem daily` skip this file (questions.NOT_ROUTINES).
 #
 # Jev's state holds only the instruction source, the rule id and heading title (the rule
-# catalog), the two raw grades, the objective result (from the session's outcome), the
-# session kind and the recurrence count. Never transcript text and never the writer's what/why/how.
+# catalog), the writer's why_category label, the two raw grades, the objective result (from
+# the session's outcome), the session kind and the recurrence count. Never transcript text and
+# never the writer's what/why/how.
 
 threshold = 0.6
 pass_question = "verdict"
@@ -18,7 +19,14 @@ the agent followed it (1 = fully, 0 = ignored). result_grade is the writer's vie
 result was anyway (1 = good, 0 = bad). objective_result is the same from the session's own facts
 (shipped 1, committed 0.8, answered without changes 0.7, partial 0.4, abandoned 0.1, failed 0;
 unknown while the session runs). When both are known, objective_result is the fact to trust.
-recurrence counts other recent sessions that deviated from the same rule."""
+recurrence counts other recent sessions that deviated from the same rule.
+why_category is the writer's reason for the deviation, and it points to the verdict:
+unclear, wrong, conflict and missing_context mean the instruction is at fault: edit_instruction.
+ignored means the instruction was clear and the agent skipped it: enforce when it hurt the result
+or recurs, leave for a harmless one-off. tool_blocked means a tool or hook got in the way: the
+setup needs fixing, not the agent; edit_instruction when the instruction must fit the setup,
+leave when it was a one-off glitch. Let the grades, objective_result and recurrence overrule
+the category only when they clearly disagree with it."""
 [questions.options]
 edit_instruction = "Change the instruction itself: it is unclear, wrong, outdated or fights another rule, so agents keep missing it or the result was fine without it."
 enforce = "Keep the instruction as written and make it stick (a hook, a check or a stronger trigger): it is right, and skipping it hurt the result."
@@ -33,7 +41,9 @@ levels = ["Can wait: rare and harmless", "Soon: recurring or some harm", "Now: r
 [[questions]]
 name = "systemic"
 kind = "noul"
-prompt = "Is this deviation more likely caused by the instruction or the setup than by one agent's slip?"
+prompt = """Is this deviation more likely caused by the instruction or the setup than by one agent's slip?
+why_category ignored points to a slip; unclear, wrong, conflict, missing_context and tool_blocked
+point to the instruction or the setup."""
 [questions.criteria]
 true = "The instruction or setup is the likely cause."
 false = "A one-off agent slip is the likely cause."

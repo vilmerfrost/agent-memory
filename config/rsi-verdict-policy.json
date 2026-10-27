@@ -10,5 +10,6 @@
   "judge_strong_winrate": 0.75,
   "require_jev": true,
   "jev_min_confidence": 0.5,
-  "jev_harness_max": 0.7
+  "jev_harness_max": 0.7,
+  "harness_dead_inconclusive": true
 }

@@ -4,6 +4,7 @@ writer output validation and the Jev state."""
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -267,6 +268,35 @@ def test_parse_reply_skips_any_bad_item_but_not_a_bad_reply() -> None:
             deviations.parse_reply(reply, OFFERED, [])
 
 
+BAD_WHY_CATEGORIES = [_MISSING, None, "", "lazy", "Ignored", 3, ["ignored"]]
+BAD_WHY_IDS = ["missing", "null", "empty", "unknown", "wrong-case", "number", "list"]
+
+
+@pytest.mark.parametrize("value", BAD_WHY_CATEGORIES, ids=BAD_WHY_IDS)
+def test_strict_parse_rejects_a_bad_why_category(value: object) -> None:
+    with pytest.raises(FindingError, match="deviation 0: why_category must be one of unclear, wrong, conflict, "
+                                           "missing_context, tool_blocked, ignored"):
+        parse_findings(_reply(_bad_item("why_category", value)), OFFERED)
+
+
+@pytest.mark.parametrize("value", BAD_WHY_CATEGORIES, ids=BAD_WHY_IDS)
+def test_parse_reply_skips_a_bad_why_category_and_keeps_the_rest(value: object) -> None:
+    reasons: list[str] = []
+    found, skipped = deviations.parse_reply(
+        _reply(_bad_item("why_category", value), finding("skill:dispatch", "Brief", 2, why_category="ignored")),
+        OFFERED, reasons)
+    assert [(f.instruction_ref, f.why_category) for f in found] == [("Brief", "ignored")]
+    got = None if value is _MISSING else value
+    assert skipped == 1 and reasons[0].startswith("deviation 0: why_category must be one of")
+    assert reasons[0].endswith(f"got {got!r}")
+
+
+@pytest.mark.parametrize("value", list(deviations.WHY_CATEGORIES))
+def test_every_why_category_parses(value: str) -> None:
+    (f,) = parse_findings(_reply(finding(why_category=value)), OFFERED)
+    assert f.why_category == value
+
+
 def test_skipped_reasons_are_redacted_and_one_line() -> None:
     reasons: list[str] = []
     deviations.parse_reply(_reply(_bad_item("followed_grade", "ghp_abcdefghijklmnopqrstuvwx\n" + "z" * 500)),
@@ -326,8 +356,20 @@ def test_jev_state_has_no_writer_text() -> None:
     assert "rule_title: Explaining (not in the rule list)" in deviations.jev_state(raw, "worker", 2)
     assert "followed_grade: 0.30" in state and "result_grade: 0.80" in state
     assert "session_kind: worker" in state and "recurrence: 2 other sessions" in state
-    for word in ("recap", "habit", "harder to read"):
+    assert "why_category: conflict (the writer's view of why: the instruction conflicts with another " \
+           "instruction)" in state.splitlines()
+    for word in ("recap", "habit", "harder to read", "competes", "summarising"):
         assert word not in state
+
+
+@pytest.mark.parametrize(("value", "gloss"), list(deviations.WHY_CATEGORIES.items()))
+def test_jev_state_names_each_why_category_with_its_fixed_gloss(value: str, gloss: str) -> None:
+    (f,) = parse_findings(_reply(finding(why_category=value)), OFFERED)
+    lines = deviations.jev_state(f, "chat", 0).splitlines()
+    assert lines[4] == f"why_category: {value} (the writer's view of why: {gloss})"  # right after rule_title
+    assert lines[3].startswith("rule_title: ")
+    # A label outside the list (never from the writer: _item rejects it) is not passed through.
+    assert "why_category: unknown" in deviations.jev_state(replace(f, why_category="free text"), "chat", 0)
 
 
 def test_question_file_loads_and_is_not_a_routine() -> None:
