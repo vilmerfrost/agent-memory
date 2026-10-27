@@ -30,7 +30,7 @@ flowchart LR
 
 ## Evidence and limits
 
-Focused regressions cover native OTLP shapes/privacy, scoped coverage, collector counters, provider deadline forwarding, exact historical identities/idempotency/conflicts, successful actual file mutation, provider-separated score rendering and fixed exporter settings. Full clean-commit integration acceptance and publication are recorded in the parent implementation report after completion.
+Focused regressions cover native OTLP shapes/privacy, scoped coverage, collector counters, provider deadline forwarding, exact historical identities/idempotency/conflicts, successful actual file mutation, provider-separated score rendering and fixed exporter settings. The installed standalone Codex0.163.0 also passed a real config/read-only smoke test with an empty dedicated private HOME and no account/read, model/list, thread/start or turn/start. Its effective native isolation and fixed local OTel settings passed the same runtime verifier. A broken unrelated Homebrew npm wrapper was not used as the nightly client. Full clean-commit integration acceptance and publication are recorded in the parent implementation report after completion.
 
 No old database rows or reports were rewritten. No manually forced nightly/daily job ran. Historical native IDs cannot be recovered from missing bytes. New Codex inference events and real output quality require the next natural run. A bounded external Langfuse read can establish present availability, not the past cause of a timeout. Other provider meter counters describe logical calls, not necessarily wire attempts or provider invoices.
 
