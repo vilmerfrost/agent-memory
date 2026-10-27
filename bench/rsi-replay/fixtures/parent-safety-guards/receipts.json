@@ -1,0 +1,37 @@
+{
+  "case": "parent-safety-guards",
+  "scenarios": [
+    {
+      "id": "stale",
+      "ready": "stale",
+      "config_exists": true,
+      "guard_flag": "on",
+      "run_path_proof": false,
+      "verification_possible": true
+    },
+    {
+      "id": "current",
+      "ready": "current",
+      "config_exists": true,
+      "guard_flag": "on",
+      "run_path_proof": true,
+      "verification_possible": true
+    },
+    {
+      "id": "unproven",
+      "ready": "stale",
+      "config_exists": true,
+      "guard_flag": "on",
+      "run_path_proof": false,
+      "verification_possible": false
+    },
+    {
+      "id": "wrong-path",
+      "ready": "stale",
+      "config_exists": true,
+      "proof": "A helper reads the flag, but the app entrypoint does not load it.",
+      "run_path_proof": false,
+      "verification_possible": true
+    }
+  ]
+}

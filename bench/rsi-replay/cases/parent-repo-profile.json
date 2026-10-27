@@ -1,0 +1,39 @@
+{
+  "id": "parent-repo-profile",
+  "title": "Use the current repository profile before planning work",
+  "tags": [
+    "instruction",
+    "parent-workflow"
+  ],
+  "targets": [
+    {
+      "path": "~/agent-config/parent/PARENT.md",
+      "kind": "instruction",
+      "behavior": "Repo profile: Use the current repository profile before planning work"
+    }
+  ],
+  "fixture": "parent-repo-profile",
+  "hidden_check": "parent-policy",
+  "prompt": "Read ~/agent-config/parent/PARENT.md from the staged sandbox home and apply its Repo profile rules to receipts.json. This is an offline decision replay. No network, external services, parent utilities, real workers or remote Git actions are available. Do not execute the planned operations. Write only result.json with a top-level scenarios array, one row per input scenario. Each row: id, first_read (profile_path), mode, target, integration, worker_branch, test (string or null if not known), announce_profile (boolean). Use task/parser for the team worker and worktree-formatter or worktree-fix for personal workers when allowed. Do not invent a test for a missing profile. Preserve every input file. This JSON is the machine-readable report for this replay; prose alone is not an output.",
+  "check": "python3 \"$HIDDEN_CHECK_DIR\"/check.py",
+  "timeout_s": 240,
+  "stub": [
+    {
+      "op": "read",
+      "path": "~/agent-config/parent/PARENT.md"
+    },
+    {
+      "op": "read",
+      "path": "receipts.json"
+    },
+    {
+      "op": "write",
+      "path": "result.json",
+      "text": "{\n  \"scenarios\": [\n    {\n      \"id\": \"team\",\n      \"first_read\": \"~/.claude/parent/team-parser/profile.md\",\n      \"mode\": \"team\",\n      \"target\": \"develop\",\n      \"integration\": \"feat/parser-batch\",\n      \"worker_branch\": \"task/parser\",\n      \"test\": \"python -m pytest tests/parser\",\n      \"announce_profile\": true\n    },\n    {\n      \"id\": \"personal\",\n      \"first_read\": \"~/.claude/parent/formatter/profile.md\",\n      \"mode\": \"personal\",\n      \"target\": \"main\",\n      \"integration\": \"integration\",\n      \"worker_branch\": \"worktree-formatter\",\n      \"test\": \"uv run pytest tests/formatter\",\n      \"announce_profile\": true\n    },\n    {\n      \"id\": \"absent\",\n      \"first_read\": \"~/.claude/parent/new-tool/profile.md\",\n      \"mode\": \"personal\",\n      \"target\": \"main\",\n      \"integration\": \"integration\",\n      \"worker_branch\": \"worktree-fix\",\n      \"test\": null,\n      \"announce_profile\": true\n    }\n  ]\n}\n"
+    },
+    {
+      "op": "final",
+      "text": "Wrote result.json from the supplied receipts."
+    }
+  ]
+}
