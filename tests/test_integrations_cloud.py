@@ -451,7 +451,7 @@ def test_langfuse_cloud_throttles_every_call_but_the_otlp_export(monkeypatch: py
         status, body, headers = 200, b"{}", {}
 
         def json(self) -> Any:
-            return {}
+            return {"data": []}
 
     def fake(method: str, url: str, **kw: Any) -> _R:
         paths.append(url.split("cloud.langfuse.com", 1)[1].split("?", 1)[0])
@@ -474,7 +474,7 @@ def test_langfuse_cloud_throttles_every_call_but_the_otlp_export(monkeypatch: py
 def test_langfuse_reads_are_bounded_to_the_visible_window(monkeypatch: pytest.MonkeyPatch) -> None:
     seen: list[dict[str, Any]] = []
     c = LF.LangfuseClient("https://cloud.langfuse.com", "pk", "sk", min_interval=0)
-    monkeypatch.setattr(c, "_pages", lambda path, params, max_pages: seen.append({"path": path, **params}) or [])
+    monkeypatch.setattr(c, "_pages", lambda path, params, max_pages, **kw: seen.append({"path": path, **params}) or [])
     start = datetime(2026, 10, 16, 10, 15, tzinfo=UTC)
     c.trace_exists("0" * 32, start, start + timedelta(minutes=5))
     assert seen[-1]["fromStartTime"] == "2026-10-15T10:15:00.000Z" and seen[-1]["toStartTime"] == "2026-10-17T10:20:00.000Z"

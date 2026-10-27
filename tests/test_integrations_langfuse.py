@@ -262,11 +262,22 @@ class FakeLangfuse:
         return 200, {"data": items, "meta": {"cursor": None}}
 
     def _list_scores(self, req: Request) -> Any:
-        rows = [s for s in self.scores.values() if not req.q("traceId") or s["traceId"] == req.q("traceId")]
+        tids = set((req.q("traceId") or "").split(","))
+        rows = [s for s in self.scores.values() if not req.q("traceId") or s["traceId"] in tids]
+        if req.q("fromTimestamp"):
+            rows = [s for s in rows if s["timestamp"] >= req.q("fromTimestamp")]
+        if req.q("toTimestamp"):
+            rows = [s for s in rows if s["timestamp"] < req.q("toTimestamp")]
         data = [{"id": s["id"], "traceId": s["traceId"], "name": s["name"], "dataType": s["dataType"],
                  "value": bool(s["value"]) if s["dataType"] == "BOOLEAN" else s["value"], "timestamp": s["timestamp"]}
                 for s in rows]
-        return 200, {"data": data, "meta": {"limit": int(req.q("limit") or 50), "cursor": None}}
+        if "subject" in (req.q("fields") or "").split(","):
+            for score in data:
+                score["subject"] = {"kind": "trace", "id": score.pop("traceId")}
+        start, limit = int(req.q("cursor") or 0), int(req.q("limit") or 50)
+        page = data[start:start+limit]
+        return 200, {"data": page, "meta": {"limit": limit,
+                        "cursor": str(start+limit) if start+limit < len(data) else None}}
 
     def _create_ds(self, req: Request) -> Any:
         name = req.json["name"]
