@@ -18,9 +18,9 @@ import {
 import type { Deps } from "./handler.ts";
 
 export const RP_ID = "night-desk-vilmer-frosts-projects.vercel.app";
-export const ROUTES = ["challenge", "decide", "enroll/options", "enroll/verify"] as const;
+export const ROUTES = ["challenge", "decide", "enroll/options", "enroll/verify", "health"] as const;
 export type Route = typeof ROUTES[number];
-const ROUTE_RE = /\/web\/(challenge|decide|enroll\/options|enroll\/verify)\/?$/;
+const ROUTE_RE = /\/web\/(challenge|decide|enroll\/options|enroll\/verify|health)\/?$/;
 const WEB_RE = /\/web(\/|$)/;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const BODY_MAX = 16384;
@@ -45,7 +45,7 @@ export function webRoute(pathname: string): Route | "unknown" | null {
 export function webCors(deps: Deps, req: Request): Record<string, string> {
   const o = req.headers.get("origin");
   return deps.origin && o === deps.origin
-    ? { "Access-Control-Allow-Origin": deps.origin, "Vary": "Origin", "Access-Control-Allow-Methods": "POST, OPTIONS",
+    ? { "Access-Control-Allow-Origin": deps.origin, "Vary": "Origin", "Access-Control-Allow-Methods": /\/web\/health\/?$/.test(new URL(req.url).pathname) ? "GET, OPTIONS" : "POST, OPTIONS",
         "Access-Control-Allow-Headers": "authorization, content-type", "Access-Control-Max-Age": "600" }
     : { "Vary": "Origin" };
 }
@@ -153,10 +153,20 @@ export async function handleWeb(req: Request, deps: Deps, route: Route | "unknow
     return h["Access-Control-Allow-Origin"] ? new Response(null, { status: 204, headers: h }) : reply("denied", h);
   }
   if (!deps.origin || req.headers.get("origin") !== deps.origin) return reply("denied", h);
-  if (req.method !== "POST" || route === "unknown") return reply("invalid", h);
+  if ((route === "health" ? req.method !== "GET" : req.method !== "POST") || route === "unknown") return reply("invalid", h);
   if (!deps.supabaseUrl || !deps.serviceKey) return reply("error", h);
   const who = await checkOwner(deps, req);
   if (who !== "ok") return reply(who, h);
+  if (route === "health") {
+    try {
+      if ((deps.rpId || RP_ID) !== new URL(deps.origin).hostname) return reply("error", h);
+      const result = await rpc(deps, "amem_rsi_web_health", {});
+      if (!result || typeof result !== "object" || Array.isArray(result)) return reply("error", h);
+      const data = result as Record<string, unknown>;
+      if (data.result !== "ok" || typeof data.passkey_enrolled !== "boolean") return reply("error", h);
+      return reply("ok", h, { passkey_enrolled: data.passkey_enrolled });
+    } catch { return reply("error", h); }
+  }
   let body: Record<string, unknown>;
   try {
     const raw = await req.text();
