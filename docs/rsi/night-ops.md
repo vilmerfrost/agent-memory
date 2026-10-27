@@ -189,6 +189,17 @@ Since 2026-10-23 (verify run of night 2026-10-23, partial, $0.14):
   - Each candidate in report.json carries the additive fields `target`, `test_cases` (the case ids that use its
     file) and `skip_reason` (null, or "no test case uses this file"). Night Desk can show `skip_reason` per candidate.
   - A candidate whose file no case uses gets no Jev triage call and never takes the experiment slot.
+  - Jev's triage state (`rsi_night.triage_state`, 2026-10-27) holds: `recurrence` from `recurrence(c)` (distinct
+    occurrences or sessions, the rank's measure; before, it showed `seen_count`, the nights that sighted it),
+    `sessions`, `followed_grade`, `result_grade`, `objective_result`, earlier verdicts, `test_cases` (how many
+    cases use the file) and one line per case with its last recorded baseline pass rate per provider profile:
+    `- meltdown-brief: baseline_passes claude=all codex=none` (none, some, most, all; `unknown` when never
+    replayed). The rate is arm A of the newest `rsi_eval_results` record of a `sandbox-replay*` suite for that
+    case version. The question tells Jev that a case the baseline always passes (or always fails) leaves no room
+    to show an improvement.
+  - Jev calls record their tokens: the night's `costs.by_model["jev-1.14.0"]` has the reported `tokens_in` and
+    `tokens_out` (the price is still the flat per-call price), the triage answers keep the answering `model`, and
+    each experiment's `jev` summary keeps `model`, `tokens_in` and `tokens_out`.
   - With `replay.cases` null, an experiment replays only its target's cases, repeated up to `min_pairs`. A change to
     the global CLAUDE.md still runs the generic cases once each.
 - **Quiet skips.** A lock overlap or a night that is already `done` logs `SKIP` with `-warn` lines, not `-fail`,

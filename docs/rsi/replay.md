@@ -92,7 +92,10 @@ under those rules. Same home + same case gives the same bytes. Scenarios (`scena
 
 Policy `config/rsi-verdict-policy.json` (`rsi-verdict-policy/1`; its sha256 goes into every record). In order:
 refusals (stale baseline, artifact not exact, experiment mismatch), budget stop, run errors or timeouts, missing
-runs, fewer than `min_pairs` (3) complete pairs, Jev harness problem → INCONCLUSIVE. Any case where B passes
+runs, fewer than `min_pairs` (3) complete pairs, Jev harness problem → INCONCLUSIVE. Then, when both arms
+fail every check on every case (A_pass = B_pass = 0), → INCONCLUSIVE `harness-dead:<cases>`: the checks cannot
+tell the arms apart, so no judge preference or Jev reading may decide (policy key `harness_dead_inconclusive`,
+default true; the 2026-10-26 codex replay had A 0/3, B 0/3 and Jev said `improves`). Any case where B passes
 less → WORSE. A case where B passes more → IMPROVES only if the blind judge's B win rate is at least 0.5 (ties
 count half; B wins where a skill-only change never fired count as ties) and Jev says `improves` with confidence
 ≥ 0.5; otherwise INCONCLUSIVE. Equal checks → NO_EFFECT, unless the judge strongly prefers A (WORSE) or B
@@ -108,7 +111,11 @@ experiment id, Docker down) leaves an existing record alone.
 - `<root>/replays/<E>/runs/<run_id>.json`: exit code, duration, tool calls, tokens, cost, check result, diff,
   final message, the instruction files the stub read (sha256).
 - `<root>/replays/<E>/judge/<case>-r<rep>.json`: the blinded prompt, the order (AB/BA), the raw and mapped winner.
-- `<root>/replays/<E>/jev.json`: the Jev state (numbers only) and answers. `log.jsonl`: the execution log.
+- `<root>/replays/<E>/jev.json`: the Jev state (numbers only) and answers. Each case line ends with a derived
+  `checks:` reading (`both arms failed every check`, `both arms passed every check`, `B passed more`, `A passed
+  more`, or the same number), and `checks overall` reads all cases, so Jev does not count. The result keeps the
+  model that answered and its input/output tokens (`model`, `tokens_in`, `tokens_out`). `log.jsonl`: the
+  execution log.
 - `<root>/experiments/<E>/logs/`: the sandbox's own stdout, stderr and docker argv per run, plus
   `<run_id>.rsi.json` (case, rep, check, judge winner, eval verdict) for the Langfuse sink.
 - Subscription attempts (`auth_mode: subscription`, the night's provider profiles) run the official client on the

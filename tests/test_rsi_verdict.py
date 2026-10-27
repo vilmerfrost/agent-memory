@@ -65,7 +65,8 @@ EQUAL = machine(("c1", 3, 3, 3))
     # 7: equal checks
     ("no-effect", EQUAL, judge(tie=3), jev("no_effect"), "NO_EFFECT", "checks-equal"),
     ("no-effect-no-judge", EQUAL, None, None, "NO_EFFECT", "checks-equal"),
-    ("no-effect-all-fail", machine(("c1", 3, 0, 0)), judge(tie=3), None, "NO_EFFECT", "checks-equal"),
+    # both arms fail every check: the checks cannot tell the arms apart (was NO_EFFECT before harness-dead)
+    ("harness-dead-all-fail", machine(("c1", 3, 0, 0)), judge(tie=3), None, "INCONCLUSIVE", "harness-dead:c1"),
     ("judge-prefers-baseline", EQUAL, judge(a=3), jev("worse"), "WORSE", "judge-prefers-baseline"),
     ("judge-only-preference", EQUAL, judge(b=3), jev(), "INCONCLUSIVE", "judge-only-preference"),
 ])

@@ -14,6 +14,8 @@ Decision order (the first rule that fires wins):
     3. fewer complete pairs than policy.min_pairs, or a case
        without a pair                                             -> INCONCLUSIVE
     4. Jev says the harness is broken (P >= jev_harness_max)      -> INCONCLUSIVE
+       both arms fail every check on every case (A_pass = B_pass
+       = 0; policy.harness_dead_inconclusive)                     -> INCONCLUSIVE harness-dead:<cases>
     5. B's pass rate drops on any case (>= min_worse_delta)       -> WORSE   (a regression anywhere blocks)
     6. B's pass rate rises on a case (>= min_improve_delta):
          judge missing / incomplete / B win rate < judge_min     -> INCONCLUSIVE
@@ -60,6 +62,7 @@ class VerdictPolicy:
     require_jev: bool = True
     jev_min_confidence: float = 0.5
     jev_harness_max: float = 0.7
+    harness_dead_inconclusive: bool = True   # every case A_pass=0 and B_pass=0 -> INCONCLUSIVE harness-dead
     sha256: str = ""              # of the policy file it came from ("" for the built-in default)
 
     def describe(self) -> dict[str, Any]:
@@ -168,6 +171,9 @@ class JevResult:
     evidence_strength: float | None = None
     error: str | None = None
     state_key: str | None = None
+    model: str | None = None               # the model that answered (Jev's response; a fixture's recording)
+    tokens_in: int | None = None           # the response's input/output tokens (None when not reported)
+    tokens_out: int | None = None
 
     def summary(self) -> dict[str, Any]:
         return asdict(self)
@@ -231,6 +237,11 @@ def decide(machine: ArmPair, judge: JudgeResult | None, jev: JevResult | None,
         return out("INCONCLUSIVE", f"too-few-pairs:{machine.pairs}<{policy.min_pairs}")
     if jev and jev.status == "ok" and jev.harness_problem is not None and jev.harness_problem >= policy.jev_harness_max:
         return out("INCONCLUSIVE", f"jev-harness-problem:{jev.harness_problem:.2f}>={policy.jev_harness_max}")
+    # Code sees what Jev may miss (2026-10-26, codex: A 0/3, B 0/3, Jev improves 0.71, harness_problem 0.22): when
+    # both arms fail every machine check on every case, the checks cannot tell the arms apart, and a judge
+    # preference alone must not become a verdict.
+    if policy.harness_dead_inconclusive and all(c.a_pass == 0 and c.b_pass == 0 for c in machine.cases):
+        return out("INCONCLUSIVE", "harness-dead:" + ",".join(c.case for c in machine.cases))
 
     worse = [c for c in machine.cases if c.a_rate - c.b_rate >= policy.min_worse_delta]
     better = [c for c in machine.cases if c.b_rate - c.a_rate >= policy.min_improve_delta]

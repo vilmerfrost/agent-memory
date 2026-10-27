@@ -429,6 +429,7 @@ class TriageAnswers:
     testability: float     # 0..2
     mode: str              # fixture | live | heuristic
     reason: str | None = None  # Jev's typed reason code; never infer a missing rationale from scores
+    model: str | None = None   # the model that answered (Jev's response; None for heuristic or an old fixture)
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -472,16 +473,45 @@ def _token(v: Any, limit: int = 120) -> str:
     return _TOKEN.sub("", str(v if v is not None else "none"))[:limit] or "none"
 
 
-def triage_state(c: Mapping[str, Any], history: Sequence[str], in_scope: bool) -> str:
-    """Jev's state for one candidate: structured fields only, bucketed, so fixtures stay stable across nights."""
+def _rate(passed: Any, total: Any) -> str:
+    """A pass rate as a stable bucket: none | some (under half) | most | all; unknown without runs."""
+    p, n = _num(passed), _num(total)
+    if p is None or not n or n <= 0:
+        return "unknown"
+    r = max(0.0, min(1.0, float(p) / float(n)))
+    return "none" if r <= 0 else "all" if r >= 1 else "some" if r < 0.5 else "most"
+
+
+# At most this many covering cases in a triage state (the rest are counted), so the state stays short.
+TRIAGE_CASES_MAX = 8
+
+
+def triage_state(c: Mapping[str, Any], history: Sequence[str], in_scope: bool, test_cases: Sequence[str] = (),
+                 baselines: Mapping[str, Mapping[str, Sequence[int]]] | None = None) -> str:
+    """Jev's state for one candidate: structured fields only, bucketed, so fixtures stay stable across nights.
+
+    recurrence is `recurrence(c)` (distinct occurrences or sessions), not `seen_count` (nights that sighted it).
+    test_cases: the replay cases that use the target (Night._test_cases). baselines: per case, per replay suite
+    label, the last recorded arm-A (unchanged file) result as (passed, pairs) (Night._baselines); a case with no
+    record reads `unknown`. Pure: the night passes everything in."""
     m = c.get("metrics") or {}
     lines = ["rsi candidate for a nightly sandbox experiment",
              f"source: {_token(c.get('source'))}", f"kind: {_token(c.get('kind'))}",
              f"target: {_token(c.get('target'))}", f"target_in_scope: {'yes' if in_scope else 'no'}",
-             f"rule: {_token(c.get('rule_key'))}", f"recurrence: {_bucket(c.get('seen_count'))}",
+             f"rule: {_token(c.get('rule_key'))}", f"recurrence: {_bucket(recurrence(c))}",
              f"sessions: {_bucket(m.get('sessions'))}", f"followed_grade: {_grade(m.get('followed_grade_mean'))}",
+             f"result_grade: {_grade(m.get('result_grade_mean'))}",
              f"objective_result: {_grade(m.get('objective_result_mean'))}",
              f"prior_experiments: {', '.join(_token(v, 20) for v in history) or 'none'}"]
+    cases = sorted({_token(t, 80) for t in test_cases})
+    lines.append(f"test_cases: {len(cases)}")
+    for case in cases[:TRIAGE_CASES_MAX]:
+        seen = (baselines or {}).get(case) or {}
+        last = " ".join(f"{_token(label, 30)}={_rate(*v[:2]) if len(v) >= 2 else 'unknown'}"
+                        for label, v in sorted((k, list(x or ())) for k, x in seen.items())) or "unknown"
+        lines.append(f"- {case}: baseline_passes {last}")
+    if len(cases) > TRIAGE_CASES_MAX:
+        lines.append(f"- and {len(cases) - TRIAGE_CASES_MAX} more")
     return "\n".join(lines)
 
 
@@ -530,6 +560,15 @@ def rank(a: TriageAnswers, recurrence: int, history: Sequence[str], weights: Map
     return round(r, 4)
 
 
+def jev_usage(answers: Any) -> Usage:
+    """The budget Usage of one Jev response: its reported input/output tokens (jev.JevAnswers.usage), no USD (Jev
+    reports none: the price table books the flat per-call price). Usage() when the response carried no usage."""
+    u = getattr(answers, "usage", None)
+    if u is None:
+        return Usage()
+    return Usage(tokens_in=int(u.input_tokens), tokens_out=int(u.output_tokens))
+
+
 class JevTriage:
     """S3 through Jev with questions/rsi-triage.toml. Fixture mode never calls the API (jev._ask_fixture)."""
 
@@ -551,10 +590,11 @@ class JevTriage:
         model = jev.MODEL if live else "jev-fixture"
 
         def ask() -> tuple[dict[str, Any], Usage]:
-            if live:   # the wrapper reports no usage: the price table books its flat per-call price (an estimate,
-                return jev.ask(state, qs), Usage()    # never labelled provider-reported)
+            if live:   # the response's token counts are recorded; the price table still books Jev's flat per-call
+                got = jev.ask(state, qs)              # price (an estimate, never labelled provider-reported)
+                return got, jev_usage(got)
             jev._validate(state, qs)
-            return jev._ask_fixture(state, qs), Usage()
+            return jev._ask_fixture(state, qs), Usage()   # a fixture's recorded usage was never spent tonight
         try:
             res = budget.call(model, "triage", ask)
         except BudgetExhausted:
@@ -576,7 +616,7 @@ class JevTriage:
         return TriageAnswers(action=str(act.value), p_experiment=float(act.probabilities.get("experiment", 0.0)),
                              impact=float(res["impact"].value), risk=float(res["risk"].value),
                              testability=float(res["testability"].value), mode="live" if live else "fixture",
-                             reason=reason)
+                             reason=reason, model=getattr(res, "model", None))
 
 
 # =========================================================================== adapters (protocols + defaults)
@@ -639,7 +679,8 @@ class ReplayOutcome:
 
 
 JUDGE_KEYS = ("mode", "judged", "wins_a", "wins_b", "ties", "unfired_b", "errors", "b_winrate")
-JEV_KEYS = ("mode", "status", "effect", "confidence", "harness_problem", "evidence_strength", "error")
+JEV_KEYS = ("mode", "status", "effect", "confidence", "harness_problem", "evidence_strength", "error", "model",
+            "tokens_in", "tokens_out")
 
 
 def _summary(obj: Any, keys: Sequence[str]) -> dict[str, Any] | None:
@@ -2241,15 +2282,54 @@ class Night:
         cov = getattr(self, "_case_coverage", None)
         if cov is None:
             cov = {}
+            self._case_digests: dict[str, str] = {}
             try:
                 from agent_memory import rsi_replay
                 for case in rsi_replay.load_cases(self.cfg.replay.get("cases")):
+                    self._case_digests[case.id] = case.digest()
                     for t in case.targets:
                         cov.setdefault(t["path"], []).append(case.id)
             except Exception as exc:  # noqa: BLE001 - fail closed: no experiment without a case
                 self.notes.append(f"test cases unavailable: {type(exc).__name__}: {str(exc)[:150]}")
             self._case_coverage = cov
         return sorted(cov.get(target or "", []))
+
+    def _baselines(self, cases: Sequence[str]) -> dict[str, dict[str, tuple[int, int]]]:
+        """Per case, per replay suite label, the last recorded arm-A result (passed, pairs): the newest
+        rsi_eval_results record of a sandbox-replay suite with that case, read from its `results.cases`. A record of
+        an older version of the case (another `case_digests` entry) does not count. Label: the suite's provider
+        profile (sandbox-replay-<profile>), `default` for the plain suite. A case without a record is absent
+        (triage_state says unknown); a failed read is a note and no history."""
+        if not cases or self.conn is None:
+            return {}
+        cache: dict[str, dict[str, tuple[int, int]]] = getattr(self, "_baseline_cache", {})
+        self._baseline_cache = cache
+        todo = sorted(set(cases) - set(cache))
+        if todo:
+            for case in todo:
+                cache[case] = {}
+            try:
+                rows = self.conn.execute(
+                    "select r.suite, x->>'case', (x->>'a_pass')::numeric, (x->>'pairs')::numeric, "
+                    "r.record->'results'->'case_digests'->>(x->>'case') "
+                    "from rsi_eval_results r cross join lateral jsonb_array_elements(case when "
+                    "jsonb_typeof(r.record->'results'->'cases') = 'array' then r.record->'results'->'cases' "
+                    "else '[]'::jsonb end) x "
+                    "where r.suite like 'sandbox-replay%%' and x->>'case' = any(%s) "
+                    "and jsonb_typeof(x->'a_pass') = 'number' and jsonb_typeof(x->'pairs') = 'number' "
+                    "order by r.created_at desc, r.id desc", (todo,)).fetchall()
+            except psycopg.Error as exc:
+                self.notes.append(f"triage: baseline history unavailable ({type(exc).__name__})")
+                rows = []
+            digests = getattr(self, "_case_digests", {})
+            for suite, case, a_pass, pairs, digest in rows:
+                label = str(suite).removeprefix("sandbox-replay").lstrip("-") or "default"
+                if pairs is None or pairs <= 0 or label in cache[case]:
+                    continue
+                if digest and digests.get(case) and digest != digests[case]:
+                    continue                          # recorded against an older version of the case
+                cache[case][label] = (int(a_pass), int(pairs))
+        return {c: dict(cache[c]) for c in cases if cache.get(c)}
 
     def _history(self, key: str) -> list[str]:
         assert self.conn is not None
@@ -2268,7 +2348,8 @@ class Night:
             ans = None
             # No replay case uses the file: no paid triage call, the deterministic heuristic ranks it for the report.
             if tests and (not self.dry_run or self.cfg.stages["triage"] == "fixture"):
-                ans = self.ad.triage.assess(c, state=triage_state(c, hist, in_scope), budget=self.budget)
+                state = triage_state(c, hist, in_scope, tests, self._baselines(tests))
+                ans = self.ad.triage.assess(c, state=state, budget=self.budget)
             if ans is None:
                 ans = heuristic_answers(c, hist, in_scope)
             r = rank(ans, recurrence(c), hist, self.cfg.weights)
@@ -2335,7 +2416,7 @@ class Night:
                 reason = "selected: backfill unused daily experiment slot"
                 if c["jev"]["action"] == "wait":
                     reason += "; scheduled exploration despite wait: " + triage_explanation(
-                        TriageAnswers(**{k: c["jev"][k] for k in TriageAnswers.__dataclass_fields__}))
+                        TriageAnswers(**{k: c["jev"][k] for k in TriageAnswers.__dataclass_fields__ if k in c["jev"]}))
                 self._update_candidate(c.get("id"), status="selected", reason=reason)
                 self.selected_ids.append(cid)
                 for entry in self.report["candidates"]:

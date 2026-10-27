@@ -2,7 +2,8 @@
 # Not a routine: `amem score` and `amem daily` skip this file (questions.NOT_ROUTINES).
 #
 # Jev's state holds only structured candidate fields: source, kind, target, rule key, bucketed recurrence and
-# grades, whether the target is in scope, and the verdicts of earlier experiments on the same candidate.
+# grades, whether the target is in scope, the verdicts of earlier experiments on the same candidate, the replay
+# cases that use the target and each case's last recorded baseline (arm A) pass rate, bucketed.
 # Never transcript text, never retrieved provider content, never model output. The final rank is computed by
 # deterministic code (rsi_night.rank) from these answers; Jev never selects or approves anything by itself.
 # Under a configured daily minimum, wait is advisory: scope, replay coverage and hard budgets still control runs.
@@ -18,10 +19,18 @@ prompt = """A nightly investigator aims for three sandbox experiments, each edit
 agents and comparing it with the unchanged file. Recommend whether this candidate should be prioritized.
 Your answer is priority advice, not authorization or a veto: the scheduler may explore a lower-priority
 candidate to meet its daily minimum, within the same safety checks and hard budgets.
-recurrence counts how often the problem was seen; sessions counts the distinct sessions. followed_grade is how
-well agents followed the rule (1 = fully, 0 = ignored); objective_result is how good the sessions' results were.
+recurrence counts the distinct occurrences of the problem (sessions or separate pieces of evidence, whichever is
+larger), not how many nights noticed it; sessions counts the distinct sessions. followed_grade is how well agents
+followed the rule (1 = fully, 0 = ignored); result_grade is how good the result was anyway, as graded when the
+deviation was found; objective_result is how good the sessions' results were by measured outcome.
 prior_experiments lists earlier experiments on the same candidate and their verdicts.
-target_in_scope says whether the file may be edited by the investigator at all."""
+target_in_scope says whether the file may be edited by the investigator at all.
+test_cases counts the replay cases that use the target; each case line gives its last recorded baseline_passes:
+how often the unchanged file (arm A) passed that case's objective check, per replay agent (none, some, most, all,
+or unknown when it was never replayed). An experiment can only show an improvement on a case where the baseline
+sometimes fails: a case the baseline already passes every time (all) leaves no room to show an improvement, and a
+case it fails every time (none) usually means the check or task cannot be passed at all, not that the
+instruction is wrong."""
 [questions.options]
 experiment = "Worth an experiment now: the problem recurs, the target is in scope, and a change to the instruction text can plausibly fix it."
 wait = "Lower priority: too rare, out of scope, already tested without effect, or unlikely to improve through instruction text."
