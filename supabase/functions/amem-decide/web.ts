@@ -160,13 +160,11 @@ export async function handleWeb(req: Request, deps: Deps, route: Route | "unknow
   if (route === "health") {
     try {
       if ((deps.rpId || RP_ID) !== new URL(deps.origin).hostname) return reply("error", h);
-      const base = deps.supabaseUrl.replace(/\/+$/, "");
-      const headers = { apikey: deps.serviceKey, Authorization: `Bearer ${deps.serviceKey}` };
-      const paths = ["rsi_passkeys?select=id&revoked_at=is.null&limit=1", "rsi_web_challenges?select=id&limit=0", "rsi_decisions?select=id&limit=0"];
-      const responses = await Promise.all(paths.map((path) => deps.fetch(`${base}/rest/v1/${path}`, { headers, signal: AbortSignal.timeout(5000), cache: "no-store" })));
-      if (responses.some((r) => !r.ok)) return reply("error", h);
-      const keys = await responses[0].json();
-      return reply("ok", h, { passkey_enrolled: Array.isArray(keys) && keys.length > 0 });
+      const result = await rpc(deps, "amem_rsi_web_health", {});
+      if (!result || typeof result !== "object" || Array.isArray(result)) return reply("error", h);
+      const data = result as Record<string, unknown>;
+      if (data.result !== "ok" || typeof data.passkey_enrolled !== "boolean") return reply("error", h);
+      return reply("ok", h, { passkey_enrolled: data.passkey_enrolled });
     } catch { return reply("error", h); }
   }
   let body: Record<string, unknown>;

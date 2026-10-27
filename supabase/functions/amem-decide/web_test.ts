@@ -395,15 +395,17 @@ Deno.test("health verifies owner and reads decision dependencies without creatin
   const reads: string[] = [];
   const deps = fake.deps({ fetch: async (url, init) => {
     if (url.endsWith("/auth/v1/user")) return fake.fetch(url, init);
-    eq(init?.method ?? "GET", "GET");
+    eq(init?.method, "POST");
+    eq(url, `${BASE}/rest/v1/rpc/amem_rsi_web_health`);
+    eq(init?.body, "{}");
     reads.push(url);
-    return new Response(JSON.stringify(url.includes("rsi_passkeys?") ? [{ id: "enrolled" }] : []));
+    return new Response(JSON.stringify({result:"ok",passkey_enrolled:true}));
   } });
   const req = new Request(`${URL_}/health`, { headers: { origin: ORIGIN, authorization: `Bearer ${GOOD}` } });
   const response = await handle(req, deps);
   eq(response.status, 200);
   eq(await response.json(), { result: "ok", passkey_enrolled: true });
-  eq(reads.length, 3);
+  eq(reads.length, 1);
   eq(fake.calls.length, 0);
   eq(fake.challenges.size, 0);
 });
