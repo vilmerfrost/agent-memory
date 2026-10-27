@@ -449,6 +449,17 @@ class _HealthOnce:
         return self._r.query(name, params)
 
 
+# Langfuse Cloud spaces calls CLOUD_MIN_INTERVAL_S (2.1s) apart. A full pack makes up to 11 Langfuse calls (health, 3 per
+# experiment, 2 per trace): 21s of spacing alone, past the common 20s. Langfuse's budget adds the spacing its client
+# enforces (0 when unthrottled), so the other retrievers and an explicit short timeout_s keep their limit.
+LF_PACK_CALLS = 11
+
+
+def _spacing_s(r: Any) -> float:
+    client = getattr(getattr(r, "inner", r), "client", None)      # through the night's GatedRetriever
+    return float(getattr(client, "interval", 0.0) or 0.0) * (LF_PACK_CALLS - 1)
+
+
 class _Runner:
     """Runs steps per retriever in daemon threads, retrievers in parallel. Each retriever has timeout_s in all,
     charged only for the time its own thread runs (waiting on another retriever costs it nothing). A retriever
@@ -458,12 +469,16 @@ class _Runner:
                  clock: Callable[[], float] = time.monotonic):
         self.r = {k: (_HealthOnce(v) if v is not None else None) for k, v in retrievers.items()}
         self.timeout_s, self.clock = timeout_s, clock
+        self.extra = {"lf": _spacing_s(retrievers.get("lf"))}
         self.used: dict[str, float] = defaultdict(float)
         self.dead: set[str] = set()
         self.log: list[dict[str, Any]] = []
 
+    def budget(self, retr: str) -> float:
+        return self.timeout_s + self.extra.get(retr, 0.0)
+
     def _left(self, retr: str) -> float:
-        return max(0.0, self.timeout_s - self.used[retr])
+        return max(0.0, self.budget(retr) - self.used[retr])
 
     def _start(self, retr: str, body: Callable[[], None]) -> tuple[threading.Thread, list[float]]:
         spent: list[float] = []
@@ -483,7 +498,7 @@ class _Runner:
         """Wait for the thread until `deadline`; charge the retriever; False (and dead) when it ran out."""
         t.join(max(0.0, deadline - self.clock()))
         if t.is_alive() or not spent:
-            self.used[retr] = self.timeout_s
+            self.used[retr] = self.budget(retr)
             self.dead.add(retr)
             return False
         self.used[retr] += spent[0]
@@ -526,7 +541,7 @@ class _Runner:
                 continue
             if retr in self.dead:
                 for st in sts:
-                    results[id(st)] = QueryResult(retr, "error", detail=f"timeout after {self.timeout_s:g}s")
+                    results[id(st)] = QueryResult(retr, "error", detail=f"timeout after {self.budget(retr):g}s")
                 continue
             box: list[tuple[_Step, QueryResult]] = []
             stop = threading.Event()
@@ -548,7 +563,7 @@ class _Runner:
             for st, res in list(box):
                 results[id(st)] = res
             for st in groups[retr]:
-                results.setdefault(id(st), QueryResult(retr, "error", detail=f"timeout after {self.timeout_s:g}s"))
+                results.setdefault(id(st), QueryResult(retr, "error", detail=f"timeout after {self.budget(retr):g}s"))
         out = [(st, results[id(st)]) for st in steps]
         self.log += [{"step": st.name, "status": res.status, "found": len(res.refs),
                       "detail": _free(res.detail, 120) or ""} for st, res in out]
@@ -837,7 +852,7 @@ def build_pack(candidate: Mapping[str, Any], *, retrievers: Mapping[str, Retriev
         if state == "ok":
             idle_health[retr] = ("ok", "") if val.ok else ("unavailable", val.detail)
         elif state == "timeout":
-            idle_health[retr] = ("error", f"timeout after {limits.timeout_s:g}s")
+            idle_health[retr] = ("error", f"timeout after {runner.budget(retr):g}s")
         else:
             idle_health[retr] = ("unavailable", f"health: {type(val).__name__}")
 
@@ -1349,7 +1364,7 @@ def delta_since(checkpoint_ts: str | datetime | None, *, conn: psycopg.Connectio
                     state, val = runner.call(retr, r.health)
                     st = ("ok" if state == "ok" and val.ok else "error" if state == "timeout" else "unavailable")
                     stat[SERVICE[retr]].append(st)
-                    runner.log.append(_health_step(retr, st, _health_detail(state, val, limits.timeout_s)))
+                    runner.log.append(_health_step(retr, st, _health_detail(state, val, runner.budget(retr))))
         for svc, sts in stat.items():
             d.health[svc] = _combine(sts)
         d.steps = list(runner.log)

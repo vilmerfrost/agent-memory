@@ -722,3 +722,13 @@ def test_provider_budget_context_covers_health_and_all_phase_calls():
     result=runner.phase(steps)
     assert result[0][1].status=='ok' and not lf.active
     assert len(lf.budgets)==2 and 0<lf.budgets[1]<=lf.budgets[0]<=20
+
+
+def test_langfuse_budget_covers_cloud_spacing():
+    # 2026-10-26 night: a full pack's Langfuse reads (up to 11 calls, 2.1s apart on Cloud) could not fit in 20s.
+    cloud = LF.LangfuseRetriever(LF.LangfuseClient("https://cloud.langfuse.com", "pk", "sk"))
+    local = LF.LangfuseRetriever(LF.LangfuseClient("http://localhost:3000", "pk", "sk"))
+    runner = P._Runner({'lf': cloud, 'ch': None}, timeout_s=20)
+    assert runner.budget('ch') == 20
+    assert runner.budget('lf') >= 20 + (P.LF_PACK_CALLS - 1) * LF.CLOUD_MIN_INTERVAL_S
+    assert P._Runner({'lf': local}, timeout_s=1).budget('lf') == 1      # unthrottled: the caller's limit stands

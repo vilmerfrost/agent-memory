@@ -730,7 +730,7 @@ def probe(environ: Mapping[str, str] | None = None, *, policy: Policy | None = N
             continue
         state, val = runners[-1].call(retr, r.health)
         seen[svc].health.append(("ok", "") if state == "ok" and val.ok else
-                                (("error", f"timeout after {lim.timeout_s:g}s") if state == "timeout" else
+                                (("error", f"timeout after {runners[-1].budget(retr):g}s") if state == "timeout" else
                                  ("unavailable", val.detail if state == "ok" else type(val).__name__)))
 
     providers = {svc: _summary(prov.states[svc], seen[svc], nz) for svc in SERVICES.values()}
