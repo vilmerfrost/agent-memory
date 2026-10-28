@@ -162,7 +162,8 @@ def test_nonstandard_json_is_rejected(raw, tmp_path):
 @pytest.mark.parametrize("path", [PARENT, WORKER])
 def test_exact_target_selection_fits_unchanged_provider_budgets(path):
     cases = R.load_cases()
-    expected = sorted(cid for cid, target in CASES.items() if target == path)
+    expected = sorted([cid for cid, target in CASES.items() if target == path] + (
+        ["worker-helper-lifecycle", "worker-server-launch"] if path == WORKER else []))
     rel = REL.select(manifest(path), cases)
     assert sorted(rel["eligible_cases"]) == expected and rel["uncovered_targets"] == []
     chosen, reps = R.plan_cases(manifest(path), cases, min_pairs=3, max_pairs=3)
@@ -203,7 +204,8 @@ def test_provider_router_runs_all_target_cases_within_existing_limits(path, tmp_
     monkeypatch.setattr(N, "SandboxReplayer", Adapter)
     P.replay(cfg.stages, cfg.replay, artifact_hash=artifact, baseline_id=baseline,
              experiment_id=EXP, budget=SimpleNamespace(cfg=cfg.budget))
-    ids = sorted(cid for cid, target in CASES.items() if target == path)
+    ids = sorted([cid for cid, target in CASES.items() if target == path] + (
+        ["worker-helper-lifecycle", "worker-server-launch"] if path == WORKER else []))
     reps = 3 // len(ids)
     assert calls == [("claude", ids, reps), ("codex", ids, reps)]
     assert sum(len(cases) * n for _, cases, n in calls) == cfg.budget.max_ab_pairs

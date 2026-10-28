@@ -1,0 +1,36 @@
+{
+  "id": "worker-helper-lifecycle",
+  "title": "Complete registered helper work and preserve failed helper results",
+  "tags": [
+    "instruction",
+    "parent-workflow",
+    "controlled-behavior"
+  ],
+  "targets": [
+    {
+      "path": "~/agent-config/agents/worker.md",
+      "kind": "instruction",
+      "behavior": "Complete registered helper work and preserve failed helper results"
+    }
+  ],
+  "fixture": "worker-helper-lifecycle",
+  "hidden_check": "worker-behavior",
+  "prompt": "Read ~/agent-config/agents/worker.md from the staged sandbox home. Implement solution.py with execute(api, scenario). Read the staged worker instruction first. This is a controlled local process fixture, not real agent delegation. Each scenario supplies helper, registered and parent_session fields. If the helper is not registered, call api.report with status BLOCKED and no spawn. Otherwise call api.spawn(helper), then api.wait(handle), then api.report. The report must include helper, parent_session, status (DONE only for a successful result; PARTIAL for failure), result_status, and worker_id from the returned handle. Never invent a helper ID or report success before completion. The API runs one tiny local subprocess and records the lifecycle. Do not create a native agent, use network, edit fixture inputs, or execute planned host operations. Write only solution.py. The hidden check calls execute with positive, failed-result and unregistered scenarios.",
+  "check": "python3 \"$HIDDEN_CHECK_DIR\"/check.py",
+  "timeout_s": 120,
+  "stub": [
+    {
+      "op": "read",
+      "path": "~/agent-config/agents/worker.md"
+    },
+    {
+      "op": "write",
+      "path": "solution.py",
+      "text": "def execute(api, scenario):\n    if not scenario['registered']:\n        api.report(status='BLOCKED', helper=scenario['helper'], parent_session=scenario['parent_session'])\n        return\n    handle = api.spawn(scenario['helper'])\n    result = api.wait(handle)\n    api.report(status='DONE' if result['status'] == 'completed' else 'PARTIAL',\n               helper=scenario['helper'], parent_session=scenario['parent_session'],\n               worker_id=handle['worker_id'], result_status=result['status'])\n"
+    },
+    {
+      "op": "final",
+      "text": "Implemented the controlled local fixture."
+    }
+  ]
+}

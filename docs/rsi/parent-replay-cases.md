@@ -85,3 +85,11 @@ Focused checks cover case loading, valid and invalid outputs, scenario mutations
 fields, unchanged provider budgets, nightly coverage lookup, exact A/B exposure and path escapes.
 The final full integration result is recorded after the committed change passes the managed gate.
 No paid run, promotion, retrospective re-scoring, or change to promotion rules is included.
+
+## Direct controlled worker behavior fixtures — 28 October 2026
+
+`worker-helper-lifecycle` exercises registered helper selection, a real small local subprocess, completion-before-report ordering, exact fixture worker and parent identities, failed-result preservation and refusal to spawn an unregistered helper. `worker-server-launch` exercises the required wrapper choice, repository/worktree binding, actual loopback HTTP readiness, cleanup and refusal when setup or authorization is absent.
+
+These are controlled API fixtures inside the existing isolated replay/check path. They do not create real native agents, run the host's parent utilities, read credentials or establish live Claude/Codex ownership enforcement. They test the generated orchestration decisions against controlled process/HTTP observations. The hidden checker rejects invented completion/readiness evidence and changes to fixture inputs. No new table, routine, model call or promotion authority is added.
+
+Together with `worker-final-report`, the three worker cases fit the existing three-pair per-provider budget with one repetition each. The nightly hard caps and final acceptance rules are unchanged. Historical worker-final-report-only records do not gain this coverage retrospectively.

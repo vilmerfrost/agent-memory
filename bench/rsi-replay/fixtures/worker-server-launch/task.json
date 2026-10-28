@@ -1,0 +1,5 @@
+{
+  "case": "worker-server-launch",
+  "scope": "controlled-local-fixture",
+  "instruction_section": "credential-aware-app-execution"
+}

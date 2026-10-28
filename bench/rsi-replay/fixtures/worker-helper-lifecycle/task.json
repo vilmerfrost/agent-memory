@@ -1,0 +1,5 @@
+{
+  "case": "worker-helper-lifecycle",
+  "scope": "controlled-local-fixture",
+  "instruction_section": "subworkers"
+}
