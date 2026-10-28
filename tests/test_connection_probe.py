@@ -90,3 +90,28 @@ def test_legacy_checks_cannot_be_relabelled_or_trigger_new_diagnostic_writes(pg_
         assert fresh['request_id']!=old['request_id']
         assert not c.execute("select public.amem_connection_probe_finish(%s,true,10,'ok')",(fresh['request_id'],)).fetchone()[0]
         c.rollback()
+
+
+def test_repair_restores_reporting_after_legacy_functions_are_reapplied(pg_url):
+    from pathlib import Path
+    migrations = Path(__file__).resolve().parents[1] / 'supabase' / 'migrations'
+    with psycopg.connect(pg_url) as c:
+        c.execute("delete from rsi_checkpoints where job='connections:clickhouse-probe'")
+        c.execute((migrations / '20261027185244_connection_probe.sql').read_text())
+        c.execute((migrations / '20261028133114_restore_clickhouse_diagnostic.sql').read_text())
+        request = c.execute('select public.amem_connection_diagnostic_start()').fetchone()[0]
+        ident = request['request_id']
+        assert c.execute("select public.amem_connection_probe_finish(%s,true,21768,'ready')", (ident,)).fetchone()[0]
+        c.execute("update rsi_checkpoints set started_at=now()-interval '6 minutes',finished_at=now()-interval '5 minutes' where job='connections:clickhouse-probe'")
+        saved = c.execute('select public.amem_connection_probe_current()').fetchone()[0]
+        assert saved['check']['status'] == 'stale'
+        assert saved['check']['latency_ms'] == 21768
+        assert 'passed' in saved['check']['message']
+        request = c.execute('select public.amem_connection_diagnostic_start()').fetchone()[0]
+        assert c.execute("select public.amem_connection_probe_finish(%s,false,20000,'timeout')", (request['request_id'],)).fetchone()[0]
+        c.execute("update rsi_checkpoints set started_at=now()-interval '6 minutes',finished_at=now()-interval '5 minutes' where job='connections:clickhouse-probe'")
+        saved = c.execute('select public.amem_connection_probe_current()').fetchone()[0]
+        assert saved['check']['status'] == 'unhealthy'
+        assert saved['check']['latency_ms'] == 20000
+        assert 'timed out' in saved['check']['message']
+        c.rollback()
