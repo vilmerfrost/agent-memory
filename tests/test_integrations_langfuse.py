@@ -484,6 +484,11 @@ def test_opt_in_result_is_still_redacted_capped_and_root_only(tmp_path: Path) ->
 class _NoSupabase:
     """The lookups LangfuseSink.batches makes: no session row, no earlier lf:trace link, no team repo."""
 
+    def commit(self) -> None:
+        # The privacy-only test uses an in-memory adapter; real sink receipts
+        # are exercised against disposable Postgres in the sink tests below.
+        pass
+
     def execute(self, *_: Any) -> Any:
         return self
 
@@ -694,7 +699,7 @@ def test_retriever_unavailable_when_unconfigured_wrong_or_down() -> None:
 
 
 def _clean(conn: psycopg.Connection) -> None:
-    conn.execute("delete from rsi_checkpoints where job = 'sync:langfuse'")
+    conn.execute("delete from rsi_checkpoints where job in ('sync:langfuse','langfuse-export')")
     conn.execute("delete from rsi_evidence where system = 'langfuse'")
     conn.execute("delete from sessions where project_dir = '/lf-test'")
 
@@ -919,3 +924,126 @@ def test_a_rejected_score_dead_letters_the_run_and_the_rest_lands(app: str, tmp_
         (dl,) = meta["dead_letters"]
         assert dl["table"] == "sandbox_runs" and "scores rejected 1 of 2" in dl["error"]
         assert conn.execute("select count(*) from rsi_evidence where system = 'langfuse'").fetchone()[0] == 1
+
+
+def test_scoped_export_preserves_daily_cursor_and_shared_receipts(app, tmp_path):
+    pa, pb = _tree(tmp_path)
+    with MockService() as svc, psycopg.connect(app) as conn:
+        lf = FakeLangfuse(svc)
+        from agent_memory import rsi_approval
+        rsi_approval.checkpoint(conn, 'sync:langfuse', 'cursor', 'done',
+                               {'watermarks': {'sandbox_runs': '00000000000000000000|before'}})
+        conn.commit()
+        first = L.export_experiment(conn, EXP, root=tmp_path, client=client_for(svc), budget_s=30, environ={})
+        assert first['status'] == 'ok' and first['rows'] == 2
+        state = sync.load(conn, 'langfuse')
+        assert state['watermarks']['sandbox_runs'] == '00000000000000000000|before'
+        assert 'sandbox_runs:' + EXP in state['watermarks']
+        assert state['usage']['rows'] == 2
+        conn.rollback()  # end this caller-owned read transaction before the committing exporter
+        n_obs, n_scores = len(lf.observations), len(lf.scores)
+        assert n_obs > 0 and n_scores > 0
+        again = L.export_experiment(conn, EXP, root=tmp_path, client=client_for(svc), budget_s=30, environ={})
+        assert again['rows'] == 0
+        assert (len(lf.observations), len(lf.scores)) == (n_obs, n_scores)
+        daily = sync.run(L.LangfuseSink(client_for(svc), tmp_path), conn, environ={})
+        assert daily.status == 'ok' and daily.rows == 2
+        assert (len(lf.observations), len(lf.scores)) == (n_obs, n_scores)
+        assert sync.load(conn, 'langfuse')['usage']['rows'] == 4
+
+
+def test_scoped_export_honors_shared_cap_and_kill_switch(app, tmp_path):
+    _tree(tmp_path)
+    with MockService() as svc, psycopg.connect(app) as conn:
+        lf = FakeLangfuse(svc)
+        off = L.export_experiment(conn, EXP, root=tmp_path, client=client_for(svc), budget_s=30,
+                                  environ={'AMEM_SYNC_LANGFUSE': 'off'})
+        assert off['status'] == 'off' and not svc.requests
+        capped = L.export_experiment(conn, EXP, root=tmp_path, client=client_for(svc), budget_s=30,
+                                     environ={'AMEM_SYNC_LANGFUSE_MAX_ROWS_PER_DAY': '0'})
+        assert capped['status'] == 'capped' and not lf.observations
+        assert not svc.requests_to('POST', L.OTLP_PATH)
+
+
+def test_scoped_export_rejects_cross_experiment_identity_and_symlinks(app, tmp_path):
+    pa, pb = _tree(tmp_path)
+    obj = json.loads(pa.read_text());obj['experiment'] = 'exp-20261017-other';pa.write_text(json.dumps(obj))
+    with MockService() as svc, psycopg.connect(app) as conn:
+        lf = FakeLangfuse(svc)
+        report = L.export_experiment(conn, EXP, root=tmp_path, client=client_for(svc), budget_s=30, environ={})
+        assert report['refused'] == 1 and report['rows'] == 1
+        assert len({o['traceId'] for o in lf.observations}) == 1
+    with pytest.raises(ValueError, match='experiment'):
+        L.LangfuseSink(client_for(svc), tmp_path, experiment_id='../other')
+    isolated = tmp_path / 'isolated';(isolated / 'experiments').mkdir(parents=True)
+    (isolated/'experiments'/EXP).symlink_to(pa.parent.parent, target_is_directory=True)
+    with pytest.raises(L.Refused, match='symlink'):
+        L.LangfuseSink(client_for(svc), isolated, experiment_id=EXP)._logs()
+
+
+def test_unknown_span_response_is_not_automatically_reexported(app, tmp_path, monkeypatch):
+    pa, pb = _tree(tmp_path);pb.unlink()
+    client = None
+    with MockService() as svc, psycopg.connect(app) as conn:
+        lf = FakeLangfuse(svc);client=client_for(svc)
+        actual = client.export_spans
+        calls = []
+        def lost(body):
+            calls.append(1)
+            actual(body)
+            raise L.http.HttpError(None, 'response lost', retryable=True)
+        monkeypatch.setattr(client, 'export_spans', lost)
+        first = L.export_experiment(conn, EXP, root=tmp_path, client=client, budget_s=30, environ={})
+        assert first['failed'] == 1 and len(calls) == 1
+        before = len(lf.observations)
+        assert before > 0
+        # Clear only backoff for this local recovery fixture; keep the real request-phase receipt.
+        conn.execute("update rsi_checkpoints set meta=meta || '{\"failures\":{}}'::jsonb where job='sync:langfuse'")
+        conn.commit()
+        monkeypatch.setattr(client, 'export_spans', actual)
+        monkeypatch.setattr(client, 'trace_exists', lambda *a, **k: False)  # ingestion read lag
+        second = L.export_experiment(conn, EXP, root=tmp_path, client=client, budget_s=30, environ={})
+        assert second['failed'] == 1 and second['uncertain'] == 1
+        assert len(lf.observations) == before and len(calls) == 1
+        # Daily scope uses the same receipt, not only the scoped watermark.
+        daily = sync.run(L.LangfuseSink(client, tmp_path), conn, environ={})
+        assert daily.failed == 1 and len(lf.observations) == before
+
+
+def test_confirmed_span_receipt_survives_a_later_score_failure(app, tmp_path, monkeypatch):
+    _tree(tmp_path)
+    with MockService() as svc, psycopg.connect(app) as conn:
+        lf = FakeLangfuse(svc)
+        real = lf._create_scores
+        attempts = []
+        def once(req):
+            attempts.append(1)
+            return (503, {'message': 'temporary score failure'}) if len(attempts) == 1 else real(req)
+        svc.route('POST', L.SCORES_WRITE_PATH, lf._guard(once))
+        first = L.export_experiment(conn, EXP, root=tmp_path, client=client_for(svc), budget_s=30, environ={})
+        assert first['failed'] == 1
+        count = len(lf.observations)
+        assert count == 3
+        conn.execute("update rsi_checkpoints set meta=meta || '{\"failures\":{}}'::jsonb where job='sync:langfuse'")
+        conn.commit()
+        second_client = client_for(svc)
+        monkeypatch.setattr(second_client, 'trace_exists', lambda *a, **k: False)
+        again = L.export_experiment(conn, EXP, root=tmp_path, client=second_client, budget_s=30, environ={})
+        assert again['status'] == 'ok' and again['rows'] == 2
+        assert len(lf.observations) == count + 7
+        assert len(svc.requests_to('POST', L.OTLP_PATH)) == 2
+
+
+def test_scoped_export_never_commits_pending_caller_work(app, tmp_path):
+    _tree(tmp_path)
+    with MockService() as svc, psycopg.connect(app) as conn:
+        FakeLangfuse(svc)
+        conn.execute("select 1")  # even a caller read transaction must be ended explicitly
+        with pytest.raises(ValueError, match='caller transaction'):
+            L.export_experiment(conn, EXP, root=tmp_path, client=client_for(svc), budget_s=30, environ={})
+        assert not svc.requests
+        conn.rollback()
+        report = L.export_experiment(conn, EXP, root=tmp_path, client=client_for(svc), budget_s=30, environ={})
+        assert report['delivered_rows'] == report['rows'] == 2
+        assert report['confirmed_trace_uploads'] == 2
+        assert report['visible_rows'] is None and report['readback_verified'] is False
