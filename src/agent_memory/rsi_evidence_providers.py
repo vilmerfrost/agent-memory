@@ -170,7 +170,8 @@ class Meter:
         return ReadOnlyViolation(what)
 
 
-_CH_READS = frozenset(q.sql for q in clickhouse.QUERIES.values())
+CH_HEALTH_SQL = "SELECT 1 AS ok FORMAT JSONEachRow"
+_CH_READS = frozenset(q.sql for q in clickhouse.QUERIES.values()) | {CH_HEALTH_SQL}
 SPECS: dict[str, Mapping[str, NamedQuery]] = {
     "clickhouse": {n: q.spec for n, q in clickhouse.QUERIES.items()},
     "langfuse": langfuse.LangfuseRetriever._QUERIES,
@@ -186,8 +187,12 @@ class ReadOnlyClickHouseClient(clickhouse.Client):
         self.meter = meter
 
     def ping(self) -> None:
+        # Cloud's unauthenticated /ping wake path can take most of the pack's
+        # budget while authenticated SELECTs are fast. Probe the exact read path.
         self.meter.hit()
-        super().ping()
+        rows = super().select(CH_HEALTH_SQL, {})
+        if rows != [{"ok": 1}]:
+            raise clickhouse.http.HttpError(None, "unexpected ClickHouse read health answer")
 
     def select(self, statement: str, params: Mapping[str, str]) -> list[dict[str, Any]]:
         if statement not in _CH_READS:
@@ -340,7 +345,7 @@ class EgressGate:
             if _DIGITS.fullmatch(v):
                 continue
             if env.match(v) or egress.email_like(v) or self._withheld().match(v):
-                raise Unavailable("a query parameter names a withheld term (egress deny list)")
+                raise Unavailable("policy-excluded: a query parameter names a withheld term (egress deny list)")
 
     def repo_own(self, repo: str) -> bool:
         with self._lock:
@@ -367,7 +372,7 @@ class EgressGate:
         if repo is None:
             return
         if repo in egress.MASKS or re.fullmatch(r"p_[0-9a-f]{16}", repo) or not self.repo_own(repo):
-            raise Unavailable("repo-scoped rule of a repo that is not positively own (team or private): not sent")
+            raise Unavailable("policy-excluded: repo-scoped rule is not positively own (team or private): not sent")
 
 
 # ---------------------------------------------------------------- the gated retriever
@@ -404,7 +409,7 @@ class GatedRetriever:
         # never `unknown-query`
         return self.inner.named_queries() if self.inner is not None else SPECS.get(self.service, {})
 
-    def query(self, name: str, params: Mapping[str, str]) -> list[EvidenceRef]:
+    def _preflight_query(self, name: str, params: Mapping[str, str]) -> None:
         if self.block or self.inner is None or self.policy is None:
             raise Unavailable(self.block or "not approved")
         if not self.policy.allows(name):
@@ -417,6 +422,8 @@ class GatedRetriever:
                 if not self.subject_rule:
                     raise Unavailable("recall words of unknown origin: not sent")
                 self.gate.check_rule(self.subject_rule)
+    def query(self, name: str, params: Mapping[str, str]) -> list[EvidenceRef]:
+        self._preflight_query(name, params)
         return self.inner.query(name, params)
 
 

@@ -107,7 +107,7 @@ def test_replay_jev_fixtures_match_their_states():
             assert set(body["answers"]) == {"effect", "harness_problem", "evidence_strength"}
     # Keep the six historical V1 outcomes and six explicit V2 counterparts, plus the recorded 2026-10-26 codex
     # replay (both arms failed every check; tests/test_rsi_jev_inputs.py).
-    assert versions == {"suite: sandbox-replay/1": 6, "suite: sandbox-replay/2": 7}
+    assert versions == {"suite: sandbox-replay/1": 6, "suite: sandbox-replay/2": 7, "suite: sandbox-replay/3": 7}
 
 
 def test_jev_state_is_numbers_only_and_fixture_mode_never_goes_live(monkeypatch):

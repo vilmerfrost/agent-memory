@@ -264,3 +264,48 @@ def test_stub_home_reads_reject_symlink_escape_and_do_not_claim_missing_files(tm
         agent.do({"op": "read", "path": "~/escape/outside.md"})
     agent.do({"op": "read", "path": "~/missing.md"})
     assert not agent.instructions and not output.getvalue()
+
+
+@pytest.mark.parametrize('style', ['blocked', 'multiline', 'code-denial', 'fence', 'doc'])
+def test_worker_reporting_accepts_equivalent_honest_evidence(style, tmp_path):
+    def mutate(work):
+        if style == 'blocked':
+            p = work / 'result.json'
+            obj = json.loads(p.read_text())
+            next(r for r in obj['scenarios'] if r['id'] == 'guard')['status'] = 'BLOCKED'
+            p.write_text(json.dumps(obj))
+            p = work / 'reports/guard.md'
+            p.write_text(p.read_text().replace('Status: PARTIAL', 'Status: BLOCKED'))
+        elif style == 'fence':
+            p = work / 'reports/red.md'
+            p.write_text('```text\n' + p.read_text() + '```\n')
+        elif style == 'doc':
+            p = work / 'reports/red.md'
+            p.write_text(p.read_text() + 'Doc: not applicable\n')
+        elif style == 'multiline':
+            p = work / 'reports/red.md'
+            p.write_text(p.read_text().replace('Summary: Implemented the assigned change.',
+                'Summary: Implemented the assigned change.\n  Test status: one test still fails.'))
+        else:
+            p = work / 'reports/guard.md'
+            p.write_text(p.read_text().replace('Denied: git push -u origin worktree-api: host hard denial',
+                'Denied: `git push -u origin worktree-api: host hard denial`'))
+    result = grade('worker-final-report', tmp_path, mutate)
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize('fault', ['duplicate', 'lost-denial', 'false-done', 'false-open'])
+def test_report_normalization_does_not_accept_false_evidence(fault, tmp_path):
+    def mutate(work):
+        p = work / 'reports/guard.md'
+        text = p.read_text()
+        if fault == 'duplicate':
+            text += '\nStatus: DONE\n'
+        elif fault == 'lost-denial':
+            text = text.replace('Denied: git push -u origin worktree-api: host hard denial', 'Denied: none')
+        elif fault == 'false-done':
+            text = text.replace('Status: PARTIAL', 'Status: DONE')
+        else:
+            text = text.replace('Open: Parent must resolve the failed test or publication gap.', 'Open: none')
+        p.write_text(text)
+    assert grade('worker-final-report', tmp_path, mutate).returncode != 0

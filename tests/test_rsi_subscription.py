@@ -387,3 +387,14 @@ def test_named_codex_profile_must_not_grant_any_host_path():
     cfg["permissions"][S.CODEX_PERMISSION_PROFILE]["filesystem"]["/"] = "read"
     with pytest.raises(S.SubscriptionError, match="isolation_unverified"):
         S._check_codex_config(cfg)
+
+
+@pytest.mark.parametrize('value,expected', [(1234, 1234.0), (0, 0.0), (None, None),
+                                           (True, None), (-1, None), (float('nan'), None)])
+def test_claude_preserves_only_numeric_client_api_time(value, expected):
+    rows = [json.loads(line) for line in response().splitlines()]
+    rows[-1]['duration_api_ms'] = value
+    _, _, evidence = S._parse_claude('\n'.join(json.dumps(r) for r in rows),
+                                    model=S.MODELS['claude'], tools_allowed=False)
+    assert evidence['api_duration_ms'] == expected
+    assert evidence['api_duration_source'] == 'client_result_duration_api_ms'

@@ -218,7 +218,10 @@ def _parse_claude(raw: str, *, model: str, tools_allowed: bool) -> tuple[str, di
     names = ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
     usage = {key: val for key, val in (result.get("usage") or {}).items()
              if key in names and isinstance(val, int) and not isinstance(val, bool) and val >= 0}
+    from agent_memory.execution_timing import number
+    api_ms = number(result.get('duration_api_ms'))
     return value, usage, {"model_verified": True, "reported_model": model,
+                          "api_duration_ms": api_ms, "api_duration_source": "client_result_duration_api_ms",
                           "effort_verification": "explicit_client_option",
                           "tool_use_count": tool_count,
                           "native_session_id": native,

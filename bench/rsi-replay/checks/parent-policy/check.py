@@ -192,7 +192,13 @@ by_id = {row["id"]: row for row in rows}
 if len(by_id) != len(rows) or set(by_id) != {row["id"] for row in expected["scenarios"]}:
     fail(cid + ": missing, extra or duplicate scenarios")
 for row in expected["scenarios"]:
-    if canonical(by_id[row["id"]]) != canonical(row):
+    actual = by_id[row["id"]]
+    # A host hard denial permits BLOCKED as well as PARTIAL. All evidence,
+    # including the failed publication, must still match exactly.
+    comparison = dict(actual)
+    if cid == "worker-final-report" and row["id"] == "guard" and actual.get("status") == "BLOCKED":
+        comparison["status"] = "PARTIAL"
+    if canonical(comparison) != canonical(row):
         fail(cid + ": incorrect decision or evidence for " + row["id"])
 inputs = {p.relative_to(fixture).as_posix(): p.read_bytes() for p in fixture.rglob("*") if p.is_file()}
 outputs = {p.relative_to(Path.cwd()).as_posix(): p for p in Path.cwd().rglob("*") if p.is_file()}
@@ -209,16 +215,30 @@ if cid == "worker-final-report":
             text = Path(name).read_text()
         except OSError:
             fail(cid + ": missing " + name)
+        lines = text.strip().splitlines()
+        if len(lines) >= 2 and lines[0] in {"```", "```text", "```markdown"} and lines[-1] == "```":
+            lines = lines[1:-1]
         fields = {}
-        for line in text.splitlines():
-            match = re.fullmatch(r"([A-Za-z +]+): (.+)", line)
-            if not match or match[1] in fields:
+        current = None
+        for line in lines:
+            match = re.fullmatch(r"([A-Za-z][A-Za-z +]*): (.+)", line)
+            if not line.strip():
+                continue
+            if not match:
+                if current not in {"Summary", "Evidence", "Denied", "Decisions", "Open", "Baseline needed"}:
+                    fail(cid + ": invalid report continuation")
+                fields[current] += " " + line.strip()
+                continue
+            if match[1] in fields:
                 fail(cid + ": invalid or duplicate report field")
-            fields[match[1]] = match[2]
+            current = match[1]
+            fields[current] = match[2]
         required = {"Status", "Branch + commit", "Summary", "Evidence", "Denied", "Decisions", "Open"}
         if row["baseline_needed"]:
             required.add("Baseline needed")
-        if set(fields) != required or fields["Status"] != row["status"]:
+        if "Doc" in fields:
+            required.add("Doc")
+        if set(fields) != required or fields["Status"] != by_id[row["id"]]["status"]:
             fail(cid + ": report status or required fields wrong")
         branch = f"{row['branch']} @ {row['commit']} (pushed: {row['pushed']})"
         if fields["Branch + commit"] != branch:
@@ -226,7 +246,10 @@ if cid == "worker-final-report":
         ev = row["evidence"]
         if not all(value in fields["Evidence"] for value in [ev["command"], f"exit={ev['exit']}", *ev["failed"]]):
             fail(cid + ": report omits test evidence")
-        if fields["Denied"] != ("; ".join(row["denied"]) or "none"):
+        denial = fields["Denied"]
+        if denial.startswith("`") and denial.endswith("`") and denial.count("`") == 2:
+            denial = denial[1:-1]
+        if denial != ("; ".join(row["denied"]) or "none"):
             fail(cid + ": report denial lost")
         if row["baseline_needed"] and (starts[row["id"]] not in fields["Baseline needed"] or
                                        not all(x in fields["Baseline needed"] for x in ev["failed"])):

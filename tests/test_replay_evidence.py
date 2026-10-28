@@ -97,3 +97,19 @@ def test_all_verdict_eval_ingestion_and_identity_validation(db,tmp_path):
     bad=json.loads(ev.read_text());bad['baseline_id']='bl-wrong';ev.write_text(json.dumps(bad))
     with psycopg.connect(db) as c,pytest.raises(RA.ArtifactError,match='binding mismatch'):
         RE.register_evaluations(c,adir,m['experiment_id'])
+
+
+def test_native_claude_api_total_has_no_invented_wall_interval(db):
+    a = attempt('exp-20261028-api', 'claude-api-total')
+    a['runtime'] = {'api_duration_ms': 1250.5, 'api_duration_source': 'client_result_duration_api_ms'}
+    with psycopg.connect(db) as conn:
+        AL.record_runner(conn, [a])
+        assert conn.execute('select api_seconds from sessions where session_id=%s',
+                            (a['native_session_id'],)).fetchone() == (1.2505,)
+        assert AL.record_runner(conn, [a]) == 0
+        assert conn.execute("select count(*),min(started_at),min(ended_at) from execution_spans "
+                            "where session_id=%s", (a['native_session_id'],)).fetchone() == (1, None, None)
+        b = {**a, 'native_session_id': 'claude-api-unknown', 'rep': 1, 'run_id': 'api-unknown', 'runtime': {}}
+        AL.record_runner(conn, [b])
+        assert conn.execute('select api_seconds from sessions where session_id=%s',
+                            (b['native_session_id'],)).fetchone() == (None,)

@@ -156,7 +156,7 @@ def attempt_record(path: Path, *, root: Path, experiment_id: str) -> tuple[AL.At
             "rep": at.rep, "run_id": expected_run, "replay_record": path.relative_to(root).as_posix(),
             "agent": row.get("agent"), "native_session_id": row.get("native_session_id"),
             "model": row.get("model"), "started_at": row.get("started_at"),
-            "duration_s": row.get("duration_s"), "error": bool(row.get("error"))}
+            "duration_s": row.get("duration_s"), "error": bool(row.get("error")), "runtime": row.get('runtime')}
     return at, data, recovered, legacy
 
 
