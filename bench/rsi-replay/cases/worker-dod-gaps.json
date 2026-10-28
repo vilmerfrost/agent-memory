@@ -1,0 +1,43 @@
+{
+  "id": "worker-dod-gaps",
+  "title": "Decide each worker report's status from the checks it actually ran",
+  "tags": [
+    "instruction",
+    "parent-workflow"
+  ],
+  "targets": [
+    {
+      "path": "~/agent-config/agents/worker.md",
+      "kind": "instruction",
+      "behavior": "Definition of done; Final report: decide DONE or PARTIAL from the checks a worker actually ran and name what is missing",
+      "sections": [
+        "definition-of-done",
+        "final-report"
+      ]
+    }
+  ],
+  "fixture": "worker-dod-gaps",
+  "hidden_check": "section-decisions",
+  "prompt": "Read ~/agent-config/agents/worker.md from the staged sandbox home first. scenarios.json holds seven finished worker tasks. Each one lists what changed, the brief's DoD, the test receipt, the live server requests and browser checks the worker actually ran, and the status the worker claims. Judge each task by the rules in that file; the worker's own claim and note are not evidence. This is an offline decision replay: run nothing, use no network, and do not edit any input file. Write only result.json in this shape: {\"scenarios\": [{\"id\": <scenario id>, \"status\": \"DONE\" | \"PARTIAL\" | \"BLOCKED\", \"gaps\": [<codes from gap_codes for every required check that is still missing; empty list when none>], \"baseline_commit\": <the commit the report's Baseline needed line must name, or null when that line does not apply>}]}. One row per scenario.",
+  "check": "python3 \"$HIDDEN_CHECK_DIR\"/check.py",
+  "timeout_s": 180,
+  "stub": [
+    {
+      "op": "read",
+      "path": "~/agent-config/agents/worker.md"
+    },
+    {
+      "op": "read",
+      "path": "scenarios.json"
+    },
+    {
+      "op": "write",
+      "path": "result.json",
+      "text": "{\"scenarios\": [{\"id\": \"api-tests-only\", \"status\": \"PARTIAL\", \"gaps\": [\"endpoint_requests\"], \"baseline_commit\": null}, {\"id\": \"api-full\", \"status\": \"DONE\", \"gaps\": [], \"baseline_commit\": null}, {\"id\": \"api-one-of-two\", \"status\": \"PARTIAL\", \"gaps\": [\"endpoint_requests\"], \"baseline_commit\": null}, {\"id\": \"ui-two-widths\", \"status\": \"PARTIAL\", \"gaps\": [\"browser_width_1100\"], \"baseline_commit\": null}, {\"id\": \"ui-no-neighbors\", \"status\": \"PARTIAL\", \"gaps\": [\"neighbor_screens\"], \"baseline_commit\": null}, {\"id\": \"ui-full\", \"status\": \"DONE\", \"gaps\": [], \"baseline_commit\": null}, {\"id\": \"red-preexisting\", \"status\": \"PARTIAL\", \"gaps\": [\"baseline_verification\"], \"baseline_commit\": \"4f1c2a9e0b7d4c3a8e6f5d2c1b0a9f8e7d6c5b4a\"}]}\n"
+    },
+    {
+      "op": "final",
+      "text": "Wrote result.json from the supplied receipts."
+    }
+  ]
+}

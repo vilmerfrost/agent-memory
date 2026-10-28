@@ -49,5 +49,6 @@ def test_all_worker_behaviors_fit_existing_three_pair_budget():
     cases=R.load_cases()
     selected,reps=R.plan_cases({'files':[{'path':'~/agent-config/agents/worker.md','kind':'instruction'}]},
                              cases,min_pairs=3,max_pairs=3)
-    assert {c.id for c in selected} == {'worker-final-report',*IDS}
+    assert {c.id for c in selected} == {'worker-final-report','worker-dod-gaps','worker-helper-routing',
+                                        'worker-credential-runner',*IDS}
     assert len(selected)*reps == 3

@@ -1,0 +1,51 @@
+{
+  "case": "parent-dod-review",
+  "you": "root parent of repo notes-app",
+  "action_codes": [
+    "accept",
+    "accept_with_note",
+    "ask_vilmer_to_check",
+    "fix_it_yourself",
+    "follow_up_to_worker",
+    "switch_tactic",
+    "verify_baseline"
+  ],
+  "scenarios": [
+    {
+      "id": "done-with-red",
+      "brief_starting_commit": "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d",
+      "history": "This is the worker's first report.",
+      "report": "Status: DONE\nEvidence: pytest -q; exit=1; failed=test_export_csv\nOpen: none",
+      "your_review": "The brief's DoD includes a passing test suite."
+    },
+    {
+      "id": "partial-preexisting",
+      "brief_starting_commit": "4f1c2a9e0b7d4c3a8e6f5d2c1b0a9f8e7d6c5b4a",
+      "integration_tip_now": "9e8d7c6b5a4f3e2d1c0b9a8f7e6d5c4b3a2f1e0d",
+      "history": "This is the worker's first report.",
+      "report": "Status: PARTIAL\nEvidence: pytest -q tests/test_time.py; exit=1; failed=test_timezone_roundtrip\nBaseline needed: 4f1c2a9e0b7d4c3a8e6f5d2c1b0a9f8e7d6c5b4a; test_timezone_roundtrip\nOpen: test_timezone_roundtrip fails on the integration tip too; I believe it is pre-existing.",
+      "your_review": "Everything else in the DoD has evidence."
+    },
+    {
+      "id": "done-disputed-first",
+      "brief_starting_commit": "2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e",
+      "history": "This is the worker's first report.",
+      "report": "Status: DONE\nEvidence: pytest -q; exit=0; failed=none\nOpen: none",
+      "your_review": "The brief changed POST /v1/notes, and the report shows no live request to it. You think this is not done."
+    },
+    {
+      "id": "done-disputed-again",
+      "brief_starting_commit": "3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f",
+      "history": "You already sent this worker one follow-up about the missing 1100 px and 375 px browser checks. It answered with DONE again and no new evidence.",
+      "report": "Status: DONE\nEvidence: npm test; exit=0; failed=none; http://worker-ui.localhost:5181/settings at 1440 px (tab-4)\nOpen: none",
+      "your_review": "The same browser gap remains. You still think this is not done."
+    },
+    {
+      "id": "done-clean",
+      "brief_starting_commit": "5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f7081",
+      "history": "This is the worker's first report.",
+      "report": "Status: DONE\nEvidence: pytest -q; exit=0; failed=none; POST http://127.0.0.1:8114/v1/notes -> 201\nOpen: none",
+      "your_review": "Every DoD item has matching evidence and you agree with DONE."
+    }
+  ]
+}
