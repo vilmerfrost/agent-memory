@@ -1690,7 +1690,13 @@ class Night:
     def __init__(self, cfg: NightConfig, adapters: Adapters, *, night: str, db_url: str | None = None,
                  dry_run: bool = False, clock: Callable[[], float] = time.monotonic,
                  install_signals: bool = True, prerequisite_warnings: Sequence[str] = (),
-                 routines_log: Path | None = None) -> None:
+                 routines_log: Path | None = None, manual_run_id: str | None = None) -> None:
+        if manual_run_id is not None and not re.fullmatch(r"manual-[a-z0-9-]{8,48}", manual_run_id):
+            raise ConfigError("manual_run_id must be manual- followed by 8..48 lowercase letters, digits or hyphens")
+        self.manual_run_id = manual_run_id
+        self.run_key = manual_run_id or night
+        self.output = (RA.sandbox_dir() / "manual-runs" / manual_run_id / "nights" / night / "report.json"
+                       if manual_run_id else report_path(night))
         self.cfg, self.ad, self.night, self.db_url, self.dry_run = cfg, adapters, night, db_url, dry_run
         self.routines_log = routines_log           # the skill_refresh prerequisite's fallback source
         self.skill_refresh: Any = None             # skill_refresh.Check, set in S1 before any sighting
@@ -1730,6 +1736,9 @@ class Night:
                      "failure_scope": "affected evidence queries; independent work continues"},
                     {"capability": "verified candidate evidence", "required_for": "hypothesis generation",
                      "failure_scope": "candidate only"}]}}
+        if manual_run_id:
+            self.report["manual_run"] = {"id": manual_run_id, "kind": "verification", "scheduled_checkpoint_unchanged": True}
+            self.notes.append("Manual verification run; scheduled report/checkpoint and promotion gates unchanged")
         if prerequisite_warnings:      # failed prerequisite steps the night does not read (rsi_schedule's gate)
             self.report["prerequisite_warnings"] = _prereq_warnings(prerequisite_warnings)
         self.allowlist: list[str] = []
@@ -1743,7 +1752,7 @@ class Night:
         self._evidence_text: dict[str, str] = {}      # candidate key -> its rendered (enveloped) evidence pack
         self._advance = False
         # data-use R4: what S1 and S4 read, used and skipped, written once in _finish (night_coverage.py)
-        self.cov = NC.Ledger(night, f"{FORMAT} config {cfg.sha256[:12]}")
+        self.cov = NC.Ledger(self.run_key, f"{FORMAT} config {cfg.sha256[:12]}")
 
     def _cov(self) -> NC.Ledger:
         """The coverage ledger (a night built without __init__, as some tests do, gets an unwritten one)."""
@@ -1899,7 +1908,7 @@ class Night:
             self.health_reasons["supabase"] = [f"preflight: database unavailable ({type(exc).__name__})"]
             raise PreflightFailed(f"database unavailable ({type(exc).__name__})") from None
         row = self.conn.execute("select status from rsi_checkpoints where job = %s and run_key = %s",
-                                (JOB, self.night)).fetchone()
+                                (JOB, self.run_key)).fetchone()
         if row and row[0] == "done":
             raise PreflightFailed(f"night {self.night} is already done")
         self.owns_night = not self.dry_run
@@ -1921,9 +1930,11 @@ class Night:
             self.allowlist = [t for t in self.allowlist if t not in self.pinned]
         self.budget.check()
         if not self.dry_run:
-            self._reconcile_orphans()
-            AP.checkpoint(self.conn, JOB, self.night, "running",
-                          meta={"started_at": self.report["started_at"], "config_sha256": self.cfg.sha256})
+            if not self.manual_run_id:
+                self._reconcile_orphans()
+            AP.checkpoint(self.conn, JOB, self.run_key, "running",
+                          meta={"started_at": self.report["started_at"], "config_sha256": self.cfg.sha256,
+                                **({"manual_run_id": self.manual_run_id} if self.manual_run_id else {})})
             self.marked_running = True
 
     # -- S1-S3 ----------------------------------------------------------------------------------------
@@ -1931,8 +1942,8 @@ class Night:
         assert self.conn is not None
         row = self.conn.execute(
             "select meta->>'next_checkpoint' from rsi_checkpoints where job = %s and status = 'done' and run_key <> %s "
-            "and meta ? 'next_checkpoint' order by finished_at desc nulls last, run_key desc limit 1",
-            (JOB, self.night)).fetchone()
+            "and meta ? 'next_checkpoint' and not (meta ? 'manual_run_id') order by finished_at desc nulls last, run_key desc limit 1",
+            (JOB, self.run_key)).fetchone()
         return row[0] if row else None
 
     def _check_skill_refresh(self, night_window_end: datetime) -> None:
@@ -2620,7 +2631,7 @@ class Night:
 
     def _exp_id(self, key: str) -> str:
         assert self.conn is not None
-        base = f"exp-{self.night.replace('-', '')}-{_sha16(key)[:8]}"
+        base = f"exp-{self.night.replace('-', '')}-{_sha16(key + (self.manual_run_id or ''))[:8]}"
         taken = {r[0] for r in self.conn.execute("select id from rsi_experiments where id = %s or id like %s",
                                                   (base, base + "-r%")).fetchall()}
         if base not in taken:
@@ -2685,10 +2696,11 @@ class Night:
         self.report["experiments"].append(entry)
         mark = self.budget.mark()
         base_meta = {"candidate_key": c["dedupe_key"], "candidate_id": str(c["id"]), "source": "rsi-night",
-                     "evidence_refs": refs[:20], "config_sha256": self.cfg.sha256}
+                     "evidence_refs": refs[:20], "config_sha256": self.cfg.sha256,
+                     **({"manual_run_id": self.manual_run_id} if self.manual_run_id else {})}
         self.conn.execute("insert into rsi_experiments (id, night, kind, hypothesis, status, meta) "
                           "values (%s, %s, 'edit_instruction', %s, 'running', %s)",
-                          (exp_id, self.night, Jsonb(h.as_dict()), Jsonb(base_meta)))
+                          (exp_id, self.run_key, Jsonb(h.as_dict()), Jsonb(base_meta)))
         previous_total = int((c.get("meta") or {}).get("attempts") or 0)
         generation = (c.get("meta") or {}).get('attempt_limit_scope') == 'verified_feedback_generation'
         attempts = int((c.get("meta") or {}).get('generation_attempts' if generation else 'attempts') or 0) + 1
@@ -2778,7 +2790,11 @@ class Night:
                 cand_status, cand_reason = "deferred", f"replay stopped by the budget ({rr.budget_stop})"
                 raise BudgetExhausted(str(rr.budget_stop), "replay")
             # S8: only IMPROVES with the exact artifact becomes a staged proposal
-            if verdict == "IMPROVES":
+            if verdict == "IMPROVES" and self.manual_run_id:
+                entry["status"] = "not_promotable"
+                cand_status, cand_reason = "tested", "manual verification only; no proposal created"
+                pending = []
+            elif verdict == "IMPROVES":
                 pid = self.ad.proposer.propose(self.conn, adir=Path(st.artifact_dir or RA.artifacts_dir() / st.artifact_hash),
                                                artifact_hash=st.artifact_hash, candidate=c, hyp=h, replay=rr, refs=refs)
                 entry.update(status="staged", proposal_id=pid)
@@ -2873,9 +2889,14 @@ class Night:
         try:
             self.conn.execute("update rsi_experiments set status = 'aborted', finished_at = now(), "
                               "meta = meta || %s where night = %s and status in ('planned', 'running')",
-                              (Jsonb({"reason": why}), self.night))
-            self.conn.execute("update rsi_candidates set status = 'deferred', decided_reason = %s "
-                              "where status = 'selected'", (f"night stopped: {why}",))
+                              (Jsonb({"reason": why}), self.run_key))
+            if self.manual_run_id:
+                self.conn.execute("update rsi_candidates set status='deferred', decided_reason=%s "
+                                  "where status='selected' and id=any(%s::uuid[])",
+                                  (f"manual verification stopped: {why}", self.selected_ids))
+            else:
+                self.conn.execute("update rsi_candidates set status = 'deferred', decided_reason = %s "
+                                  "where status = 'selected'", (f"night stopped: {why}",))
         except psycopg.Error as exc:
             self.notes.append(f"unwind failed: {type(exc).__name__}")
 
@@ -2929,6 +2950,7 @@ class Night:
 
     def _finish(self, status: str) -> None:
         advance = self._advance and status in ("ok", "partial") and not self.failed and not self.dry_run
+        scheduled_advance = advance and not self.manual_run_id
         r = self.report
         r["status"] = status
         r["finished_at"] = _now_iso()
@@ -2979,7 +3001,7 @@ class Night:
                 notes.insert(0, _one_line(f"{WRITER_NEVER_RAN}: {ws['fell_back']}/{ws['experiments']} experiments fell "
                                           f"back to the stub ({top})", 300))
         r["notes"] = notes[:1] + notes[1:][-29:] if ws and ws["all_fell_back"] else notes[-30:]
-        if advance:
+        if scheduled_advance:
             r["checkpoint"]["after"] = self.next_checkpoint
             r["checkpoint"]["advanced"] = True
         if self.conn is not None:
@@ -2989,10 +3011,11 @@ class Night:
                                 "order by created_at, id")
                     r["pending_decisions"] = [str(x[0]) for x in cur.fetchall()]
                 if self.marked_running:
-                    meta = {"status": status, "report": str(report_path(self.night)), "costs": r["costs"]["total_usd"]}
+                    meta = {"status": status, "report": str(self.output), "costs": r["costs"]["total_usd"],
+                            **({"manual_run_id": self.manual_run_id} if self.manual_run_id else {})}
                     if advance:
                         meta.update(next_checkpoint=self.next_checkpoint, since=r["delta"]["since"])
-                    AP.checkpoint(self.conn, JOB, self.night, "done" if advance else "failed", meta=meta)
+                    AP.checkpoint(self.conn, JOB, self.run_key, "done" if advance else "failed", meta=meta)
             except psycopg.Error as exc:
                 r["notes"].append(f"finish: database error {type(exc).__name__}")
                 if advance:
@@ -3000,7 +3023,7 @@ class Night:
                     r["checkpoint"]["after"] = r["checkpoint"]["before"]
         if self.owns_night:
             try:
-                _write_json(report_path(self.night), r)
+                _write_json(self.output, r)
             except OSError as exc:
                 r["notes"].append(f"report not written: {type(exc).__name__}")
         if self.lock is not None:
@@ -3019,7 +3042,8 @@ def _prereq_warnings(warnings: Sequence[str]) -> list[str]:
 def run_night(*, night: str | None = None, config_path: Path | None = None, dry_run: bool = False,
               db_url: str | None = None, adapters: Adapters | None = None,
               clock: Callable[[], float] = time.monotonic, install_signals: bool = True,
-              prerequisite_warnings: Sequence[str] = (), routines_log: Path | None = None) -> dict[str, Any]:
+              prerequisite_warnings: Sequence[str] = (), routines_log: Path | None = None,
+              manual_run_id: str | None = None) -> dict[str, Any]:
     """One night. Returns the report (rsi-night/1); writes it to $RSI_SANDBOX_DIR/nights/<night>/report.json
     unless dry_run (then nothing is written: no lock, no rows, no report file). `prerequisite_warnings` (the night
     job's gate: failed prerequisite steps the night does not read) go into the report as they are. `routines_log`:
@@ -3040,7 +3064,7 @@ def run_night(*, night: str | None = None, config_path: Path | None = None, dry_
         return rep
     return Night(cfg, adapters or default_adapters(cfg, db_url), night=night, db_url=db_url, dry_run=dry_run,
                  clock=clock, install_signals=install_signals, prerequisite_warnings=prerequisite_warnings,
-                 routines_log=routines_log).run()
+                 routines_log=routines_log, manual_run_id=manual_run_id).run()
 
 
 # =========================================================================== the contract check
@@ -3129,7 +3153,7 @@ def validate_report(obj: Any) -> list[str]:
                "blocked",                                      # optional: ideas no experiment can use (2026-10-25)
                "writer",                                       # optional: the section writer's tally (2026-10-26)
                "prerequisites",                                # optional: the night's own prerequisite checks (R2)
-               "coverage", "experiment_goal", "connection_recovery"}                  # optional: coverage ledger and daily cadence
+               "coverage", "experiment_goal", "connection_recovery", "manual_run"}                  # optional: coverage ledger and daily cadence
     errs += [f"unknown key {k}" for k in sorted(set(obj) - allowed)]
     if obj.get("format") != FORMAT:
         errs.append("format is not rsi-night/1")
@@ -3141,6 +3165,12 @@ def validate_report(obj: Any) -> list[str]:
             errs.append(f"{k} is not an ISO timestamp")
     if obj.get("status") not in STATUSES:
         errs.append(f"status {obj.get('status')!r} not in {STATUSES}")
+    manual = obj.get("manual_run")
+    if manual is not None and not (isinstance(manual, dict)
+            and re.fullmatch(r"manual-[a-z0-9-]{8,48}", str(manual.get("id", "")))
+            and manual.get("kind") == "verification" and manual.get("scheduled_checkpoint_unchanged") is True):
+        errs.append("manual_run: invalid verification identity")
+        return errs
     if "connection_recovery" in obj:
         errs += connection_recovery_problems(obj["connection_recovery"])
     if "experiment_goal" in obj:
@@ -3306,8 +3336,8 @@ def validate_report(obj: Any) -> list[str]:
             errs += SR.report_problems(pr["skill_refresh"])
     if "coverage" in obj:
         errs += NC.report_problems(obj["coverage"])
-        if isinstance(obj["coverage"], dict) and obj["coverage"].get("run_key") != obj.get("night"):
-            errs.append("coverage.run_key must be the night")
+        if isinstance(obj["coverage"], dict) and obj["coverage"].get("run_key") != (obj.get("manual_run") or {}).get("id", obj.get("night")):
+            errs.append("coverage.run_key must match the execution identity")
     return errs
 
 
@@ -3360,7 +3390,24 @@ def cli(args: argparse.Namespace) -> int:
     guard = _read_guard if args.dry_run else _write_guard
     if (code := guard("rsi night")) is not None:
         return code
-    rep = run_night(night=args.night, config_path=args.config, dry_run=args.dry_run)
+    manual_id = getattr(args, "manual_run_id", None)
+    warnings = []
+    if manual_id:
+        # Manual runs require fresh, successful inputs, not a future night's calendar slot.
+        from dataclasses import replace
+        from agent_memory import rsi_schedule as schedule
+        cfg = load_config(args.config)
+        current = datetime.now().astimezone()
+        prereqs = [replace(p, same_night=False, max_age_h=p.max_age_h or 25)
+                   for p in schedule.prerequisites(schedule.schedule_section(cfg.path))]
+        gate = schedule.evaluate_prerequisites(schedule.routines_log_path(), args.night or AP.night_key(), current, prereqs)
+        problems = [*gate.reasons, *schedule.credential_problems(cfg)]
+        if problems:
+            print("Manual verification preflight failed: " + "; ".join(_one_line(x, 200) for x in problems), file=sys.stderr)
+            return 2
+        warnings = [*gate.warnings, "Manual verification uses fresh latest prerequisites; not scheduled-night acceptance"]
+    rep = run_night(night=args.night, config_path=args.config, dry_run=args.dry_run,
+                    manual_run_id=manual_id, prerequisite_warnings=warnings)
     if args.json:
         print(json.dumps(rep, sort_keys=True, default=str))
     else:
@@ -3381,6 +3428,8 @@ def register(sub: argparse._SubParsersAction) -> None:
     p = sub.add_parser("night", help="the nightly RSI investigator (S0-S9); stages proposals, never approves")
     p.add_argument("--night", default=None, help="the night key YYYY-MM-DD (default: the current night)")
     p.add_argument("--config", type=Path, default=None, help="config file (default: config/rsi-night.json)")
+    p.add_argument("--manual-run-id", default=None,
+                   help="separate manual- identity for an approved verification run; preserves scheduled checkpoints/report")
     p.add_argument("--dry-run", action="store_true", help="read and rank only; write nothing")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cli)
