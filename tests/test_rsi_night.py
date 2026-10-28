@@ -951,3 +951,40 @@ def test_target_outside_improves_allowed_targets_is_dropped(env: SimpleNamespace
     rep = run(env)
     assert rep["candidates"] == [] and rep["experiments"] == []
     assert any("on a target improve refuses" in n and "CLAUDE.md" in n for n in rep["notes"]), rep["notes"]
+
+
+def test_manual_verification_keeps_scheduled_report_checkpoint_and_coverage(env: SimpleNamespace) -> None:
+    seed_ab(env)
+    scheduled = run(env)
+    original = N.report_path(N1).read_bytes()
+    checkpoint = rows(env.url, "select status,meta from rsi_checkpoints where job='rsi-night' and run_key=%s", N1)
+    manual_id = 'manual-20261028-test-a'
+    manual = run(env, manual_run_id=manual_id)
+    assert manual['manual_run']['id'] == manual_id
+    assert N.report_path(N1).read_bytes() == original
+    assert rows(env.url, "select status,meta from rsi_checkpoints where job='rsi-night' and run_key=%s", N1) == checkpoint
+    assert manual['checkpoint']['before'] == scheduled['checkpoint']['after']
+    assert manual['checkpoint']['advanced'] is False
+    assert manual['coverage']['run_key'] == manual_id
+    assert (env.sandbox / 'manual-runs' / manual_id / 'nights' / N1 / 'report.json').exists()
+    assert rows(env.url, "select count(*) from rsi_experiments where night=%s", manual_id)[0][0] > 0
+    assert all(e.get('proposal_id') is None for e in manual['experiments'])
+    assert rows(env.url, "select meta->>'manual_run_id' from rsi_checkpoints where run_key=%s", manual_id) == [(manual_id,)]
+    manual_path = env.sandbox / 'manual-runs' / manual_id / 'nights' / N1 / 'report.json'
+    manual_bytes = manual_path.read_bytes()
+    duplicate = run(env, manual_run_id=manual_id)
+    assert duplicate['status'] == 'preflight_failed'
+    assert 'already done' in ' '.join(duplicate['notes'])
+    assert manual_path.read_bytes() == manual_bytes
+    # A following scheduled night reads the scheduled cursor, not the manual cursor.
+    next_scheduled = run(env, night=N2)
+    assert next_scheduled['checkpoint']['before'] == scheduled['checkpoint']['after']
+    assert 'already done' not in ' '.join(next_scheduled['notes'])
+
+
+def test_manual_identity_rejects_path_traversal_before_any_write(env: SimpleNamespace) -> None:
+    import pytest
+    with pytest.raises(N.ConfigError, match='manual_run_id'):
+        run(env, manual_run_id='../scheduled')
+    assert not N.report_path(N1).exists()
+    assert rows(env.url, "select count(*) from rsi_checkpoints") == [(0,)]
