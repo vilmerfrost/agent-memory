@@ -3337,7 +3337,7 @@ def validate_report(obj: Any) -> list[str]:
     if "coverage" in obj:
         errs += NC.report_problems(obj["coverage"])
         if isinstance(obj["coverage"], dict) and obj["coverage"].get("run_key") != (obj.get("manual_run") or {}).get("id", obj.get("night")):
-            errs.append("coverage.run_key must match the execution identity")
+            errs.append("coverage.run_key must match the execution identity" if manual else "coverage.run_key must be the night")
     return errs
 
 
