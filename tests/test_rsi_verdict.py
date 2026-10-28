@@ -88,7 +88,7 @@ def test_one_flipped_run_is_noise_not_worse():
     """A 5/5, B 4/5: one run's flip. Was WORSE under policy/1 (any 0.01 drop); now NO_EFFECT."""
     v = V.decide(machine(("c1", 5, 5, 4)), judge(a=1, tie=4), jev("worse"), POLICY)
     assert v.verdict == "NO_EFFECT", v.reasons
-    assert "within-noise:c1 A 5/5 -> B 4/5" in v.reasons and "score-margin:2" in v.reasons
+    assert "within-noise:c1 A 5/5 -> B 4/5" in v.reasons and "total-delta:-1 margin 2" in v.reasons
 
 
 def test_one_flipped_run_is_noise_not_improves():
@@ -126,7 +126,57 @@ def test_judge_b_winrate_zero_with_equal_checks_is_not_worse():
 
 def test_judge_and_jev_cannot_rescue_a_worse_case():
     v = V.decide(machine(("c1", 5, 5, 2)), judge(b=5), jev("improves", 0.99), POLICY)
-    assert v.verdict == "WORSE" and v.reasons == ("regressed:c1 A 5/5 -> B 2/5", "score-margin:2")
+    assert v.verdict == "WORSE" and v.reasons == ("regressed:c1 A 5/5 -> B 2/5", "total-delta:-3 margin 2")
+
+
+# ---------------------------------------------------------------- multi-case plans: the margin is on the total
+
+
+def test_multi_case_plan_moves_on_the_total():
+    """worker-cases adds 2-3 cases per section, so 5 pairs split 2+2+1. A per-case margin of 2.0 could never move
+    the 1-pair case and needed a perfect swing on the 2-pair ones; the total keeps the same two runs' worth."""
+    plan = (("c1", 2, 0, 1), ("c2", 2, 1, 2), ("c3", 1, 0, 1))          # B +1 on each case: total +3
+    v = V.decide(machine(*plan), judge(b=3, tie=2), jev(), POLICY)
+    assert v.verdict == "IMPROVES", v.reasons
+    assert v.reasons[:4] == ("improved:c1 A 0/2 -> B 1/2", "improved:c2 A 1/2 -> B 2/2", "improved:c3 A 0/1 -> B 1/1",
+                             "total-delta:+3 margin 2")
+    # the better path still needs the judge and Jev
+    assert V.decide(machine(*plan), judge(a=3, tie=2), jev(), POLICY).verdict == "INCONCLUSIVE"
+    assert V.decide(machine(*plan), judge(b=3, tie=2), jev("no_effect"), POLICY).verdict == "INCONCLUSIVE"
+
+
+def test_multi_case_plan_inside_the_margin_is_equal_checks():
+    m = machine(("c1", 2, 0, 1), ("c2", 2, 1, 2), ("c3", 1, 1, 0))     # +1, +1, -1: total +1
+    v = V.decide(m, judge(b=2, tie=3), jev(), POLICY)
+    assert v.verdict == "NO_EFFECT", v.reasons
+    assert v.reasons == ("checks-equal, judge b_winrate 0.70", "within-noise:c1 A 0/2 -> B 1/2",
+                         "within-noise:c2 A 1/2 -> B 2/2", "within-noise:c3 A 1/1 -> B 0/1", "total-delta:+1 margin 2")
+    # and the mirror, total -1, is not WORSE
+    mirror = machine(("c1", 2, 1, 0), ("c2", 2, 2, 1), ("c3", 1, 0, 1))
+    assert V.decide(mirror, judge(b=2, tie=3), jev(), POLICY).verdict == "NO_EFFECT"
+
+
+def test_one_big_regression_blocks_even_when_the_total_improves():
+    m = machine(("c1", 2, 2, 0), ("c2", 2, 0, 2), ("c3", 2, 0, 2))     # -2, +2, +2: total +2
+    v = V.decide(m, judge(b=6), jev(), POLICY)
+    assert v.verdict == "WORSE" and v.reasons == ("regressed:c1 A 2/2 -> B 0/2", "total-delta:+2 margin 2")
+
+
+def test_small_regressions_add_up_to_worse():
+    m = machine(("c1", 2, 2, 1), ("c2", 2, 2, 1), ("c3", 1, 1, 1))     # -1, -1, 0: total -2
+    v = V.decide(m, judge(b=5), jev(), POLICY)
+    assert v.verdict == "WORSE" and v.reasons == ("regressed:c1 A 2/2 -> B 1/2", "regressed:c2 A 2/2 -> B 1/2",
+                                                  "total-delta:-2 margin 2")
+    # symmetric: small improvements add up to the better path
+    up = machine(("c1", 2, 1, 2), ("c2", 2, 1, 2), ("c3", 1, 1, 1))
+    assert V.decide(up, judge(b=3, tie=2), jev(), POLICY).verdict == "IMPROVES"
+
+
+def test_an_improving_total_reports_a_small_loss_as_noise():
+    m = machine(("c1", 2, 0, 2), ("c2", 2, 0, 2), ("c3", 1, 1, 0))     # +2, +2, -1: total +3
+    v = V.decide(m, judge(b=5), jev(), POLICY)
+    assert v.verdict == "IMPROVES"
+    assert "within-noise:c3 A 1/1 -> B 0/1" in v.reasons and "total-delta:+3 margin 2" in v.reasons
 
 
 # ---------------------------------------------------------------- scores

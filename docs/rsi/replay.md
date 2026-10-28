@@ -100,10 +100,12 @@ run passed: `check_score`, or `check_scenarios` passed/total, from the run recor
 before. A case's arm score (`a_score`, `b_score`) is the sum over its complete pairs: 0..5 with 5 pairs.
 `a_pass`/`b_pass` (runs that passed every scenario) stay in the record for reporting.
 
-**Noise margin, the same both ways.** A case moves only when the arm scores differ by at least
-`min_score_margin` (2.0). The margin is in summed score units, not a rate: two full runs' worth. So with 5 pairs,
-one flipped run is noise in both directions. A 5/5 → B 4/5 is not WORSE, and A 4/5 → B 5/5 is not IMPROVES.
-Partial credit counts: A 3.0 → B 5.0 moves.
+**Noise margin, the same both ways.** Each case has a delta, `b_score - a_score`. The checks move only when the
+total delta over all cases reaches `min_score_margin` (2.0), or when one case alone regresses by it. The margin
+is in summed score units, not a rate: two full runs' worth. So with 5 pairs, one flipped run is noise in both
+directions. A 5/5 → B 4/5 is not WORSE, and A 4/5 → B 5/5 is not IMPROVES. Partial credit counts: A 3.0 → B 5.0
+moves. The total lets a multi-case plan move: with 2+2+1 pairs, B +1 on every case (total +3) moves, while
++1, +1, −1 (total +1) does not. A per-case margin could never move a 1-pair case.
 
 In order:
 
@@ -112,11 +114,13 @@ In order:
 2. Both arms score 0 on every case → INCONCLUSIVE `harness-dead:<cases>`. The checks cannot tell the arms apart,
    so no judge preference or Jev reading may decide (policy key `harness_dead_inconclusive`, default true; the
    2026-10-26 codex replay had A 0/3, B 0/3 and Jev said `improves`). A run that passes some scenarios is alive.
-3. B scores at least the margin less on any case → WORSE (`regressed:`). No judge or Jev reading rescues it.
-4. B scores at least the margin more on a case → IMPROVES only when the blind judge's B win rate is at least
-   0.5 (ties count half; B wins where a skill-only change never fired count as ties) and Jev says `improves`
-   with confidence ≥ 0.5. Otherwise INCONCLUSIVE.
-5. Equal checks (every case inside the margin; `within-noise:` names the cases that differ) → NO_EFFECT. When
+3. Total delta ≤ −margin, or any one case's delta ≤ −margin → WORSE (`regressed:` per losing case, then
+   `total-delta:`). A big loss on one case is never averaged away: −2, +2, +2 is WORSE. No judge or Jev reading
+   rescues it.
+4. Total delta ≥ margin → IMPROVES (`improved:` per winning case, then `total-delta:`) only when the blind
+   judge's B win rate is at least 0.5 (ties count half; B wins where a skill-only change never fired count as
+   ties) and Jev says `improves` with confidence ≥ 0.5. Otherwise INCONCLUSIVE.
+5. Equal checks (total delta inside the margin; `within-noise:` names the cases that differ) → NO_EFFECT. When
    the judge strongly prefers one arm (B win rate ≤ 0.25 or ≥ 0.75) → INCONCLUSIVE `judge-only-preference`.
 
 The judge alone never decides: it can block an IMPROVES the checks found, but never turns equal checks into

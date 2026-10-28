@@ -106,7 +106,7 @@ def test_the_flips_now_read_as_noise_with_their_numbers():
     assert row["old_reasons"] == ["regressed:worker-final-report A 3/3 -> B 2/3"]
     v = new_verdict(row, RECORDED)
     assert v.reasons == ("checks-equal, judge b_winrate 0.50", "within-noise:worker-final-report A 3/3 -> B 2/3",
-                         "score-margin:2")
+                         "total-delta:-1 margin 2")
     row = next(r for r in ROWS if (r["experiment"], r["provider"]) == ("exp-20261027-7c731284", "claude"))
     assert row["old_reasons"] == ["checks-equal", "judge-prefers-baseline:b_winrate 0.00"]
     assert new_verdict(row, RECORDED).reasons == ("checks-equal", "judge-only-preference:b_winrate 0.00")

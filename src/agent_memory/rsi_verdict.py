@@ -10,9 +10,10 @@ ever decides the verdict, and the investigator cannot change the policy: it is r
 The machine layer counts scores, not just passes. A run's check score is in 0..1: the share of the case's
 scenarios it passed (`check_score`, or `check_scenarios` passed/total), or 1.0/0.0 from `check_passed` when the
 run record has neither (records before scenario scores). A case's arm score is the sum over its complete pairs, so
-5 pairs give a score in 0..5. A case moves only when the two arm scores differ by at least
-`policy.min_score_margin` (in summed score units, the same both ways). The policy/2 margin is 2.0: two full runs'
-worth, so one run that flips (A 5/5, B 4/5) is noise, not a regression and not an improvement.
+5 pairs give a score in 0..5. The checks move only when the total delta, the sum over cases of
+(b_score - a_score), reaches `policy.min_score_margin` (in summed score units, the same both ways), or when one
+case alone regresses by the margin. The policy/2 margin is 2.0: two full runs' worth, so one run that flips
+(A 5/5, B 4/5) is noise, not a regression and not an improvement. Totals let a multi-case plan (2+2+1 pairs) move.
 
 Decision order (the first rule that fires wins):
 
@@ -23,13 +24,14 @@ Decision order (the first rule that fires wins):
     4. Jev says the harness is broken (P >= jev_harness_max)      -> INCONCLUSIVE
        both arms score 0 on every case (policy.
        harness_dead_inconclusive)                                 -> INCONCLUSIVE harness-dead:<cases>
-    5. a_score - b_score >= min_score_margin on any case          -> WORSE   (a regression anywhere blocks;
+    5. total delta <= -min_score_margin, or any one case's
+       a_score - b_score >= min_score_margin                     -> WORSE   (a big regression anywhere blocks;
                                                                      no judge or Jev reading rescues it)
-    6. b_score - a_score >= min_score_margin on a case:
+    6. total delta >= min_score_margin:
          judge missing / incomplete / B win rate < judge_min     -> INCONCLUSIVE
          Jev missing / not "improves" / confidence < min         -> INCONCLUSIVE
          else                                                     -> IMPROVES
-    7. checks equal within the margin:
+    7. checks equal (total delta inside the margin):
          judge B win rate >= judge_strong or <= 1 - judge_strong -> INCONCLUSIVE judge-only-preference
          else                                                     -> NO_EFFECT
 
@@ -268,14 +270,16 @@ def decide(machine: ArmPair, judge: JudgeResult | None, jev: JevResult | None,
     """The verdict. Pure: the same inputs always give the same Verdict.
 
     The checks decide the direction, and only by a margin. Per case, delta = b_score - a_score (summed check
-    scores over the case's complete pairs). delta <= -min_score_margin on any case is WORSE, whatever the judge
-    or Jev say. delta >= min_score_margin (and no case worse) is IMPROVES only when the blind judge
-    (b_winrate >= judge_min_b_winrate) and Jev (`improves`, confidence >= jev_min_confidence) agree; otherwise
-    INCONCLUSIVE. Anything inside the margin counts as equal checks: NO_EFFECT, or INCONCLUSIVE
-    `judge-only-preference` when the judge strongly prefers either arm. The judge alone never yields WORSE or
-    IMPROVES. With policy/2 (5 pairs, margin 2.0) one flipped run is noise both ways: A 5/5 vs B 4/5 is
-    NO_EFFECT, and so is A 4/5 vs B 5/5. Partial scores count: A 3.0 vs B 5.0 moves. The full order is in the
-    module docstring."""
+    scores over the case's complete pairs); total = the sum of the case deltas. total <= -min_score_margin, or
+    any one case with delta <= -min_score_margin, is WORSE, whatever the judge or Jev say. total >=
+    min_score_margin (and no case worse by the margin) is IMPROVES only when the blind judge (b_winrate >=
+    judge_min_b_winrate) and Jev (`improves`, confidence >= jev_min_confidence) agree; otherwise INCONCLUSIVE.
+    A total inside the margin counts as equal checks: NO_EFFECT, or INCONCLUSIVE `judge-only-preference` when the
+    judge strongly prefers either arm. The judge alone never yields WORSE or IMPROVES. With policy/2 (5 pairs,
+    margin 2.0) one flipped run is noise both ways: A 5/5 vs B 4/5 is NO_EFFECT, and so is A 4/5 vs B 5/5.
+    Partial scores count: A 3.0 vs B 5.0 moves. A 2+2+1 plan with B +1 on every case (total +3) moves; +1, +1,
+    -1 (total +1) does not; -2 on one case with +2, +2 elsewhere is WORSE. The full order is in the module
+    docstring."""
     policy = policy or VerdictPolicy()
     inputs = _inputs(machine, judge, jev, policy)
 
@@ -305,17 +309,20 @@ def decide(machine: ArmPair, judge: JudgeResult | None, jev: JevResult | None,
     if policy.harness_dead_inconclusive and all(c.a_score == 0 and c.b_score == 0 for c in machine.cases):
         return out("INCONCLUSIVE", "harness-dead:" + ",".join(c.case for c in machine.cases))
 
+    # The margin applies to the total over all cases (a plan of 2+2+1 pairs can still move), and a single case
+    # that regresses by the margin blocks on its own, so a big loss on one case is never averaged away.
     margin = policy.min_score_margin
     delta = {c.case: round(c.b_score - c.a_score, 6) for c in machine.cases}
-    worse = [c for c in machine.cases if -delta[c.case] >= margin]
-    better = [c for c in machine.cases if delta[c.case] >= margin]
-    noise = [c for c in machine.cases if delta[c.case] and abs(delta[c.case]) < margin]
-    if worse:
-        return out("WORSE", *(f"regressed:{_moved(c)}" for c in worse), f"score-margin:{_score(margin)}")
+    total = round(sum(delta.values()), 6)
+    total_why = f"total-delta:{total:+g} margin {_score(margin)}"
+    up = [c for c in machine.cases if delta[c.case] > 0]
+    down = [c for c in machine.cases if delta[c.case] < 0]
+    if total <= -margin or any(-delta[c.case] >= margin for c in down):
+        return out("WORSE", *(f"regressed:{_moved(c)}" for c in down), total_why)
 
     wr = judge.b_winrate if judge else None
-    if better:
-        why = [f"improved:{_moved(c)}" for c in better] + [f"score-margin:{_score(margin)}"]
+    if total >= margin:
+        why = ([f"improved:{_moved(c)}" for c in up] + [f"within-noise:{_moved(c)}" for c in down] + [total_why])
         if policy.require_judge:
             if judge is None or judge.mode == "none" or not judge.judged:
                 return out("INCONCLUSIVE", *why, "judge-missing")
@@ -336,7 +343,8 @@ def decide(machine: ArmPair, judge: JudgeResult | None, jev: JevResult | None,
         return out("IMPROVES", *why, *tail)
 
     # Equal checks (inside the margin). The judge may make the result unclear, never WORSE or IMPROVES.
-    within = [f"within-noise:{_moved(c)}" for c in noise] + ([f"score-margin:{_score(margin)}"] if noise else [])
+    moved = [c for c in machine.cases if delta[c.case]]
+    within = [f"within-noise:{_moved(c)}" for c in moved] + ([total_why] if moved else [])
     # b_winrate <= 1 - judge_strong: the judge prefers the baseline; >= judge_strong: the candidate.
     if wr is not None and (wr <= 1 - policy.judge_strong_winrate or wr >= policy.judge_strong_winrate):
         return out("INCONCLUSIVE", "checks-equal", *within, f"judge-only-preference:b_winrate {wr:.2f}")
