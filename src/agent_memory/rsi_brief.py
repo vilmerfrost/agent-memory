@@ -588,6 +588,7 @@ def provider_summaries(value: Any) -> list[dict[str, Any]]:
                     "baseline_pass": arm_rate(arms, "A"), "candidate_pass": arm_rate(arms, "B"),
                     "baseline_checked": a.get("checked") if _count(a.get("checked")) else None,
                     "candidate_checked": b.get("checked") if _count(b.get("checked")) else None,
+                    "baseline_scenarios": arm_scenarios(arms, "A"), "candidate_scenarios": arm_scenarios(arms, "B"),
                     "judge": _small(p.get("judge"), JUDGE_FIELDS), "jev": _small(p.get("jev"), JEV_FIELDS)})
     return out
 
@@ -849,6 +850,16 @@ def arm_rate(arms: Any, arm: str) -> float | None:
     return None
 
 
+def arm_scenarios(arms: Any, arm: str) -> str | None:
+    """'score X of Y scenarios' from the arm's partial-credit totals (rsi_replay arms: scenarios_passed and
+    scenarios_total); None when the report has none (older reports, or no checked run)."""
+    a = _obj(_obj(arms).get(arm))
+    passed, total = a.get("scenarios_passed"), a.get("scenarios_total")
+    if _count(passed) and _count(total) and total > 0 and passed <= total:
+        return f"score {passed} of {total} scenarios"
+    return None
+
+
 HEADLINES = {
     "ok": "The night finished.",
     "partial": "The night finished in part: some stages did not complete (see Service health).",
@@ -932,6 +943,8 @@ def build_brief(rep: Mapping[str, Any], db: Db, *, artifacts_root: Path, report:
                     "verdict": e.get("verdict"), "status": e["status"], "cost_usd": e.get("cost_usd"),
                     "db_status": (db.experiments.get(e.get("experiment_id") or "") or {}).get("status"),
                     "baseline_pass": arm_rate(e.get("arms"), "A"), "candidate_pass": arm_rate(e.get("arms"), "B"),
+                    "baseline_scenarios": arm_scenarios(e.get("arms"), "A"),
+                    "candidate_scenarios": arm_scenarios(e.get("arms"), "B"),
                     "judge": _small(e.get("judge"), JUDGE_FIELDS), "jev": _small(e.get("jev"), JEV_FIELDS),
                     **({"provider_results": provider_summaries(e["provider_results"])}
                        if provider_summaries(e.get("provider_results")) else {})}
@@ -1243,14 +1256,20 @@ def render_markdown(b: dict[str, Any]) -> str:
                 for p in x["provider_results"]:
                     rate_a = f"{100 * p['baseline_pass']:.0f}%" if _num(p["baseline_pass"]) else "unknown"
                     rate_b = f"{100 * p['candidate_pass']:.0f}%" if _num(p["candidate_pass"]) else "unknown"
+                    sc_a = f", {p['baseline_scenarios']}" if p.get("baseline_scenarios") else ""
+                    sc_b = f", {p['candidate_scenarios']}" if p.get("candidate_scenarios") else ""
                     out.append(f"- {x['experiment_id']}, {p['provider']}: baseline pass {rate_a} "
-                               f"({_fmt(p['baseline_checked'])} checked), candidate pass {rate_b} "
-                               f"({_fmt(p['candidate_checked'])} checked); {p['verdict'] or 'verdict unknown'}; "
+                               f"({_fmt(p['baseline_checked'])} checked{sc_a}), candidate pass {rate_b} "
+                               f"({_fmt(p['candidate_checked'])} checked{sc_b}); {p['verdict'] or 'verdict unknown'}; "
                                f"{judgment_text(p['judge'], p['jev'])}. Providers are not pooled.")
             elif x["experiment_id"] and (x["judge"] or x["jev"]):
                 out.append(f"- {x['experiment_id']}: {judgment_text(x['judge'], x['jev'])}.")
             elif x["experiment_id"] and x["verdict"]:
                 out.append(f"- {x['experiment_id']}: judge and Jev results not in the report.")
+            if x["experiment_id"] and not x.get("provider_results") and (
+                    x.get("baseline_scenarios") or x.get("candidate_scenarios")):
+                out.append(f"- {x['experiment_id']}: baseline {x.get('baseline_scenarios') or 'score unknown'}, "
+                           f"candidate {x.get('candidate_scenarios') or 'score unknown'}.")
     else:
         out.append("- None ran: the night did not run." if sk else "- None ran.")
 

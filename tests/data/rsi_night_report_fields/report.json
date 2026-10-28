@@ -1,0 +1,1053 @@
+{
+ "blocked": {
+  "groups": {
+   "grades_loop": 0,
+   "hand_edited": 0,
+   "no_target": 0,
+   "outside_allowed": 0,
+   "pinned": 0
+  },
+  "refused_files": [],
+  "targets": [],
+  "total": 0
+ },
+ "budget": {
+  "max_ab_pairs": 60,
+  "max_experiments": 2,
+  "max_hypotheses": 2,
+  "max_sandbox_runs": 200,
+  "max_subscription_tokens": 0,
+  "max_usd": 0.0,
+  "model_calls": {
+   "codex": 2,
+   "jev-1.14.0": 25,
+   "opus": 2,
+   "sonnet": 2
+  },
+  "model_retries": 1,
+  "subscription_models": [],
+  "wall_clock_s": 5400.0
+ },
+ "candidates": [
+  {
+   "hypotheses_accepted": 2,
+   "hypotheses_rejected": [],
+   "id": "82888c3f-407d-4394-8d44-d18a50db1d30",
+   "key": "dev:claude-md:global:claude-md-global--closing-line",
+   "rank": 0.6945,
+   "reason": "selected: rank 0.695",
+   "selected": true,
+   "skip_reason": null,
+   "source": "deviations",
+   "target": "~/.claude/CLAUDE.md",
+   "test_cases": [
+    "docs-typo",
+    "fix-add",
+    "report-todos"
+   ],
+   "triage": {
+    "action": "experiment",
+    "explanation": "A replay can test a plausible improvement.",
+    "impact": 2.0,
+    "mode": "fixture",
+    "model": "jev-1.14.0",
+    "p_experiment": 0.91,
+    "reason": "worth_testing",
+    "risk": 0.0,
+    "testability": 2.0
+   }
+  },
+  {
+   "hypotheses_accepted": 2,
+   "hypotheses_rejected": [],
+   "id": "ba249a5b-ef0c-4bf6-8fa0-e2ed3863573e",
+   "key": "dev:claude-md:global:claude-md-global--explaining",
+   "rank": 0.3895,
+   "reason": "selected: rank 0.390",
+   "selected": true,
+   "skip_reason": null,
+   "source": "deviations",
+   "target": "~/.claude/CLAUDE.md",
+   "test_cases": [
+    "docs-typo",
+    "fix-add",
+    "report-todos"
+   ],
+   "triage": {
+    "action": "experiment",
+    "explanation": "A replay can test a plausible improvement.",
+    "impact": 1.0,
+    "mode": "fixture",
+    "model": "jev-1.14.0",
+    "p_experiment": 0.76,
+    "reason": "worth_testing",
+    "risk": 0.0,
+    "testability": 1.0
+   }
+  }
+ ],
+ "checkpoint": {
+  "advanced": true,
+  "after": "2026-10-28T21:53:30.430486+00:00",
+  "before": null
+ },
+ "connection_recovery": {
+  "checks": [],
+  "dependencies": [
+   {
+    "capability": "database, run lock and budget",
+    "failure_scope": "whole run",
+    "required_for": "durable safe execution"
+   },
+   {
+    "capability": "sandbox and configured evaluation providers",
+    "failure_scope": "dependent replay; required provider comparisons are never dropped",
+    "required_for": "valid paired replay"
+   },
+   {
+    "capability": "clickhouse, langfuse and pastdev reads",
+    "failure_scope": "affected evidence queries; independent work continues",
+    "required_for": "supporting evidence"
+   },
+   {
+    "capability": "verified candidate evidence",
+    "failure_scope": "candidate only",
+    "required_for": "hypothesis generation"
+   }
+  ],
+  "format": "rsi-connection-recovery/1",
+  "policy": {
+   "max_attempts": 3,
+   "retry_delay_s": 0.25,
+   "scope": "read-only evidence; shared provider deadline"
+  }
+ },
+ "costs": {
+  "accounting": {
+   "booked_usd": 0.0,
+   "calls_taken": {
+    "hypothesizer-fixture": 2,
+    "implementer-stub": 2,
+    "jev-fixture": 2
+   },
+   "cap_usd": 0.0,
+   "currency": "USD",
+   "experiment_cap": 2,
+   "experiments_taken": 2,
+   "format": "rsi-budget-decision/1",
+   "prices": {
+    "format": "rsi-prices/1",
+    "sha256": "9feb9d06389082475b4f79c485f810c2184652260210abec7a1ac92c70ce9d95",
+    "version": "2026-10-17"
+   },
+   "remaining_usd": 0.0,
+   "reserved_usd": 0.0,
+   "resource": null,
+   "sandbox_run_cap": 200,
+   "sandbox_runs_released": 90,
+   "sandbox_runs_taken": 60,
+   "scope": "all-recorded"
+  },
+  "budget_decisions": [],
+  "by_basis": {
+   "free": {
+    "kind": "free",
+    "records": 36,
+    "usd": 0.0
+   },
+   "none": {
+    "kind": "free",
+    "records": 30,
+    "usd": 0.0
+   }
+  },
+  "by_model": {
+   "hypothesizer-fixture": {
+    "calls": 2,
+    "tokens_in": 0,
+    "tokens_out": 0,
+    "usd": 0.0
+   },
+   "implementer-stub": {
+    "calls": 2,
+    "tokens_in": 0,
+    "tokens_out": 0,
+    "usd": 0.0
+   },
+   "jev-fixture": {
+    "calls": 2,
+    "tokens_in": 0,
+    "tokens_out": 0,
+    "usd": 0.0
+   }
+  },
+  "estimated_usd": 0,
+  "model_bases": {
+   "hypothesizer-fixture": {
+    "free": 0.0
+   },
+   "implementer-stub": {
+    "free": 0.0
+   },
+   "jev-fixture": {
+    "free": 0.0
+   },
+   "stub": {
+    "free": 0.0
+   }
+  },
+  "prices": {
+   "format": "rsi-prices/1",
+   "sha256": "9feb9d06389082475b4f79c485f810c2184652260210abec7a1ac92c70ce9d95",
+   "version": "2026-10-17"
+  },
+  "providers": {
+   "clickhouse": {
+    "requests": 2,
+    "usd": 0.0
+   },
+   "langfuse": {
+    "requests": 2,
+    "usd": 0.0
+   },
+   "pastdev": {
+    "requests": 2,
+    "usd": 0.0
+   }
+  },
+  "reported_usd": 0,
+  "sandbox_releases": {
+   "records": [
+    {
+     "first": "exp-20261028-f8d2569f-claude-A-r0-t1",
+     "last": "exp-20261028-f8d2569f-claude-A-r0-t3",
+     "reason": "subscription agent: unused tool containers",
+     "released_usd": 0.0,
+     "runs": 3,
+     "taken_after": 2
+    },
+    {
+     "first": "exp-20261028-f8d2569f-claude-A-r1-t1",
+     "last": "exp-20261028-f8d2569f-claude-A-r1-t3",
+     "reason": "subscription agent: unused tool containers",
+     "released_usd": 0.0,
+     "runs": 3,
+     "taken_after": 4
+    },
+    {
+     "first": "exp-20261028-f8d2569f-claude-A-r2-t1",
+     "last": "exp-20261028-f8d2569f-claude-A-r2-t3",
+     "reason": "subscription agent: unused tool containers",
+     "released_usd": 0.0,
+     "runs": 3,
+     "taken_after": 6
+    },
+    {
+     "first": "exp-20261028-f8d2569f-claude-A-r3-t1",
+     "last": "exp-20261028-f8d2569f-claude-A-r3-t3",
+     "reason": "subscription agent: unused tool containers",
+     "released_usd": 0.0,
+     "runs": 3,
+     "taken_after": 8
+    },
+    {
+     "first": "exp-20261028-f8d2569f-claude-A-r4-t1",
+     "last": "exp-20261028-f8d2569f-claude-A-r4-t3",
+     "reason": "subscription agent: unused tool containers",
+     "released_usd": 0.0,
+     "runs": 3,
+     "taken_after": 10
+    },
+    {
+     "first": "exp-20261028-f8d2569f-claude-B-r0-t1",
+     "last": "exp-20261028-f8d2569f-claude-B-r0-t3",
+     "reason": "subscription agent: unused tool containers",
+     "released_usd": 0.0,
+     "runs": 3,
+     "taken_after": 12
+    },
+    {
+     "first": "exp-20261028-f8d2569f-claude-B-r1-t1",
+     "last": "exp-20261028-f8d2569f-claude-B-r1-t3",
+     "reason": "subscription agent: unused tool containers",
+     "released_usd": 0.0,
+     "runs": 3,
+     "taken_after": 14
+    },
+    {
+     "first": "exp-20261028-f8d2569f-claude-B-r2-t1",
+     "last": "exp-20261028-f8d2569f-claude-B-r2-t3",
+     "reason": "subscription agent: unused tool containers",
+     "released_usd": 0.0,
+     "runs": 3,
+     "taken_after": 16
+    },
+    {
+     "first": "exp-20261028-f8d2569f-claude-B-r3-t1",
+     "last": "exp-20261028-f8d2569f-claude-B-r3-t3",
+     "reason": "subscription agent: unused tool containers",
+     "released_usd": 0.0,
+     "runs": 3,
+     "taken_after": 18
+    },
+    {
+     "first": "exp-20261028-f8d2569f-claude-B-r4-t1",
+     "last": "exp-20261028-f8d2569f-claude-B-r4-t3",
+     "reason": "subscription agent: unused tool containers",
+     "released_usd": 0.0,
+     "runs": 3,
+     "taken_after": 20
+    },
+    {
+     "first": "exp-20261028-9c951b2b-claude-A-r0-t1",
+     "last": "exp-20261028-9c951b2b-claude-A-r0-t3",
+     "reason": "subscription agent: unused tool containers",
+     "released_usd": 0.0,
+     "runs": 3,
+     "taken_after": 22
+    },
+    {
+     "first": "exp-20261028-9c951b2b-claude-A-r1-t1",
+     "last": "exp-20261028-9c951b2b-claude-A-r1-t3",
+     "reason": "subscription agent: unused tool containers",
+     "released_usd": 0.0,
+     "runs": 3,
+     "taken_after": 24
+    },
+    {
+     "first": "exp-20261028-9c951b2b-claude-A-r2-t1",
+     "last": "exp-20261028-9c951b2b-claude-A-r2-t3",
+     "reason": "subscription agent: unused tool containers",
+     "released_usd": 0.0,
+     "runs": 3,
+     "taken_after": 26
+    },
+    {
+     "first": "exp-20261028-9c951b2b-claude-A-r3-t1",
+     "last": "exp-20261028-9c951b2b-claude-A-r3-t3",
+     "reason": "subscription agent: unused tool containers",
+     "released_usd": 0.0,
+     "runs": 3,
+     "taken_after": 28
+    },
+    {
+     "first": "exp-20261028-9c951b2b-claude-A-r4-t1",
+     "last": "exp-20261028-9c951b2b-claude-A-r4-t3",
+     "reason": "subscription agent: unused tool containers",
+     "released_usd": 0.0,
+     "runs": 3,
+     "taken_after": 30
+    },
+    {
+     "first": "exp-20261028-9c951b2b-claude-B-r0-t1",
+     "last": "exp-20261028-9c951b2b-claude-B-r0-t3",
+     "reason": "subscription agent: unused tool containers",
+     "released_usd": 0.0,
+     "runs": 3,
+     "taken_after": 32
+    },
+    {
+     "first": "exp-20261028-9c951b2b-claude-B-r1-t1",
+     "last": "exp-20261028-9c951b2b-claude-B-r1-t3",
+     "reason": "subscription agent: unused tool containers",
+     "released_usd": 0.0,
+     "runs": 3,
+     "taken_after": 34
+    },
+    {
+     "first": "exp-20261028-9c951b2b-claude-B-r2-t1",
+     "last": "exp-20261028-9c951b2b-claude-B-r2-t3",
+     "reason": "subscription agent: unused tool containers",
+     "released_usd": 0.0,
+     "runs": 3,
+     "taken_after": 36
+    },
+    {
+     "first": "exp-20261028-9c951b2b-claude-B-r3-t1",
+     "last": "exp-20261028-9c951b2b-claude-B-r3-t3",
+     "reason": "subscription agent: unused tool containers",
+     "released_usd": 0.0,
+     "runs": 3,
+     "taken_after": 38
+    },
+    {
+     "first": "exp-20261028-9c951b2b-claude-B-r4-t1",
+     "last": "exp-20261028-9c951b2b-claude-B-r4-t3",
+     "reason": "subscription agent: unused tool containers",
+     "released_usd": 0.0,
+     "runs": 3,
+     "taken_after": 40
+    },
+    {
+     "first": "exp-20261028-9c951b2b-codex-A-r0-t1",
+     "last": "exp-20261028-9c951b2b-codex-A-r0-t3",
+     "reason": "subscription agent: unused tool containers",
+     "released_usd": 0.0,
+     "runs": 3,
+     "taken_after": 42
+    },
+    {
+     "first": "exp-20261028-9c951b2b-codex-A-r1-t1",
+     "last": "exp-20261028-9c951b2b-codex-A-r1-t3",
+     "reason": "subscription agent: unused tool containers",
+     "released_usd": 0.0,
+     "runs": 3,
+     "taken_after": 44
+    },
+    {
+     "first": "exp-20261028-9c951b2b-codex-A-r2-t1",
+     "last": "exp-20261028-9c951b2b-codex-A-r2-t3",
+     "reason": "subscription agent: unused tool containers",
+     "released_usd": 0.0,
+     "runs": 3,
+     "taken_after": 46
+    },
+    {
+     "first": "exp-20261028-9c951b2b-codex-A-r3-t1",
+     "last": "exp-20261028-9c951b2b-codex-A-r3-t3",
+     "reason": "subscription agent: unused tool containers",
+     "released_usd": 0.0,
+     "runs": 3,
+     "taken_after": 48
+    },
+    {
+     "first": "exp-20261028-9c951b2b-codex-A-r4-t1",
+     "last": "exp-20261028-9c951b2b-codex-A-r4-t3",
+     "reason": "subscription agent: unused tool containers",
+     "released_usd": 0.0,
+     "runs": 3,
+     "taken_after": 50
+    },
+    {
+     "first": "exp-20261028-9c951b2b-codex-B-r0-t1",
+     "last": "exp-20261028-9c951b2b-codex-B-r0-t3",
+     "reason": "subscription agent: unused tool containers",
+     "released_usd": 0.0,
+     "runs": 3,
+     "taken_after": 52
+    },
+    {
+     "first": "exp-20261028-9c951b2b-codex-B-r1-t1",
+     "last": "exp-20261028-9c951b2b-codex-B-r1-t3",
+     "reason": "subscription agent: unused tool containers",
+     "released_usd": 0.0,
+     "runs": 3,
+     "taken_after": 54
+    },
+    {
+     "first": "exp-20261028-9c951b2b-codex-B-r2-t1",
+     "last": "exp-20261028-9c951b2b-codex-B-r2-t3",
+     "reason": "subscription agent: unused tool containers",
+     "released_usd": 0.0,
+     "runs": 3,
+     "taken_after": 56
+    },
+    {
+     "first": "exp-20261028-9c951b2b-codex-B-r3-t1",
+     "last": "exp-20261028-9c951b2b-codex-B-r3-t3",
+     "reason": "subscription agent: unused tool containers",
+     "released_usd": 0.0,
+     "runs": 3,
+     "taken_after": 58
+    },
+    {
+     "first": "exp-20261028-9c951b2b-codex-B-r4-t1",
+     "last": "exp-20261028-9c951b2b-codex-B-r4-t3",
+     "reason": "subscription agent: unused tool containers",
+     "released_usd": 0.0,
+     "runs": 3,
+     "taken_after": 60
+    }
+   ],
+   "released_runs": 90,
+   "taken_runs": 60
+  },
+  "sandbox_runs": 60,
+  "sandbox_runs_released": 90,
+  "sandbox_runs_used": 60,
+  "total_usd": 0.0,
+  "total_usd_scope": "all-recorded"
+ },
+ "coverage": {
+  "analysis_version": "rsi-night/1 config 624fcce903bf",
+  "consumption": {
+   "analysis_not_run": 8,
+   "findings": 3,
+   "read_excluded": 2
+  },
+  "datasets": {
+   "deviations:deviations": "findings",
+   "evidence_links:clickhouse": "findings",
+   "evidence_links:langfuse": "analysis_not_run",
+   "evidence_links:pastdev": "findings",
+   "evidence_links:rsi_evidence": "analysis_not_run",
+   "evidence_links:supabase": "analysis_not_run",
+   "experiments:native-attempt-sessions": "read_excluded",
+   "experiments:replay-evidence": "read_excluded",
+   "experiments:rsi_eval_results": "analysis_not_run",
+   "experiments:rsi_experiments": "analysis_not_run",
+   "routine_runs:runs": "analysis_not_run",
+   "sessions:sessions": "analysis_not_run",
+   "skills:skill_scores": "analysis_not_run"
+  },
+  "enabled": true,
+  "failed": 0,
+  "job": "amem-rsi-night",
+  "required": [
+   "deviations:deviations",
+   "routine_runs:runs",
+   "experiments:rsi_eval_results",
+   "experiments:rsi_experiments",
+   "evidence_links:rsi_evidence",
+   "evidence_links:supabase",
+   "evidence_links:clickhouse",
+   "evidence_links:langfuse",
+   "evidence_links:pastdev",
+   "experiments:replay-evidence",
+   "experiments:native-attempt-sessions"
+  ],
+  "run_key": "2026-10-28",
+  "snapshots": {
+   "complete": 4,
+   "no_eligible_data": 6,
+   "not_collected": 2
+  }
+ },
+ "delta": {
+  "deviations": 5,
+  "eval_failures": 0,
+  "routine_failures": 0,
+  "sessions": 5,
+  "since": "2026-10-21T21:53:30.430486+00:00"
+ },
+ "experiments": [
+  {
+   "arms": {
+    "A": {
+     "check_pass_rate": 0.2,
+     "checked": 5,
+     "errors": 0,
+     "home": "baseline",
+     "runs": 5,
+     "scenarios_passed": 9,
+     "scenarios_total": 20,
+     "score_sum": 2.25,
+     "timeouts": 0
+    },
+    "B": {
+     "check_pass_rate": 0.6,
+     "checked": 5,
+     "errors": 0,
+     "home": "baseline + artifact a2e59740d54c",
+     "runs": 5,
+     "scenarios_passed": 18,
+     "scenarios_total": 20,
+     "score_sum": 4.5,
+     "timeouts": 0
+    }
+   },
+   "artifact_hash": "a2e59740d54ce564239f488950746d31b05641e0e0dac02fe00a8543a3062553",
+   "baseline_id": "bl-1af872dd4291",
+   "candidate_key": "dev:claude-md:global:claude-md-global--closing-line",
+   "confidence": 0.5,
+   "cost_usd": 0.0,
+   "evidence_measurements": [
+    {
+     "measurements": {
+      "rate": 0.3
+     },
+     "n": 12,
+     "ref": "ch:deviation-rate:2026-W42",
+     "source": "clickhouse",
+     "ts": null
+    }
+   ],
+   "evidence_refs": [
+    "amem:deviation/41c04001-e98e-463c-8ab0-9ed9ae0a9e19",
+    "amem:deviation/269b5e7a-0340-4ac1-a876-f00e3b740272",
+    "amem:deviation/d40940ab-daef-4bd8-8bd3-147f9c50aa47",
+    "ch:deviation-rate:2026-W42",
+    "pastdev:decision/17"
+   ],
+   "experiment_id": "exp-20261028-f8d2569f",
+   "hypothesis": {
+    "what": "Rewrite the rule claude-md:global:claude-md-global--closing-line as one short explicit checklist item",
+    "why": "Seen 1 time(s) across 3 session(s): agents keep missing the rule claude-md:global:claude-md-global--closing-line."
+   },
+   "implementation": {
+    "contract_verified": false,
+    "diff": null,
+    "intended_intervention": true,
+    "kind": null,
+    "new_sha256": "44038b004a84a18d975197831af9013a64a508790854cd2afc7ddbfccd3063ae",
+    "replay_verdict": "NO_EFFECT",
+    "section_from": null,
+    "section_id": null
+   },
+   "implementer": "stub",
+   "implementer_fallback_reason": null,
+   "jev": null,
+   "judge": null,
+   "judge_pairs": [],
+   "judge_prompt_version": "2",
+   "judge_rule": {
+    "heading": "Closing line",
+    "section_id": "closing-line",
+    "text": "## Closing line\n\n- End every non-trivial task with a section named Skills, Plugins or MCPs used.\n- List only integrations actually used. If none were used, write: None"
+   },
+   "proposal_id": null,
+   "provider_results": [
+    {
+     "arms": {
+      "A": {
+       "check_pass_rate": 0.2,
+       "checked": 5,
+       "errors": 0,
+       "home": "baseline",
+       "runs": 5,
+       "scenarios_passed": 9,
+       "scenarios_total": 20,
+       "score_sum": 2.25,
+       "timeouts": 0
+      },
+      "B": {
+       "check_pass_rate": 0.6,
+       "checked": 5,
+       "errors": 0,
+       "home": "baseline + artifact a2e59740d54c",
+       "runs": 5,
+       "scenarios_passed": 18,
+       "scenarios_total": 20,
+       "score_sum": 4.5,
+       "timeouts": 0
+      }
+     },
+     "eval_path": "/sandbox/artifacts/a2e59740d54ce564239f488950746d31b05641e0e0dac02fe00a8543a3062553/evals/sandbox-replay.json",
+     "jev": null,
+     "judge": null,
+     "judge_pairs": [],
+     "judge_prompt_version": "2",
+     "judge_rule": {
+      "heading": "Closing line",
+      "section_id": "closing-line",
+      "text": "## Closing line\n\n- End every non-trivial task with a section named Skills, Plugins or MCPs used.\n- List only integrations actually used. If none were used, write: None"
+     },
+     "provider": "claude",
+     "reasons": [
+      "claude: fake replay"
+     ],
+     "relevance": {},
+     "sandbox_reservations_released": 30,
+     "test_setup": {
+      "agent": "claude",
+      "tasks": [
+       {
+        "id": "worker-final-report",
+        "title": "Write the worker's final report"
+       }
+      ]
+     },
+     "verdict": "NO_EFFECT"
+    }
+   ],
+   "relevance": {},
+   "replay_runs": 10,
+   "risk": "low",
+   "status": "not_promotable",
+   "target": "~/.claude/CLAUDE.md",
+   "test_setup": {},
+   "unlinked_refs": [],
+   "verdict": "NO_EFFECT",
+   "verdict_reasons": [
+    "fake replay: NO_EFFECT"
+   ]
+  },
+  {
+   "arms": {
+    "A": {},
+    "B": {}
+   },
+   "artifact_hash": null,
+   "baseline_id": null,
+   "budget_decision": {
+    "booked_usd": 0.0,
+    "calls_taken": {
+     "hypothesizer-fixture": 1,
+     "implementer-stub": 1,
+     "jev-fixture": 2
+    },
+    "cap_usd": 0.0,
+    "currency": "USD",
+    "decision": "deferred",
+    "detail": "",
+    "experiment_cap": 2,
+    "experiments_taken": 1,
+    "format": "rsi-budget-decision/1",
+    "policy": "one_experiment_per_candidate",
+    "prices": {
+     "format": "rsi-prices/1",
+     "sha256": "9feb9d06389082475b4f79c485f810c2184652260210abec7a1ac92c70ce9d95",
+     "version": "2026-10-17"
+    },
+    "remaining_usd": 0.0,
+    "reserved_usd": 0.0,
+    "resource": null,
+    "sandbox_run_cap": 200,
+    "sandbox_runs_released": 30,
+    "sandbox_runs_taken": 20,
+    "scope": "all-recorded"
+   },
+   "candidate_key": "dev:claude-md:global:claude-md-global--closing-line",
+   "confidence": 0.4,
+   "cost_usd": 0.0,
+   "evidence_measurements": [
+    {
+     "measurements": {
+      "rate": 0.3
+     },
+     "n": 12,
+     "ref": "ch:deviation-rate:2026-W42",
+     "source": "clickhouse",
+     "ts": null
+    }
+   ],
+   "evidence_refs": [
+    "amem:deviation/41c04001-e98e-463c-8ab0-9ed9ae0a9e19",
+    "amem:deviation/269b5e7a-0340-4ac1-a876-f00e3b740272",
+    "amem:deviation/d40940ab-daef-4bd8-8bd3-147f9c50aa47",
+    "ch:deviation-rate:2026-W42",
+    "pastdev:decision/17"
+   ],
+   "experiment_id": null,
+   "hypothesis": {
+    "what": "Move the rule claude-md:global:claude-md-global--closing-line to the top of its section with a one-line reason",
+    "why": "Seen 1 time(s) across 3 session(s): agents keep missing the rule claude-md:global:claude-md-global--closing-line."
+   },
+   "jev": null,
+   "judge": null,
+   "proposal_id": null,
+   "risk": "low",
+   "skip_reason": "one_experiment_per_candidate",
+   "status": "deferred_policy",
+   "target": "~/.claude/CLAUDE.md",
+   "unlinked_refs": [],
+   "verdict": null,
+   "verdict_reasons": [
+    "one_experiment_per_candidate"
+   ]
+  },
+  {
+   "arms": {
+    "A": {
+     "scenarios_passed": null,
+     "scenarios_total": null,
+     "score_sum": null
+    },
+    "B": {
+     "scenarios_passed": null,
+     "scenarios_total": null,
+     "score_sum": null
+    }
+   },
+   "artifact_hash": "133821a1d3ad6096639b9975c78cbe125bb64d685402290bd02657ed83ae2ae0",
+   "baseline_id": "bl-1af872dd4291",
+   "candidate_key": "dev:claude-md:global:claude-md-global--explaining",
+   "confidence": 0.5,
+   "cost_usd": 0.0,
+   "evidence_measurements": [
+    {
+     "measurements": {
+      "rate": 0.3
+     },
+     "n": 12,
+     "ref": "ch:deviation-rate:2026-W42",
+     "source": "clickhouse",
+     "ts": null
+    }
+   ],
+   "evidence_refs": [
+    "amem:deviation/750a3356-a3ae-4a75-8b2d-75a780471edf",
+    "amem:deviation/67c3f9a2-3724-43e6-a1c5-9484815424ec",
+    "ch:deviation-rate:2026-W42",
+    "pastdev:decision/17"
+   ],
+   "experiment_id": "exp-20261028-9c951b2b",
+   "hypothesis": {
+    "what": "Rewrite the rule claude-md:global:claude-md-global--explaining as one short explicit checklist item",
+    "why": "Seen 1 time(s) across 2 session(s): agents keep missing the rule claude-md:global:claude-md-global--explaining."
+   },
+   "implementation": {
+    "contract_verified": false,
+    "diff": null,
+    "intended_intervention": true,
+    "kind": null,
+    "new_sha256": "7012131c3307a4b7445ad081c07f725816e95da9649a2ef98e94585428d2a643",
+    "replay_verdict": "NO_EFFECT",
+    "section_from": null,
+    "section_id": null
+   },
+   "implementer": "stub",
+   "implementer_fallback_reason": null,
+   "jev": null,
+   "judge": null,
+   "judge_pairs": [],
+   "judge_prompt_version": "2",
+   "judge_rule": {
+    "heading": "Closing line",
+    "section_id": "closing-line",
+    "text": "## Closing line\n\n- End every non-trivial task with a section named Skills, Plugins or MCPs used.\n- List only integrations actually used. If none were used, write: None"
+   },
+   "proposal_id": null,
+   "provider_results": [
+    {
+     "arms": {
+      "A": {
+       "check_pass_rate": 0.2,
+       "checked": 5,
+       "errors": 0,
+       "home": "baseline",
+       "runs": 5,
+       "scenarios_passed": 9,
+       "scenarios_total": 20,
+       "score_sum": 2.25,
+       "timeouts": 0
+      },
+      "B": {
+       "check_pass_rate": 0.6,
+       "checked": 5,
+       "errors": 0,
+       "home": "baseline + artifact 133821a1d3ad",
+       "runs": 5,
+       "scenarios_passed": 18,
+       "scenarios_total": 20,
+       "score_sum": 4.5,
+       "timeouts": 0
+      }
+     },
+     "eval_path": "/sandbox/artifacts/133821a1d3ad6096639b9975c78cbe125bb64d685402290bd02657ed83ae2ae0/evals/sandbox-replay.json",
+     "jev": null,
+     "judge": null,
+     "judge_pairs": [],
+     "judge_prompt_version": "2",
+     "judge_rule": {
+      "heading": "Closing line",
+      "section_id": "closing-line",
+      "text": "## Closing line\n\n- End every non-trivial task with a section named Skills, Plugins or MCPs used.\n- List only integrations actually used. If none were used, write: None"
+     },
+     "provider": "claude",
+     "reasons": [
+      "claude: fake replay"
+     ],
+     "relevance": {},
+     "sandbox_reservations_released": 30,
+     "test_setup": {
+      "agent": "claude",
+      "tasks": [
+       {
+        "id": "worker-final-report",
+        "title": "Write the worker's final report"
+       }
+      ]
+     },
+     "verdict": "NO_EFFECT"
+    },
+    {
+     "arms": {
+      "A": {
+       "check_pass_rate": 0.6,
+       "checked": 5,
+       "errors": 0,
+       "home": "baseline",
+       "runs": 5,
+       "scenarios_passed": 12,
+       "scenarios_total": 15,
+       "score_sum": 4.0,
+       "timeouts": 0
+      },
+      "B": {
+       "check_pass_rate": 0.8,
+       "checked": 5,
+       "errors": 0,
+       "home": "baseline + artifact 133821a1d3ad",
+       "runs": 5,
+       "scenarios_passed": 14,
+       "scenarios_total": 15,
+       "score_sum": 4.667,
+       "timeouts": 0
+      }
+     },
+     "eval_path": "/sandbox/artifacts/133821a1d3ad6096639b9975c78cbe125bb64d685402290bd02657ed83ae2ae0/evals/sandbox-replay.json",
+     "jev": null,
+     "judge": null,
+     "judge_pairs": [],
+     "judge_prompt_version": "2",
+     "judge_rule": {
+      "heading": "Closing line",
+      "section_id": "closing-line",
+      "text": "## Closing line\n\n- End every non-trivial task with a section named Skills, Plugins or MCPs used.\n- List only integrations actually used. If none were used, write: None"
+     },
+     "provider": "codex",
+     "reasons": [
+      "codex: fake replay"
+     ],
+     "relevance": {},
+     "sandbox_reservations_released": 30,
+     "test_setup": {
+      "agent": "codex",
+      "tasks": [
+       {
+        "id": "worker-final-report",
+        "title": "Write the worker's final report"
+       }
+      ]
+     },
+     "verdict": "NO_EFFECT"
+    }
+   ],
+   "relevance": {},
+   "replay_runs": 20,
+   "risk": "low",
+   "status": "not_promotable",
+   "target": "~/.claude/CLAUDE.md",
+   "test_setup": {},
+   "unlinked_refs": [],
+   "verdict": "NO_EFFECT",
+   "verdict_reasons": [
+    "fake replay: NO_EFFECT"
+   ]
+  },
+  {
+   "arms": {
+    "A": {},
+    "B": {}
+   },
+   "artifact_hash": null,
+   "baseline_id": null,
+   "budget_decision": {
+    "booked_usd": 0.0,
+    "calls_taken": {
+     "hypothesizer-fixture": 2,
+     "implementer-stub": 2,
+     "jev-fixture": 2
+    },
+    "cap_usd": 0.0,
+    "currency": "USD",
+    "decision": "deferred",
+    "detail": "",
+    "experiment_cap": 2,
+    "experiments_taken": 2,
+    "format": "rsi-budget-decision/1",
+    "policy": "one_experiment_per_candidate",
+    "prices": {
+     "format": "rsi-prices/1",
+     "sha256": "9feb9d06389082475b4f79c485f810c2184652260210abec7a1ac92c70ce9d95",
+     "version": "2026-10-17"
+    },
+    "remaining_usd": 0.0,
+    "reserved_usd": 0.0,
+    "resource": null,
+    "sandbox_run_cap": 200,
+    "sandbox_runs_released": 90,
+    "sandbox_runs_taken": 60,
+    "scope": "all-recorded"
+   },
+   "candidate_key": "dev:claude-md:global:claude-md-global--explaining",
+   "confidence": 0.4,
+   "cost_usd": 0.0,
+   "evidence_measurements": [
+    {
+     "measurements": {
+      "rate": 0.3
+     },
+     "n": 12,
+     "ref": "ch:deviation-rate:2026-W42",
+     "source": "clickhouse",
+     "ts": null
+    }
+   ],
+   "evidence_refs": [
+    "amem:deviation/750a3356-a3ae-4a75-8b2d-75a780471edf",
+    "amem:deviation/67c3f9a2-3724-43e6-a1c5-9484815424ec",
+    "ch:deviation-rate:2026-W42",
+    "pastdev:decision/17"
+   ],
+   "experiment_id": null,
+   "hypothesis": {
+    "what": "Move the rule claude-md:global:claude-md-global--explaining to the top of its section with a one-line reason",
+    "why": "Seen 1 time(s) across 2 session(s): agents keep missing the rule claude-md:global:claude-md-global--explaining."
+   },
+   "jev": null,
+   "judge": null,
+   "proposal_id": null,
+   "risk": "low",
+   "skip_reason": "one_experiment_per_candidate",
+   "status": "deferred_policy",
+   "target": "~/.claude/CLAUDE.md",
+   "unlinked_refs": [],
+   "verdict": null,
+   "verdict_reasons": [
+    "one_experiment_per_candidate"
+   ]
+  }
+ ],
+ "finished_at": "2026-10-28T21:53:30+00:00",
+ "format": "rsi-night/1",
+ "health": {
+  "clickhouse": "ok",
+  "jev": "fixture",
+  "langfuse": "ok",
+  "pastdev": "ok",
+  "sandbox": "ok",
+  "supabase": "ok"
+ },
+ "night": "2026-10-28",
+ "notes": [],
+ "patterns": [
+  {
+   "blocked": null,
+   "key": "dev:claude-md:global:claude-md-global--closing-line",
+   "n": 3,
+   "refs": [
+    "amem:deviation/41c04001-e98e-463c-8ab0-9ed9ae0a9e19",
+    "amem:deviation/269b5e7a-0340-4ac1-a876-f00e3b740272",
+    "amem:deviation/d40940ab-daef-4bd8-8bd3-147f9c50aa47"
+   ],
+   "sessions": 3,
+   "summary": "claude-md:global / Closing line: 3 deviations in 3 sessions (3 new)",
+   "target": "~/.claude/CLAUDE.md"
+  },
+  {
+   "blocked": null,
+   "key": "dev:claude-md:global:claude-md-global--explaining",
+   "n": 2,
+   "refs": [
+    "amem:deviation/750a3356-a3ae-4a75-8b2d-75a780471edf",
+    "amem:deviation/67c3f9a2-3724-43e6-a1c5-9484815424ec"
+   ],
+   "sessions": 2,
+   "summary": "claude-md:global / Explaining: 2 deviations in 2 sessions (2 new)",
+   "target": "~/.claude/CLAUDE.md"
+  }
+ ],
+ "pending_decisions": [],
+ "prerequisites": {
+  "skill_refresh": {
+   "decision": "skip_skill_candidates",
+   "max_lag_h": 2.0,
+   "mode": "report",
+   "night_window_end": "2026-10-28T21:53:30+00:00",
+   "reason": "no skill refresh is recorded",
+   "required_end": "2026-10-28T19:53:30+00:00",
+   "run": null,
+   "run_status": null,
+   "skipped_candidates": 0,
+   "skipped_keys": [],
+   "source": "db",
+   "status": "missing",
+   "window_end": null,
+   "window_start": null
+  }
+ },
+ "started_at": "2026-10-28T21:53:30+00:00",
+ "status": "ok"
+}
