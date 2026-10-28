@@ -18,6 +18,11 @@ def required_providers(files):
 
 
 def combined_verdict(outcomes):
+    """One verdict from each required provider's own verdict; scores are never pooled across providers.
+
+    Any INCONCLUSIVE (or unknown) -> INCONCLUSIVE; else any WORSE -> WORSE; IMPROVES only when every provider
+    IMPROVES; else NO_EFFECT. A provider's WORSE already needs rsi_verdict's score margin (policy/2: 2.0 over
+    5 pairs), so one flipped run on one provider no longer sinks the change."""
     verdicts = [r.verdict for r in outcomes]
     if not verdicts or any(v == "INCONCLUSIVE" or v not in ("IMPROVES", "NO_EFFECT", "WORSE") for v in verdicts):
         return "INCONCLUSIVE"

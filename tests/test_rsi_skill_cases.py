@@ -208,6 +208,10 @@ def test_subscription_profile_replays_the_skill_case_for_both_providers(tmp_path
 
 # ---------------------------------------------------------------- stub replay: exposure in both arms
 
+# Stub-size policy: this deterministic stub replay runs 3 pairs (max_pairs=3), below the shipped policy/2
+# minimum of 5; the shipped score margin (2.0) is kept.
+STUB_POLICY = V.VerdictPolicy(require_jev=False, min_pairs=3)
+
 
 @pytest.mark.parametrize("cid", sorted(SKILLS))
 def test_stub_replay_shows_skill_exposure_in_both_arms(cid, tmp_path, monkeypatch):
@@ -217,7 +221,7 @@ def test_stub_replay_shows_skill_exposure_in_both_arms(cid, tmp_path, monkeypatc
     assert [c.id for c in cases] == [cid] and reps == 3
     sb = HostSandbox(root)
     res = R.run_replay(h, cases, R.ReplayConfig(reps=reps, jev="none"), root=root, experiment_id=EXP, sandbox=sb,
-                       policy=V.VerdictPolicy(require_jev=False))
+                       policy=STUB_POLICY)
     rel = res.relevance
     assert rel["eligible_cases"] == {cid: [target(cid)]} and rel["uncovered_targets"] == []
     assert len(rel["pairs"]) == 3

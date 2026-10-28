@@ -9,6 +9,7 @@ codex arm failed every check in both arms (A 0/3, B 0/3) and Jev still said impr
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 from collections.abc import Iterator
@@ -134,26 +135,29 @@ def _machine(*cases: tuple[str, int, int, int]) -> V.ArmPair:
 
 
 CODEX_1026 = _machine(("meltdown-brief", 3, 0, 0))
+# The recorded nights ran 3 pairs (policy/1 min_pairs). The shipped policy/2 asks for 5; these tests replay the
+# recorded inputs through the shipped rules with only the pair minimum the night had.
+RECORDED = dataclasses.replace(V.load_policy(), min_pairs=3)
 JUDGE_1026 = V.JudgeResult(mode="codex", judged=3, wins_a=0, wins_b=2, ties=1)
 JEV_1026 = V.JevResult(mode="live", status="ok", effect="improves", confidence=0.71, harness_problem=0.22,
                        evidence_strength=0.64)
 
 
 def test_both_arms_failing_every_check_is_harness_dead() -> None:
-    policy = V.load_policy()
+    policy = RECORDED
     assert policy.harness_dead_inconclusive is True
     v = V.decide(CODEX_1026, JUDGE_1026, JEV_1026, policy)
     assert v.verdict == "INCONCLUSIVE" and v.reasons == ("harness-dead:meltdown-brief",)
     two = _machine(("meltdown-brief", 3, 0, 0), ("pepe-lock", 3, 0, 0))
     assert V.decide(two, JUDGE_1026, JEV_1026, policy).reasons == ("harness-dead:meltdown-brief,pepe-lock",)
     # Before the rule, the judge's preference alone decided (b_winrate 0.83 >= 0.75: judge-only-preference).
-    off = V.VerdictPolicy(harness_dead_inconclusive=False)
+    off = dataclasses.replace(RECORDED, harness_dead_inconclusive=False)
     assert V.decide(CODEX_1026, JUDGE_1026, JEV_1026, off).reasons == (
         "checks-equal", "judge-only-preference:b_winrate 0.83")
 
 
 def test_mixed_cases_keep_their_verdicts() -> None:
-    policy = V.load_policy()
+    policy = RECORDED
     # claude 2026-10-26: both arms pass everything -> NO_EFFECT, as before
     claude = _machine(("meltdown-brief", 3, 3, 3))
     judge = V.JudgeResult(mode="codex", judged=3, wins_a=1, wins_b=2)
@@ -267,7 +271,7 @@ def test_codex_1026_fixture_reads_through_to_harness_dead() -> None:
     res = R.run_jev(st, "fixture")
     assert (res.status, res.effect, res.harness_problem) == ("ok", "improves", pytest.approx(0.22))
     assert res.model == "jev-1.14.0" and res.tokens_in == 0
-    v = V.decide(CODEX_1026, JUDGE_1026, res, V.load_policy())
+    v = V.decide(CODEX_1026, JUDGE_1026, res, RECORDED)
     assert v.verdict == "INCONCLUSIVE" and v.reasons == ("harness-dead:meltdown-brief",)
     assert v.inputs["jev"]["model"] == "jev-1.14.0"
 
