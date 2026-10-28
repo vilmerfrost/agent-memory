@@ -94,7 +94,16 @@ def select(manifest: Mapping[str, Any], cases: Sequence[Any]) -> dict[str, Any]:
     targets = {f["path"]: f["kind"] for f in manifest.get("files", [])}
     eligible = {}
     for case in cases:
-        matching = [t["path"] for t in case.targets if targets.get(t["path"]) == t["kind"]]
+        matching = []
+        for t in case.targets:
+            if targets.get(t["path"]) != t["kind"]:
+                continue
+            file = next(f for f in manifest.get("files", []) if f["path"] == t["path"])
+            rule = file.get("rule_id", "")
+            if isinstance(rule, str) and rule.startswith("rsi-section-"):
+                if not any(rule == "rsi-section-" + sid.replace("/", "--") for sid in t.get("sections", [])):
+                    continue
+            matching.append(t["path"])
         if matching:
             eligible[case.id] = sorted(set(matching))
     covered = {p for paths in eligible.values() for p in paths}
