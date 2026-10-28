@@ -41,8 +41,21 @@ def grade(cid, tmp_path, mutate=None):
     return subprocess.run(["bash", "-c", case.check], cwd=work, env=env, capture_output=True, text=True, timeout=30)
 
 
+def scenario_report(result):
+    """The worker-checks contract: the LAST stdout line is `RSI-SCENARIOS {passed, total, scenarios}`."""
+    last = result.stdout.strip().splitlines()[-1]
+    assert last.startswith("RSI-SCENARIOS "), result.stdout
+    body = json.loads(last[len("RSI-SCENARIOS "):])
+    rows = body["scenarios"]
+    assert body["total"] == len(rows) >= 1 and body["passed"] == sum(r["passed"] for r in rows)
+    assert len({r["id"] for r in rows}) == len(rows)
+    if body["passed"] < body["total"]:
+        assert result.returncode != 0          # a wrong scenario never exits 0
+    return rows
+
+
 def lines(result):
-    return [json.loads(x[len("SCENARIO "):]) for x in result.stdout.splitlines() if x.startswith("SCENARIO ")]
+    return scenario_report(result)
 
 
 def edit(scenario, **changes):
@@ -89,10 +102,9 @@ def test_stub_writes_the_known_good_answer(cid):
 @pytest.mark.parametrize("cid", sorted(CASES))
 def test_known_good_output_passes_with_one_machine_line_per_scenario(cid, tmp_path):
     result = grade(cid, tmp_path)
-    assert result.returncode == 0 and result.stdout.strip().splitlines()[-1] == "ok", result.stderr
+    assert result.returncode == 0 and result.stdout.strip().splitlines()[-2] == "ok", result.stderr
     rows = lines(result)
-    assert len(rows) == CASES[cid][2] and all(r["pass"] and r["case"] == cid for r in rows)
-    assert len({r["scenario"] for r in rows}) == len(rows)
+    assert len(rows) == CASES[cid][2] and all(r["passed"] for r in rows)
 
 
 def reorder_and_restyle(work):
@@ -178,7 +190,7 @@ BAD = [
 def test_known_bad_output_fails_on_exactly_that_scenario(cid, scenario, kind, mutate, tmp_path):
     result = grade(cid, tmp_path, mutate)
     assert result.returncode != 0 and "section-decisions:" in result.stderr
-    failed = [r["scenario"] for r in lines(result) if not r["pass"]]
+    failed = [r["id"] for r in lines(result) if not r["passed"]]
     assert failed == [scenario], (kind, result.stdout)
 
 
@@ -221,6 +233,10 @@ def no_result(work):
 def test_missing_invented_or_tampered_output_fails(cid, mutate, tmp_path):
     result = grade(cid, tmp_path, mutate)
     assert result.returncode != 0 and "section-decisions:" in result.stderr
+    rows = scenario_report(result)            # the machine line is still printed, never upgraded
+    assert len(rows) == CASES[cid][2]
+    if mutate in (no_result, drop_row, duplicate_row):
+        assert sum(not r["passed"] for r in rows) == (len(rows) if mutate is no_result else 1)
 
 
 def test_only_scenarios_that_are_wrong_fail(tmp_path):
@@ -228,7 +244,7 @@ def test_only_scenarios_that_are_wrong_fail(tmp_path):
         edit("api-tests-only", status="DONE", gaps=[])(work)
         edit("ui-full", status="PARTIAL")(work)
     result = grade("worker-dod-gaps", tmp_path, two_wrong)
-    verdicts = {r["scenario"]: r["pass"] for r in lines(result)}
+    verdicts = {r["id"]: r["passed"] for r in lines(result)}
     assert result.returncode != 0 and sum(not v for v in verdicts.values()) == 2
     assert not verdicts["api-tests-only"] and not verdicts["ui-full"] and verdicts["api-full"]
 

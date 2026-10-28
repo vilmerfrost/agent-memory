@@ -6,7 +6,9 @@ action, gaps, commands, commits) and lenient on form: extra keys, row order, gap
 backticks around a command and the letter case of enum values do not matter. Extra output files are allowed;
 changed or deleted inputs are not.
 
-One machine line per scenario (see `emit`), then `ok` only when every scenario passes. Exit 0 only then.
+Every scenario is graded (no early exit inside the loop). `ok` is printed only when all pass; the last stdout
+line is always the shared `RSI-SCENARIOS {...}` machine line (see `scenario_line`). Exit 0 only when every
+scenario and every global check (no invented scenarios, inputs unchanged) passes.
 """
 import json
 import os
@@ -65,17 +67,24 @@ EXPECTED = {
 ENUMS = {"status", "action", "next", "helper_id_from", "mode"}
 
 
-def emit(case, scenario, passed, reason):
-    """The per-scenario machine line. One helper so the format can follow the shared contract."""
-    print("SCENARIO " + json.dumps({"case": case, "scenario": scenario, "pass": bool(passed),
-                                    "reason": reason[:120]}, sort_keys=True))
+GRADED = []   # (scenario id, passed, reason), in expected order
+
+
+def scenario_line():
+    """The shared per-scenario machine line (worker-checks contract): the LAST stdout line, printed once."""
+    rows = [{"id": sid, "passed": bool(ok), "reason": reason[:200]} for sid, ok, reason in GRADED]
+    print("RSI-SCENARIOS " + json.dumps({"passed": sum(r["passed"] for r in rows), "total": len(rows),
+                                         "scenarios": rows}, sort_keys=True), flush=True)
 
 
 def fail(message):
+    if GRADED:
+        scenario_line()
     sys.exit("section-decisions: " + message)
 
 
-def load(path):
+def parse(path):
+    """Strict JSON: duplicate keys and NaN/Infinity are not valid report evidence."""
     def pairs(items):
         out = {}
         for key, value in items:
@@ -86,8 +95,12 @@ def load(path):
 
     def invalid(value):
         raise ValueError("non-finite JSON number")
+    return json.loads(path.read_text(), object_pairs_hook=pairs, parse_constant=invalid)
+
+
+def load(path):
     try:
-        return json.loads(path.read_text(), object_pairs_hook=pairs, parse_constant=invalid)
+        return parse(path)
     except (OSError, ValueError) as exc:
         fail(f"missing or invalid {path.name}: {exc}")
 
@@ -129,27 +142,37 @@ cid = load(fixture / "scenarios.json").get("case")
 if cid not in EXPECTED:
     fail("unknown case")
 expected = EXPECTED[cid]
-got = load(Path("result.json"))
+
+
+def unreadable(message):
+    GRADED.extend((sid, False, message) for sid in expected)
+    fail(cid + ": " + message)
+
+
+try:
+    got = parse(Path("result.json"))
+except (OSError, ValueError) as exc:
+    unreadable(f"missing or invalid result.json: {exc}"[:200])
 if not isinstance(got, dict) or not isinstance(got.get("scenarios"), list):
-    fail(cid + ": expected an object with a scenarios array")
+    unreadable("expected an object with a scenarios array")
 rows = got["scenarios"]
 if not all(isinstance(r, dict) and isinstance(r.get("id"), str) for r in rows):
-    fail(cid + ": invalid scenario row")
-by_id = {}
+    unreadable("invalid scenario row")
+by_id, duplicated = {}, set()
 for r in rows:
     if r["id"] in by_id:
-        fail(cid + ": duplicate scenario " + r["id"])
+        duplicated.add(r["id"])
     by_id[r["id"]] = r
 extra = sorted(set(by_id) - set(expected))
 failed = 0
 for sid, want in expected.items():
     row = by_id.get(sid)
-    if row is None:
-        emit(cid, sid, False, "scenario missing")
+    if row is None or sid in duplicated:
+        GRADED.append((sid, False, "scenario missing" if row is None else "duplicate rows"))
         failed += 1
         continue
     wrong = [k for k in want if k not in row or not same(k, want[k], row[k])]
-    emit(cid, sid, not wrong, "wrong " + ",".join(wrong) if wrong else "decision and evidence match")
+    GRADED.append((sid, not wrong, "wrong " + ",".join(wrong) if wrong else "decision and evidence match"))
     failed += bool(wrong)
 if extra:
     fail(cid + ": invented scenarios " + ",".join(extra))
@@ -161,3 +184,4 @@ for p in fixture.rglob("*"):
 if failed:
     fail(f"{cid}: {failed} of {len(expected)} scenarios wrong")
 print("ok")
+scenario_line()
