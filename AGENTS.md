@@ -1,6 +1,7 @@
 # Testing and visible progress
 
 - Read `~/.claude/parent/agent-memory/profile.md` when using the local parent workflow. It owns the integration test command.
+- If `parent-run` refuses a test command (for example, setup not verified), list it under `Denied:` in your report and keep working on other parts. Run the tests once the root has fixed setup.
 - For the final full integration gate, run `parent-integrate test` from the managed `_integration` checkout after committing the fix. Only this command records a passing result for the clean commit and configuration.
 - In other managed worktrees, run `parent-run -- uv run --locked --quiet python -u scripts/integration_tests.py`. It runs all tests across four processes, keeps each file together, prints progress every five seconds, and saves full pytest output in that worktree's Git metadata.
 - Keep the command's live output visible. Do not pipe it to `tail -15` or wait until completion before checking progress. The runner prints its full log path; `tail -f <printed-path>` follows the detailed log during the run.
