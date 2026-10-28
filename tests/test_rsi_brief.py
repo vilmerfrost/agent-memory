@@ -789,3 +789,24 @@ def test_recorded_recovery_reaches_brief_and_markdown(sandbox: Path) -> None:
     markdown = BR.render_markdown(brief)
     assert 'clickhouse / S1 delta / ch.rule_gap: recovered; 2 attempt(s)' in markdown
     assert 'read completed' in markdown
+
+
+def test_manual_brief_reads_separate_coverage_identity(sandbox: Path, rdb: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    from agent_memory import coverage as CV
+    manual_id = 'manual-20261028-reader-test'
+    rep = night_report()
+    rep['manual_run'] = {'id': manual_id, 'kind': 'verification', 'scheduled_checkpoint_unchanged': True}
+    rep['coverage'] = {'job': 'amem-rsi-night', 'run_key': manual_id, 'enabled': True,
+        'analysis_version': 'test', 'consumption': {}, 'snapshots': {}, 'datasets': {}, 'required': [], 'failed': 0}
+    assert BR.validate_report(rep) == []
+    write_report(sandbox, rep)
+    seen = []
+    original = CV.verdict
+    def observe(conn, **kw):
+        seen.append(kw['run_key'])
+        return original(conn, **kw)
+    monkeypatch.setattr(CV, 'verdict', observe)
+    brief = BR.make_brief(root=sandbox, db_url=rdb)
+    assert seen == [manual_id]
+    assert brief['manual_run']['id'] == manual_id
+    assert BR.render_markdown(brief).startswith('# RSI manual verification: '+manual_id)
