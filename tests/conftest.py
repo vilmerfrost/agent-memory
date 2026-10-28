@@ -17,6 +17,11 @@
   port (never a fixed port: other worktrees run in parallel) and removes it after.
   Its data dir is tmpfs (no Docker volume), and each session first removes the
   containers of earlier runs that were killed before their teardown.
+- `TEST_POSTGRES_URL` replaces that container with one the caller started, for runs
+  that cannot reach Docker (`recon-test run --postgres TEST_POSTGRES_URL` starts it
+  outside the Seatbelt sandbox). Only a loopback host and an empty database are
+  accepted, so it can never point the suite at a real store. The name has no
+  `AMEM_`/`PG` prefix on purpose: those are removed below.
 """
 
 from __future__ import annotations
@@ -30,11 +35,14 @@ import tempfile
 import time
 from collections.abc import Iterator, Mapping
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import psycopg
 import pytest
 
 PG_IMAGE = "pgvector/pgvector:pg17"
+EXTERNAL_PG_ENV = "TEST_POSTGRES_URL"
+LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost"}
 AMEM = str(Path(sys.executable).parent / "amem")
 
 # Env names a test must never inherit: they pick or authenticate a store
@@ -146,8 +154,43 @@ def _sweep_orphan_containers() -> None:
             subprocess.run(["docker", "rm", "-f", "-v", container], capture_output=True, timeout=60)
 
 
+def _wait_and_migrate(url: str) -> None:
+    deadline = time.monotonic() + 60
+    while True:
+        try:
+            with psycopg.connect(url, connect_timeout=2) as conn:
+                conn.execute("select 1")
+            break
+        except psycopg.OperationalError:
+            if time.monotonic() > deadline:
+                raise
+            time.sleep(0.5)
+    result = run_amem("db", "migrate", env=base_env(AMEM_DB_URL=url))
+    assert result.returncode == 0, result.stderr
+
+
+def external_pg_url(url: str) -> str:
+    """The caller's throwaway Postgres, only if it is on loopback and holds no tables yet."""
+    host = urlsplit(url).hostname
+    if host not in LOOPBACK_HOSTS:
+        raise RuntimeError(f"{EXTERNAL_PG_ENV} must point at a loopback host, not {host!r}")
+    with psycopg.connect(url, connect_timeout=5) as conn:
+        tables = conn.execute(
+            "select count(*) from pg_tables where schemaname not in ('pg_catalog', 'information_schema')"
+        ).fetchone()[0]
+    if tables:
+        raise RuntimeError(f"{EXTERNAL_PG_ENV} must point at an empty database; it has {tables} table(s)")
+    return url
+
+
 @pytest.fixture(scope="session")
 def pg_url() -> Iterator[str]:
+    external = os.environ.get(EXTERNAL_PG_ENV)
+    if external:
+        url = external_pg_url(external)
+        _wait_and_migrate(url)
+        yield url
+        return
     if shutil.which("docker") is None:
         pytest.skip("docker not installed")
     _sweep_orphan_containers()
@@ -160,18 +203,7 @@ def pg_url() -> Iterator[str]:
         mapping = _docker("port", container, "5432/tcp").splitlines()[0]  # e.g. 127.0.0.1:55012
         port = mapping.rsplit(":", 1)[1]
         url = f"postgresql://postgres:postgres@127.0.0.1:{port}/postgres"
-        deadline = time.monotonic() + 60
-        while True:
-            try:
-                with psycopg.connect(url, connect_timeout=2) as conn:
-                    conn.execute("select 1")
-                break
-            except psycopg.OperationalError:
-                if time.monotonic() > deadline:
-                    raise
-                time.sleep(0.5)
-        result = run_amem("db", "migrate", env=base_env(AMEM_DB_URL=url))
-        assert result.returncode == 0, result.stderr
+        _wait_and_migrate(url)
         yield url
     finally:
         # -v: `rm -f` on a running container skips --rm, so the image's anonymous data volume would stay.
