@@ -7,6 +7,13 @@
 `decide` is a pure function of those numbers and a versioned policy (config/rsi-verdict-policy.json). No model
 ever decides the verdict, and the investigator cannot change the policy: it is repo data, read here only.
 
+The machine layer counts scores, not just passes. A run's check score is in 0..1: the share of the case's
+scenarios it passed (`check_score`, or `check_scenarios` passed/total), or 1.0/0.0 from `check_passed` when the
+run record has neither (records before scenario scores). A case's arm score is the sum over its complete pairs, so
+5 pairs give a score in 0..5. A case moves only when the two arm scores differ by at least
+`policy.min_score_margin` (in summed score units, the same both ways). The policy/2 margin is 2.0: two full runs'
+worth, so one run that flips (A 5/5, B 4/5) is noise, not a regression and not an improvement.
+
 Decision order (the first rule that fires wins):
 
     1. refusals (stale baseline, artifact not exact, ...)        -> INCONCLUSIVE
@@ -14,24 +21,27 @@ Decision order (the first rule that fires wins):
     3. fewer complete pairs than policy.min_pairs, or a case
        without a pair                                             -> INCONCLUSIVE
     4. Jev says the harness is broken (P >= jev_harness_max)      -> INCONCLUSIVE
-       both arms fail every check on every case (A_pass = B_pass
-       = 0; policy.harness_dead_inconclusive)                     -> INCONCLUSIVE harness-dead:<cases>
-    5. B's pass rate drops on any case (>= min_worse_delta)       -> WORSE   (a regression anywhere blocks)
-    6. B's pass rate rises on a case (>= min_improve_delta):
+       both arms score 0 on every case (policy.
+       harness_dead_inconclusive)                                 -> INCONCLUSIVE harness-dead:<cases>
+    5. a_score - b_score >= min_score_margin on any case          -> WORSE   (a regression anywhere blocks;
+                                                                     no judge or Jev reading rescues it)
+    6. b_score - a_score >= min_score_margin on a case:
          judge missing / incomplete / B win rate < judge_min     -> INCONCLUSIVE
          Jev missing / not "improves" / confidence < min         -> INCONCLUSIVE
          else                                                     -> IMPROVES
-    7. equal checks: judge B win rate <= 1 - judge_strong         -> WORSE
-                     judge B win rate >= judge_strong             -> INCONCLUSIVE (a preference no check sees)
-                     else                                         -> NO_EFFECT
+    7. checks equal within the margin:
+         judge B win rate >= judge_strong or <= 1 - judge_strong -> INCONCLUSIVE judge-only-preference
+         else                                                     -> NO_EFFECT
 
-Only IMPROVES maps to a passing rsi-eval/1 verdict (`improves`).
+The judge alone never decides: it can block an IMPROVES the checks found, but it never makes WORSE or IMPROVES
+when the checks are equal. Only IMPROVES maps to a passing rsi-eval/1 verdict (`improves`).
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any
@@ -40,7 +50,7 @@ from agent_memory import config
 
 VERDICTS = ("IMPROVES", "NO_EFFECT", "WORSE", "INCONCLUSIVE")
 EVAL_VERDICT = {"IMPROVES": "improves", "NO_EFFECT": "no-effect", "WORSE": "worse", "INCONCLUSIVE": "inconclusive"}
-POLICY_FORMAT = "rsi-verdict-policy/1"
+POLICY_FORMAT = "rsi-verdict-policy/2"
 POLICY_PATH = config.REPO_ROOT / "config" / "rsi-verdict-policy.json"
 JEV_EFFECTS = ("improves", "no_effect", "worse", "unclear")
 
@@ -52,10 +62,9 @@ class PolicyError(ValueError):
 @dataclass(frozen=True)
 class VerdictPolicy:
     version: str = POLICY_FORMAT
-    min_pairs: int = 3
+    min_pairs: int = 5
     max_error_runs: int = 0
-    min_improve_delta: float = 0.01
-    min_worse_delta: float = 0.01
+    min_score_margin: float = 2.0  # summed check score (0..pairs per arm) a case must move, both ways
     require_judge: bool = True
     judge_min_b_winrate: float = 0.5
     judge_strong_winrate: float = 0.75
@@ -70,7 +79,10 @@ class VerdictPolicy:
 
 
 def load_policy(path: Path | None = None) -> VerdictPolicy:
-    """The versioned policy file (default config/rsi-verdict-policy.json). Unknown keys or a bad value refuse."""
+    """The versioned policy file (default config/rsi-verdict-policy.json). Unknown keys or a bad value refuse.
+
+    Only the current format loads. Records keep just the policy's version and sha256, and nothing reads an old
+    policy file back, so a policy/1 file (pass-rate deltas) is refused rather than read with policy/2 rules."""
     path = path or POLICY_PATH
     try:
         raw = path.read_bytes()
@@ -92,24 +104,54 @@ def load_policy(path: Path | None = None) -> VerdictPolicy:
             ok = isinstance(v, bool)
         elif isinstance(default, int):
             ok = isinstance(v, int) and not isinstance(v, bool) and v >= 0
+        elif k == "min_score_margin":
+            # Summed score units, not a rate. Zero would let any difference decide.
+            ok = isinstance(v, (int, float)) and not isinstance(v, bool) and 0 < v < float("inf")
         else:
             ok = isinstance(v, (int, float)) and not isinstance(v, bool) and 0 <= v <= 1
         if not ok:
             raise PolicyError(f"{path}: bad value for {k}: {v!r}")
-        kwargs[k] = v
+        kwargs[k] = float(v) if k == "min_score_margin" else v
     return VerdictPolicy(**kwargs, sha256=hashlib.sha256(raw).hexdigest())
 
 
 # ---------------------------------------------------------------- the three layers
 
 
+def run_check_score(check_passed: bool | None, check_score: Any = None, check_scenarios: Any = None) -> float:
+    """One run's check score in 0..1, from what its run record has.
+
+    `check_score` (a number in 0..1) first, then `check_scenarios` ({"passed": int, "total": int}, total > 0), then
+    1.0/0.0 from `check_passed`, so a record written before scenario scores scores exactly as its pass bit."""
+    if isinstance(check_score, (int, float)) and not isinstance(check_score, bool) and 0 <= check_score <= 1:
+        return float(check_score)
+    if isinstance(check_scenarios, Mapping):
+        passed, total = check_scenarios.get("passed"), check_scenarios.get("total")
+        if (isinstance(passed, int) and isinstance(total, int) and not isinstance(passed, bool)
+                and not isinstance(total, bool) and 0 <= passed <= total and total > 0):
+            return passed / total
+    return 1.0 if check_passed else 0.0
+
+
 @dataclass(frozen=True)
 class CaseStats:
-    """One case: complete A/B pairs and how many runs of each arm passed the objective check."""
+    """One case: complete A/B pairs, how many runs of each arm passed every scenario of the objective check
+    (a_pass/b_pass, for reporting), and each arm's summed check score (a_score/b_score, 0..pairs; see
+    run_check_score). The verdict reads the scores. Without them, the scores are the pass counts."""
     case: str
     pairs: int
     a_pass: int
     b_pass: int
+    a_score: float | None = None
+    b_score: float | None = None
+
+    def __post_init__(self) -> None:
+        for arm in ("a", "b"):
+            score = getattr(self, f"{arm}_score")
+            score = float(getattr(self, f"{arm}_pass")) if score is None else float(score)
+            if not (-1e-9 <= score <= self.pairs + 1e-9):
+                raise ValueError(f"{self.case}: {arm}_score {score} outside 0..{self.pairs}")
+            object.__setattr__(self, f"{arm}_score", round(score, 6))
 
     @property
     def a_rate(self) -> float:
@@ -200,20 +242,40 @@ class Verdict:
 
 def _inputs(machine: ArmPair, judge: JudgeResult | None, jev: JevResult | None, policy: VerdictPolicy) -> dict:
     return {
-        "policy": {"version": policy.version, "sha256": policy.sha256},
+        "policy": {"version": policy.version, "sha256": policy.sha256, "min_pairs": policy.min_pairs,
+                   "min_score_margin": policy.min_score_margin},
         "machine": {"pairs": machine.pairs, "runs_expected": machine.runs_expected, "runs_done": machine.runs_done,
                     "errors": len(machine.errors), "refusals": list(machine.refusals),
                     "budget_stop": machine.budget_stop,
                     "cases": [{"case": c.case, "pairs": c.pairs, "a_pass": c.a_pass, "b_pass": c.b_pass,
-                               "a_rate": round(c.a_rate, 4), "b_rate": round(c.b_rate, 4)} for c in machine.cases]},
+                               "a_rate": round(c.a_rate, 4), "b_rate": round(c.b_rate, 4),
+                               "a_score": c.a_score, "b_score": c.b_score} for c in machine.cases]},
         "judge": judge.summary() if judge else None,
         "jev": jev.summary() if jev else None,
     }
 
 
+def _score(x: float) -> str:
+    return f"{x:g}"
+
+
+def _moved(c: CaseStats) -> str:
+    return f"{c.case} A {_score(c.a_score)}/{c.pairs} -> B {_score(c.b_score)}/{c.pairs}"
+
+
 def decide(machine: ArmPair, judge: JudgeResult | None, jev: JevResult | None,
            policy: VerdictPolicy | None = None) -> Verdict:
-    """The verdict. Pure: the same inputs always give the same Verdict."""
+    """The verdict. Pure: the same inputs always give the same Verdict.
+
+    The checks decide the direction, and only by a margin. Per case, delta = b_score - a_score (summed check
+    scores over the case's complete pairs). delta <= -min_score_margin on any case is WORSE, whatever the judge
+    or Jev say. delta >= min_score_margin (and no case worse) is IMPROVES only when the blind judge
+    (b_winrate >= judge_min_b_winrate) and Jev (`improves`, confidence >= jev_min_confidence) agree; otherwise
+    INCONCLUSIVE. Anything inside the margin counts as equal checks: NO_EFFECT, or INCONCLUSIVE
+    `judge-only-preference` when the judge strongly prefers either arm. The judge alone never yields WORSE or
+    IMPROVES. With policy/2 (5 pairs, margin 2.0) one flipped run is noise both ways: A 5/5 vs B 4/5 is
+    NO_EFFECT, and so is A 4/5 vs B 5/5. Partial scores count: A 3.0 vs B 5.0 moves. The full order is in the
+    module docstring."""
     policy = policy or VerdictPolicy()
     inputs = _inputs(machine, judge, jev, policy)
 
@@ -239,18 +301,21 @@ def decide(machine: ArmPair, judge: JudgeResult | None, jev: JevResult | None,
         return out("INCONCLUSIVE", f"jev-harness-problem:{jev.harness_problem:.2f}>={policy.jev_harness_max}")
     # Code sees what Jev may miss (2026-10-26, codex: A 0/3, B 0/3, Jev improves 0.71, harness_problem 0.22): when
     # both arms fail every machine check on every case, the checks cannot tell the arms apart, and a judge
-    # preference alone must not become a verdict.
-    if policy.harness_dead_inconclusive and all(c.a_pass == 0 and c.b_pass == 0 for c in machine.cases):
+    # preference alone must not become a verdict. Scores, not pass bits: a run that passes some scenarios is alive.
+    if policy.harness_dead_inconclusive and all(c.a_score == 0 and c.b_score == 0 for c in machine.cases):
         return out("INCONCLUSIVE", "harness-dead:" + ",".join(c.case for c in machine.cases))
 
-    worse = [c for c in machine.cases if c.a_rate - c.b_rate >= policy.min_worse_delta]
-    better = [c for c in machine.cases if c.b_rate - c.a_rate >= policy.min_improve_delta]
+    margin = policy.min_score_margin
+    delta = {c.case: round(c.b_score - c.a_score, 6) for c in machine.cases}
+    worse = [c for c in machine.cases if -delta[c.case] >= margin]
+    better = [c for c in machine.cases if delta[c.case] >= margin]
+    noise = [c for c in machine.cases if delta[c.case] and abs(delta[c.case]) < margin]
     if worse:
-        return out("WORSE", *(f"regressed:{c.case} A {c.a_pass}/{c.pairs} -> B {c.b_pass}/{c.pairs}" for c in worse))
+        return out("WORSE", *(f"regressed:{_moved(c)}" for c in worse), f"score-margin:{_score(margin)}")
 
     wr = judge.b_winrate if judge else None
     if better:
-        why = [f"improved:{c.case} A {c.a_pass}/{c.pairs} -> B {c.b_pass}/{c.pairs}" for c in better]
+        why = [f"improved:{_moved(c)}" for c in better] + [f"score-margin:{_score(margin)}"]
         if policy.require_judge:
             if judge is None or judge.mode == "none" or not judge.judged:
                 return out("INCONCLUSIVE", *why, "judge-missing")
@@ -270,8 +335,9 @@ def decide(machine: ArmPair, judge: JudgeResult | None, jev: JevResult | None,
             tail.append(f"jev {jev.effect} {jev.confidence}")
         return out("IMPROVES", *why, *tail)
 
-    if wr is not None and wr <= 1 - policy.judge_strong_winrate:
-        return out("WORSE", "checks-equal", f"judge-prefers-baseline:b_winrate {wr:.2f}")
-    if wr is not None and wr >= policy.judge_strong_winrate:
-        return out("INCONCLUSIVE", "checks-equal", f"judge-only-preference:b_winrate {wr:.2f}")
-    return out("NO_EFFECT", "checks-equal" + (f", judge b_winrate {wr:.2f}" if wr is not None else ""))
+    # Equal checks (inside the margin). The judge may make the result unclear, never WORSE or IMPROVES.
+    within = [f"within-noise:{_moved(c)}" for c in noise] + ([f"score-margin:{_score(margin)}"] if noise else [])
+    # b_winrate <= 1 - judge_strong: the judge prefers the baseline; >= judge_strong: the candidate.
+    if wr is not None and (wr <= 1 - policy.judge_strong_winrate or wr >= policy.judge_strong_winrate):
+        return out("INCONCLUSIVE", "checks-equal", *within, f"judge-only-preference:b_winrate {wr:.2f}")
+    return out("NO_EFFECT", "checks-equal" + (f", judge b_winrate {wr:.2f}" if wr is not None else ""), *within)
