@@ -66,7 +66,7 @@ def target_path(value: Any) -> str | None:
     return value
 
 
-def case_targets(raw: Any) -> tuple[dict[str, str], ...]:
+def case_targets(raw: Any) -> tuple[dict[str, Any], ...]:
     if not isinstance(raw, (list, tuple)):
         raise ValueError("targets must be a list of exact path, kind and behavior declarations")
     out = []
@@ -75,7 +75,16 @@ def case_targets(raw: Any) -> tuple[dict[str, str], ...]:
             raise ValueError("target path must be an exact ~/ path without traversal")
         if not all(isinstance(item.get(k), str) and item[k].strip() for k in ("kind", "behavior")):
             raise ValueError("target kind and behavior must be nonempty strings")
-        out.append({k: item[k] for k in ("path", "kind", "behavior")})
+        row = {k: item[k] for k in ("path", "kind", "behavior")}
+        if "sections" in item:
+            sections = item["sections"]
+            if not isinstance(sections, list) or not sections or not all(
+                    isinstance(x, str) and re.fullmatch(r"[a-z0-9][a-z0-9/_-]{0,119}", x) for x in sections):
+                raise ValueError("sections must list explicit instruction section IDs")
+            if len(set(sections)) != len(sections):
+                raise ValueError("duplicate instruction section declaration")
+            row["sections"] = list(sections)
+        out.append(row)
     if len({(x["path"], x["kind"]) for x in out}) != len(out):
         raise ValueError("duplicate target declaration")
     return tuple(out)

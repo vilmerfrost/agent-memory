@@ -60,7 +60,7 @@ from agent_memory import rsi_verdict as V
 from agent_memory import rsi_relevance as REL
 
 SUITE = "sandbox-replay"
-SUITE_VERSION = "3"
+SUITE_VERSION = "4"
 REPLAY_FORMAT = "rsi-replay/1"
 BENCH_DIR = config.REPO_ROOT / "bench" / "rsi-replay"
 SANDBOX_PY = config.REPO_ROOT / "sandbox" / "rsi_sandbox.py"
@@ -138,7 +138,7 @@ class ReplayCase:
     tags: tuple[str, ...] = ()
     stub: tuple[dict, ...] = ()          # the stub agent's scripted plan (live agents get only the prompt)
 
-    targets: tuple[dict[str, str], ...] = ()  # exact path/kind plus the behavior this task exercises
+    targets: tuple[dict[str, Any], ...] = ()  # exact path/kind plus the behavior this task exercises
 
     def digest(self) -> str:
         """sha256 over the case definition and its fixture and check files (reproducibility evidence)."""
