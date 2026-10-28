@@ -461,11 +461,14 @@ class ReplayResult:
     started_at: str = ""
     finished_at: str = ""
     relevance: dict = field(default_factory=dict)
+    judge_rule: dict | None = None       # judge_rule(): the rule text the judge saw; None for a legacy artifact
+    judge_prompt_version: str = ""
 
     def to_json(self) -> dict[str, Any]:
         return {"format": REPLAY_FORMAT, "experiment_id": self.experiment_id, "artifact_hash": self.artifact_hash,
                 "baseline_id": self.baseline_id, "verdict": self.verdict.to_json(), "arms": self.arms,
-                "relevance": self.relevance,
+                "relevance": self.relevance, "judge_rule": self.judge_rule,
+                "judge_prompt_version": self.judge_prompt_version or None,
                 "judge": self.judge.summary() if self.judge else None,
                 "judge_pairs": list(self.judge.pairs) if self.judge else [],
                 "jev": self.jev.summary() if self.jev else None, "budget_stop": self.budget_stop,
@@ -582,6 +585,38 @@ def _score(run: RunRecord) -> float:
     return check_score({"check_passed": run.check_passed, "check_scenarios": run.check_scenarios})[0]
 
 
+def scenario_counts(run: RunRecord) -> tuple[int, int]:
+    """(passed, total) scenarios of one checked run: its check_scenarios, or 1/1 (passed) and 0/1 (failed) for a
+    binary check that reports no scenarios."""
+    sc = run.check_scenarios or {}
+    passed, total = sc.get("passed"), sc.get("total")
+    if (isinstance(passed, int) and isinstance(total, int) and not isinstance(passed, bool)
+            and not isinstance(total, bool) and 0 <= passed <= total and total > 0):
+        return passed, total
+    return (1 if run.check_passed else 0), 1
+
+
+def arm_scores(runs: Sequence[RunRecord]) -> dict[str, Any]:
+    """An arm's partial-credit totals over its checked runs: score_sum (sum of the per-run check score, 3
+    decimals), scenarios_passed and scenarios_total. All three None when no run was checked."""
+    checked = [r for r in runs if r.check_passed is not None]
+    if not checked:
+        return {"score_sum": None, "scenarios_passed": None, "scenarios_total": None}
+    counts = [scenario_counts(r) for r in checked]
+    return {"score_sum": round(sum(_score(r) for r in checked), 3),
+            "scenarios_passed": sum(p for p, _ in counts), "scenarios_total": sum(t for _, t in counts)}
+
+
+def judge_rule(edit: Mapping[str, Any] | None) -> dict[str, str] | None:
+    """The rule under test exactly as the judge prompt shows it: {section_id, heading, text}, text capped at
+    MAX_PROMPT_RULE. None when the judge saw no rule (a legacy artifact without a declared edit)."""
+    if not edit or not str(edit.get("after") or "").strip():
+        return None
+    heading = str(edit.get("heading") or edit.get("section_id") or "").strip()
+    return {"section_id": str(edit.get("section_id") or ""), "heading": heading,
+            "text": str(edit["after"])[:MAX_PROMPT_RULE]}
+
+
 def _attempt(run: RunRecord) -> dict[str, Any]:
     """What the judge may see of one run: no arm, run id, artifact or instruction details."""
     return {"check_passed": run.check_passed, "final": (run.final or "")[-2000:],
@@ -594,10 +629,10 @@ def judge_prompt(task: str, first: Mapping[str, Any], second: Mapping[str, Any],
     declared_edit); None -> the legacy prompt without a rule."""
     kw = dict(task=task, c1=first["check_passed"], f1=first["final"], d1=first["diff"],
               c2=second["check_passed"], f2=second["final"], d2=second["diff"])
-    if not edit or not str(edit.get("after") or "").strip():
+    rule = judge_rule(edit)
+    if rule is None:
         return JUDGE_PROMPT.format(**kw)
-    heading = str(edit.get("heading") or edit.get("section_id") or "").strip()
-    return JUDGE_PROMPT_RULE.format(heading=heading, rule=str(edit["after"])[:MAX_PROMPT_RULE], **kw)
+    return JUDGE_PROMPT_RULE.format(heading=rule["heading"], rule=rule["text"], **kw)
 
 
 def declared_edit(manifest: Mapping[str, Any], artifact_dir: Path) -> dict[str, Any] | None:
@@ -1480,6 +1515,7 @@ class _Replay:
                         "tool_calls": sum(len(r.tool_calls) for r in rows),
                         "tokens_in": sum(r.tokens_in for r in rows), "tokens_out": sum(r.tokens_out for r in rows),
                         "cost_usd": round(sum(r.cost_usd for r in rows), 6),
+                        **arm_scores(rows),
                         "home": "baseline" if arm == "A" else f"baseline + artifact {self.h[:12]}"}
         return out
 
@@ -1583,7 +1619,8 @@ def run_replay(artifact_hash: str, cases: Sequence[ReplayCase], cfg: ReplayConfi
     result = ReplayResult(verdict=verdict, arms=r.arms(), runs=r.runs, judge=judge, jev=jev_res,
                           evidence_dir=r.evidence, eval_path=None, artifact_hash=artifact_hash,
                           baseline_id=r.baseline_id or None, experiment_id=experiment_id, budget_stop=r.budget_stop,
-                          totals=totals, started_at=r.started, finished_at=finished, relevance=r.relevance)
+                          totals=totals, started_at=r.started, finished_at=finished, relevance=r.relevance,
+                          judge_rule=judge_rule(r.edit), judge_prompt_version=JUDGE_PROMPT_VERSION)
     result = _record(r, result, cfg, policy)
     _write_evidence(r, result, cfg, policy)
     if interrupted is not None:
@@ -1607,6 +1644,7 @@ def _record(r: _Replay, result: ReplayResult, cfg: ReplayConfig, policy: V.Verdi
                "reps": cfg.reps, "pairs_planned": cfg.planned_pairs(len(r.cases)),
                "judge_prompt_version": JUDGE_PROMPT_VERSION,
                "rule_under_test": ({k: r.edit[k] for k in ("path", "section_id", "heading")} if r.edit else None),
+               "judge_rule": result.judge_rule,
                "sandbox_reservations_released": r.released_tool_runs,
                "limits": cfg.describe()["limits"], "judge": result.judge.summary() if result.judge else None,
                "jev": result.jev.summary() if result.jev else None, "cases": v.inputs["machine"]["cases"],

@@ -654,7 +654,10 @@ class Budget:
         providers = {k: {"requests": int(v["requests"]), "usd": float(v["usd"])}
                      for k, v in sorted(self.provider_requests.items())}
         subscriptions = [r for r in [*self.calls, *self.runs] if r.get("price_basis") == "subscription"]
+        # sandbox_runs_used: containers that ran (recorded runs); sandbox_runs_released: reservations given back
+        # unused (each release row counted once). Both come from this ledger, never from the replay records.
         return {"by_model": dict(sorted(by_model.items())), "sandbox_runs": len(self.runs),
+                "sandbox_runs_used": len(self.runs), "sandbox_runs_released": self.released_sandbox_runs(),
                 **({"sandbox_releases": {"released_runs": self.released_sandbox_runs(),
                                          "taken_runs": self._taken_runs, "records": list(self.sandbox_releases)}}
                    if self.sandbox_releases else {}),
