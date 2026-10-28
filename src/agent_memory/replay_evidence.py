@@ -277,9 +277,10 @@ def night_records(conn, *, night: str, start, end):
         gaps = total-linked
         records += [CV.Snapshot(dataset,start,end,detail,total,collected,linked,collected-linked,
                                 measured_fields=('expected_population','exact_linkage'), last_analysed_at=end,
-                                source_versions={'collector':'replay-evidence/1'}),
-                    CV.Consumption('amem-rsi-night',night,dataset,'replay-evidence/1',start,end,
-                                   queried=total,considered=total,used=total,findings=gaps,
+                                source_versions={'collector':'replay-evidence/2'}),
+                    CV.Consumption('amem-rsi-night',night,dataset,'replay-evidence/2',start,end,
+                                   queried=total,considered=total,used=linked,findings=0,
+                                   skipped={'missing_evidence': gaps} if gaps else {},
                                    evidence_refs=evidence[:20] if total else (),
                                    detail=f'{linked}/{total} expected observations linked; missing stays unknown')]
     return records

@@ -113,3 +113,19 @@ def test_native_claude_api_total_has_no_invented_wall_interval(db):
         AL.record_runner(conn, [b])
         assert conn.execute('select api_seconds from sessions where session_id=%s',
                             (b['native_session_id'],)).fetchone() == (None,)
+
+
+def test_missing_replay_evidence_is_a_coverage_gap_not_an_analytical_finding(db):
+    from datetime import UTC, datetime, timedelta
+    from agent_memory import coverage as CV
+    night = '2026-10-28-missing'
+    now = datetime.now(UTC)
+    with psycopg.connect(db) as conn:
+        conn.execute("insert into rsi_experiments(id,night,kind,status,meta) "
+                     "values('exp-20261028-missing',%s,'edit_instruction','evaluated','{}')", (night,))
+        records = RE.night_records(conn, night=night, start=now-timedelta(days=1), end=now)
+    snap = next(r for r in records if isinstance(r, CV.Snapshot) and r.dataset == 'experiments:replay-evidence')
+    use = next(r for r in records if isinstance(r, CV.Consumption) and r.dataset == snap.dataset)
+    assert (snap.eligible, snap.collected, snap.linked) == (1, 0, 0)
+    assert use.findings == 0 and use.used == 0 and use.skipped == {'missing_evidence': 1}
+    assert use.analysis_version == 'replay-evidence/2'
