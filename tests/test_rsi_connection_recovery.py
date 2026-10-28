@@ -62,7 +62,7 @@ def execute(monkeypatch, read, *, retr='ch', budget=2):
     runner = P._Runner({retr: read}, budget, clock)
     step = P._Step(retr, 'read', {}, P.SERVICE[retr])
     result = runner._query(retr, runner.r[retr], step, budget)
-    return result, runner.observations[step.name], clock
+    return result, runner.observations[id(step)], clock
 
 
 def test_temporary_read_recovers_and_records_attempts(monkeypatch):
@@ -212,3 +212,17 @@ def test_exhausted_budget_starts_no_read_and_keeps_attempt_count_unknown(monkeyp
     assert result.status == 'error'
     assert read.calls == read.health_calls == 0
     assert check['attempts'] is None
+
+
+def test_repeated_query_names_keep_their_own_measured_duration():
+    class VariableRead(Read):
+        def query(self, name, params):
+            self.calls += 1
+            self.clock.at += self.calls * .1
+            return []
+    clock = Clock()
+    read = VariableRead(clock=clock)
+    runner = P._Runner({'ch': read}, 2, clock)
+    steps = [P._Step('ch', 'read', {}, 'clickhouse'), P._Step('ch', 'read', {}, 'clickhouse')]
+    assert all(result.status == 'ok' for _, result in runner.phase(steps))
+    assert [row['elapsed_ms'] for row in runner.log] == [100, 200]

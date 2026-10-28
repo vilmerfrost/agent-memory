@@ -229,6 +229,12 @@ def validate_report(rep: Any) -> list[str]:
     if "connection_recovery" in rep:
         from agent_memory.rsi_night import connection_recovery_problems
         p += connection_recovery_problems(rep["connection_recovery"])
+    manual = rep.get("manual_run")
+    if manual is not None and not (isinstance(manual, dict)
+            and re.fullmatch(r"manual-[a-z0-9-]{8,48}", str(manual.get("id", "")))
+            and manual.get("kind") == "verification" and manual.get("scheduled_checkpoint_unchanged") is True):
+        p.append("manual_run: invalid verification identity")
+        return p
     pw = rep.get("prerequisite_warnings")
     if pw is not None and not (isinstance(pw, list) and all(isinstance(w, str) for w in pw)):
         p.append("prerequisite_warnings: not a list of strings")
@@ -237,7 +243,7 @@ def validate_report(rep: Any) -> list[str]:
         p.append("prerequisites: not an object with a skill_refresh object")
     if rep.get("coverage") is not None:                   # optional (R4): the coverage rows the night wrote
         p += NC.report_problems(rep["coverage"])
-        if isinstance(rep["coverage"], dict) and rep["coverage"].get("run_key") != rep["night"]:
+        if isinstance(rep["coverage"], dict) and rep["coverage"].get("run_key") != (manual or {}).get("id", rep["night"]):
             p.append("coverage.run_key: not the report's night")
     _check_map(rep["delta"], "delta", COUNTS, p)
     if "experiment_goal" in rep:
@@ -466,8 +472,9 @@ def coverage_verdict(rep: Mapping[str, Any], *, db_url: str | None = None) -> di
         reqs = NC.requirements(rep["coverage"].get("required") or [])
         with store.connect(db_url, connect_timeout=10) as conn:
             conn.read_only = True
-            v = CV.verdict(conn, job=NC.JOB, run_key=rep["night"], required=reqs)
-            rows = {r["dataset"]: r["status"] for r in CV.consumption(conn, job=NC.JOB, run_key=rep["night"], limit=200)}
+            run_key = _obj(rep.get("manual_run")).get("id", rep["night"])
+            v = CV.verdict(conn, job=NC.JOB, run_key=run_key, required=reqs)
+            rows = {r["dataset"]: r["status"] for r in CV.consumption(conn, job=NC.JOB, run_key=run_key, limit=200)}
     except (psycopg.Error, config.BackendError, ValueError) as exc:
         return _verdict("unknown", f"coverage not read ({type(exc).__name__})")
     gaps = [{"dataset": text(g.dataset, 80), "distinction": g.distinction, "detail": text(g.detail, 120)}
@@ -993,6 +1000,7 @@ def build_brief(rep: Mapping[str, Any], db: Db, *, artifacts_root: Path, report:
         "passed": passed, "failed": failed, "costs": costs, "health": health, "pending_decisions": pending,
         **({"connection_recovery": rep["connection_recovery"]} if "connection_recovery" in rep else {}),
         "sections": list(SECTIONS),
+        **({"manual_run": rep["manual_run"]} if "manual_run" in rep else {}),
     }
 
 
@@ -1138,7 +1146,9 @@ def usd4(v: Any) -> str:
 
 
 def render_markdown(b: dict[str, Any]) -> str:
-    out = [f"# RSI morning brief: night {b['night']}", "", f"{b['headline']} {b['summary']}"]
+    title = (f"# RSI manual verification: {_obj(b.get('manual_run')).get('id')}" if b.get("manual_run") else
+             f"# RSI morning brief: night {b['night']}")
+    out = [title, "", f"{b['headline']} {b['summary']}"]
     ck = b["checkpoint"]
     sk = b.get("skipped")
     not_run = "not analyzed: the night did not run" if sk else ""
