@@ -234,6 +234,7 @@ def test_plan_counts_the_writer_and_keeps_room_for_three() -> None:
     (impl,) = [r for r in plan["calls"] if r["stage"] == "implement"]
     assert (impl["model"], impl["count"], impl["billing_source"]) == (OPUS, 3, "subscription")
     room = plan["room"]
-    assert room["fits"] and room["experiments"] == 3
-    assert room["per_experiment"]["calls"][OPUS] == 8
+    # every cap has room for three; only the worst-case wall clock (every timeout) is reported as not fitting
+    assert room["experiments"] == 3 and [c["limit"] for c in room["checks"] if not c["fits"]] == ["wall clock"]
+    assert room["per_experiment"]["calls"][OPUS] == 12          # hypothesis + writer + 10 agent runs
     assert room["per_experiment"]["wall_clock_parts_s"]["implement"] == 300

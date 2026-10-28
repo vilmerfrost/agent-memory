@@ -465,13 +465,18 @@ def paid_plan(cfg: Any, *, cases: int | None = None) -> dict[str, Any]:
     provider_count = len(profiles) or 1
     n_cases = cases if cases is not None else len(rsi_replay.load_cases(rp.get("cases")))
     reps = int(rp.get("reps") or 1)
-    if cases is None and rp.get("cases") is None:
-        # No explicit list: each experiment replays only its target's cases (rsi_replay.plan_cases). Plan for the
-        # biggest such replay within one provider's share of the night's A/B pairs.
-        from agent_memory import rsi_verdict
-        n_cases, reps = rsi_replay.largest_auto_plan(rsi_replay.load_cases(), min_pairs=rsi_verdict.load_policy().min_pairs,
-                                                     max_pairs=max(1, b.max_ab_pairs // provider_count), reps=reps)
     pairs = n_cases * reps
+    if cases is None and rp.get("cases") is None:
+        # No explicit list: each experiment replays only its target's cases (rsi_replay.plan_pairs), spread to
+        # exactly one provider's share of the night's A/B pairs. Plan for the biggest such replay.
+        from agent_memory import rsi_verdict
+        n_cases, reps, pairs = rsi_replay.largest_auto_plan(
+            rsi_replay.load_cases(), min_pairs=rsi_verdict.load_policy().min_pairs,
+            max_pairs=max(1, b.max_ab_pairs // provider_count), reps=reps)
+        if not profiles and n_cases:
+            # The single-provider path runs every case equally often (rsi_replay.plan_cases)
+            reps = max(1, b.max_ab_pairs // n_cases) if n_cases * reps > pairs else reps
+            pairs = n_cases * reps
     exps = b.max_experiments
     rows: list[dict[str, Any]] = []
     per_exp: dict[str, int] = {}       # model -> the calls one experiment can make
@@ -535,6 +540,7 @@ def paid_plan(cfg: Any, *, cases: int | None = None) -> dict[str, Any]:
     exp_total = round(sum(x for x in expected if x is not None), 6)
     worst_total = round(sum(r["worst_usd"] for r in rows), 6)
     return {"config_sha256": cfg.sha256, "paid_stages": paid_stages(cfg), "cases": n_cases, "reps": reps,
+            "ab_pairs_per_provider": pairs,
             "ab_pairs_per_experiment": pairs * provider_count, "max_ab_pairs": b.max_ab_pairs, "max_experiments": exps,
             "max_hypotheses": min(b.max_hypotheses, rsi_budget.HARD_MAX_HYPOTHESES), "model_retries": b.model_retries,
             "wall_clock_s": b.wall_clock_s, "max_usd": b.max_usd, "calls": rows,
@@ -558,7 +564,7 @@ def night_room(cfg: Any, *, pairs: int, per_exp: Mapping[str, int], per_night: M
     (paid stages only; free stand-ins have `free_model_calls`). Per-night caps (calls, sandbox runs, wall clock,
     subscription tokens) must cover max_experiments x one experiment; `max_ab_pairs` is per replay and must cover
     one. The night itself stops at the experiment cap (rsi_night runs at most one experiment per candidate)."""
-    from agent_memory import rsi_replay
+    from agent_memory import rsi_budget, rsi_replay
     b, st, rp = cfg.budget, cfg.stages, cfg.replay
     exps = b.max_experiments
     base = {k: v for k, v in rp.items() if k != "provider_profiles"}
@@ -592,7 +598,13 @@ def night_room(cfg: Any, *, pairs: int, per_exp: Mapping[str, int], per_night: M
     check("wall clock", NIGHT_OVERHEAD_S + exps * one_s, b.wall_clock_s, "s")
     if b.subscription_models:
         check("subscription tokens", exps * SUBSCRIPTION_TOKENS_PER_EXPERIMENT, b.max_subscription_tokens)
+    # How many experiments the wall clock holds when every model stage and case runs to its full timeout. The
+    # night still stops cleanly at the wall clock (rsi_budget); this only says how far the worst case reaches.
+    wall_fit = max(0, int((b.wall_clock_s - NIGHT_OVERHEAD_S) // one_s)) if one_s > 0 else exps
     return {"experiments": exps, "fits": all(c["fits"] for c in checks), "checks": checks,
+            "worst_case_experiments_in_wall_clock": min(exps, wall_fit),
+            "hard_max_wall_clock_s": rsi_budget.HARD_MAX_WALL_CLOCK_S,
+            "worst_case_wall_clock_s": NIGHT_OVERHEAD_S + exps * one_s,
             "per_experiment": {"calls": dict(sorted(per_exp.items())), "ab_pairs": pairs * len(profiles),
                                "sandbox_runs": runs, "wall_clock_s": one_s,
                                "wall_clock_parts_s": secs, "case_timeout_s": case_s,
@@ -614,13 +626,20 @@ def render_room(room: Mapping[str, Any]) -> list[str]:
     for c in room["checks"]:
         out.append(f"  - {c['limit']}: need {num(c['need'])}{c['unit']} of {num(c['cap'])}{c['unit']} "
                    + ("fits" if c["fits"] else "DOES NOT FIT"))
+    worst, hard = room.get("worst_case_wall_clock_s"), room.get("hard_max_wall_clock_s")
+    if worst is not None and hard is not None and worst > hard:
+        out.append(f"  ! worst-case wall clock {num(worst)}s is over the code's hard maximum {num(hard)}s: at every "
+                   f"timeout only {room['worst_case_experiments_in_wall_clock']} of {room['experiments']} "
+                   "experiment(s) finish; the night stops cleanly at the wall clock (later experiments are not "
+                   "run, never cut short silently).")
     return out
 
 
 def render_plan(plan: Mapping[str, Any]) -> str:
     out = [f"Paid plan for config {plan['config_sha256'][:12]} (prices {plan['prices']['version']}): "
            f"{plan['max_experiments']} experiment(s), <= {plan['max_hypotheses']} hypotheses per candidate, "
-           f"{plan['ab_pairs_per_experiment']} A/B pair(s) ({plan['cases']} case(s) x {plan['reps']} rep(s), cap "
+           f"{plan['ab_pairs_per_experiment']} A/B pair(s) ({plan.get('ab_pairs_per_provider', plan['ab_pairs_per_experiment'])} "
+           f"per provider: {plan['cases']} case(s), up to {plan['reps']} rep(s) each, cap "
            f"{plan['max_ab_pairs']}), retries {plan['model_retries']}, wall clock {plan['wall_clock_s']:g}s."]
     if not plan["calls"]:
         out.append("No paid call: every stage is a stub or a fixture. Expected $0.")
