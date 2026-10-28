@@ -21,7 +21,7 @@ from typing import Any, Protocol
 import psycopg
 from psycopg import sql
 
-from agent_memory.integrations import refs
+from agent_memory.integrations import refs, http
 
 STATUSES = ("ok", "unavailable", "error", "unknown-query", "bad-params")
 
@@ -57,6 +57,7 @@ class EvidenceRef:
 class Health:
     ok: bool
     detail: str = ""
+    retryable: bool = False
 
 
 @dataclass(frozen=True)
@@ -98,9 +99,18 @@ class QueryResult:
     refs: list[EvidenceRef] = field(default_factory=list)
     detail: str = ""
 
+    retryable: bool = False
+
     def to_json(self) -> dict[str, Any]:
         return {"source": self.source, "status": self.status, "detail": self.detail,
                 "refs": [r.to_json() for r in self.refs]}
+
+
+def transient_read_error(exc: Exception) -> bool:
+    """Only transport/temporary server failures; never auth, policy or malformed data."""
+    if isinstance(exc, (TimeoutError, ConnectionError)):
+        return True
+    return isinstance(exc, http.HttpError) and exc.retryable
 
 
 def run_query(r: Retriever, name: str, params: Mapping[str, str]) -> QueryResult:
@@ -121,17 +131,17 @@ def run_query(r: Retriever, name: str, params: Mapping[str, str]) -> QueryResult
     try:
         h = r.health()
     except Exception as exc:  # noqa: BLE001 - a broken health check is "unavailable", never a crash
-        return QueryResult(r.source, "unavailable", detail=f"health: {type(exc).__name__}")
+        return QueryResult(r.source, "unavailable", detail=f"health: {type(exc).__name__}", retryable=transient_read_error(exc))
     if not h.ok:
-        return QueryResult(r.source, "unavailable", detail=h.detail)
+        return QueryResult(r.source, "unavailable", detail=h.detail, retryable=getattr(h, "retryable", False))
     try:
         return QueryResult(r.source, "ok", r.query(name, checked))
     except Unavailable as exc:
         return QueryResult(r.source, "unavailable", detail=str(exc)[:200])
     except TimeoutError as exc:
-        return QueryResult(r.source, "error", detail=f"timeout ({type(exc).__name__})")
+        return QueryResult(r.source, "error", detail=f"timeout ({type(exc).__name__})", retryable=True)
     except Exception as exc:  # noqa: BLE001 - one retriever's failure never blocks the others
-        return QueryResult(r.source, "error", detail=type(exc).__name__)
+        return QueryResult(r.source, "error", detail=type(exc).__name__, retryable=transient_read_error(exc))
 
 
 def gather(name: str, params: Mapping[str, str], retrievers: Sequence[Retriever]) -> list[QueryResult]:

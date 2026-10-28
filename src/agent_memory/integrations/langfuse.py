@@ -890,7 +890,8 @@ class LangfuseClient:
         try:
             self._call("GET", HEALTH_PATH, retries=0, timeout=min(self.timeout, 3.0))
         except http.HttpError as exc:
-            return Health(False, f"HTTP {exc.status}" if exc.status else "unreachable")
+            return Health(False, f"HTTP {exc.status}" if exc.status else "unreachable",
+                          exc.retryable)
         return Health(True)
 
     def export_spans(self, body: Mapping[str, Any]) -> None:
