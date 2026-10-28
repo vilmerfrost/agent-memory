@@ -170,3 +170,10 @@ def test_legacy_candidate_rule_pin_survives_section_identity_upgrade(monkeypatch
     monkeypatch.setattr(N.ET,'pinned_rule',lambda identity,text: ('pinned','old human pin') if identity==old_identity else None)
     got,calls=implement(hyp(),reply(AFTER),dedupe_key=candidate)
     assert calls==[] and got.fallback_reason=='the rule is pinned: no writer call'
+
+
+def test_section_delimiter_newlines_do_not_make_an_unchanged_baseline_stale(monkeypatch):
+    monkeypatch.setattr(N.ET,'pinned_sections',lambda *a:False)
+    got,calls=implement(hyp(before='\n'+hyp().edit['before']+'\n'),reply(AFTER))
+    assert got.contract_verified and len(calls)==1
+    assert got.text == ES.splice(OLD,'summary',AFTER)

@@ -1328,7 +1328,7 @@ class WriterImplementer:
             if declared is None or (sec is not None and sec.id != declared.id):
                 return fallback("declared edit names another rule section: no writer call")
             sec, picked_by = declared, "declared_edit"
-            if edits_sections.section_text(old_text, sec.id) != hyp.edit["before"]:
+            if edits_sections.section_text(old_text, sec.id).strip("\r\n") != hyp.edit["before"].strip("\r\n"):
                 return fallback("declared edit baseline is stale: no writer call")
         if sec is None:
             sec, picked_by = section_for_hypothesis(old_text, hyp.what), "hypothesis"
