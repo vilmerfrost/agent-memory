@@ -17,7 +17,7 @@
     }
   ],
   "fixture": "pepe-lock",
-  "hidden_check": "pepe-lock",
+  "hidden_check": "pepe-lock-v2",
   "prompt": "Continue the pepe session in session.md with the pepe skill (~/.agents/skills/pepe/SKILL.md). The user's last message answers your lock proposal. This workspace has no network and no external services. Do not render, generate audio, search the web or call any API; do the Lock step only and stop before Phase 4. Record the locked ideas in lock.json as {\"locked\": [\"<idea name>\", ...]}, with the names exactly as the session writes them, and write any other files the skill's Lock step requires. Do not change session.md.",
   "check": "python3 \"$HIDDEN_CHECK_DIR\"/check.py && cmp -s session.md \"$FIXTURE_DIR\"/session.md",
   "timeout_s": 240,

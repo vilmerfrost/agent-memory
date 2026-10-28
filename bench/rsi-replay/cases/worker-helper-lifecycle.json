@@ -17,7 +17,7 @@
     }
   ],
   "fixture": "worker-helper-lifecycle",
-  "hidden_check": "worker-behavior",
+  "hidden_check": "worker-behavior-v2",
   "prompt": "Read ~/agent-config/agents/worker.md from the staged sandbox home. Implement solution.py with execute(api, scenario). Read the staged worker instruction first. This is a controlled local process fixture, not real agent delegation. Each scenario supplies helper, registered and parent_session fields. If the helper is not registered, call api.report with status BLOCKED and no spawn. Otherwise call api.spawn(helper), then api.wait(handle), then api.report. The report must include helper, parent_session, status (DONE only for a successful result; PARTIAL for failure), result_status, and worker_id from the returned handle. Never invent a helper ID or report success before completion. The API runs one tiny local subprocess and records the lifecycle. Do not create a native agent, use network, edit fixture inputs, or execute planned host operations. Write only solution.py. The hidden check calls execute with positive, failed-result and unregistered scenarios.",
   "check": "python3 \"$HIDDEN_CHECK_DIR\"/check.py",
   "timeout_s": 120,

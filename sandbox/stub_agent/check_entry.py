@@ -10,7 +10,13 @@ original). The agent never saw the check, and
 nothing it left in its own home or workspace can change this container's tools. The diff between the
 fixture and the agent's workspace is computed before the check runs.
 
-Prints one JSON line: {check_exit, check_passed, timed_out, log, diff_stat, diff}.
+Prints one JSON line: {check_exit, check_passed, check_scenarios, check_score, timed_out, log, diff_stat, diff}.
+
+Scenario line (docs/rsi/replay.md, "Scenario results"): a check that grades several scenarios prints, as the last
+`RSI-SCENARIOS ` line of its stdout, one JSON object {"passed": int, "total": int, "scenarios": [{"id", "passed",
+"reason"?}, ...]}. check_scenarios = {passed, total} and check_score = passed / total come from that line only when
+it is well formed and agrees with the exit code. Otherwise (no line, malformed, or inconsistent) the run counts as
+one scenario: {1, 1} and 1.0 when the check passed, {0, 1} and 0.0 when it failed. check_passed never changes.
 """
 from __future__ import annotations
 
@@ -78,6 +84,41 @@ def copy_into(src: Path, dst: Path) -> None:
             shutil.copy2(child, dst / child.name, follow_symlinks=False)
 
 
+SCENARIO_PREFIX = "RSI-SCENARIOS "
+MAX_SCENARIOS = 1000
+
+
+def _scenario_line(stdout: str) -> dict | None:
+    """The well-formed scenario summary from the last RSI-SCENARIOS line of stdout, or None."""
+    lines = [ln for ln in stdout.splitlines() if ln.startswith(SCENARIO_PREFIX)]
+    if not lines:
+        return None
+    try:
+        body = json.loads(lines[-1][len(SCENARIO_PREFIX):])
+    except ValueError:
+        return None
+    if not isinstance(body, dict):
+        return None
+    passed, total, rows = body.get("passed"), body.get("total"), body.get("scenarios")
+    if type(passed) is not int or type(total) is not int or not isinstance(rows, list):
+        return None
+    if not 1 <= total <= MAX_SCENARIOS or not 0 <= passed <= total or len(rows) != total:
+        return None
+    if not all(isinstance(r, dict) and type(r.get("id")) is str and type(r.get("passed")) is bool for r in rows):
+        return None
+    if len({r["id"] for r in rows}) != total or sum(r["passed"] for r in rows) != passed:
+        return None
+    return {"passed": passed, "total": total}
+
+
+def scenario_result(stdout: str, check_passed: bool) -> tuple[dict, float]:
+    """(check_scenarios, check_score). A line that disagrees with the binary result gives no extra credit."""
+    got = _scenario_line(stdout)
+    if got is not None and (got["passed"] == got["total"]) == check_passed:
+        return got, got["passed"] / got["total"]
+    return {"passed": int(check_passed), "total": 1}, float(check_passed)
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--spec", required=True, type=Path)
@@ -92,14 +133,17 @@ def main(argv: list[str] | None = None) -> int:
     env = {"PATH": "/usr/local/bin:/usr/bin:/bin", "HOME": os.environ.get("HOME", "/home/rsi"),
            "LANG": "C.UTF-8", "PYTHONDONTWRITEBYTECODE": "1", "PYTHONNOUSERSITE": "1",
            "HIDDEN_CHECK_DIR": str(a.hidden) if a.hidden else "", "FIXTURE_DIR": str(a.fixture) if a.fixture else ""}
-    timed_out = False
+    timed_out, stdout = False, ""
     try:
         p = subprocess.run(["bash", "-c", spec["check"]], cwd=a.work, env=env, capture_output=True, text=True,
                            timeout=float(spec.get("timeout_s", 120)), stdin=subprocess.DEVNULL)
-        code, log = p.returncode, (p.stdout + p.stderr)
+        code, log, stdout = p.returncode, (p.stdout + p.stderr), p.stdout
     except subprocess.TimeoutExpired:
         code, log, timed_out = 124, "check timed out", True
-    print(json.dumps({"check_exit": code, "check_passed": code == 0 and not timed_out, "timed_out": timed_out,
+    passed = code == 0 and not timed_out
+    scenarios, score = scenario_result(stdout, passed)
+    print(json.dumps({"check_exit": code, "check_passed": passed, "check_scenarios": scenarios,
+                      "check_score": score, "timed_out": timed_out,
                       "log": log[-MAX_LOG:], "diff_stat": stat, "diff": text}, sort_keys=True))
     return 0
 

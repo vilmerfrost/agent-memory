@@ -1,0 +1,50 @@
+{
+  "scenarios": [
+    {
+      "id": "red",
+      "status": "PARTIAL",
+      "branch": "worktree-parser",
+      "commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "pushed": "yes",
+      "evidence": {
+        "command": "pytest -q tests/test_parser.py",
+        "exit": 1,
+        "failed": [
+          "test_unicode"
+        ]
+      },
+      "baseline_needed": true,
+      "denied": []
+    },
+    {
+      "id": "green",
+      "status": "DONE",
+      "branch": "worktree-format",
+      "commit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "pushed": "yes",
+      "evidence": {
+        "command": "pytest -q tests/test_format.py",
+        "exit": 0,
+        "failed": []
+      },
+      "baseline_needed": false,
+      "denied": []
+    },
+    {
+      "id": "guard",
+      "status": "BLOCKED",
+      "branch": "worktree-api",
+      "commit": "cccccccccccccccccccccccccccccccccccccccc",
+      "pushed": "denied",
+      "evidence": {
+        "command": "pytest -q tests/test_api.py",
+        "exit": 0,
+        "failed": []
+      },
+      "baseline_needed": false,
+      "denied": [
+        "git push -u origin worktree-api: host hard denial"
+      ]
+    }
+  ]
+}

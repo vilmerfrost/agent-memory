@@ -124,7 +124,8 @@ def test_cases_load_and_grade_real_outputs(cid, tmp_path):
     assert CASES[cid] in case.prompt
     assert not (case.fixture / "result.json").exists()
     result = grade(cid, tmp_path / "good")
-    assert result.returncode == 0 and result.stdout.strip() == "ok", result.stderr
+    assert result.returncode == 0 and result.stdout.splitlines()[0] == "ok", result.stderr
+    assert result.stdout.splitlines()[-1].startswith("RSI-SCENARIOS ")
     result = grade(cid, tmp_path / "empty", empty=True)
     assert result.returncode != 0 and "missing" in result.stderr
     writes = {s["path"]: s["text"] for s in case.stub if s["op"] == "write"}

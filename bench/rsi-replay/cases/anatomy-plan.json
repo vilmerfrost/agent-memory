@@ -17,7 +17,7 @@
     }
   ],
   "fixture": "anatomy-plan",
-  "hidden_check": "anatomy-plan",
+  "hidden_check": "anatomy-plan-v2",
   "prompt": "Use the anatomy skill (~/.agents/skills/anatomy/SKILL.md) for the figure requested in request.md. This workspace has no network and no external services. Do not render, generate audio, search the web or call any API; there is also no browser and no Node. Do only the planning that comes before any geometry, then stop. Write plan.json with these keys: size (\"Figure\", \"Hero\" or \"Epic\"), estimate_minutes ([low, high]), object (the physical object you will draw), motion (one sentence: what moves and what that motion means), lit_part (the name of the one lit part), parts (a list of {\"name\", \"group\"}) and numbers (the numbers the readout will show, as strings). Write no code or SVG. Do not change request.md.",
   "check": "python3 \"$HIDDEN_CHECK_DIR\"/check.py && cmp -s request.md \"$FIXTURE_DIR\"/request.md",
   "timeout_s": 240,

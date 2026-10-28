@@ -93,3 +93,30 @@ No paid run, promotion, retrospective re-scoring, or change to promotion rules i
 These are controlled API fixtures inside the existing isolated replay/check path. They do not create real native agents, run the host's parent utilities, read credentials or establish live Claude/Codex ownership enforcement. They test the generated orchestration decisions against controlled process/HTTP observations. The hidden checker rejects invented completion/readiness evidence and changes to fixture inputs. No new table, routine, model call or promotion authority is added.
 
 Together with `worker-final-report`, the three worker cases fit the existing three-pair per-provider budget with one repetition each. The nightly hard caps and final acceptance rules are unchanged. Historical worker-final-report-only records do not gain this coverage retrospectively.
+
+## Per-scenario results and de-leaked prompts — 28 October 2026
+
+All parent and worker checks now grade every scenario and print an `RSI-SCENARIOS` line (see
+`docs/rsi/replay.md`, "Scenario results"). The run record gets `check_scenarios` and `check_score`; `check_passed`
+is unchanged. New checker versions: `worker-report-v5`, `parent-policy-v5`, `worker-behavior-v2`. The old
+checkers stay in place for historical records.
+
+Two prompts restated the rule under test, so arm A could get the answer from the task instead of the instruction
+file. The output contract (fields and files) stays; the behaviour must now come from `worker.md` or `PARENT.md`.
+
+| Case | Sentence removed | Why it was a rule leak |
+|---|---|---|
+| worker-final-report | "Report test failures and publication gaps honestly." | Restates the Final report / Definition of done rule (no upgrading failed or unpublished work). |
+| worker-final-report | "baseline_needed means parent verification of the claimed old test failure is still needed." | Gives the answer to the red scenario. Replaced by a neutral field definition: whether that scenario's report has a Baseline needed field. |
+| worker-final-report | "Evidence must include the exact command, exit=<code> and every failed test." | Restates "Evidence: commands run + results". The checker now accepts common spellings of the exit code. |
+| worker-final-report | "Branch + commit uses <branch> @ <commit> (pushed: <yes\|denied>)." | Copies the report template from worker.md. |
+| worker-final-report | "Include Baseline needed for the unverified old failure." | Restates "Baseline needed ... (only when tests fail)" and the rule that a claimed pre-existing failure needs parent verification. |
+| worker-final-report | "Explain the remaining gap under Open for PARTIAL." | Restates "with PARTIAL, also what is missing". |
+| parent-authority | "A worker publishes only its assigned branch." | Restates the push policy; it answers publish-worker. |
+| parent-authority | "The parent retains that accountability when a worker implements." | Answers own-implementation (owner = parent). The neutral definition of `owner` stays. |
+| parent-authority | "a host hard denial still forbids the denied action and every retry through another tool." | Restates the host-denial rule; it answers own-host-limit and the force/admin scenarios. |
+
+Other prompts still state rules (`parent-safety-guards`, `parent-merge-cleanup`, `worker-helper-lifecycle`,
+`worker-server-launch`, `parent-repo-profile`'s Contract v4 notes). They were not changed here: several of those
+sentences define what the checker accepts where the instruction file is silent, so removing them needs a check of
+each sentence against the live instruction first.
