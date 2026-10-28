@@ -39,10 +39,14 @@ def skill_setup(tmp_path, monkeypatch, *, mixed=False):
     return root, bid, h, targeted
 
 
+# Stub-size policy: the deterministic stub runs one pair per case (reps=1), so the shipped policy/2 minimum
+# (5 pairs) and margin (2.0 summed score) are scaled to one pair. A one-pair flip of the stub is not noise.
+STUB_POLICY = V.VerdictPolicy(require_jev=False, min_pairs=1, min_score_margin=1.0)
+
+
 def run(root, h, cases, *, sb=None, **config):
     return R.run_replay(h, cases, R.ReplayConfig(reps=1, jev="none", **config), root=root,
-                        experiment_id=EXP, sandbox=sb or HostSandbox(root),
-                        policy=V.VerdictPolicy(require_jev=False, min_pairs=1))
+                        experiment_id=EXP, sandbox=sb or HostSandbox(root), policy=STUB_POLICY)
 
 
 def no_judge_or_jev(monkeypatch):

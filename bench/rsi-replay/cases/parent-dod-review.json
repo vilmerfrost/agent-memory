@@ -1,0 +1,42 @@
+{
+  "id": "parent-dod-review",
+  "title": "Respond to worker reports by the shared DoD without accepting unverified work",
+  "tags": [
+    "instruction",
+    "parent-workflow"
+  ],
+  "targets": [
+    {
+      "path": "~/agent-config/parent/PARENT.md",
+      "kind": "instruction",
+      "behavior": "DoD: accept, follow up, verify a baseline or switch tactic on a worker report",
+      "sections": [
+        "dod"
+      ]
+    }
+  ],
+  "fixture": "parent-dod-review",
+  "hidden_check": "section-decisions",
+  "prompt": "Read ~/agent-config/parent/PARENT.md from the staged sandbox home first. You are the root parent described in scenarios.json. Each scenario is one worker report that just arrived, with its history and your own review of it. Decide each one by the rules in that file. This is an offline decision replay: contact no one, run nothing, use no network, and do not edit any input file. Write only result.json in this shape: {\"scenarios\": [{\"id\": <scenario id>, \"action\": <one of action_codes: your next step>, \"baseline_commit\": <the commit you check a claimed old failure against, or null when no such check applies>, \"tell_vilmer_preexisting\": <true when you must tell Vilmer about a pre-existing test failure, else false>}]}. One row per scenario.",
+  "check": "python3 \"$HIDDEN_CHECK_DIR\"/check.py",
+  "timeout_s": 180,
+  "stub": [
+    {
+      "op": "read",
+      "path": "~/agent-config/parent/PARENT.md"
+    },
+    {
+      "op": "read",
+      "path": "scenarios.json"
+    },
+    {
+      "op": "write",
+      "path": "result.json",
+      "text": "{\"scenarios\": [{\"id\": \"done-with-red\", \"action\": \"follow_up_to_worker\", \"baseline_commit\": null, \"tell_vilmer_preexisting\": false}, {\"id\": \"partial-preexisting\", \"action\": \"verify_baseline\", \"baseline_commit\": \"4f1c2a9e0b7d4c3a8e6f5d2c1b0a9f8e7d6c5b4a\", \"tell_vilmer_preexisting\": true}, {\"id\": \"done-disputed-first\", \"action\": \"follow_up_to_worker\", \"baseline_commit\": null, \"tell_vilmer_preexisting\": false}, {\"id\": \"done-disputed-again\", \"action\": \"switch_tactic\", \"baseline_commit\": null, \"tell_vilmer_preexisting\": false}, {\"id\": \"done-clean\", \"action\": \"accept\", \"baseline_commit\": null, \"tell_vilmer_preexisting\": false}]}\n"
+    },
+    {
+      "op": "final",
+      "text": "Wrote result.json with one decision per report."
+    }
+  ]
+}

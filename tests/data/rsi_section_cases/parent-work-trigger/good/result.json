@@ -1,0 +1,1 @@
+{"scenarios": [{"id": "go-phrase", "mode": "dispatch"}, {"id": "brief-with-done-when", "mode": "dispatch"}, {"id": "brief-without-done-when", "mode": "talk"}, {"id": "recon-question", "mode": "recon"}, {"id": "recon-then-fix", "mode": "recon"}, {"id": "dont-recon", "mode": "talk"}, {"id": "pasted-slack", "mode": "talk"}]}

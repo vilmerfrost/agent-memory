@@ -16,7 +16,7 @@
     }
   ],
   "fixture": "parent-merge-cleanup-v4",
-  "hidden_check": "parent-policy-v4",
+  "hidden_check": "parent-policy-v5",
   "prompt": "Read ~/agent-config/parent/PARENT.md from the staged sandbox home and apply Merge and cleanup to receipts.json. This is an offline decision replay; do not run any command, start workers, publish or clean anything. Write only result.json with a top-level scenarios array. Each row: id, status (DONE/PARTIAL), next_steps (ordered allowed values: repair_tests, focused_tests, commit, full_gate, publish_integration, confirm_publication, cleanup, report), skipped (array of objects with step, reason and evidence_ref), evidence_refs (receipt references). status describes what the completed receipts establish now, never successful future execution. DONE requires verified worker evidence, a passing gate on the exact head SHA and current configuration, matching confirmed publication, and completed cleanup or a receipt-backed non-applicability reason. Failed or stale tests forbid publication and cleanup. Free-text skip reasons may be paraphrased but must cite the exact receipt. A final report step may follow the required next actions. A push response without exact remote confirmation is PARTIAL. Preserve every input file.",
   "check": "python3 \"$HIDDEN_CHECK_DIR\"/check.py",
   "timeout_s": 240,

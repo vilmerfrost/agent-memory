@@ -500,27 +500,32 @@ def room_needs(plan: dict[str, Any]) -> dict[str, tuple[float, float]]:
 def test_subscription_plan_has_room_for_three_experiments() -> None:
     plan = S.paid_plan(N.load_config(SUBSCRIPTION))
     one = plan["room"]["per_experiment"]
-    # one shared-skill experiment: 3 pairs per provider, each agent run 8 tool + 1 check containers, judge on subscription
-    # the section writer (S6) adds one Opus call and its 300 s timeout per experiment
-    assert one["calls"] == {"claude-opus-5-5": 8, "gpt-6.1-sol": 12, "jev-1.14.0": 2}
-    assert (one["ab_pairs"], one["sandbox_runs"], one["case_timeout_s"]) == (6, 108, 240)
+    # one shared-skill experiment: 5 pairs per provider (Vilmer 2026-10-28), each agent run 8 tool + 1 check
+    # containers, judge on subscription; the section writer (S6) adds one Opus call and its 300 s timeout
+    assert one["calls"] == {"claude-opus-5-5": 12, "gpt-6.1-sol": 20, "jev-1.14.0": 2}
+    assert (one["ab_pairs"], one["sandbox_runs"], one["case_timeout_s"]) == (10, 180, 240)
     assert one["wall_clock_parts_s"] == {"hypothesize": 300, "implement": 300, "stage": 300,
-                                         "replay": 2 * (6 * (240 + S.CHECK_RUN_S) + 3 * 300 + S.JEV_CALL_S)}
-    assert one["wall_clock_s"] == 5760
+                                         "replay": 2 * (10 * (240 + S.CHECK_RUN_S) + 5 * 300 + S.JEV_CALL_S)}
+    assert one["wall_clock_s"] == 8960
     assert room_needs(plan) == {
-        "calls claude-opus-5-5": (24, 26), "calls gpt-6.1-sol": (36, 40), "calls jev-1.14.0": (5 + 6, 12),
-        "A/B pairs per experiment": (6, 6), "sandbox runs": (324, 360), "wall clock": (600 + 3 * 5760, 17940),
+        "calls claude-opus-5-5": (36, 40), "calls gpt-6.1-sol": (60, 64), "calls jev-1.14.0": (5 + 6, 12),
+        "A/B pairs per experiment": (10, 10), "sandbox runs": (540, 540), "wall clock": (600 + 3 * 8960, 17940),
         "subscription tokens": (6_000_000, 6_000_000)}
-    assert plan["room"]["fits"] and plan["max_experiments"] == 3 and plan["within_cap"]
+    assert plan["max_experiments"] == 3 and plan["within_cap"]
+    # Every cap fits except the worst-case wall clock, which the room reports instead of hiding: at every
+    # timeout one experiment finishes inside the night; the night stops cleanly at the wall clock.
+    assert [c["limit"] for c in plan["room"]["checks"] if not c["fits"]] == ["wall clock"]
+    assert plan["room"]["worst_case_experiments_in_wall_clock"] == 1
     text = S.render_plan(plan)
-    assert "Room for 3 experiment(s) (every limit fits):" in text and "- wall clock: need 17,880s of 17,940s fits" in text
+    assert "- wall clock: need 27,480s of 17,940s DOES NOT FIT" in text
+    assert "worst-case wall clock 27,480s is over the code's hard maximum 18,000s" in text
     assert "- subscription tokens: need 6,000,000 of 6,000,000 fits" in text
 
 
 def test_room_flags_caps_sized_for_one_experiment(tmp_path: Path) -> None:
     d = json.loads(SUBSCRIPTION.read_text())
-    d["budget"].update(max_sandbox_runs=128, wall_clock_s=2700, max_subscription_tokens=2_000_000,
-                       model_calls={"jev-1.14.0": 7, "claude-opus-5-5": 8, "gpt-6.1-sol": 12})
+    d["budget"].update(max_sandbox_runs=180, wall_clock_s=2700, max_subscription_tokens=2_000_000,
+                       model_calls={"jev-1.14.0": 7, "claude-opus-5-5": 12, "gpt-6.1-sol": 20})
     p = tmp_path / "old.json"
     p.write_text(json.dumps(d))
     plan = S.paid_plan(N.load_config(p))
@@ -551,7 +556,8 @@ def test_cli_plan_prints_the_room(tmp_path: Path) -> None:
                        capture_output=True, text=True, timeout=60)
     assert r.returncode == 0, r.stderr
     room = json.loads(r.stdout)["room"]
-    assert room["fits"] and room["experiments"] == 3
+    assert room["experiments"] == 3 and room["per_experiment"]["ab_pairs"] == 10
+    assert [c["limit"] for c in room["checks"] if not c["fits"]] == ["wall clock"]   # reported, not hidden
     assert not (tmp_path / "sandbox").exists()
 
 

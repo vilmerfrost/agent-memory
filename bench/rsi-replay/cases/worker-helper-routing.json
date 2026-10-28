@@ -1,0 +1,42 @@
+{
+  "id": "worker-helper-routing",
+  "title": "Route each helper need to the right launcher, mode and follow-up",
+  "tags": [
+    "instruction",
+    "parent-workflow"
+  ],
+  "targets": [
+    {
+      "path": "~/agent-config/agents/worker.md",
+      "kind": "instruction",
+      "behavior": "Subworkers: choose who launches a helper, in which mode, and what the worker does while it runs",
+      "sections": [
+        "subworkers"
+      ]
+    }
+  ],
+  "fixture": "worker-helper-routing",
+  "hidden_check": "section-decisions",
+  "prompt": "Read ~/agent-config/agents/worker.md from the staged sandbox home first. You are the depth-1 worker described in scenarios.json. Each scenario is a moment in your task where some help might be useful. Decide each one by the rules in that file. This is an offline decision replay: launch nothing, use no network, and do not edit any input file. Write only result.json in this shape: {\"scenarios\": [{\"id\": <scenario id>, \"action\": <one of action_codes>, \"next\": <one of next_codes: what you do right after the action>, \"helper_id_from\": <one of helper_id_from_codes: who first obtains the helper's actual agent ID, none when no helper starts>}]}. One row per scenario.",
+  "check": "python3 \"$HIDDEN_CHECK_DIR\"/check.py",
+  "timeout_s": 180,
+  "stub": [
+    {
+      "op": "read",
+      "path": "~/agent-config/agents/worker.md"
+    },
+    {
+      "op": "read",
+      "path": "scenarios.json"
+    },
+    {
+      "op": "write",
+      "path": "result.json",
+      "text": "{\"scenarios\": [{\"id\": \"docs-research\", \"action\": \"launch_reader_foreground\", \"next\": \"wait_for_result\", \"helper_id_from\": \"self\"}, {\"id\": \"long-research-while-coding\", \"action\": \"launch_reader_foreground\", \"next\": \"wait_for_result\", \"helper_id_from\": \"self\"}, {\"id\": \"parallel-migration\", \"action\": \"request_root_launch\", \"next\": \"continue_independent_work\", \"helper_id_from\": \"root\"}, {\"id\": \"blocked-on-migration\", \"action\": \"request_root_launch\", \"next\": \"report_partial\", \"helper_id_from\": \"root\"}, {\"id\": \"other-app-no-isolation\", \"action\": \"do_it_yourself\", \"next\": \"none\", \"helper_id_from\": \"none\"}]}\n"
+    },
+    {
+      "op": "final",
+      "text": "Wrote result.json with one routing decision per scenario."
+    }
+  ]
+}

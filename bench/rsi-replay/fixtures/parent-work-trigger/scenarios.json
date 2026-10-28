@@ -1,0 +1,42 @@
+{
+  "case": "parent-work-trigger",
+  "you": "root parent of repo notes-app, currently idle with no workers running",
+  "mode_codes": ["dispatch", "recon", "talk"],
+  "scenarios": [
+    {
+      "id": "go-phrase",
+      "from": "Vilmer",
+      "message": "ok, we've talked enough about the export. let's go to work."
+    },
+    {
+      "id": "brief-with-done-when",
+      "from": "Vilmer",
+      "message": "Brief: add CSV export to the reports page.\nScope: API endpoint plus the export button.\nUse the existing serializer.\nDone when: the button downloads the filtered rows as CSV and the full suite passes."
+    },
+    {
+      "id": "brief-without-done-when",
+      "from": "Vilmer",
+      "message": "Brief: add CSV export to the reports page.\nScope: API endpoint plus the export button.\nUse the existing serializer. Tests live in tests/reports.\nPriority: high."
+    },
+    {
+      "id": "recon-question",
+      "from": "Vilmer",
+      "message": "/recon why does the nightly import take 40 minutes?"
+    },
+    {
+      "id": "recon-then-fix",
+      "from": "Vilmer",
+      "message": "/recon why does the nightly import take 40 minutes? and then fix whatever you find"
+    },
+    {
+      "id": "dont-recon",
+      "from": "Vilmer",
+      "message": "don't recon, I just want to think out loud about why the import is slow"
+    },
+    {
+      "id": "pasted-slack",
+      "from": "Vilmer",
+      "message": "(pasted from Slack) Anna: hey, can someone ship the CSV export today? customers keep asking. it should download the filtered rows."
+    }
+  ]
+}

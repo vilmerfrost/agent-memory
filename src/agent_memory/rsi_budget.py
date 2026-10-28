@@ -51,8 +51,10 @@ HARD_MAX_RETRIES = 2
 # and the watchdog's hard exit (+10 + 2 min, rsi_schedule) at 06:42. Each container keeps its own short timeout.
 HARD_MAX_WALL_CLOCK_S = 5 * 3600
 HARD_MAX_AB_PAIRS = 60           # rsi_replay: 3 cases x 20 reps
-# 3 experiments x 2 providers x 6 subscription runs x (8 reserved tool containers + 1 check) = 324, plus a margin.
-HARD_MAX_SANDBOX_RUNS = 400
+# Worst case of the 5 + 5 pair night (Vilmer, 2026-10-28): 3 experiments x 2 providers x 10 subscription agent runs
+# x (8 tool containers + 1 check) = 540, plus a margin. Unused tool reservations are given back after each run
+# (Budget.release_sandbox_runs), so the cap binds on containers that ran, plus at most one run's reservation.
+HARD_MAX_SANDBOX_RUNS = 600
 FREE_MODELS = ("stub", "fixture", "none")
 # What each price basis means for the human reading the costs (Mission 005.5: verified provider billing vs local
 # estimates). "reported": the provider's own CLI reported the cost of the call (Claude Code's total_cost_usd); it is
@@ -351,6 +353,7 @@ class Budget:
         self._pending_calls: list[dict[str, Any]] = []
         self._pending_runs: dict[str, dict[str, Any]] = {}
         self.decisions: list[dict[str, Any]] = []
+        self.sandbox_releases: list[dict[str, Any]] = []   # release_sandbox_runs: unused reservations given back
 
     # -- time and money ------------------------------------------------------------------------------
     def elapsed_s(self) -> float:
@@ -387,6 +390,7 @@ class Budget:
                     "remaining_usd": round(max(0.0, self.cfg.max_usd - spent - reserved), 6),
                     "experiments_taken": self._experiments, "experiment_cap": self.cfg.max_experiments,
                     "calls_taken": dict(self._taken_calls), "sandbox_runs_taken": self._taken_runs,
+                    "sandbox_runs_released": sum(int(r["runs"]) for r in self.sandbox_releases),
                     "sandbox_run_cap": self.cfg.max_sandbox_runs, "prices": self.prices.describe()}
 
     def _stop(self, kind: str, detail: str = "") -> BudgetExhausted:
@@ -549,6 +553,33 @@ class Budget:
             self._taken_runs += 1
             self._pending_runs[run_id] = {"estimate_usd": est, "before": before}
 
+    def release_sandbox_runs(self, run_ids: list[str] | tuple[str, ...], *, reason: str) -> int:
+        """Give back reserved container runs that never started (a subscription agent run reserves its maximum
+        tool containers up front and returns the ones it did not use). Only an outstanding, never-recorded
+        reservation can be released, and each one once: an unknown, recorded or already released id refuses the
+        whole call (BudgetConfigError) and changes nothing. Each release is a ledger row (`sandbox_releases`,
+        reported in costs() and the snapshot), so the report shows taken and released runs. Returns the count."""
+        ids = [str(r) for r in run_ids]
+        with self._lock:
+            if len(set(ids)) != len(ids):
+                raise BudgetConfigError("duplicate sandbox run in one release")
+            bad = [r for r in ids if r not in self._pending_runs]
+            if bad:
+                raise BudgetConfigError(f"sandbox run not reserved or already settled: {bad[0]}")
+            if not ids:
+                return 0
+            usd = math.fsum(self._pending_runs[r]["estimate_usd"] for r in ids)
+            for r in ids:
+                del self._pending_runs[r]
+            self._taken_runs -= len(ids)          # >= 0: each id was counted once when it was taken
+            self.sandbox_releases.append({"runs": len(ids), "first": ids[0], "last": ids[-1],
+                                          "reason": str(reason)[:200], "released_usd": usd,
+                                          "taken_after": self._taken_runs})
+            return len(ids)
+
+    def released_sandbox_runs(self) -> int:
+        return sum(int(r["runs"]) for r in self.sandbox_releases)
+
     def record_run(self, run_id: str, *, duration_s: float = 0.0, tokens_in: int = 0, tokens_out: int = 0,
                    usd: float = 0.0, model: str | None = None, exit_code: int | None = None,
                    error: str | None = None, tokens_cached: int = 0, tokens_cache_write: int = 0,
@@ -624,6 +655,9 @@ class Budget:
                      for k, v in sorted(self.provider_requests.items())}
         subscriptions = [r for r in [*self.calls, *self.runs] if r.get("price_basis") == "subscription"]
         return {"by_model": dict(sorted(by_model.items())), "sandbox_runs": len(self.runs),
+                **({"sandbox_releases": {"released_runs": self.released_sandbox_runs(),
+                                         "taken_runs": self._taken_runs, "records": list(self.sandbox_releases)}}
+                   if self.sandbox_releases else {}),
                 "providers": providers, "total_usd": self.spent_usd(), "prices": self.prices.describe(),
                 "accounting": self.snapshot(), "budget_decisions": list(self.decisions),
                 **({"subscription": {"records": len(subscriptions),

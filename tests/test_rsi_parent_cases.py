@@ -42,7 +42,8 @@ def manifest(path):
 
 def expected_cases(path):
     return ["parent-repo-profile"] if path == PARENT else [
-        "worker-final-report", "worker-helper-lifecycle", "worker-server-launch"]
+        "worker-credential-runner", "worker-dod-gaps", "worker-final-report", "worker-helper-lifecycle",
+        "worker-helper-routing", "worker-server-launch"]
 
 
 def bind_synthetic_section(root, digest, path):
@@ -124,7 +125,8 @@ def test_cases_load_and_grade_real_outputs(cid, tmp_path):
     assert CASES[cid] in case.prompt
     assert not (case.fixture / "result.json").exists()
     result = grade(cid, tmp_path / "good")
-    assert result.returncode == 0 and result.stdout.strip() == "ok", result.stderr
+    assert result.returncode == 0 and result.stdout.splitlines()[0] == "ok", result.stderr
+    assert result.stdout.splitlines()[-1].startswith("RSI-SCENARIOS ")
     result = grade(cid, tmp_path / "empty", empty=True)
     assert result.returncode != 0 and "missing" in result.stderr
     writes = {s["path"]: s["text"] for s in case.stub if s["op"] == "write"}
@@ -194,8 +196,8 @@ def test_exact_target_selection_fits_unchanged_provider_budgets(path):
     expected = sorted(expected_cases(path))
     rel = REL.select(manifest(path), cases)
     assert sorted(rel["eligible_cases"]) == expected and rel["uncovered_targets"] == []
-    chosen, reps = R.plan_cases(manifest(path), cases, min_pairs=3, max_pairs=3)
-    assert sorted(c.id for c in chosen) == expected and len(chosen) * reps == 3
+    chosen, reps, pairs = R.plan_pairs(manifest(path), cases, min_pairs=5, max_pairs=5)
+    assert sorted(c.id for c in chosen) == expected[:5] and pairs == 5 and len(chosen) * reps >= 5
     assert P.required_providers(manifest(path)["files"]) == ["claude", "codex"]
 
 
@@ -206,7 +208,7 @@ def test_night_triage_sees_all_five_formerly_uncovered_entries():
     for path in [WORKER, PARENT, PARENT, PARENT, PARENT]:
         assert night._test_cases(path)
     plan = S.paid_plan(night.cfg)
-    assert plan["ab_pairs_per_experiment"] == 6
+    assert plan["ab_pairs_per_experiment"] == 10 and plan["ab_pairs_per_provider"] == 5
     assert plan["ab_pairs_per_experiment"] <= plan["max_ab_pairs"]
 
 
@@ -225,7 +227,7 @@ def test_provider_router_runs_all_target_cases_within_existing_limits(path, tmp_
 
     class Adapter:
         def __init__(self, stages, settings):
-            calls.append((stages["replay_agent"], settings["cases"], settings["reps"]))
+            calls.append((stages["replay_agent"], settings["cases"], settings["reps"], settings["pairs"]))
 
         def replay(self, **kw):
             return N.ReplayOutcome(verdict="NO_EFFECT", reasons=[], arms={}, eval_path="local-fixture", runs=6)
@@ -233,10 +235,15 @@ def test_provider_router_runs_all_target_cases_within_existing_limits(path, tmp_
     monkeypatch.setattr(N, "SandboxReplayer", Adapter)
     P.replay(cfg.stages, cfg.replay, artifact_hash=artifact, baseline_id=baseline,
              experiment_id=EXP, budget=SimpleNamespace(cfg=cfg.budget))
-    ids = sorted(expected_cases(path))
-    reps = 3 // len(ids)
-    assert calls == [("claude", ids, reps), ("codex", ids, reps)]
-    assert sum(len(cases) * n for _, cases, n in calls) == cfg.budget.max_ab_pairs
+    ids = sorted(expected_cases(path))[:5]                     # one target: the first 5 cases in id order
+    reps = -(-5 // len(ids))
+    assert calls == [("claude", ids, reps, 5), ("codex", ids, reps, 5)]
+    assert sum(pairs for *_, pairs in calls) == cfg.budget.max_ab_pairs   # 5 A + 5 B per provider
+
+
+# Stub-size policy: this deterministic stub replay runs 3 pairs (max_pairs=3), below the shipped policy/2
+# minimum of 5; the shipped score margin (2.0) is kept.
+STUB_POLICY = V.VerdictPolicy(require_jev=False, min_pairs=3)
 
 
 @pytest.mark.parametrize("path", [PARENT, WORKER])
@@ -254,7 +261,7 @@ def test_stub_replay_reads_exact_parent_or_worker_bytes_in_both_arms(path, tmp_p
     cases, reps = R.auto_cases(artifact, R.load_cases(), root=root, reps=1, max_pairs=3)
     sb = HostSandbox(root)
     result = R.run_replay(artifact, cases, R.ReplayConfig(reps=reps, jev="none"), root=root,
-                          experiment_id=EXP, sandbox=sb, policy=V.VerdictPolicy(require_jev=False))
+                          experiment_id=EXP, sandbox=sb, policy=STUB_POLICY)
     assert len(result.runs) == 6
     assert all(run.check_passed and run.error is None for run in result.runs), \
         [(r.error, r.check_log) for r in result.runs]

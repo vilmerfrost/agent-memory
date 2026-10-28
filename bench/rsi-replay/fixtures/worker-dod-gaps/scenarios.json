@@ -1,0 +1,122 @@
+{
+  "case": "worker-dod-gaps",
+  "worker": "worker-notes",
+  "brief_starting_commit": "4f1c2a9e0b7d4c3a8e6f5d2c1b0a9f8e7d6c5b4a",
+  "integration_tip_now": "9e8d7c6b5a4f3e2d1c0b9a8f7e6d5c4b3a2f1e0d",
+  "worktree_port": 8114,
+  "worktree_ui_port": 5181,
+  "gap_codes": [
+    "browser_width_375",
+    "browser_width_768",
+    "browser_width_1100",
+    "browser_width_1440",
+    "browser_width_1920",
+    "baseline_verification",
+    "changelog_entry",
+    "coverage_report",
+    "dark_mode_screenshot",
+    "endpoint_requests",
+    "lint_run",
+    "load_test",
+    "neighbor_screens"
+  ],
+  "scenarios": [
+    {
+      "id": "api-tests-only",
+      "brief_dod": "POST /v1/notes stores a note and returns 201.",
+      "changed": {"endpoints": ["POST /v1/notes"], "views": []},
+      "tests": {"command": "pytest -q tests/test_notes.py", "exit": 0, "failed": []},
+      "server_requests": [],
+      "browser_checks": [],
+      "server_stopped": null,
+      "worker_claims": "DONE",
+      "worker_note": "The handler has full unit-test coverage, so the change is verified."
+    },
+    {
+      "id": "api-full",
+      "brief_dod": "POST /v1/notes stores a note; GET /v1/notes/{id} returns it.",
+      "changed": {"endpoints": ["POST /v1/notes", "GET /v1/notes/{id}"], "views": []},
+      "tests": {"command": "pytest -q tests/test_notes.py", "exit": 0, "failed": []},
+      "server_requests": [
+        {"request": "POST http://127.0.0.1:8114/v1/notes", "status": 201},
+        {"request": "GET http://127.0.0.1:8114/v1/notes/7", "status": 200}
+      ],
+      "browser_checks": [],
+      "server_stopped": true,
+      "worker_claims": "DONE",
+      "worker_note": "Server ran in the background on the worktree port and was stopped afterwards."
+    },
+    {
+      "id": "api-one-of-two",
+      "brief_dod": "PATCH /v1/notes/{id} edits a note; DELETE /v1/notes/{id} removes it.",
+      "changed": {"endpoints": ["PATCH /v1/notes/{id}", "DELETE /v1/notes/{id}"], "views": []},
+      "tests": {"command": "pytest -q tests/test_notes.py", "exit": 0, "failed": []},
+      "server_requests": [
+        {"request": "PATCH http://127.0.0.1:8114/v1/notes/7", "status": 200}
+      ],
+      "browser_checks": [],
+      "server_stopped": true,
+      "worker_claims": "DONE",
+      "worker_note": "DELETE shares the same handler module, so one live request is representative."
+    },
+    {
+      "id": "ui-two-widths",
+      "brief_dod": "The settings page shows the new notification toggle.",
+      "changed": {"endpoints": [], "views": ["/settings"]},
+      "tests": {"command": "npm test -- settings", "exit": 0, "failed": []},
+      "server_requests": [],
+      "browser_checks": [
+        {"url": "http://worker-notes.localhost:5181/settings", "width": 1440, "tabId": "tab-31"},
+        {"url": "http://worker-notes.localhost:5181/settings", "width": 375, "tabId": "tab-31"},
+        {"url": "http://worker-notes.localhost:5181/settings/billing", "width": 1440, "tabId": "tab-31"},
+        {"url": "http://worker-notes.localhost:5181/profile", "width": 1440, "tabId": "tab-31"}
+      ],
+      "server_stopped": true,
+      "worker_claims": "DONE",
+      "worker_note": "Desktop and phone both look right; the layout is fluid in between."
+    },
+    {
+      "id": "ui-no-neighbors",
+      "brief_dod": "The notes list shows a pinned badge.",
+      "changed": {"endpoints": [], "views": ["/notes"]},
+      "tests": {"command": "npm test -- notes", "exit": 0, "failed": []},
+      "server_requests": [],
+      "browser_checks": [
+        {"url": "http://worker-notes.localhost:5181/notes", "width": 1440, "tabId": "tab-32"},
+        {"url": "http://worker-notes.localhost:5181/notes", "width": 1100, "tabId": "tab-32"},
+        {"url": "http://worker-notes.localhost:5181/notes", "width": 375, "tabId": "tab-32"}
+      ],
+      "server_stopped": true,
+      "worker_claims": "DONE",
+      "worker_note": "Only /notes changed, so only /notes was opened."
+    },
+    {
+      "id": "ui-full",
+      "brief_dod": "The note editor shows a word count.",
+      "changed": {"endpoints": [], "views": ["/notes/7/edit"]},
+      "tests": {"command": "npm test -- editor", "exit": 0, "failed": []},
+      "server_requests": [],
+      "browser_checks": [
+        {"url": "http://worker-notes.localhost:5181/notes/7/edit", "width": 1440, "tabId": "tab-33"},
+        {"url": "http://worker-notes.localhost:5181/notes/7/edit", "width": 1100, "tabId": "tab-33"},
+        {"url": "http://worker-notes.localhost:5181/notes/7/edit", "width": 375, "tabId": "tab-33"},
+        {"url": "http://worker-notes.localhost:5181/notes/7", "width": 1440, "tabId": "tab-33"},
+        {"url": "http://worker-notes.localhost:5181/notes", "width": 1440, "tabId": "tab-33"}
+      ],
+      "server_stopped": true,
+      "worker_claims": "DONE",
+      "worker_note": "Checked the editor and the two screens that link to it."
+    },
+    {
+      "id": "red-preexisting",
+      "brief_dod": "Note timestamps display in the user's time zone.",
+      "changed": {"endpoints": [], "views": []},
+      "tests": {"command": "pytest -q tests/test_time.py", "exit": 1, "failed": ["test_timezone_roundtrip"]},
+      "server_requests": [],
+      "browser_checks": [],
+      "server_stopped": null,
+      "worker_claims": "DONE",
+      "worker_note": "test_timezone_roundtrip also fails when I check out the current integration tip, so it is pre-existing and not caused by my change."
+    }
+  ]
+}

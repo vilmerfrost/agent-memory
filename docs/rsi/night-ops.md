@@ -200,7 +200,7 @@ Since 2026-10-23 (verify run of night 2026-10-23, partial, $0.14):
   - Jev calls record their tokens: the night's `costs.by_model["jev-1.14.0"]` has the reported `tokens_in` and
     `tokens_out` (the price is still the flat per-call price), the triage answers keep the answering `model`, and
     each experiment's `jev` summary keeps `model`, `tokens_in` and `tokens_out`.
-  - With `replay.cases` null, an experiment replays only its target's cases, repeated up to `min_pairs`. A change to
+  - With `replay.cases` null, an experiment replays only its target's cases, spread to exactly 5 A/B pairs per provider (`min_pairs`, policy/2). A change to
     the global CLAUDE.md still runs the generic cases once each.
 - **Quiet skips.** A lock overlap or a night that is already `done` logs `SKIP` with `-warn` lines, not `-fail`,
   so routine-audit (which flags a SKIP with `-fail` lines) stays green. A night whose run failed is retried by the
