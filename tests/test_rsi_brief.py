@@ -774,3 +774,18 @@ def test_watch_list_shows_first_step_misses_and_possible_guard_bypasses(rdb: str
     assert "  - first step skipped: Watch Me · agent:worker rules:" in md
     assert "It opened the PR itself" not in md
     sections_once(md)
+
+
+def test_recorded_recovery_reaches_brief_and_markdown(sandbox: Path) -> None:
+    check = dict(source='clickhouse', stage='S1 delta', step='ch.rule_gap', status='recovered', attempts=2,
+                 checked_at='2026-10-28T00:30:00Z', elapsed_ms=450,
+                 reason='temporary read failure; recheck succeeded', impact='read completed')
+    recovery = {'format': 'rsi-connection-recovery/1', 'checks': [check]}
+    rep = night_report()
+    rep['connection_recovery'] = recovery
+    write_report(sandbox, rep)
+    brief = BR.make_brief(root=sandbox, db_url=CLOSED_DB)
+    assert brief['connection_recovery'] == recovery
+    markdown = BR.render_markdown(brief)
+    assert 'clickhouse / S1 delta / ch.rule_gap: recovered; 2 attempt(s)' in markdown
+    assert 'read completed' in markdown

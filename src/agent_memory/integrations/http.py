@@ -57,9 +57,10 @@ def tls_context(environ: Mapping[str, str] | None = None) -> ssl.SSLContext:
 
 
 class HttpError(Exception):
-    def __init__(self, status: int | None, message: str):
+    def __init__(self, status: int | None, message: str, *, retryable: bool | None = None):
         super().__init__(f"HTTP {status}: {message}" if status else message)
         self.status = status
+        self.retryable = status in {500, 502, 503, 504} if retryable is None else retryable
 
 
 @dataclass
@@ -219,10 +220,11 @@ def request(method: str, url: str, *, headers: Mapping[str, str] | None = None, 
         except http_client.HTTPException as exc:
             if deadline is None:
                 raise  # preserve the non-budgeted retry contract, especially billed POST reads
-            raise HttpError(None, f"{type(exc).__name__}: bounded response interrupted") from None
+            raise HttpError(None, f"{type(exc).__name__}: bounded response interrupted", retryable=True) from None
         except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as e:
             if attempt >= retries or deadline is not None:
-                raise HttpError(None, f"{type(e).__name__}: {getattr(e, 'reason', e)!s}"[:300]) from None
+                raise HttpError(None, f"{type(e).__name__}: {getattr(e, 'reason', e)!s}"[:300],
+                                retryable=not isinstance(getattr(e, "reason", e), ssl.SSLError)) from None
             attempt += 1
             sleep(backoff * 2 ** (attempt - 1))
             continue
@@ -235,4 +237,5 @@ def request(method: str, url: str, *, headers: Mapping[str, str] | None = None, 
             attempt += 1
             sleep(max(backoff * 2 ** (attempt - 1), wait or 0.0))
             continue
-        raise HttpError(resp.status, resp.text()[:300])
+        raise HttpError(resp.status, resp.text()[:300],
+                        retryable=False if retry_after(resp.headers) is not None else None)

@@ -1703,6 +1703,7 @@ class Night:
         self.owns_night = False        # the night's checkpoint row and report belong to this run
         self.marked_running = False
         self.failed = False            # an experiment or stage failed: the checkpoint is not advanced
+        self.execution_ready = True    # missing sandbox blocks paid stages, not deterministic collection
         self.degraded = False          # a provider was down or an experiment failed: partial, but S1-S8 finished
         self.health_reasons: dict[str, list[str]] = {}   # provider -> why it was not ok (redacted, one line each)
         self.health_where: dict[str, str] = {}            # provider -> the stage that first reported it not ok
@@ -1716,7 +1717,19 @@ class Night:
             "checkpoint": {"before": None, "after": None, "advanced": False},
             "delta": {"since": None, "sessions": 0, "deviations": 0, "eval_failures": 0, "routine_failures": 0},
             "patterns": [], "candidates": [], "experiments": [], "costs": {}, "health": {},
-            "pending_decisions": [], "notes": []}
+            "pending_decisions": [], "notes": [],
+            "connection_recovery": {"format": "rsi-connection-recovery/1",
+                "policy": {"max_attempts": 3, "retry_delay_s": 0.25,
+                           "scope": "read-only evidence; shared provider deadline"},
+                "checks": [], "dependencies": [
+                    {"capability": "database, run lock and budget", "required_for": "durable safe execution",
+                     "failure_scope": "whole run"},
+                    {"capability": "sandbox and configured evaluation providers", "required_for": "valid paired replay",
+                     "failure_scope": "dependent replay; required provider comparisons are never dropped"},
+                    {"capability": "clickhouse, langfuse and pastdev reads", "required_for": "supporting evidence",
+                     "failure_scope": "affected evidence queries; independent work continues"},
+                    {"capability": "verified candidate evidence", "required_for": "hypothesis generation",
+                     "failure_scope": "candidate only"}]}}
         if prerequisite_warnings:      # failed prerequisite steps the night does not read (rsi_schedule's gate)
             self.report["prerequisite_warnings"] = _prereq_warnings(prerequisite_warnings)
         self.allowlist: list[str] = []
@@ -1800,6 +1813,26 @@ class Night:
                     if not hasattr(self, "health_where"):
                         self.health_where = {}
                     self.health_where.setdefault(k, _one_line(where, 120))
+        for step in steps or []:
+            if not isinstance(step, Mapping):
+                continue
+            source = _RETRIEVER.get(str(step.get("step", "")).split(".", 1)[0])
+            if source is None:
+                continue
+            state = step.get("recovery_status")
+            if state not in {"healthy", "recovered", "failed", "excluded", "not_required"}:
+                state = "healthy" if step.get("status") == "ok" else (
+                    "excluded" if str(step.get("detail", "")).startswith("policy-excluded:") else "failed")
+            checks = getattr(self, "report", {}).get("connection_recovery", {}).get("checks")
+            if checks is not None and len(checks) < 200:
+                checks.append({"source": source, "stage": _one_line(where, 160),
+                    "step": _one_line(step.get("step", "unknown"), 80), "status": state,
+                    "attempts": step.get("attempts"), "checked_at": step.get("checked_at") or _now_iso(),
+                    "elapsed_ms": step.get("elapsed_ms"),
+                    "reason": step.get("recovery_reason") or (
+                        "read succeeded" if state == "healthy" else "see recorded health reason"),
+                    "impact": "supporting evidence unavailable; independent work continues" if state == "failed" else (
+                        "query excluded; coverage gap retained" if state == "excluded" else "read completed")})
         # Why a provider was not ok: the failing steps' own detail (the 2026-10-23 night logged only "error").
         for st in steps or []:
             if not isinstance(st, Mapping) or st.get("status") in (None, "ok"):
@@ -1871,8 +1904,17 @@ class Night:
             raise PreflightFailed(f"night {self.night} is already done")
         self.owns_night = not self.dry_run
         self.health["sandbox"] = self.ad.replayer.preflight()
-        if self.health["sandbox"] != "ok" and not self.dry_run:      # a dry run never reaches the sandbox
-            raise PreflightFailed("sandbox unavailable (docker or the worker image)")
+        if self.health["sandbox"] != "ok" and not self.dry_run:
+            self.execution_ready = False
+            self.degraded = True
+            reason = "sandbox unavailable (docker or the worker image); paid stages deferred; collection continues"
+            self.notes.append(reason)
+            self.health_reasons["sandbox"] = [reason]
+            self.report["connection_recovery"]["checks"].append({
+                "source": "sandbox", "stage": "S0 preflight", "step": "sandbox.preflight", "status": "failed",
+                "attempts": 1, "checked_at": _now_iso(), "elapsed_ms": None,
+                "reason": "sandbox unavailable; no automatic service restart configured",
+                "impact": "paid triage and experiments deferred; deterministic evidence collection continues"})
         self.allowlist = list(self.ad.targets())
         self.pinned = [t for t in self.allowlist if _refused_by_improve(t)]
         if self.pinned:                # improve refuses these: a candidate on one only burns triage and model money
@@ -2347,7 +2389,7 @@ class Night:
             tests = self._test_cases(c.get("target"))
             ans = None
             # No replay case uses the file: no paid triage call, the deterministic heuristic ranks it for the report.
-            if tests and (not self.dry_run or self.cfg.stages["triage"] == "fixture"):
+            if tests and self.execution_ready and (not self.dry_run or self.cfg.stages["triage"] == "fixture"):
                 state = triage_state(c, hist, in_scope, tests, self._baselines(tests))
                 ans = self.ad.triage.assess(c, state=state, budget=self.budget)
             if ans is None:
@@ -2404,6 +2446,15 @@ class Night:
 
     # -- S4-S8 -----------------------------------------------------------------------------------------
     def _experiments(self) -> None:
+        if not self.execution_ready:
+            for cid in self.selected_ids:
+                c = self._pool_rows[cid]
+                reason = "deferred: sandbox unavailable; no paid experiment attempted"
+                self._update_candidate(c.get("id"), status="deferred", reason=reason)
+                for entry in self.report["candidates"]:
+                    if entry["key"] == c["dedupe_key"]:
+                        entry.update(selected=False, reason=reason, skip_reason="sandbox unavailable")
+            return
         target = self.cfg.experiment_goal[1]
         standby = self.standby_ids if self.cfg.experiment_goal[0] > 0 else []
         for cid in [*self.selected_ids, *standby]:
@@ -2433,6 +2484,7 @@ class Night:
         # S4: a bounded evidence pack (untrusted data; it only reaches the model inside its envelope)
         refs = list(c.get("evidence_refs") or [])[:20]
         evidence_text = ""
+        pack = None
         self._evidence[str(c["dedupe_key"])] = evidence_detail([])
         try:
             with self._interruptible():
@@ -2453,6 +2505,22 @@ class Night:
             self.degraded = True
             self.notes.append(f"evidence pack for {c['dedupe_key']}: {type(exc).__name__}")
             self._cov().pack_failed(f"evidence pack for {c['dedupe_key']}: {type(exc).__name__}")
+        # A missing optional source is not a whole-night stop. But without any
+        # re-readable authoritative support this candidate must wait before S5.
+        if pack is None or any(self.health.get(k) in UNHEALTHY for k in PROVIDERS[1:]):
+            from agent_memory.rsi_evidence_pack import existing
+            local_refs = [r for r in refs if isinstance(r, str) and r.startswith("amem:")]
+            verified = existing(self.conn, local_refs) if local_refs else set()
+            pack_ok = any(_dget(f, "status") == "ok" and _dget(f, "authority")
+                          for f in (_dget(pack, "findings") or []))
+            if not verified and not pack_ok:
+                reason = "deferred: required candidate evidence unavailable; independent candidates continue"
+                self._update_candidate(c.get("id"), status="deferred", reason=reason)
+                for entry in self.report["candidates"]:
+                    if entry["key"] == c["dedupe_key"]:
+                        entry.update(selected=False, reason=reason, skip_reason="required evidence unavailable")
+                self.degraded = True
+                return
         refs = list(dict.fromkeys(refs))[:20]
         self._evidence_text[str(c["dedupe_key"])] = evidence_text     # S6's writer sees it only in its envelope
         # S5: typed hypotheses (pending ones from an earlier night first: no new model call)
@@ -3005,6 +3073,35 @@ def experiment_goal_problems(goal: Any, experiments: Any = None) -> list[str]:
     return errors
 
 
+def connection_recovery_problems(value: Any) -> list[str]:
+    """Optional additive execution evidence, never current service health."""
+    if not isinstance(value, dict) or value.get("format") != "rsi-connection-recovery/1":
+        return ["connection_recovery: unsupported format"]
+    checks = value.get("checks")
+    if not isinstance(checks, list) or len(checks) > 200:
+        return ["connection_recovery.checks: expected at most 200 checks"]
+    problems = []
+    for row in checks:
+        if not isinstance(row, dict):
+            problems.append("connection_recovery: check is not an object")
+            continue
+        attempts, elapsed = row.get("attempts"), row.get("elapsed_ms")
+        if row.get("source") not in HEALTH_KEYS or row.get("status") not in {
+                "healthy", "recovered", "failed", "excluded", "not_required"}:
+            problems.append("connection_recovery: invalid source or status")
+        if attempts is not None and (type(attempts) is not int or not 1 <= attempts <= 3):
+            problems.append("connection_recovery: invalid attempt count")
+        if row.get("status") == "recovered" and (type(attempts) is not int or attempts < 2):
+            problems.append("connection_recovery: recovery requires a successful retry")
+        if elapsed is not None and (type(elapsed) not in (int, float) or not math.isfinite(elapsed) or elapsed < 0):
+            problems.append("connection_recovery: invalid duration")
+        if not isinstance(row.get("checked_at"), str) or _parse_ts(row["checked_at"]) is None:
+            problems.append("connection_recovery: invalid check time")
+        if not all(isinstance(row.get(k), str) for k in ("stage", "step", "reason", "impact")):
+            problems.append("connection_recovery: missing check description")
+    return problems
+
+
 def validate_report(obj: Any) -> list[str]:
     """Problems with a night report against contract 2.5 (rsi-night/1). Empty list: valid."""
     errs: list[str] = []
@@ -3032,7 +3129,7 @@ def validate_report(obj: Any) -> list[str]:
                "blocked",                                      # optional: ideas no experiment can use (2026-10-25)
                "writer",                                       # optional: the section writer's tally (2026-10-26)
                "prerequisites",                                # optional: the night's own prerequisite checks (R2)
-               "coverage", "experiment_goal"}                  # optional: coverage ledger and daily cadence
+               "coverage", "experiment_goal", "connection_recovery"}                  # optional: coverage ledger and daily cadence
     errs += [f"unknown key {k}" for k in sorted(set(obj) - allowed)]
     if obj.get("format") != FORMAT:
         errs.append("format is not rsi-night/1")
@@ -3044,6 +3141,8 @@ def validate_report(obj: Any) -> list[str]:
             errs.append(f"{k} is not an ISO timestamp")
     if obj.get("status") not in STATUSES:
         errs.append(f"status {obj.get('status')!r} not in {STATUSES}")
+    if "connection_recovery" in obj:
+        errs += connection_recovery_problems(obj["connection_recovery"])
     if "experiment_goal" in obj:
         errs += experiment_goal_problems(obj["experiment_goal"], obj.get("experiments"))
     cp = need(obj, "checkpoint", dict, "report")

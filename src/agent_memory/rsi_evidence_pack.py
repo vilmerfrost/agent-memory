@@ -438,6 +438,11 @@ class _HealthOnce:
             raise self._h
         return self._h
 
+    def reset_health(self) -> None:
+        # One provider thread owns these calls. Never clear another provider's cache.
+        with self._lock:
+            self._h = None
+
     def read_budget(self, seconds: float):
         budget = getattr(self._r, "read_budget", None)
         return budget(seconds) if callable(budget) else nullcontext()
@@ -478,6 +483,7 @@ class _Runner:
         self.used: dict[str, float] = defaultdict(float)
         self.dead: set[str] = set()
         self.log: list[dict[str, Any]] = []
+        self.observations: dict[str, dict[str, Any]] = {}
 
     def budget(self, retr: str) -> float:
         return self.timeout_s + self.extra.get(retr, 0.0)
@@ -531,6 +537,45 @@ class _Runner:
             return "timeout", None
         return box[0]
 
+    def _query(self, retr: str, r: _HealthOnce, st: _Step, remaining: float) -> QueryResult:
+        """Retry only idempotent CH/LF reads, at most twice, inside the original deadline.
+
+        No model, past.dev recall, write, auth or policy retry. A timed-out runner
+        never starts a second provider thread. Individual attempts share the budget.
+        """
+        started = self.clock()
+        deadline = started + remaining
+        attempts = 0
+        failures: list[str] = []
+        limit = 3 if retr in {"ch", "lf"} else 1
+        result = QueryResult(r.source, "error", detail="read budget exhausted")
+        while attempts < limit and self.clock() < deadline:
+            attempts += 1
+            left = max(0.0, deadline - self.clock())
+            with r.read_budget(left):
+                result = run_query(r, st.query, st.params)
+            if result.status == "ok" or not result.retryable:
+                break
+            failures.append("temporary read failure")
+            if attempts >= limit or deadline - self.clock() <= 0.25:
+                break
+            time.sleep(0.25)
+            r.reset_health()
+        excluded = result.status == "unavailable" and (
+            result.detail.startswith("policy-excluded:") or _owner_off(r._r))
+        state = ("recovered" if failures else "healthy") if result.status == "ok" else (
+            "excluded" if excluded else "failed")
+        self.observations[st.name] = {
+            "attempts": attempts or None, "recovery_status": state,
+            "checked_at": datetime.now(UTC).isoformat(timespec="seconds"),
+            "elapsed_ms": round(max(0.0, self.clock() - started) * 1000, 3),
+            "recovery_reason": "temporary read failure; recheck succeeded" if state == "recovered" else (
+                "policy exclusion; no repair attempted" if excluded else
+                "read succeeded" if state == "healthy" else
+                "read unavailable; inspect recorded step detail"),
+        }
+        return result
+
     def phase(self, steps: Sequence[_Step]) -> list[tuple[_Step, QueryResult]]:
         groups: dict[str, list[_Step]] = defaultdict(list)
         for st in steps:
@@ -552,12 +597,12 @@ class _Runner:
             stop = threading.Event()
 
             def body(r: Any = r, sts: list[_Step] = sts, box: list[tuple[_Step, QueryResult]] = box,
-                     stop: threading.Event = stop, remaining: float = self._left(retr)) -> None:
-                with r.read_budget(remaining):
-                    for st in sts:
-                        if stop.is_set():
-                            return
-                        box.append((st, run_query(r, st.query, st.params)))
+                     stop: threading.Event = stop,
+                     deadline_at: float = self.clock() + self._left(retr)) -> None:
+                for st in sts:
+                    if stop.is_set():
+                        return
+                    box.append((st, self._query(st.retr, r, st, max(0.0, deadline_at - self.clock()))))
 
             deadline = self.clock() + self._left(retr)
             t, spent = self._start(retr, body)
@@ -571,7 +616,8 @@ class _Runner:
                 results.setdefault(id(st), QueryResult(retr, "error", detail=f"timeout after {self.budget(retr):g}s"))
         out = [(st, results[id(st)]) for st in steps]
         self.log += [{"step": st.name, "status": res.status, "found": len(res.refs),
-                      "detail": _free(res.detail, 120) or ""} for st, res in out]
+                      "detail": _free(res.detail, 120) or "",
+                      **self.observations.get(st.name, {})} for st, res in out]
         return out
 
 
@@ -1357,11 +1403,12 @@ def delta_since(checkpoint_ts: str | datetime | None, *, conn: psycopg.Connectio
         done = runner.phase(steps)
         stat: dict[str, list[str]] = defaultdict(list)
         for st, res in done:
-            stat[st.source].append(res.status)
+            if not (res.status == "unavailable" and res.detail.startswith("policy-excluded:")):
+                stat[st.source].append(res.status)
         for retr in ("ch", "lf", "pd"):
             if retr not in retrievers:
                 continue
-            if SERVICE[retr] not in stat:
+            if SERVICE[retr] not in stat and not any(st.retr == retr for st, _ in done):
                 r = runner.r.get(retr)
                 if r is None:
                     stat[SERVICE[retr]].append("unavailable")

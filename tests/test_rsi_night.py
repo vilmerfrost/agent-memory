@@ -552,12 +552,15 @@ def test_lock_contention_and_stale_lock_recovery(env: SimpleNamespace) -> None:
     assert rep["status"] == "ok" and not held.exists()
 
 
-def test_sandbox_unavailable_fails_preflight(env: SimpleNamespace) -> None:
+def test_sandbox_unavailable_preserves_collection_without_paid_stages(env: SimpleNamespace) -> None:
     seed_ab(env)
     rep = run(env, replayer=FakeReplayer(health="unavailable"))
-    assert rep["status"] == "preflight_failed" and rep["health"]["sandbox"] == "unavailable"
-    assert rows(env.url, "select count(*) from rsi_candidates") == [(0,)]
-    assert read_report(N1)["status"] == "preflight_failed"
+    assert rep["status"] == "partial" and rep["health"]["sandbox"] == "unavailable"
+    assert rows(env.url, "select count(*) from rsi_candidates") == [(2,)]
+    assert rows(env.url, "select count(*) from rsi_candidates where status = 'selected'") == [(0,)]
+    assert rep["experiments"] == [] and rep["costs"]["by_model"] == {}
+    assert rep["delta"]["sessions"] == 5 and rep["delta"]["deviations"] == 5
+    assert read_report(N1)["status"] == "partial"
 
 
 # --------------------------------------------------------------------------- providers, injection, safety
@@ -877,11 +880,11 @@ def test_an_earlier_hard_killed_night_is_reconciled_under_the_lock(env: SimpleNa
     assert rows(env.url, "select count(*) from rsi_candidates where status = 'selected'") == [(0,)]
 
 
-def test_docker_unavailable_fails_closed_with_the_real_sandbox_check(env: SimpleNamespace, tmp_path: Path,
+def test_docker_unavailable_defers_paid_work_with_the_real_sandbox_check(env: SimpleNamespace, tmp_path: Path,
                                                                     monkeypatch: pytest.MonkeyPatch) -> None:
     """Mission 005.6: Docker Desktop does not auto-start after a reboot. The REAL SandboxReplayer.preflight (docker
-    info against an unreachable daemon) must fail the night before any paid call: preflight_failed, $0, nothing
-    written, the lock released, and the night-job's routines.log status FAIL naming the sandbox."""
+    info against an unreachable daemon) must block paid work, preserve deterministic collection,
+    release the lock, and retain a FAIL diagnostic naming the sandbox."""
     from agent_memory import rsi_schedule as S
     monkeypatch.setenv("DOCKER_HOST", f"unix://{tmp_path / 'no-docker.sock'}")
     monkeypatch.delenv("DOCKER_CONTEXT", raising=False)
@@ -889,7 +892,9 @@ def test_docker_unavailable_fails_closed_with_the_real_sandbox_check(env: Simple
     replayer = N.SandboxReplayer({"replay_agent": "stub", "judge": "stub", "replay_jev": "fixture"}, {})
     assert replayer.preflight() == "unavailable"
     rep = run(env, replayer=replayer)
-    assert rep["status"] == "preflight_failed" and rep["health"]["sandbox"] == "unavailable"
+    assert rep["status"] == "partial" and rep["health"]["sandbox"] == "unavailable"
+    assert rep["costs"]["by_model"] == {}
+    assert rep["delta"]["sessions"] == 5
     assert any("sandbox unavailable" in n for n in rep["notes"]), rep["notes"]
     assert rep["experiments"] == [] and float(rep["costs"]["total_usd"]) == 0.0
     assert rows(env.url, "select count(*) from rsi_experiments") == [(0,)]

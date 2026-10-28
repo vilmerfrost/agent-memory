@@ -226,6 +226,9 @@ def validate_report(rep: Any) -> list[str]:
     if sk is not None and not (isinstance(sk, dict) and sk.get("reason") in SKIP_REASONS
                                and isinstance(sk.get("summary", ""), str) and isinstance(sk.get("items", []), list)):
         p.append(f"skipped: not an object with reason {' or '.join(SKIP_REASONS)}, a summary and items")
+    if "connection_recovery" in rep:
+        from agent_memory.rsi_night import connection_recovery_problems
+        p += connection_recovery_problems(rep["connection_recovery"])
     pw = rep.get("prerequisite_warnings")
     if pw is not None and not (isinstance(pw, list) and all(isinstance(w, str) for w in pw)):
         p.append("prerequisite_warnings: not a list of strings")
@@ -988,6 +991,7 @@ def build_brief(rep: Mapping[str, Any], db: Db, *, artifacts_root: Path, report:
                        "items": cands[:MAX_CANDIDATES]},
         "experiments": {"total": len(exps), "items": experiments},
         "passed": passed, "failed": failed, "costs": costs, "health": health, "pending_decisions": pending,
+        **({"connection_recovery": rep["connection_recovery"]} if "connection_recovery" in rep else {}),
         "sections": list(SECTIONS),
     }
 
@@ -1292,6 +1296,13 @@ def render_markdown(b: dict[str, Any]) -> str:
             out.append(f"- {k}: {v}" + (" (DEGRADED)" if k in h["degraded"] else "") + (f": {why}" if why else ""))
         if not h["services"]:
             out.append("- The report lists no services.")
+    recovery = b.get("connection_recovery") or {}
+    for check in recovery.get("checks") or []:
+        attempts = check.get("attempts")
+        out.append(f"- {text(check.get('source'), 32)} / {text(check.get('stage'), 160)} / "
+                   f"{text(check.get('step'), 80)}: {text(check.get('status'), 24)}; "
+                   + (f"{attempts} attempt(s)" if attempts is not None else "attempt count unknown")
+                   + f". {text(check.get('impact'), 200)}")
     db = h["database"]
     out.append(f"- Database rows for this brief: {db['status']}" + (f" ({db['detail']})" if db["detail"] else "") + ".")
 
