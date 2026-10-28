@@ -86,7 +86,9 @@ def replay(stages, settings, *, artifact_hash, experiment_id, baseline_id, budge
         views.append({"provider": provider, "verdict": outcome.verdict, "reasons": outcome.reasons,
                       "arms": outcome.arms, "test_setup": outcome.setup, "relevance": outcome.relevance,
                       "judge_pairs": outcome.judge_pairs, "eval_path": outcome.eval_path,
-                      "judge": outcome.judge, "jev": outcome.jev})
+                      "judge": outcome.judge, "jev": outcome.jev,
+                      "judge_rule": getattr(outcome, "judge_rule", None),
+                      "judge_prompt_version": getattr(outcome, "judge_prompt_version", None)})
         if outcome.budget_stop:
             break
     verdict = combined_verdict(results) if len(results) == len(required) else "INCONCLUSIVE"
@@ -113,4 +115,7 @@ def replay(stages, settings, *, artifact_hash, experiment_id, baseline_id, budge
         judge=single.judge if single else None, jev=single.jev if single else None,
         setup=single.setup if single else {"agent":"separate provider comparisons","auth_mode":"subscription","effort":"high"},
         relevance=single.relevance if single else {}, judge_pairs=single.judge_pairs if single else [], provider_results=views,
-        attempts=[a for r in results for a in getattr(r, "attempts", [])])
+        attempts=[a for r in results for a in getattr(r, "attempts", [])],
+        # Every provider replays the same artifact, so the judge saw the same rule: the first one recorded.
+        judge_rule=next((v["judge_rule"] for v in views if v.get("judge_rule")), None),
+        judge_prompt_version=next((v["judge_prompt_version"] for v in views if v.get("judge_prompt_version")), None))

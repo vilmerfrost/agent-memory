@@ -689,6 +689,8 @@ class ReplayOutcome:
     judge_pairs: list[dict[str, Any]] = field(default_factory=list)
     provider_results: list[dict[str, Any]] = field(default_factory=list)
     attempts: list[dict[str, Any]] = field(default_factory=list)   # attempt identities (attempt_links.runner_identity)
+    judge_rule: dict[str, Any] | None = None    # rsi_replay.judge_rule: {section_id, heading, text} the judge saw
+    judge_prompt_version: str | None = None
 
 
 JUDGE_KEYS = ("mode", "judged", "wins_a", "wins_b", "ties", "unfired_b", "errors", "b_winrate")
@@ -736,10 +738,40 @@ def report_judge_pairs(pairs: Any, setup: Mapping[str, Any] | None = None) -> li
     return out
 
 
+ARM_SCORE_KEYS = ("score_sum", "scenarios_passed", "scenarios_total")
+
+
+def report_arms(arms: Any) -> dict[str, dict[str, Any]]:
+    """The A and B arm summaries as the report keeps them. An arm summary without the partial-credit totals (an
+    older replay record) gets them as null, so a reader finds the keys on every replayed arm."""
+    arms = arms if isinstance(arms, Mapping) else {}
+    return {k: {**{s: None for s in ARM_SCORE_KEYS}, **dict(arms.get(k) or {})} for k in ("A", "B")}
+
+
+def report_judge_rule(rule: Any) -> dict[str, str] | None:
+    """The rule under test the judge saw ({section_id, heading, text}), credentials redacted; None when the judge
+    saw no rule (legacy artifact) or the record has no valid rule."""
+    from agent_memory.redact import redact
+    if not isinstance(rule, Mapping) or not isinstance(rule.get("text"), str) or not rule["text"].strip():
+        return None
+    return {"section_id": _one_line(str(rule.get("section_id") or ""), 200),
+            "heading": redact(_one_line(str(rule.get("heading") or ""), 200)), "text": redact(rule["text"])}
+
+
 def report_provider_results(views: Any) -> list[dict[str, Any]]:
-    """rsi_provider_replay's per-provider views with their judge pairs reduced as report_judge_pairs does."""
-    return [{**v, "judge_pairs": report_judge_pairs(v.get("judge_pairs"), v.get("test_setup"))}
-            for v in list(views or []) if isinstance(v, Mapping)]
+    """rsi_provider_replay's per-provider views with their judge pairs reduced as report_judge_pairs does, arm
+    summaries carrying the partial-credit totals, and the judge's rule and prompt version (null when absent)."""
+    out = []
+    for v in list(views or []):
+        if not isinstance(v, Mapping):
+            continue
+        item = {**v, "judge_pairs": report_judge_pairs(v.get("judge_pairs"), v.get("test_setup")),
+                "judge_rule": report_judge_rule(v.get("judge_rule")),
+                "judge_prompt_version": v.get("judge_prompt_version") if isinstance(v.get("judge_prompt_version"), str) else None}
+        if isinstance(v.get("arms"), Mapping) and v["arms"]:
+            item["arms"] = report_arms(v["arms"])
+        out.append(item)
+    return out
 
 
 class Replayer(Protocol):
@@ -1586,7 +1618,9 @@ class SandboxReplayer:
                                     "tasks": [{"id": c.id, "title": c.title or c.id} for c in cases]},
                              relevance=dict(_dget(r, "relevance") or {}),
                              judge_pairs=list(getattr(_dget(r, "judge"), "pairs", ()) or ()),
-                             attempts=_attempts(experiment_id, _dget(r, "runs") or [], getattr(rc, "profile", None)))
+                             attempts=_attempts(experiment_id, _dget(r, "runs") or [], getattr(rc, "profile", None)),
+                             judge_rule=_dget(r, "judge_rule"),
+                             judge_prompt_version=_dget(r, "judge_prompt_version") or None)
 
 
 class ApprovalProposer:
@@ -2939,18 +2973,21 @@ class Night:
                     if c.get('source')=='skill_scores' else str(c.get('rule_key') or '').removeprefix('dev:'))
             self._update_candidate(c['id'], meta=tested)
             c['meta'] = {**(c.get('meta') or {}), **tested}
-            entry.update(verdict=verdict, verdict_reasons=reasons[:20],
-                         arms={"A": dict(rr.arms.get("A") or {}), "B": dict(rr.arms.get("B") or {})},
+            entry.update(verdict=verdict, verdict_reasons=reasons[:20], arms=report_arms(rr.arms),
                          judge=_summary(getattr(rr, "judge", None), JUDGE_KEYS),
                          jev=_summary(getattr(rr, "jev", None), JEV_KEYS))
             pairs = report_judge_pairs(rr.judge_pairs, rr.setup)     # titled, one redacted short line per reason
             views = report_provider_results(rr.provider_results)
-            entry.update(test_setup=rr.setup, relevance=rr.relevance, judge_pairs=pairs, provider_results=views)
+            jv = getattr(rr, "judge_prompt_version", None)
+            entry.update(test_setup=rr.setup, relevance=rr.relevance, judge_pairs=pairs, provider_results=views,
+                         judge_rule=report_judge_rule(getattr(rr, "judge_rule", None)),
+                         judge_prompt_version=jv if isinstance(jv, str) else None)
             row = {"status": "evaluated", "verdict": verdict,
                    "meta": {"verdict_reasons": reasons[:20], "arms": entry["arms"], "eval_path": rr.eval_path,
                             "replay_runs": rr.runs, "budget_stop": rr.budget_stop, "judge": entry["judge"],
                             "jev": entry["jev"], "test_setup": rr.setup, "relevance": rr.relevance,
                             "judge_pairs": pairs, "provider_results": views,
+                            "judge_rule": entry["judge_rule"], "judge_prompt_version": entry["judge_prompt_version"],
                             "intended_intervention": intended, "replay_verdict": replay_verdict}}
             if rr.budget_stop:
                 entry["status"] = "skipped_budget"
@@ -3224,7 +3261,8 @@ def run_night(*, night: str | None = None, config_path: Path | None = None, dry_
                "status": "preflight_failed", "checkpoint": {"before": None, "after": None, "advanced": False},
                "delta": {"since": None, "sessions": 0, "deviations": 0, "eval_failures": 0, "routine_failures": 0},
                "patterns": [], "candidates": [], "experiments": [],
-               "costs": {"by_model": {}, "sandbox_runs": 0, "providers": {}, "total_usd": 0.0},
+               "costs": {"by_model": {}, "sandbox_runs": 0, "sandbox_runs_used": 0, "sandbox_runs_released": 0,
+                         "providers": {}, "total_usd": 0.0},
                "health": {k: "skipped" for k in HEALTH_KEYS}, "pending_decisions": [], "notes": [f"config: {exc}"[:300]]}
         if prerequisite_warnings:
             rep["prerequisite_warnings"] = _prereq_warnings(prerequisite_warnings)
