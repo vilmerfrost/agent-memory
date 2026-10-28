@@ -1,0 +1,42 @@
+{
+  "_note": "sandbox-replay/5 counterpart of 8fb3ae53face3b9aaf28fcc5ec0286ff.json (suite version bump: checker contracts and judge prompt v2, 2026-10-28). Same synthetic answers for the same structured outcomes. Not a live response.",
+  "_replay_state": "suite: sandbox-replay/5\nagent: codex\nmodel: gpt-6.1-sol\nreps: 3\ncases:\n- meltdown-brief: pairs=3 A_pass=0 B_pass=0 checks: both arms failed every check\nchecks overall: both arms failed every check\njudge: mode=codex judged=3 A_wins=0 B_wins=2 ties=1 unfired_B=0 errors=0\nruns: expected=6 done=6 errors=0",
+  "model": "jev-1.14.0",
+  "usage": {
+    "input_tokens": 0,
+    "output_tokens": 0
+  },
+  "answers": {
+    "effect": {
+      "type": "choice",
+      "choice": "improves",
+      "confidence": 0.71,
+      "probabilities": {
+        "improves": 0.71,
+        "no_effect": 0.12,
+        "worse": 0.03,
+        "unclear": 0.14
+      }
+    },
+    "harness_problem": {
+      "type": "noul",
+      "noul": 0.22
+    },
+    "evidence_strength": {
+      "type": "score",
+      "score": 0.64,
+      "confidence": 0.46,
+      "legend": {
+        "0": "Weak",
+        "1": "Moderate",
+        "2": "Strong"
+      },
+      "probabilities": {
+        "0": 0.45,
+        "1": 0.46,
+        "2": 0.09
+      }
+    }
+  },
+  "_source_fixture": "8fb3ae53face3b9aaf28fcc5ec0286ff.json"
+}

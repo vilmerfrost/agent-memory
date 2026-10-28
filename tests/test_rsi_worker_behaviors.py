@@ -5,7 +5,7 @@ import shutil
 import subprocess
 
 import pytest
-from agent_memory import rsi_replay as R
+from agent_memory import rsi_relevance as REL, rsi_replay as R
 
 ROOT = Path(__file__).parent / 'data/rsi_parent_cases'
 IDS = ['worker-helper-lifecycle', 'worker-server-launch']
@@ -45,9 +45,11 @@ def test_false_completion_wrong_scope_and_missing_lifecycle_fail(cid,before,afte
     assert result.returncode != 0 and 'worker-behavior:' in result.stderr
 
 
-def test_all_worker_behaviors_fit_existing_three_pair_budget():
+def test_all_worker_behaviors_fit_the_five_pair_budget():
     cases=R.load_cases()
-    selected,reps=R.plan_cases({'files':[{'path':'~/agent-config/agents/worker.md','kind':'instruction'}]},
-                             cases,min_pairs=3,max_pairs=3)
-    assert {c.id for c in selected} == {'worker-final-report',*IDS}
-    assert len(selected)*reps == 3
+    whole={'files':[{'path':'~/agent-config/agents/worker.md','kind':'instruction'}]}
+    selected,reps,pairs=R.plan_pairs(whole,cases,min_pairs=5,max_pairs=5)
+    eligible=set(REL.select(whole,cases)['eligible_cases'])
+    assert {'worker-final-report',*IDS} <= eligible
+    # At most 5 cases (the first in id order), exactly 5 A/B pairs per provider
+    assert {c.id for c in selected} == set(sorted(eligible)[:5]) and pairs == 5 and len(selected)*reps >= 5

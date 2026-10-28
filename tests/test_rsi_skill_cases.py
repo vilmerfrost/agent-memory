@@ -151,7 +151,9 @@ def test_planning_keeps_explicit_limits_and_generic_targets():
                                  min_pairs=3, max_pairs=3)
     assert [c.id for c in generic] == ["docs-typo", "fix-add", "report-todos"] and reps == 1   # unchanged night
     assert R.plan_cases(manifest(target("pepe-lock")), cases, min_pairs=3, max_pairs=2)[1] == 2
-    assert R.plan_cases(manifest(target("pepe-lock")), cases, min_pairs=3, max_pairs=6, reps=4)[1] == 4
+    # The pair target is the provider's share: one case runs it all; a larger config reps cannot pass the cap
+    assert R.plan_pairs(manifest(target("pepe-lock")), cases, min_pairs=3, max_pairs=6, reps=4)[1:] == (6, 6)
+    assert R.plan_pairs(manifest(target("pepe-lock")), cases, min_pairs=3, max_pairs=3, reps=4)[2] == 3
     # Uncovered: one case, so run_replay refuses before any container and records the uncovered file.
     one, reps = R.plan_cases(manifest("~/.agents/skills/handoff/SKILL.md"), cases, min_pairs=3, max_pairs=3)
     assert len(one) == 1 and reps == 1
@@ -162,7 +164,7 @@ def test_planning_keeps_explicit_limits_and_generic_targets():
 
 
 def test_paid_plan_stays_within_the_calibrated_pairs():
-    for name, pairs in (("rsi-night.subscription.json", 6), ("rsi-night.subscription-claude.json", 3),
+    for name, pairs in (("rsi-night.subscription.json", 10), ("rsi-night.subscription-claude.json", 3),
                         ("rsi-night.subscription-codex.json", 3), ("rsi-night.first.json", 3)):
         plan = S.paid_plan(N.load_config(config.REPO_ROOT / "config" / name))
         assert plan["ab_pairs_per_experiment"] == pairs, name
@@ -194,13 +196,14 @@ def test_subscription_profile_replays_the_skill_case_for_both_providers(tmp_path
 
         def replay(self, **kw):
             seen.append((self.provider, self.settings["cases"], self.settings["reps"], self.settings["model"]))
+            assert self.settings["pairs"] == 5                          # exactly 5 A + 5 B per provider
             return N.ReplayOutcome(verdict="NO_EFFECT", reasons=[], arms={}, eval_path="x", runs=6)
 
     monkeypatch.setattr(N, "SandboxReplayer", Adapter)
     budget = SimpleNamespace(cfg=cfg.budget)
     out = P.replay(cfg.stages, cfg.replay, artifact_hash=h, experiment_id=EXP, baseline_id=bid, budget=budget)
-    assert seen == [("claude", [cid], 3, "claude-opus-5-5"), ("codex", [cid], 3, "gpt-6.1-sol")]
-    assert len(seen) * 3 <= cfg.budget.max_ab_pairs and out.reasons[:2] == ["claude: NO_EFFECT", "codex: NO_EFFECT"]
+    assert seen == [("claude", [cid], 5, "claude-opus-5-5"), ("codex", [cid], 5, "gpt-6.1-sol")]
+    assert len(seen) * 5 == cfg.budget.max_ab_pairs and out.reasons[:2] == ["claude: NO_EFFECT", "codex: NO_EFFECT"]
 
 
 # ---------------------------------------------------------------- stub replay: exposure in both arms
