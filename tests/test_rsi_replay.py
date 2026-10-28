@@ -52,9 +52,12 @@ def record(root: Path, h: str) -> dict:
 
 def test_shipped_cases_load_and_are_stable():
     cases = R.load_cases()
-    assert [c.id for c in cases] == ["anatomy-plan", "docs-typo", "fix-add", "meltdown-brief", "parent-authority", "parent-merge-cleanup",
-                                     "parent-repo-profile", "parent-safety-guards", "pepe-lock",
-                                     "report-todos", "worker-final-report", "worker-helper-lifecycle", "worker-server-launch"]
+    assert [c.id for c in cases] == ["anatomy-plan", "docs-typo", "fix-add", "meltdown-brief", "parent-authority",
+                                     "parent-dod-review", "parent-merge-cleanup",
+                                     "parent-repo-profile", "parent-safety-guards", "parent-work-trigger", "pepe-lock",
+                                     "report-todos", "worker-credential-runner", "worker-dod-gaps",
+                                     "worker-final-report", "worker-helper-lifecycle", "worker-helper-routing",
+                                     "worker-server-launch"]
     assert all(c.fixture.is_dir() and c.stub and c.check for c in cases)
     assert R.load_cases(["report-todos"])[0].hidden_check.name == "report-todos"
     assert cases[1].digest() == R.load_cases(["docs-typo"])[0].digest()

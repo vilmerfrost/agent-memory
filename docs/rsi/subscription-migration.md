@@ -80,7 +80,7 @@ Crafted compliant and non-compliant outputs live in `tests/data/rsi_skill_cases/
 also break each rule alone and check that the hidden check fails.
 
 **Which cases run.** With `replay.cases: null`, an experiment replays only the cases that
-declare its changed file. Only those cases count towards the verdict's `min_pairs` (3), so
+declare its changed file. Only those cases count towards the verdict's `min_pairs` (5, policy/2), so
 one skill case runs 3 repetitions. That fits each provider's share of the night: 3 pairs for
 Claude and 3 for Codex on a shared skill (6 of 6). A `CLAUDE.md` change still runs the three
 generic cases once. An explicit case list is replayed as given.

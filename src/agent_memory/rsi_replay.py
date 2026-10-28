@@ -1736,7 +1736,8 @@ def stage_synthetic(root: Path, experiment_id: str, candidate: str, *, bench: Pa
 
 
 def _plan(cases: Sequence[ReplayCase], cfg: ReplayConfig, experiment_id: str) -> dict[str, Any]:
-    runs = [run_id_for(experiment_id, c.id, arm, rep) for rep in range(cfg.reps) for c in cases for arm in ("A", "B")]
+    slots = [(rep, c) for rep in range(cfg.reps) for c in cases][:cfg.pairs]   # repetition-major, as the run
+    runs = [run_id_for(experiment_id, c.id, arm, rep) for rep, c in slots for arm in ("A", "B")]
     live_judge = cfg.judge in ("claude", "codex")
     return {"agent_runs": len(runs), "check_runs": len(runs), "judge_runs": len(runs) // 2 if live_judge else 0,
             "run_ids": runs, "paid_calls": cfg.agent != "stub" or live_judge or cfg.jev == "live",
@@ -1791,12 +1792,14 @@ def main(argv: Sequence[str] | None = None, out: Callable[[str], None] = print) 
             out(json.dumps({"baseline_id": bid, "artifact_hash": h}))
             return 0
         cases = load_cases(args.cases.split(",") if args.cases else None)
-        reps = args.reps
-        if not args.cases:     # default: the artifact's own cases, repeated up to the verdict's minimum pairs
-            plan = auto_cases(args.artifact, cases, root=_root(args), reps=args.reps,
+        reps, pairs = args.reps, None
+        if not args.cases:     # default: the artifact's own cases, exactly the verdict's minimum pairs
+            plan = auto_pairs(args.artifact, cases, root=_root(args), reps=args.reps,
                               max_pairs=max(V.load_policy().min_pairs, args.reps))
-            cases, reps = plan or (cases, reps)
-        cfg = ReplayConfig(agent=args.agent, model=args.model, effort=args.effort, reps=reps, judge=args.judge,
+            if plan is not None:
+                cases, reps, pairs = plan
+        cfg = ReplayConfig(agent=args.agent, model=args.model, effort=args.effort, reps=reps, pairs=pairs,
+                           judge=args.judge,
                            judge_model=args.judge_model, jev=args.jev, credentials=args.credentials,
                            credential_name=args.credential_name, judge_credentials=args.judge_credentials,
                            judge_credential_name=args.judge_credential_name, max_budget_usd=args.max_budget_usd)

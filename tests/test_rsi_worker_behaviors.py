@@ -81,6 +81,6 @@ def test_all_worker_behaviors_fit_the_five_pair_budget():
     whole={'files':[{'path':'~/agent-config/agents/worker.md','kind':'instruction'}]}
     selected,reps,pairs=R.plan_pairs(whole,cases,min_pairs=5,max_pairs=5)
     eligible=set(REL.select(whole,cases)['eligible_cases'])
-    assert {'worker-final-report',*IDS} <= eligible
+    assert {'worker-final-report','worker-dod-gaps','worker-helper-routing','worker-credential-runner',*IDS} <= eligible
     # At most 5 cases (the first in id order), exactly 5 A/B pairs per provider
     assert {c.id for c in selected} == set(sorted(eligible)[:5]) and pairs == 5 and len(selected)*reps >= 5
