@@ -827,7 +827,11 @@ def _finding(raw: _Raw, found: set[str] | None, lim: PackLimits, c: _Cand | None
         detail = "" if status == "ok" else f"{len(subjects) - len(resolved)} subject(s) no longer resolve"
     if raw.source == "pastdev" and status == "ok" and c is not None and not _about(c, subjects, scopes or {}):
         # a similar past record that is about another rule and another file: context, never support
-        status, authority, detail = "unlinked", None, "about another rule or target: context only; authoritative record resolved"
+        comparable = any((c.rule and rs) or (c.target and ts)
+                         for rs, ts in ((scopes or {}).get(s, (set(), set())) for s in subjects))
+        detail = ("about another rule or target: context only; authoritative record resolved" if comparable else
+                  "authoritative record resolved, but rule/target binding is not recorded: context only")
+        status, authority = "unlinked", None
     if ev.kind == "production-outcome":
         status, authority, detail = "unlinked", None, "production observation needs current-version and coverage validation"
     if ev.metrics.get("intended_intervention") is False:

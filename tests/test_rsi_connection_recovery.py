@@ -289,6 +289,10 @@ def test_external_context_is_not_reported_as_missing_authority():
                          {source: ({'skill:other:rule'}, {'~/.agents/skills/other/SKILL.md'})})
     assert finding.status == 'unlinked' and finding.authority is None
     assert 'context only' in finding.detail and 'authoritative record resolved' in finding.detail
+    unknown_scope = P._finding(raw, {source}, P.PackLimits(), candidate, {})
+    assert unknown_scope.status == 'unlinked' and unknown_scope.authority is None
+    assert 'binding is not recorded' in unknown_scope.detail
+    assert 'another rule' not in unknown_scope.detail
     missing = P._evidence_finding(('e1', datetime.now(UTC), 'pastdev', 'decision-memory', 'past:x', [], {}, None, ''), set(), 200)
     assert missing.status == 'unlinked' and 'producer identity required' in missing.detail
     stale = P._evidence_finding(('e2', datetime.now(UTC), 'pastdev', 'decision-memory', 'past:y', [source], {}, None, ''), set(), 200)
