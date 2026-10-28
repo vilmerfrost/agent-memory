@@ -1,0 +1,79 @@
+{
+  "scenarios": [
+    {
+      "id": "complete",
+      "status": "DONE",
+      "next_steps": [
+        "report"
+      ],
+      "skipped": [],
+      "evidence_refs": [
+        "receipt:complete"
+      ]
+    },
+    {
+      "id": "red",
+      "status": "PARTIAL",
+      "next_steps": [
+        "repair_tests",
+        "focused_tests",
+        "commit",
+        "full_gate"
+      ],
+      "skipped": [],
+      "evidence_refs": [
+        "receipt:red"
+      ]
+    },
+    {
+      "id": "stale-gate",
+      "status": "PARTIAL",
+      "next_steps": [
+        "full_gate"
+      ],
+      "skipped": [],
+      "evidence_refs": [
+        "receipt:stale-gate"
+      ]
+    },
+    {
+      "id": "unconfirmed",
+      "status": "PARTIAL",
+      "next_steps": [
+        "confirm_publication"
+      ],
+      "skipped": [],
+      "evidence_refs": [
+        "receipt:unconfirmed"
+      ]
+    },
+    {
+      "id": "no-cleanup",
+      "status": "DONE",
+      "next_steps": [
+        "report"
+      ],
+      "skipped": [
+        {
+          "step": "cleanup",
+          "reason": "No completed clean merged worktrees belong to this parent.",
+          "evidence_ref": "receipt:no-cleanup"
+        }
+      ],
+      "evidence_refs": [
+        "receipt:no-cleanup"
+      ]
+    },
+    {
+      "id": "stale-config",
+      "status": "PARTIAL",
+      "next_steps": [
+        "full_gate"
+      ],
+      "skipped": [],
+      "evidence_refs": [
+        "receipt:stale-config"
+      ]
+    }
+  ]
+}
