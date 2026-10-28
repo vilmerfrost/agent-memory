@@ -66,12 +66,24 @@ def env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pg_url: str) -> SimpleN
     return SimpleNamespace(url=pg_url, home=home, sandbox=sandbox, tmp=tmp_path)
 
 
-def night(env: SimpleNamespace, writer: FakeWriter, *, stager: Any = None) -> tuple[dict[str, Any], N.Adapters]:
+def night(env: SimpleNamespace, writer: FakeWriter, *, stager: Any = None, declared_section: str = NEW_SECTION) -> tuple[dict[str, Any], N.Adapters]:
     cfg = N.load_config(PROFILE)
     seed_rule(env.url, RULE_A, "a")
+    class DeclaredHypotheses(N.FixtureHypothesizer):
+        def reply(self, candidate, **kw):
+            raw=json.loads(super().reply(candidate, **kw))
+            from agent_memory.edits_sections import section_text
+            for h in raw["hypotheses"]:
+                h["edit"]={"section_id":"closing-line", "before":section_text(kw["target_text"],"closing-line"),
+                           "after":declared_section}
+            return json.dumps(raw)
+
     ad = adapters(implementer=N.WriterImplementer(cfg.implementer, call=writer), stager=stager or FakeStager(),
-                  replayer=FakeReplayer("NO_EFFECT"))
-    rep = N.Night(cfg, ad, night=NIGHT, db_url=env.url, install_signals=False).run()
+                  replayer=FakeReplayer("NO_EFFECT"),hypothesizer=DeclaredHypotheses())
+    runner=N.Night(cfg, ad, night=NIGHT, db_url=env.url, install_signals=False)
+    # This component test injects explicit coverage and a fake replay; real-case section coverage has separate tests.
+    runner._test_cases=lambda *args,**kw:["fixture-closing-line"]
+    rep = runner.run()
     assert N.validate_report(rep) == [], N.validate_report(rep)
     return rep, ad
 
@@ -126,8 +138,8 @@ def test_proposal_error_falls_back_to_the_stub_with_its_reason(env: SimpleNamesp
     e = ran(rep)
     assert e["implementer"] == "stub-fallback"
     assert e["implementer_fallback_reason"].startswith("writer proposal refused: model reply is not JSON")
-    assert staged_text(e) == N.stub_change(CLAUDE_MD, N.Hypothesis(**e["hypothesis"], target=e["target"]))
-    assert e["status"] == "not_promotable"                                   # the experiment still ran
+    assert e["artifact_hash"] is None and e["status"] == "failed"
+    assert e.get("replay_runs",0) == 0
     note = next(n for n in rep["notes"] if "fell back to the stub" in n)
     assert "model reply is not JSON" in note
     md = BR.render_markdown(BR.make_brief(root=env.sandbox, db_url=env.url))
@@ -148,11 +160,11 @@ def test_writer_crash_falls_back(env: SimpleNamespace) -> None:
 def test_content_guard_refusal_falls_back_to_the_stub(env: SimpleNamespace) -> None:
     pasted = NEW_SECTION + "\n- See the log in /Users/vilmerfrost/Projects/demo/out.txt first."
     stager = GuardStager()
-    rep, _ = night(env, FakeWriter(reply(pasted)), stager=stager)
+    rep, ad = night(env, FakeWriter(reply(pasted)), stager=stager,declared_section=pasted)
     e = ran(rep)
-    assert [c.get("refused", False) for c in stager.calls] == [True, False]
-    assert e["implementer"] == "stub-fallback" and "content guard: project path" in e["implementer_fallback_reason"]
-    assert e["artifact_hash"] and "/Users/" not in staged_text(e)
+    assert [c.get("refused", False) for c in stager.calls] == [True]
+    assert e["status"] == "failed" and e["artifact_hash"] is None
+    assert ad.replayer.calls == [] and "content guard: project path" in ' '.join(rep["notes"])
 
 
 @pytest.mark.parametrize("bad", ["- Run it again.\n- Session 0b6c2f9e-1d2a-4c5b-9e8f-7a6b5c4d3e2f broke it.",
@@ -162,7 +174,7 @@ def test_pasted_ids_and_code_never_reach_staging(env: SimpleNamespace, bad: str)
     rep, _ = night(env, FakeWriter(reply(NEW_SECTION + "\n" + bad)), stager=stager)
     e = ran(rep)
     assert e["implementer"] == "stub-fallback" and e["implementer_fallback_reason"].startswith("writer proposal refused")
-    assert bad not in stager.calls[0]["new_text"]
+    assert stager.calls == []
 
 
 def _budget(**over: Any) -> Budget:

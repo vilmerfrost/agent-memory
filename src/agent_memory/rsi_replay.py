@@ -60,7 +60,7 @@ from agent_memory import rsi_verdict as V
 from agent_memory import rsi_relevance as REL
 
 SUITE = "sandbox-replay"
-SUITE_VERSION = "3"
+SUITE_VERSION = "4"
 REPLAY_FORMAT = "rsi-replay/1"
 BENCH_DIR = config.REPO_ROOT / "bench" / "rsi-replay"
 SANDBOX_PY = config.REPO_ROOT / "sandbox" / "rsi_sandbox.py"
@@ -138,7 +138,7 @@ class ReplayCase:
     tags: tuple[str, ...] = ()
     stub: tuple[dict, ...] = ()          # the stub agent's scripted plan (live agents get only the prompt)
 
-    targets: tuple[dict[str, str], ...] = ()  # exact path/kind plus the behavior this task exercises
+    targets: tuple[dict[str, Any], ...] = ()  # exact path/kind plus the behavior this task exercises
 
     def digest(self) -> str:
         """sha256 over the case definition and its fixture and check files (reproducibility evidence)."""
@@ -211,8 +211,13 @@ def largest_auto_plan(cases: Sequence[ReplayCase], *, min_pairs: int, max_pairs:
                       reps: int = 1) -> tuple[int, int]:
     """(cases, reps) of the biggest automatic replay any one declared target can get (rsi_schedule's paid plan)."""
     best = (0, int(reps))
-    for target in sorted({(t["path"], t["kind"]) for c in cases for t in c.targets}):
-        chosen, r = plan_cases({"files": [{"path": target[0], "kind": target[1]}]}, cases,
+    targets = {(t["path"], t["kind"], sid) for c in cases for t in c.targets
+               for sid in (t.get("sections") or [""])}
+    for path, kind, section in sorted(targets):
+        target = {"path": path, "kind": kind}
+        if section:
+            target["rule_id"] = REL.section_rule_id(path, section)
+        chosen, r = plan_cases({"files": [target]}, cases,
                                min_pairs=min_pairs, max_pairs=max_pairs, reps=reps)
         if len(chosen) * r > best[0] * best[1]:
             best = (len(chosen), r)

@@ -10,6 +10,7 @@ unknown. No command or target code is executed, and no path is resolved, by this
 from __future__ import annotations
 
 import json
+import hashlib
 import re
 import shlex
 from collections.abc import Mapping, Sequence
@@ -66,7 +67,7 @@ def target_path(value: Any) -> str | None:
     return value
 
 
-def case_targets(raw: Any) -> tuple[dict[str, str], ...]:
+def case_targets(raw: Any) -> tuple[dict[str, Any], ...]:
     if not isinstance(raw, (list, tuple)):
         raise ValueError("targets must be a list of exact path, kind and behavior declarations")
     out = []
@@ -75,17 +76,40 @@ def case_targets(raw: Any) -> tuple[dict[str, str], ...]:
             raise ValueError("target path must be an exact ~/ path without traversal")
         if not all(isinstance(item.get(k), str) and item[k].strip() for k in ("kind", "behavior")):
             raise ValueError("target kind and behavior must be nonempty strings")
-        out.append({k: item[k] for k in ("path", "kind", "behavior")})
+        row = {k: item[k] for k in ("path", "kind", "behavior")}
+        if "sections" in item:
+            sections = item["sections"]
+            if not isinstance(sections, list) or not sections or not all(
+                    isinstance(x, str) and re.fullmatch(r"[a-z0-9][a-z0-9/_-]{0,119}", x) for x in sections):
+                raise ValueError("sections must list explicit instruction section IDs")
+            if len(set(sections)) != len(sections):
+                raise ValueError("duplicate instruction section declaration")
+            row["sections"] = list(sections)
+        out.append(row)
     if len({(x["path"], x["kind"]) for x in out}) != len(out):
         raise ValueError("duplicate target declaration")
     return tuple(out)
+
+
+def section_rule_id(path: str, section: str) -> str:
+    """Stable file+section identity; equal heading names in different files never share a pin."""
+    return "rsi-section-" + hashlib.sha256((path + "\0" + section).encode()).hexdigest()[:20]
 
 
 def select(manifest: Mapping[str, Any], cases: Sequence[Any]) -> dict[str, Any]:
     targets = {f["path"]: f["kind"] for f in manifest.get("files", [])}
     eligible = {}
     for case in cases:
-        matching = [t["path"] for t in case.targets if targets.get(t["path"]) == t["kind"]]
+        matching = []
+        for t in case.targets:
+            if targets.get(t["path"]) != t["kind"]:
+                continue
+            file = next(f for f in manifest.get("files", []) if f["path"] == t["path"])
+            rule = file.get("rule_id", "")
+            if isinstance(rule, str) and rule.startswith("rsi-section-"):
+                if not any(rule == section_rule_id(t["path"], sid) for sid in t.get("sections", [])):
+                    continue
+            matching.append(t["path"])
         if matching:
             eligible[case.id] = sorted(set(matching))
     covered = {p for paths in eligible.values() for p in paths}

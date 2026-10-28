@@ -10,7 +10,10 @@
     {
       "path": "~/agent-config/agents/worker.md",
       "kind": "instruction",
-      "behavior": "Complete registered helper work and preserve failed helper results"
+      "behavior": "Complete registered helper work and preserve failed helper results",
+      "sections": [
+        "subworkers"
+      ]
     }
   ],
   "fixture": "worker-helper-lifecycle",

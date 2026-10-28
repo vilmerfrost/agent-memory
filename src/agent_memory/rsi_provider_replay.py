@@ -72,7 +72,7 @@ def replay(stages, settings, *, artifact_hash, experiment_id, baseline_id, budge
     eval_path = None
     try:
         eval_path = box.record_eval(artifact=artifact_hash, experiment=experiment_id, arm="B", suite="sandbox-replay",
-            suite_version="3", verdict={"IMPROVES":"improves","WORSE":"worse","NO_EFFECT":"no-effect"}.get(verdict,"inconclusive"),
+            suite_version=R.SUITE_VERSION, verdict={"IMPROVES":"improves","WORSE":"worse","NO_EFFECT":"no-effect"}.get(verdict,"inconclusive"),
             results={"required_providers": required, "provider_results": views, "verdict": verdict, "reasons": reasons},
             model="provider-specific", effort="high", control_arm="A", replace=True)
     except (rs.SandboxError, OSError, ValueError):

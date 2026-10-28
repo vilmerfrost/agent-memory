@@ -15,20 +15,49 @@ from types import SimpleNamespace
 
 import pytest
 
-from agent_memory import config, rsi_night as N, rsi_provider_replay as P
+from agent_memory import config, rsi_artifact as RA, rsi_night as N, rsi_provider_replay as P
 from agent_memory import rsi_relevance as REL, rsi_replay as R, rsi_schedule as S, rsi_verdict as V
 from rsi_replay_support import HostSandbox, setup_root
 
 DATA = Path(__file__).parent / "data/rsi_parent_cases"
+
+
+def case_data(cid):
+    return DATA / (cid + "-v4" if cid.startswith("parent-") else cid)
+
+
 PARENT = "~/agent-config/parent/PARENT.md"
 WORKER = "~/agent-config/agents/worker.md"
 CASES = {"worker-final-report": WORKER, "parent-repo-profile": PARENT,
-         "parent-authority": PARENT, "parent-safety-guards": PARENT}
+         "parent-authority": PARENT, "parent-safety-guards": PARENT, "parent-merge-cleanup": PARENT}
 EXP = "exp-20261027-01"
 
 
 def manifest(path):
-    return {"files": [{"path": path, "kind": "instruction"}]}
+    item = {"path": path, "kind": "instruction"}
+    if path == PARENT:
+        item["rule_id"] = REL.section_rule_id(PARENT, "repo-profile")
+    return {"files": [item]}
+
+
+def expected_cases(path):
+    return ["parent-repo-profile"] if path == PARENT else [
+        "worker-final-report", "worker-helper-lifecycle", "worker-server-launch"]
+
+
+def bind_synthetic_section(root, digest, path):
+    if path != PARENT:
+        return digest
+    original = root / "artifacts" / digest
+    body = json.loads((original / "manifest.json").read_text())
+    body["files"][0]["rule_id"] = REL.section_rule_id(PARENT, "repo-profile")
+    bound = RA.artifact_hash(body)
+    directory = root / "artifacts" / bound
+    shutil.copytree(original, directory)
+    (directory / "manifest.json").chmod(0o644)
+    (directory / "manifest.json").write_bytes(RA.canonical(body) + b"\n")
+    (directory / "manifest.json").chmod(0o444)
+    return bound
 
 
 def grade(cid, tmp_path, mutate=None, *, empty=False):
@@ -36,7 +65,7 @@ def grade(cid, tmp_path, mutate=None, *, empty=False):
     work = tmp_path / "work"
     shutil.copytree(case.fixture, work)
     if not empty:
-        shutil.copytree(DATA / cid / "good", work, dirs_exist_ok=True)
+        shutil.copytree(case_data(cid) / "good", work, dirs_exist_ok=True)
     if mutate:
         mutate(work)
     env = {"PATH": os.environ["PATH"], "HIDDEN_CHECK_DIR": str(case.hidden_check),
@@ -66,7 +95,7 @@ VIOLATIONS = [
     edit_row("parent-repo-profile", "team", "test", "npm test"),
     edit_row("parent-repo-profile", "personal", "first_read", "README.md"),
     edit_row("parent-repo-profile", "absent", "test", "pytest"),
-    edit_row("parent-repo-profile", "absent", "announce_profile", False),
+    edit_row("parent-repo-profile", "explicit-announcement", "announce_profile", False),
     edit_row("parent-authority", "own-merge", "owner", "worker"),
     edit_row("parent-authority", "own-implementation", "steps", ["delegate_implementation"]),
     edit_row("parent-authority", "own-worker-limit", "ask_user_to_do_work", True),
@@ -99,8 +128,8 @@ def test_cases_load_and_grade_real_outputs(cid, tmp_path):
     result = grade(cid, tmp_path / "empty", empty=True)
     assert result.returncode != 0 and "missing" in result.stderr
     writes = {s["path"]: s["text"] for s in case.stub if s["op"] == "write"}
-    assert writes == {p.relative_to(DATA / cid / "good").as_posix(): p.read_text()
-                      for p in (DATA / cid / "good").rglob("*") if p.is_file()}
+    assert writes == {p.relative_to(case_data(cid) / "good").as_posix(): p.read_text()
+                      for p in (case_data(cid) / "good").rglob("*") if p.is_file()}
 
 
 @pytest.mark.parametrize("cid,rule,mutate", VIOLATIONS, ids=[f"{c}:{r}" for c, r, _ in VIOLATIONS])
@@ -162,8 +191,7 @@ def test_nonstandard_json_is_rejected(raw, tmp_path):
 @pytest.mark.parametrize("path", [PARENT, WORKER])
 def test_exact_target_selection_fits_unchanged_provider_budgets(path):
     cases = R.load_cases()
-    expected = sorted([cid for cid, target in CASES.items() if target == path] + (
-        ["worker-helper-lifecycle", "worker-server-launch"] if path == WORKER else []))
+    expected = sorted(expected_cases(path))
     rel = REL.select(manifest(path), cases)
     assert sorted(rel["eligible_cases"]) == expected and rel["uncovered_targets"] == []
     chosen, reps = R.plan_cases(manifest(path), cases, min_pairs=3, max_pairs=3)
@@ -190,7 +218,8 @@ def test_provider_router_runs_all_target_cases_within_existing_limits(path, tmp_
         p = directory / path[2:]
         p.parent.mkdir(parents=True)
         p.write_text(text)
-    _, baseline, artifact = setup_root(tmp_path, monkeypatch, "policy", experiment=EXP, bench=bench)
+    root, baseline, artifact = setup_root(tmp_path, monkeypatch, "policy", experiment=EXP, bench=bench)
+    artifact = bind_synthetic_section(root, artifact, path)
     cfg = N.load_config(config.REPO_ROOT / "config/rsi-night.subscription.json")
     calls = []
 
@@ -204,8 +233,7 @@ def test_provider_router_runs_all_target_cases_within_existing_limits(path, tmp_
     monkeypatch.setattr(N, "SandboxReplayer", Adapter)
     P.replay(cfg.stages, cfg.replay, artifact_hash=artifact, baseline_id=baseline,
              experiment_id=EXP, budget=SimpleNamespace(cfg=cfg.budget))
-    ids = sorted([cid for cid, target in CASES.items() if target == path] + (
-        ["worker-helper-lifecycle", "worker-server-launch"] if path == WORKER else []))
+    ids = sorted(expected_cases(path))
     reps = 3 // len(ids)
     assert calls == [("claude", ids, reps), ("codex", ids, reps)]
     assert sum(len(cases) * n for _, cases, n in calls) == cfg.budget.max_ab_pairs
@@ -222,6 +250,7 @@ def test_stub_replay_reads_exact_parent_or_worker_bytes_in_both_arms(path, tmp_p
     after.parent.mkdir(parents=True)
     after.write_text("# Synthetic instruction\n\nKeep evidence truthful and report gaps.\n")
     root, _, artifact = setup_root(tmp_path, monkeypatch, "policy", experiment=EXP, bench=bench)
+    artifact = bind_synthetic_section(root, artifact, path)
     cases, reps = R.auto_cases(artifact, R.load_cases(), root=root, reps=1, max_pairs=3)
     sb = HostSandbox(root)
     result = R.run_replay(artifact, cases, R.ReplayConfig(reps=reps, jev="none"), root=root,

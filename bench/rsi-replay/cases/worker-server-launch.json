@@ -10,7 +10,10 @@
     {
       "path": "~/agent-config/agents/worker.md",
       "kind": "instruction",
-      "behavior": "Launch the correct local server through its required wrapper and verify readiness"
+      "behavior": "Launch the correct local server through its required wrapper and verify readiness",
+      "sections": [
+        "credential-aware-app-execution"
+      ]
     }
   ],
   "fixture": "worker-server-launch",

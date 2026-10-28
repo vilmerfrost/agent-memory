@@ -541,7 +541,7 @@ class _Runner:
         """Retry only idempotent CH/LF reads, at most twice, inside the original deadline.
 
         No model, past.dev recall, write, auth or policy retry. A timed-out runner
-        never starts a second provider thread. Individual attempts share the budget.
+        never starts a second provider thread. ClickHouse attempts reserve recovery slices; Langfuse retains its paginated-read allowance.
         """
         started = self.clock()
         deadline = started + remaining
@@ -552,7 +552,20 @@ class _Runner:
         while attempts < limit and self.clock() < deadline:
             attempts += 1
             left = max(0.0, deadline - self.clock())
-            with r.read_budget(left):
+            # Reserve time for another completed attempt rather than allowing a
+            # single socket timeout to consume the complete provider deadline.
+            # The transport's nested read budget aborts the active socket before
+            # the next sequential attempt starts. Uncooperative calls are still
+            # stopped by the outer runner; no replacement thread is spawned.
+            # ClickHouse Cloud wake/read latency caused the observed starvation.
+            # Langfuse keeps its existing full paginated-read allowance; its
+            # explicit pacing can legitimately occupy most of that allowance.
+            remaining_attempts = limit - attempts + 1 if retr == "ch" else 1
+            retry_room = 0.25 * (remaining_attempts - 1)
+            attempt_budget = (left - retry_room) / remaining_attempts
+            if attempt_budget <= 0:
+                attempt_budget = left
+            with r.read_budget(attempt_budget):
                 result = run_query(r, st.query, st.params)
             if result.status == "ok" or not result.retryable:
                 break
@@ -814,7 +827,11 @@ def _finding(raw: _Raw, found: set[str] | None, lim: PackLimits, c: _Cand | None
         detail = "" if status == "ok" else f"{len(subjects) - len(resolved)} subject(s) no longer resolve"
     if raw.source == "pastdev" and status == "ok" and c is not None and not _about(c, subjects, scopes or {}):
         # a similar past record that is about another rule and another file: context, never support
-        status, authority, detail = "unlinked", None, "about another rule or target: context only"
+        comparable = any((c.rule and rs) or (c.target and ts)
+                         for rs, ts in ((scopes or {}).get(s, (set(), set())) for s in subjects))
+        detail = ("about another rule or target: context only; authoritative record resolved" if comparable else
+                  "authoritative record resolved, but rule/target binding is not recorded: context only")
+        status, authority = "unlinked", None
     if ev.kind == "production-outcome":
         status, authority, detail = "unlinked", None, "production observation needs current-version and coverage validation"
     if ev.metrics.get("intended_intervention") is False:
@@ -1336,10 +1353,12 @@ def _evidence_finding(row: tuple[Any, ...], found: set[str], lim_text: int) -> F
     source = SYSTEM_SOURCE.get(system, "supabase")
     if not subj:
         status, authority = "unlinked", None
+        detail = "no authoritative subject refs recorded; producer identity required, not inferred"
     else:
         resolved = [s for s in subj if s in found]
         status = "ok" if len(resolved) == len(subj) else "stale"
         authority = resolved[0] if resolved else None
+        detail = "" if status == "ok" else f"{len(subj) - len(resolved)} recorded authoritative subject(s) no longer resolve"
     m = dict(metrics or {}) if isinstance(metrics, Mapping) else {}
     if kind == "production-outcome":
         # Delta reads have no freshly measured target bytes. The dedicated
@@ -1347,7 +1366,7 @@ def _evidence_finding(row: tuple[Any, ...], found: set[str], lim_text: int) -> F
         status, authority = "unlinked", None
     return Finding(source, ref, _ts_str(observed), _measure(m), _n(m), status, kind, authority, "sb.rsi_evidence",
                    _free(summary, lim_text), "requires current instruction version and complete coverage"
-                   if kind == "production-outcome" else "")
+                   if kind == "production-outcome" else detail)
 
 
 def delta_since(checkpoint_ts: str | datetime | None, *, conn: psycopg.Connection,

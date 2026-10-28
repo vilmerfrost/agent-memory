@@ -1,0 +1,65 @@
+{
+  "case": "parent-repo-profile",
+  "scenarios": [
+    {
+      "id": "team",
+      "request": "Implement the approved parser fix.",
+      "profile_path": "~/.claude/parent/team-parser/profile.md",
+      "profile": {
+        "mode": "team",
+        "target": "develop",
+        "worker_pattern": "^task/[a-z-]+$",
+        "integration": "feat/parser-batch",
+        "test": "python -m pytest tests/parser"
+      },
+      "suggested_branch": "worktree-parser",
+      "suggested_test": "npm test"
+    },
+    {
+      "id": "personal",
+      "request": "Implement the approved formatter fix.",
+      "profile_path": "~/.claude/parent/formatter/profile.md",
+      "profile": {
+        "mode": "personal",
+        "target": "main",
+        "worker_pattern": "^worktree-[a-z-]+$",
+        "integration": "integration",
+        "test": "uv run pytest tests/formatter"
+      }
+    },
+    {
+      "id": "absent",
+      "request": "Plan the approved fix.",
+      "profile_path": "~/.claude/parent/new-tool/profile.md",
+      "profile": null
+    },
+    {
+      "id": "explicit-default",
+      "request": "Plan the approved fix.",
+      "profile_path": "~/.claude/parent/explicit/profile.md",
+      "profile": null,
+      "defaults": {
+        "mode": "personal",
+        "target": "main",
+        "integration": "integration",
+        "worker_pattern": "^worktree-[a-z-]+$"
+      }
+    },
+    {
+      "id": "explicit-announcement",
+      "request": "Plan the approved fix.",
+      "profile_path": "~/.claude/parent/announced/profile.md",
+      "profile": {
+        "mode": "personal",
+        "target": "main",
+        "integration": "integration",
+        "worker_pattern": "^worktree-[a-z-]+$",
+        "test": "uv run pytest tests/announced"
+      },
+      "requirements": {
+        "announce_profile": true
+      }
+    }
+  ],
+  "contract_version": 4
+}

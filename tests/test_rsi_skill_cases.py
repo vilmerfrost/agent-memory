@@ -35,7 +35,10 @@ def manifest(*paths: str) -> dict:
 @pytest.mark.parametrize("cid", sorted(SKILLS))
 def test_skill_case_loads_with_one_exact_skill_target(cid):
     (case,) = R.load_cases([cid])
-    assert case.targets == ({"path": target(cid), "kind": "skill", "behavior": case.targets[0]["behavior"]},)
+    sections = {"anatomy-plan": ["workflow"], "meltdown-brief": ["intro", "pick-the-style"],
+                "pepe-lock": ["phase-3-lock"]}
+    assert case.targets == ({"path": target(cid), "kind": "skill", "behavior": case.targets[0]["behavior"],
+                             "sections": sections[cid]},)
     assert case.hidden_check is not None and (case.hidden_check / "check.py").is_file()
     assert case.fixture.is_dir() and any(case.fixture.iterdir())
     assert case.stub[0] == {"op": "skill", "name": SKILLS[cid]} and case.stub[-1]["op"] == "final"
