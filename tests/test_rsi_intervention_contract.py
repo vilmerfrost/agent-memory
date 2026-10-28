@@ -130,3 +130,23 @@ def test_current_experiment_export_follows_evaluation_ingestion_and_is_optional(
     assert seen == [e['experiment_id'] for e in actual]
     assert actual[0]['verdict']=='NO_EFFECT' and actual[0]['langfuse_export']['readback_verified'] is False
     assert result['status']==('ok' if export_status=='ok' else 'partial')
+
+
+def test_invalid_declared_heading_is_refused_before_writer():
+    got,calls=implement(hyp(after='## Other\n\n- Change the other rule.\n'),reply(AFTER))
+    assert calls==[] and 'declared edit violates' in got.fallback_reason
+
+
+def test_legacy_unbound_hypothesis_cannot_reach_writer_or_replay(tmp_path,monkeypatch,pg_url):
+    from rsi_night_support import adapters,clean_db,make_home,seed_rule,RULE_A
+    from agent_memory import config
+    clean_db(pg_url);make_home(tmp_path,monkeypatch)
+    box=tmp_path/'sandbox';box.mkdir();monkeypatch.setenv('RSI_SANDBOX_DIR',str(box))
+    seed_rule(pg_url,RULE_A,'legacy')
+    ad=adapters(implementer=N.WriterImplementer({},call=lambda _: (_ for _ in ()).throw(AssertionError('writer called'))))
+    runner=N.Night(N.load_config(config.REPO_ROOT/'config/rsi-night.subscription.json'),ad,night='2026-10-28',db_url=pg_url,install_signals=False)
+    runner._test_cases=lambda *a,**kw:['explicit-fixture-coverage']
+    result=runner.run()
+    assert result['experiments']==[] and ad.replayer.calls==[]
+    assert result['candidates'][0]['hypotheses_accepted']==0
+    assert any(r['code']=='bad_edit_contract' for r in result['candidates'][0]['hypotheses_rejected'])

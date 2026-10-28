@@ -1348,6 +1348,16 @@ class WriterImplementer:
             kind_reason_max=edits_writer.KIND_REASON_MAX, strategy=edits_writer.STRATEGY, policy=edits_writer.POLICY,
             target=hyp.target, rule_id=sec.id, rule_title=sec.title, section=section_text, prev=prev or "(none)",
             next=nxt or "(none)", evidence=evidence)
+        cand = {"examples": [{"what": evidence}], "session_ids": [], "deviation_ids": []}
+        expected_prop = None
+        if hyp.edit is not None:
+            expected_reply = json.dumps({"new_section": hyp.edit["after"], "topic": "declared section edit",
+                "why": "the exact intervention declared before writing", "summary": "apply the declared replacement",
+                "kind": "prose", "kind_reason": "one declared section replacement"})
+            try:
+                expected_prop = edits_writer.parse_proposal(expected_reply, file_text=old_text, rule_id=sec.id, cand=cand)
+            except (edits_writer.ProposalError, edits_sections.SectionError):
+                return fallback("declared edit violates the existing content policy: no writer call")
         self.calls += 1
         try:
             reply = budget.call(self.model, "implement", lambda: self._run(prompt, budget),
@@ -1366,16 +1376,8 @@ class WriterImplementer:
             return fallback(f"writer proposal refused: {_one_line(exc, 200)}")
         except edits_sections.SectionError as exc:
             return fallback(f"writer proposal refused: {_one_line(exc, 200)}")
-        if hyp.edit is not None:
-            expected_reply = json.dumps({"new_section": hyp.edit["after"], "topic": "declared section edit",
-                "why": "the exact intervention declared before writing", "summary": "apply the declared replacement",
-                "kind": "prose", "kind_reason": "one declared section replacement"})
-            try:
-                expected_prop = edits_writer.parse_proposal(expected_reply, file_text=old_text, rule_id=sec.id, cand=cand)
-            except (edits_writer.ProposalError, edits_sections.SectionError):
-                return fallback("declared edit violates the existing content policy")
-            if prop.new_text != expected_prop.new_text:
-                return fallback("writer drift: output differs from the declared edit")
+        if expected_prop is not None and prop.new_text != expected_prop.new_text:
+            return fallback("writer drift: output differs from the declared edit")
         diff = "\n".join(difflib.unified_diff(old_text.splitlines(), prop.new_text.splitlines(), "a" + hyp.target[1:],
                                               "b" + hyp.target[1:], lineterm="", n=1))
         return Implementation(prop.new_text, "writer", None, sec.id, prop.kind, diff[:IMPLEMENTATION_DIFF_MAX],
@@ -2415,7 +2417,7 @@ class Night:
         return ids
 
     def _writer_block(self, c: Mapping[str, Any]) -> str | None:
-        if not isinstance(self.ad.implementer, WriterImplementer) or c.get("target") not in self.allowlist:
+        if not isinstance(getattr(self.ad, "implementer", None), WriterImplementer) or c.get("target") not in self.allowlist:
             return None
         try:
             path = rsi_targets.untilde(c["target"])
@@ -2662,6 +2664,10 @@ class Night:
             hyps, rejected = parse_hypotheses(reply, allowlist=self.allowlist, cap=cap)
         except HypothesisParseError as exc:
             hyps, rejected = [], [{"index": None, "reason": str(exc), "code": "unparseable", "field": None}]
+        if isinstance(self.ad.implementer, WriterImplementer):
+            rejected.extend({"index": i, "field": "edit", "code": "bad_edit_contract", "reason": "missing exact edit contract"}
+                            for i, h in enumerate(hyps) if h.edit is None)
+            hyps = [h for h in hyps if h.edit is not None]
         if rejected:
             self.notes.append(f"{len(rejected)} hypothesis(es) rejected for {c['dedupe_key']}")
         for ce in self.report["candidates"]:       # additive (Night Desk decision 18): why each idea was thrown out
@@ -2705,6 +2711,14 @@ class Night:
                         if candidate_entry["key"] == c["dedupe_key"]:
                             candidate_entry.update(selected=False, reason="deferred: " + reason, skip_reason=reason)
                     continue
+            if isinstance(self.ad.implementer, WriterImplementer) and h.edit:
+                self._update_candidate(c.get("id"), status="selected", reason="selected: exact intervention validated")
+                for candidate_entry in self.report["candidates"]:
+                    if candidate_entry["key"] == c["dedupe_key"]:
+                        candidate_entry.update(selected=True, skip_reason=None,
+                            test_cases=self._test_cases(h.target, section_id=h.edit["section_id"]))
+                        if candidate_entry.get("reason", "").startswith("deferred:"):
+                            candidate_entry["reason"] = "selected: a later exact intervention has declared coverage"
             if self.budget.experiments_left() <= 0:
                 self.report["experiments"].append(self._skipped_entry(c, h, refs, resource="experiments"))
                 continue
