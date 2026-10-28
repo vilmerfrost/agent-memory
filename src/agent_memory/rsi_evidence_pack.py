@@ -448,6 +448,11 @@ class _HealthOnce:
     def query(self, name: str, params: Mapping[str, str]) -> list[EvidenceRef]:
         return self._r.query(name, params)
 
+    def _preflight_query(self, name: str, params: Mapping[str, str]) -> None:
+        preflight = getattr(self._r, '_preflight_query', None)
+        if callable(preflight):
+            preflight(name, params)
+
 
 # Langfuse Cloud spaces calls CLOUD_MIN_INTERVAL_S (2.1s) apart. A full pack makes up to 11 Langfuse calls (health, 3 per
 # experiment, 2 per trace): 21s of spacing alone, past the common 20s. Langfuse's budget adds the spacing its client
@@ -957,7 +962,8 @@ def build_pack(candidate: Mapping[str, Any], *, retrievers: Mapping[str, Retriev
 
     per_source_status: dict[str, list[str]] = defaultdict(list)
     for st, res in done:
-        per_source_status[st.source].append(res.status)
+        if not (res.status == 'unavailable' and res.detail.startswith('policy-excluded:')):
+            per_source_status[st.source].append(res.status)
     for retr, (status, detail) in idle_health.items():
         per_source_status[SERVICE[retr]].append(status)
         runner.log.append(_health_step(retr, status, detail))   # the pack's steps then explain its health too

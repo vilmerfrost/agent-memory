@@ -125,7 +125,8 @@ def runner_identity(experiment_id: str, run: Any, profile: str | None) -> dict[s
             "rep": run.rep, "run_id": run.run_id, "replay_record": rel.as_posix(), "error": bool(run.error),
             "native_session_id": native_session_id(getattr(run, "agent", None), getattr(run, "native_session_id", None)),
             "agent": getattr(run, "agent", None), "model": getattr(run, "model", None),
-            "started_at": getattr(run, "started_at", None), "duration_s": getattr(run, "duration_s", None)}
+            "started_at": getattr(run, "started_at", None), "duration_s": getattr(run, "duration_s", None),
+            "runtime": getattr(run, 'runtime', None)}
 
 
 def record_native_session(conn: psycopg.Connection, attempt: Attempt, a: Mapping[str, Any]) -> str | None:
@@ -160,9 +161,18 @@ def record_native_session(conn: psycopg.Connection, attempt: Attempt, a: Mapping
         if previous_attempt in (None, attempt.key):
             # Native API spans can arrive before the async session observation.
             # Reuse exact-ID profiling; absent API measurements remain NULL.
-            if provider == "codex":
-                from agent_memory import timing_store
-                timing_store.refresh_profiles(conn, [native])
+            from agent_memory import timing_store
+            runtime = a.get('runtime')
+            if provider == 'claude' and isinstance(runtime, dict) and runtime.get('api_duration_source') == 'client_result_duration_api_ms':
+                from agent_memory.execution_timing import Span, key
+                api_ms = number(runtime.get('api_duration_ms'))
+                if api_ms is not None:
+                    # A cumulative client total has no per-request wall interval.
+                    timing_store.upsert_conn(conn, [Span(key('claude.api.total/1', native, attempt.key), native,
+                        'claude', 'api', 'claude.api.total', None, None, api_ms,
+                        'failed' if a.get('error') else 'passed', 'provider_reported', 'claude.result',
+                        meta={'duration_source': 'client_result_duration_api_ms', 'api_scope': 'session'})])
+            timing_store.refresh_profiles(conn, [native])
             return native
     return None  # A real actor collision stays visible; never relabel a prod session.
 

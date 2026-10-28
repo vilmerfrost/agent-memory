@@ -169,3 +169,45 @@ def test_api_arriving_before_native_session_registration_refreshes_exact_profile
         with psycopg.connect(db) as conn:
             AL.record_runner(conn,[b])
             assert conn.execute('select api_seconds from sessions where session_id=%s',(b['native_session_id'],)).fetchone()==(None,)
+
+
+def test_websocket_send_duration_is_transport_not_inference():
+    payload = otlp()
+    rec = payload['resourceLogs'][0]['scopeLogs'][0]['logRecords'][0]
+    rec['attributes'] = [attr('event.name', 'codex.websocket_request'), attr('duration_ms', '0')]
+    span, = T.otlp_spans(payload)
+    assert span.session_id == 'codex:thread'
+    assert span.category == 'unclassified' and span.elapsed_ms == 0
+    assert span.meta['api_scope'] == 'session_transport'
+    assert span.meta['timing_unavailable'] == 'inference_duration_not_reported'
+    assert span.method_version == 4
+
+
+def test_stream_wait_is_captured_without_response_payload():
+    payload = otlp()
+    rec = payload['resourceLogs'][0]['scopeLogs'][0]['logRecords'][0]
+    rec['attributes'] = [attr('event.name', 'codex.sse_event'), attr('duration_ms', '520'),
+                         attr('event.kind', 'response.output_text.delta'), attr('text', 'SECRET')]
+    span, = T.otlp_spans(payload)
+    assert span.category == 'api' and span.elapsed_ms == 520
+    assert 'SECRET' not in str(span.record())
+
+
+def test_old_transport_spans_do_not_make_session_inference_measured(pg_url):
+    with fresh_db(pg_url) as db:
+        add_session(db, 'codex:thread')
+        span, = T.otlp_spans(otlp())
+        span.operation = 'codex.websocket_request'
+        timing_store.upsert([span], db_url=db)
+        with psycopg.connect(db) as conn:
+            assert conn.execute("select api_seconds from sessions where session_id='codex:thread'").fetchone() == (None,)
+
+
+def test_legacy_transport_spool_cannot_restore_inference_classification():
+    span, = T.otlp_spans(otlp())
+    record = span.record()
+    record['operation'] = 'codex.websocket_request'
+    parsed = T.parse_record(record)
+    assert parsed.span_id == span.span_id
+    assert parsed.elapsed_ms == span.elapsed_ms  # retained as transport evidence
+    assert parsed.category == 'unclassified' and parsed.method_version == 4

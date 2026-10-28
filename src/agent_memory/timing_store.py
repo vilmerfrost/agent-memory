@@ -80,15 +80,16 @@ def refresh_profiles(conn: psycopg.Connection, session_ids: Iterable[str]) -> No
         # A missing API event remains NULL; model output is never substituted for API time.
         conn.execute("""
         update public.sessions s set
-          api_seconds=coalesce(t.api_seconds,s.api_seconds),
+          api_seconds=t.api_seconds,
           tool_seconds=coalesce(t.tool_seconds,s.tool_seconds),
-          meta=s.meta || jsonb_build_object('timing_method','execution_spans_v1')
+          meta=s.meta || jsonb_build_object('timing_method','execution_spans_v2')
         from (
           select session_id,
-            sum(elapsed_ms/1000) filter(where category='api' and measurement_kind='provider_reported') as api_seconds,
+            sum(elapsed_ms/1000) filter(where category='api' and measurement_kind='provider_reported'
+                and operation<>'codex.websocket_request') as api_seconds,
             sum(elapsed_ms/1000) filter(where source='codex.item' and category in ('tool','command','test_full','test_targeted')) as tool_seconds
           from public.execution_spans where session_id=any(%s) group by session_id
-        ) t where s.session_id=t.session_id and s.tool='codex'
+        ) t where s.session_id=t.session_id and s.tool in ('codex','claude')
         """, (sorted(touched),))
 
 

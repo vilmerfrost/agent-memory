@@ -111,6 +111,13 @@ def run_query(r: Retriever, name: str, params: Mapping[str, str]) -> QueryResult
         checked = nq.check(params)
     except ValueError as exc:
         return QueryResult(r.source, "bad-params", detail=str(exc))
+    # Policy exclusions must be decided before contacting even the health URL.
+    preflight = getattr(r, '_preflight_query', None)
+    if callable(preflight):
+        try:
+            preflight(name, checked)
+        except Unavailable as exc:
+            return QueryResult(r.source, "unavailable", detail=str(exc)[:200])
     try:
         h = r.health()
     except Exception as exc:  # noqa: BLE001 - a broken health check is "unavailable", never a crash

@@ -142,7 +142,12 @@ def parse_record(d: Any) -> Span | None:
     if d.get("source") == "codex.otel" and end is not None and end.timestamp() == 0:
         start = end = None
         meta["clock"] = "unavailable"
-    return Span(d["span_id"], sid, d["tool"], d["category"], label(d.get("operation")), start, end,
+    category = d['category']
+    if d.get('source') == 'codex.otel' and d.get('operation') == 'codex.websocket_request':
+        category, version = 'unclassified', max(version, 4)
+        meta.update(api_scope='session_transport' if sid else 'unknown_transport',
+                    timing_unavailable='inference_duration_not_reported')
+    return Span(d["span_id"], sid, d["tool"], category, label(d.get("operation")), start, end,
                 elapsed, d["status"], d["measurement_kind"], label(d.get("source")), parent, code,
                 method_version=version, meta=meta)
 
@@ -292,7 +297,7 @@ def otlp_spans(payload: Any) -> list[Span]:
                 record_attrs = otlp_attributes(rec.get("attributes"))
                 attrs = {**common, **scoped, **record_attrs}
                 name = attrs.get("event.name") or attrs.get("event") or mapping(rec.get("body")).get("stringValue")
-                if name not in {"codex.api_request", "codex.websocket_request"}:
+                if name not in {"codex.api_request", "codex.websocket_request", "codex.sse_event"}:
                     continue
                 duration = attrs.get("duration_ms")
                 if duration is None and isinstance(attrs.get("duration"), str):
@@ -326,6 +331,9 @@ def otlp_spans(payload: Any) -> list[Span]:
                 if catalog:
                     session, identity_basis = None, "session_not_applicable"
                 api_scope = "client_control" if catalog else "session" if session else "unknown"
+                transport = name == 'codex.websocket_request'
+                if transport:
+                    api_scope = 'session_transport' if session else 'unknown_transport'
                 if clock != "provider_event_end":
                     event_clock = attrs.get("event.timestamp")
                     try:
@@ -356,11 +364,13 @@ def otlp_spans(payload: Any) -> list[Span]:
                           else "passed" if success is True or success == "true" or (http.isdigit() and 200<=int(http)<400)
                           else "unknown")
                 meta.update(duration_source='otel_duration_ms', clock=clock, api_scope=api_scope)
+                if transport:
+                    meta['timing_unavailable'] = 'inference_duration_not_reported'
                 if catalog:
                     meta['endpoint'] = 'models'
                 meta["identity_source" if session else "identity_unavailable"] = identity_basis
-                found[span_id] = Span(span_id, session, "codex", "unclassified" if catalog else "api", name, end-timedelta(milliseconds=elapsed) if end else None,
-                                      end, elapsed, status, "provider_reported", "codex.otel", method_version=3, meta=meta)
+                found[span_id] = Span(span_id, session, "codex", "unclassified" if catalog or transport else "api", name, end-timedelta(milliseconds=elapsed) if end else None,
+                                      end, elapsed, status, "provider_reported", "codex.otel", method_version=4 if transport else 3, meta=meta)
     return list(found.values())
 
 

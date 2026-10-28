@@ -60,7 +60,7 @@ from agent_memory import rsi_verdict as V
 from agent_memory import rsi_relevance as REL
 
 SUITE = "sandbox-replay"
-SUITE_VERSION = "2"
+SUITE_VERSION = "3"
 REPLAY_FORMAT = "rsi-replay/1"
 BENCH_DIR = config.REPO_ROOT / "bench" / "rsi-replay"
 SANDBOX_PY = config.REPO_ROOT / "sandbox" / "rsi_sandbox.py"

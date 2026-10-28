@@ -44,6 +44,7 @@ class CollectorState:
     session_api: int = 0
     unattributed_api: int = 0
     client_control: int = 0
+    transport: int = 0
     flushes: int = 0
     database_error: str | None = None
     lock: threading.Lock = field(default_factory=threading.Lock)
@@ -55,7 +56,8 @@ class CollectorState:
                     "database_flushes": self.flushes, "database_error": self.database_error,
                     "raw_payloads_stored": False,
                     "session_api_spans": self.session_api, "unattributed_api_spans": self.unattributed_api,
-                    "client_control_spans": self.client_control}
+                    "client_control_spans": self.client_control, "transport_spans": self.transport,
+                    "timing_semantics_version": 4}
 
 
 def server(state: CollectorState, port: int) -> ThreadingHTTPServer:
@@ -106,6 +108,7 @@ def server(state: CollectorState, port: int) -> ThreadingHTTPServer:
                     state.session_api += sum(s.category == "api" and s.session_id is not None for s in spans)
                     state.unattributed_api += sum(s.category == "api" and s.session_id is None for s in spans)
                     state.client_control += sum(s.meta.get("api_scope") == "client_control" for s in spans)
+                    state.transport += sum(s.meta.get('api_scope') in ('session_transport', 'unknown_transport') for s in spans)
                 self.respond(200, {})  # OTLP ExportLogsServiceResponse
             except (ValueError, TypeError, AttributeError, OSError, OverflowError):
                 self.respond(400, {})
