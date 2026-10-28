@@ -72,7 +72,7 @@ def test_temporary_read_recovers_and_records_attempts(monkeypatch):
     assert (check['recovery_status'], check['attempts']) == ('recovered', 2)
     assert check['elapsed_ms'] == 450
     assert read.health_calls == 2
-    assert read.budgets == pytest.approx([2, 1.65])
+    assert read.budgets == pytest.approx([.5, .7])
     assert clock.at < 2
 
 
@@ -226,3 +226,81 @@ def test_repeated_query_names_keep_their_own_measured_duration():
     steps = [P._Step('ch', 'read', {}, 'clickhouse'), P._Step('ch', 'read', {}, 'clickhouse')]
     assert all(result.status == 'ok' for _, result in runner.phase(steps))
     assert [row['elapsed_ms'] for row in runner.log] == [100, 200]
+
+
+def test_attempt_timeout_leaves_budget_for_sequential_recovery(monkeypatch):
+    class CooperativeTimeout(Read):
+        current_budget = None
+        in_flight = 0
+        maximum_in_flight = 0
+        @contextmanager
+        def read_budget(self, seconds):
+            self.budgets.append(seconds)
+            self.current_budget = seconds
+            yield
+        def query(self, name, params):
+            self.calls += 1
+            self.in_flight += 1
+            self.maximum_in_flight = max(self.maximum_in_flight, self.in_flight)
+            try:
+                if self.calls == 1:
+                    self.clock.at += self.current_budget
+                    raise TimeoutError('attempt read deadline')
+                self.clock.at += .1
+                return []
+            finally:
+                self.in_flight -= 1
+    read = CooperativeTimeout(clock=Clock())
+    result, check, clock = execute(monkeypatch, read, budget=20)
+    assert result.status == 'ok' and check['recovery_status'] == 'recovered'
+    assert check['attempts'] == 2
+    assert read.maximum_in_flight == 1 and read.in_flight == 0
+    assert read.budgets == pytest.approx([6.5, 6.5])
+    assert clock.at == pytest.approx(6.85) and clock.at < 20
+
+
+def test_all_attempt_timeouts_share_original_deadline(monkeypatch):
+    class AlwaysTimeout(Read):
+        @contextmanager
+        def read_budget(self, seconds):
+            self.budgets.append(seconds)
+            self.current_budget = seconds
+            yield
+        def query(self, name, params):
+            self.calls += 1
+            self.clock.at += self.current_budget
+            raise TimeoutError('attempt deadline')
+    read = AlwaysTimeout(clock=Clock())
+    result, check, clock = execute(monkeypatch, read, budget=20)
+    assert result.status == 'error' and check['recovery_status'] == 'failed'
+    assert check['attempts'] == read.calls == 3
+    assert read.budgets == pytest.approx([6.5, 6.5, 6.5])
+    assert clock.at == 20
+
+
+def test_external_context_is_not_reported_as_missing_authority():
+    from datetime import datetime, UTC
+    from agent_memory.integrations import refs
+    source = 'amem:experiment/exp-20261017-other'
+    candidate = P._Cand('candidate-a', 'parent-md:repo-profile', None, (), None, '~/agent-config/parent/PARENT.md')
+    ev = E.EvidenceRef('past:'+source, 'pd', 'decision-memory', [source])
+    raw = P._Raw(P._Step('pd', 'recall', {}, 'pastdev'), ev, 'pastdev', True)
+    finding = P._finding(raw, {source}, P.PackLimits(), candidate,
+                         {source: ({'skill:other:rule'}, {'~/.agents/skills/other/SKILL.md'})})
+    assert finding.status == 'unlinked' and finding.authority is None
+    assert 'context only' in finding.detail and 'authoritative record resolved' in finding.detail
+    unknown_scope = P._finding(raw, {source}, P.PackLimits(), candidate, {})
+    assert unknown_scope.status == 'unlinked' and unknown_scope.authority is None
+    assert 'binding is not recorded' in unknown_scope.detail
+    assert 'another rule' not in unknown_scope.detail
+    missing = P._evidence_finding(('e1', datetime.now(UTC), 'pastdev', 'decision-memory', 'past:x', [], {}, None, ''), set(), 200)
+    assert missing.status == 'unlinked' and 'producer identity required' in missing.detail
+    stale = P._evidence_finding(('e2', datetime.now(UTC), 'pastdev', 'decision-memory', 'past:y', [source], {}, None, ''), set(), 200)
+    assert stale.status == 'stale' and 'no longer resolve' in stale.detail
+
+
+def test_langfuse_keeps_its_full_paginated_read_allowance(monkeypatch):
+    read = Read([ConnectionError()], clock=Clock())
+    result, check, _ = execute(monkeypatch, read, retr='lf', budget=20)
+    assert result.status == 'ok' and check['attempts'] == 2
+    assert read.budgets == pytest.approx([20, 19.65])

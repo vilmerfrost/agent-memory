@@ -243,3 +243,22 @@ def test_read_budget_cannot_be_used_to_export(monkeypatch):
     monkeypatch.setattr(L.http, "request", lambda *a, **kw: pytest.fail("write must not reach HTTP"))
     with c.read_budget(), pytest.raises(L.LangfuseError, match="non-GET"):
         c.export_spans({"resourceSpans": []})
+
+
+def test_export_budget_bounds_ingestion_without_enabling_evidence_writes(monkeypatch):
+    from agent_memory.integrations import langfuse as L, http
+    clock = [0.0]
+    seen = []
+    def request(method, url, **kw):
+        seen.append((method, kw['retries'], kw['total_timeout']))
+        clock[0] += .1 if len(seen) == 1 else .15
+        return http.Response(200, b'{}', {})
+    monkeypatch.setattr(L.http, 'request', request)
+    client = L.LangfuseClient('http://127.0.0.1', 'test', 'test', clock=lambda: clock[0], min_interval=0)
+    with client.export_budget(.2), pytest.raises(L.ReadDeadline):
+        client.export_spans({})
+        client.create_scores([])
+    assert seen == [('POST', 0, .2), ('POST', 0, .1)]
+    # Export scope ends; the original evidence read scope still refuses ingestion.
+    with client.read_budget(1), pytest.raises(L.LangfuseError, match='non-GET'):
+        client.create_scores([])
