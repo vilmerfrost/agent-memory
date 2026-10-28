@@ -39,7 +39,7 @@ def record(root: Path, h: str) -> dict:
 
 def test_shipped_cases_load_and_are_stable():
     cases = R.load_cases()
-    assert [c.id for c in cases] == ["anatomy-plan", "docs-typo", "fix-add", "meltdown-brief", "parent-authority",
+    assert [c.id for c in cases] == ["anatomy-plan", "docs-typo", "fix-add", "meltdown-brief", "parent-authority", "parent-merge-cleanup",
                                      "parent-repo-profile", "parent-safety-guards", "pepe-lock",
                                      "report-todos", "worker-final-report", "worker-helper-lifecycle", "worker-server-launch"]
     assert all(c.fixture.is_dir() and c.stub and c.check for c in cases)
@@ -107,7 +107,7 @@ def test_replay_jev_fixtures_match_their_states():
             assert set(body["answers"]) == {"effect", "harness_problem", "evidence_strength"}
     # Keep the six historical V1 outcomes and six explicit V2 counterparts, plus the recorded 2026-10-26 codex
     # replay (both arms failed every check; tests/test_rsi_jev_inputs.py).
-    assert versions == {"suite: sandbox-replay/1": 6, "suite: sandbox-replay/2": 7, "suite: sandbox-replay/3": 7}
+    assert versions == {"suite: sandbox-replay/1": 6, "suite: sandbox-replay/2": 7, "suite: sandbox-replay/3": 7, "suite: sandbox-replay/4": 7}
 
 
 def test_jev_state_is_numbers_only_and_fixture_mode_never_goes_live(monkeypatch):

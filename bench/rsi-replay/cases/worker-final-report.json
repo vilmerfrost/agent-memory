@@ -9,7 +9,11 @@
     {
       "path": "~/agent-config/agents/worker.md",
       "kind": "instruction",
-      "behavior": "Final report; Definition of done: Report worker results without upgrading failed or unverified work"
+      "behavior": "Final report; Definition of done: Report worker results without upgrading failed or unverified work",
+      "sections": [
+        "definition-of-done",
+        "final-report"
+      ]
     }
   ],
   "fixture": "worker-final-report",

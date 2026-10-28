@@ -268,12 +268,16 @@ class Hypothesis:
     expected: str = ""
     risk: str = "medium"
     confidence: float = 0.5
+    edit: dict[str, str] | None = None  # S5's exact declared section intervention; legacy records remain readable
 
     def as_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        out = asdict(self)
+        if self.edit is None:
+            out.pop("edit")
+        return out
 
 
-HYP_FIELDS = {"what": 200, "why": 400, "target": 300, "expected": 200, "risk": 10, "confidence": 0}
+HYP_FIELDS = {"what": 200, "why": 400, "target": 300, "expected": 200, "risk": 10, "confidence": 0, "edit": 0}
 HYP_REQUIRED = ("what", "why", "target")
 # Text that an instruction-edit hypothesis never needs: commands, code, links, secrets, approval verbs and the
 # usual prompt-injection phrasing. A false positive only drops one hypothesis; nothing runs because of it.
@@ -328,12 +332,20 @@ def parse_hypothesis(obj: Any, allowlist: Sequence[str]) -> Hypothesis:
     conf = obj.get("confidence", 0.5)
     if isinstance(conf, bool) or not isinstance(conf, (int, float)) or not math.isfinite(conf) or not 0 <= conf <= 1:
         raise HypothesisRejected("bad_confidence", "confidence must be a number in 0..1", "confidence")
-    return Hypothesis(what=what, why=why, target=target, expected=expected, risk=risk, confidence=float(conf))
+    edit = obj.get("edit")
+    if edit is not None:
+        if (not isinstance(edit, dict) or set(edit) != {"section_id", "before", "after"}
+                or not all(isinstance(v, str) and v for v in edit.values())
+                or not re.fullmatch(r"[a-z0-9][a-z0-9/_-]{0,119}", edit["section_id"])
+                or any(len(edit[k]) > 16_000 for k in ("before", "after")) or edit["before"] == edit["after"]):
+            raise HypothesisRejected("bad_edit_contract", "edit must declare one bounded exact section replacement")
+    return Hypothesis(what=what, why=why, target=target, expected=expected, risk=risk, confidence=float(conf), edit=edit)
 
 
 # Why a hypothesis was thrown out before any test, in fixed plain words (Night Desk decision 18). The report keeps
 # the code and these words only; the model's own text never reaches it.
 REJECT_REASONS = {
+    "bad_edit_contract": "the proposed edit lacked one exact bounded section replacement",
     "unparseable": "the idea writer's reply was not the required JSON shape",
     "not_an_object": "the idea was not a structured object",
     "unknown_fields": "the idea had fields the rules do not allow",
@@ -926,10 +938,16 @@ with the unchanged one, so each change must be small, concrete and testable.
 Reply with JSON only, exactly this shape and nothing else:
 {{"hypotheses": [{{"what": "<the concrete change to the instruction text, one sentence, <= 200 chars>",
   "why": "<the evidence-based reason, <= 400 chars>", "target": "<one path from the list below>",
-  "expected": "<the measurable effect, <= 200 chars>", "risk": "low|medium|high", "confidence": <0..1>}}]}}
+  "expected": "<the measurable effect, <= 200 chars>", "risk": "low|medium|high", "confidence": <0..1>,
+  "edit": {{"section_id": "<existing section id>", "before": "<exact current full section text including heading>",
+           "after": "<exact proposed full section text including unchanged heading>"}}}}]}}
 
 Rules: "target" must be exactly one of: {targets}
-Plain prose only: no commands, code, links, file paths other than the target, or secrets.
+The edit object is the authoritative intervention. Copy before exactly from the displayed section; after must
+make only the proposed change in that same section. Preserve its heading and every unrelated requirement.
+Use the candidate's rule section when one is named. Do not move the change to another section or add reporting
+requirements that are absent from the proposed intervention. Legacy ideas without an edit object cannot run.
+For what/why/expected use plain prose only: no commands, code, links, file paths other than the target, or secrets.
 
 Problem (structured, from the investigator's own database):
 {candidate}
@@ -1035,6 +1053,8 @@ class ClaudeCliHypothesizer:
             argv += ["--effort", str(self.cfg["effort"])]
         cand = {k: candidate.get(k) for k in ("dedupe_key", "source", "kind", "target", "rule_key", "seen_count")}
         cand["metrics"] = {k: v for k, v in (candidate.get("metrics") or {}).items() if isinstance(v, (int, float))}
+        from agent_memory import edits_sections
+        cand["section_ids"] = {s.id: s.title for s in edits_sections.sections(target_text)}
         limit = int(self.cfg.get("max_prompt_chars") or 24_000)
         fields = dict(cap=cap, targets=", ".join(targets), candidate=json.dumps(cand, sort_keys=True, default=str),
                       target=candidate.get("target") or "(choose from the list)", evidence=evidence_text)
@@ -1087,12 +1107,14 @@ class Implementation:
     kind: str | None = None
     diff: str | None = None
     section_from: str | None = None     # "rule_key" (the candidate's rule section) | "hypothesis" (the section it names)
+    contract_verified: bool = False
 
     def record(self) -> dict[str, Any]:
         return {"implementer": self.implementer, "implementer_fallback_reason": self.fallback_reason,
                 "implementation": {"section_id": self.section_id, "section_from": self.section_from,
                                    "kind": self.kind, "diff": self.diff,
-                                   "new_sha256": hashlib.sha256(self.text.encode()).hexdigest()}}
+                                   "new_sha256": hashlib.sha256(self.text.encode()).hexdigest(),
+                                   "contract_verified": self.contract_verified}}
 
 
 IMPLEMENTATION_DIFF_MAX = 12_000
@@ -1103,6 +1125,7 @@ test this change to the rule:
   what: {what}
   why: {why}
 Rewrite only this rule's section so the change is made. Do not append a new line at the end of the file.
+{edit_contract}
 
 Reply with ONLY one JSON object. No prose, no code fence. Shape:
 {{"new_section": string, "topic": string, "why": string, "summary": string, "kind": string,
@@ -1232,9 +1255,9 @@ class WriterImplementer:
     candidate without one (skill scores, routine failures, findings), the section its hypothesis names. The call
     is the hypothesizer's: `claude -p` with no tools, hooks off, model pinned to claude-opus-5-5, through the
     subscription runner when the profile says so, counted in the night budget. The evidence reaches it only inside
-    its untrusted-data envelope. Pinned files and rules get no writer call. On a pin, no matching section, a writer
-    or proposal error, or a budget stop, this experiment falls back to `stub_change` and records why; a staging
-    refusal of the writer's text (improve's content guard) falls back in Night._experiment."""
+    its untrusted-data envelope. Pinned files and rules get no writer call. The legacy diagnostic return
+    retains fallback reasons; Night never stages or replays that fallback. Live writer-mode hypotheses require
+    an exact declared section replacement, and only byte-matching writer output can reach replay."""
 
     wants_context = True
 
@@ -1289,10 +1312,24 @@ class WriterImplementer:
         # The candidate's own rule section (a deviation's rule key names it); else the section the hypothesis names
         # (skill scores, routine failures and findings carry no section id: the 2026-10-25 night fell back 3 of 3).
         sec, picked_by = _section_for(old_text, ctx.get("rule_key")), "rule_key"
+        if hyp.edit is not None:
+            declared = next((x for x in edits_sections.sections(old_text) if x.id == hyp.edit["section_id"]), None)
+            if declared is None or (sec is not None and sec.id != declared.id):
+                return fallback("declared edit names another rule section: no writer call")
+            sec, picked_by = declared, "declared_edit"
+            if edits_sections.section_text(old_text, sec.id) != hyp.edit["before"]:
+                return fallback("declared edit baseline is stale: no writer call")
         if sec is None:
             sec, picked_by = section_for_hypothesis(old_text, hyp.what), "hypothesis"
         if sec is None:
             return fallback("no section matches the candidate or the hypothesis: no writer call")
+        if hyp.edit is not None:
+            for other in edits_sections.sections(old_text):
+                heading = other.title.rsplit(" > ", 1)[-1]
+                if other.id != sec.id and re.search(
+                        r"\b(?:under|in|within|below|to)\s+(?:the\s+)?[\"']?" + re.escape(heading) + r"(?=[\s\"'.,:]|$)",
+                        hyp.what, re.I):
+                    return fallback("hypothesis placement conflicts with the declared section: no writer call")
         section_text = edits_sections.section_text(old_text, sec.id)
         if ET.pinned_rule(f"rsi-night-{sec.id}", section_text) is not None:
             return fallback("the rule is pinned: no writer call")
@@ -1302,8 +1339,11 @@ class WriterImplementer:
         heading_note = (f"({sec.heading.strip()!r}, unchanged)" if sec.heading
                         else "(this section has no heading of its own: keep it that way)")
         evidence = str(ctx.get("evidence_text") or "") or "(no evidence pack tonight)"
+        contract_note = ("Exact declared replacement (do not add, omit, paraphrase or relocate any part):\n"
+                         + json.dumps(hyp.edit, ensure_ascii=True) if hyp.edit else
+                         "Legacy writer diagnostic: the original intent has no exact edit contract.")
         prompt = WRITER_NIGHT_PROMPT.format(
-            what=hyp.what, why=hyp.why, heading_note=heading_note, added_max=edits_writer.ADDED_MAX,
+            edit_contract=contract_note, what=hyp.what, why=hyp.why, heading_note=heading_note, added_max=edits_writer.ADDED_MAX,
             why_max=edits_writer.WHY_MAX, summary_max=edits_writer.SUMMARY_MAX,
             kind_reason_max=edits_writer.KIND_REASON_MAX, strategy=edits_writer.STRATEGY, policy=edits_writer.POLICY,
             target=hyp.target, rule_id=sec.id, rule_title=sec.title, section=section_text, prev=prev or "(none)",
@@ -1326,10 +1366,20 @@ class WriterImplementer:
             return fallback(f"writer proposal refused: {_one_line(exc, 200)}")
         except edits_sections.SectionError as exc:
             return fallback(f"writer proposal refused: {_one_line(exc, 200)}")
+        if hyp.edit is not None:
+            expected_reply = json.dumps({"new_section": hyp.edit["after"], "topic": "declared section edit",
+                "why": "the exact intervention declared before writing", "summary": "apply the declared replacement",
+                "kind": "prose", "kind_reason": "one declared section replacement"})
+            try:
+                expected_prop = edits_writer.parse_proposal(expected_reply, file_text=old_text, rule_id=sec.id, cand=cand)
+            except (edits_writer.ProposalError, edits_sections.SectionError):
+                return fallback("declared edit violates the existing content policy")
+            if prop.new_text != expected_prop.new_text:
+                return fallback("writer drift: output differs from the declared edit")
         diff = "\n".join(difflib.unified_diff(old_text.splitlines(), prop.new_text.splitlines(), "a" + hyp.target[1:],
                                               "b" + hyp.target[1:], lineterm="", n=1))
         return Implementation(prop.new_text, "writer", None, sec.id, prop.kind, diff[:IMPLEMENTATION_DIFF_MAX],
-                              picked_by)
+                              picked_by, hyp.edit is not None)
 
 
 def sandbox_module() -> Any:
@@ -1593,6 +1643,12 @@ class Adapters:
     sandbox: SandboxOps
     targets: Callable[[], list[str]] = instruction_targets
     baseline: Callable[[str], tuple[str, Path]] = create_baseline
+    exporter: Callable[..., Mapping[str, Any]] | None = None
+
+
+def export_replay(conn: psycopg.Connection, experiment_id: str, *, budget_s: float) -> Mapping[str, Any]:
+    from agent_memory.integrations.langfuse import export_experiment
+    return export_experiment(conn, experiment_id, budget_s=budget_s, root=RA.sandbox_dir())
 
 
 def default_adapters(cfg: NightConfig, db_url: str | None = None) -> Adapters:
@@ -1608,7 +1664,8 @@ def default_adapters(cfg: NightConfig, db_url: str | None = None) -> Adapters:
         impl = StubImplementer()
     return Adapters(evidence=PackEvidence(db_url), triage=JevTriage(st["triage"]), hypothesizer=hyp, implementer=impl,
                     stager=ImproveStager(), replayer=SandboxReplayer(st, cfg.replay), proposer=ApprovalProposer(),
-                    sandbox=SandboxOps())
+                    sandbox=SandboxOps(), exporter=export_replay if cfg.replay.get("provider_profiles") or
+                    st.get("replay_agent") in ("claude", "codex") else None)
 
 
 # =========================================================================== candidates (S2)
@@ -2329,23 +2386,50 @@ class Night:
                                       f"evidence {finding['ref']}"[:300])
                     break
 
-    def _test_cases(self, target: str | None) -> list[str]:
+    def _test_cases(self, target: str | None, rule_key: str | None = None,
+                    section_id: str | None = None) -> list[str]:
         """Replay cases (the night's `replay.cases`, default all of bench/rsi-replay) that declare `target`. Path
         only: the artifact's kind is checked again by the replay. A bench that does not load covers nothing."""
         cov = getattr(self, "_case_coverage", None)
         if cov is None:
             cov = {}
             self._case_digests: dict[str, str] = {}
+            self._case_sections: dict[tuple[str, str], list[str]] = {}
             try:
                 from agent_memory import rsi_replay
                 for case in rsi_replay.load_cases(self.cfg.replay.get("cases")):
                     self._case_digests[case.id] = case.digest()
                     for t in case.targets:
                         cov.setdefault(t["path"], []).append(case.id)
+                        self._case_sections[(t["path"], case.id)] = list(t.get("sections", []))
             except Exception as exc:  # noqa: BLE001 - fail closed: no experiment without a case
                 self.notes.append(f"test cases unavailable: {type(exc).__name__}: {str(exc)[:150]}")
             self._case_coverage = cov
-        return sorted(cov.get(target or "", []))
+        if section_id is None and rule_key and target in self.allowlist:
+            with contextlib.suppress(OSError, ValueError):
+                sec = _section_for(rsi_targets.untilde(target).read_text(), rule_key)
+                section_id = sec.id if sec else None
+        ids = sorted(cov.get(target or "", []))
+        if section_id is not None:
+            return [cid for cid in ids if section_id in self._case_sections.get((target, cid), [])]
+        return ids
+
+    def _writer_block(self, c: Mapping[str, Any]) -> str | None:
+        if not isinstance(self.ad.implementer, WriterImplementer) or c.get("target") not in self.allowlist:
+            return None
+        try:
+            path = rsi_targets.untilde(c["target"])
+            if ET.pinned_file(path) is not None:
+                return "target file is pinned"
+            sec = _section_for(path.read_text(), (c.get("meta") or {}).get("last_tested_rule_key") or c.get("rule_key"))
+            if sec is not None:
+                from agent_memory.edits_sections import section_text
+                text = section_text(path.read_text(), sec.id)
+                if ET.pinned_rule(f"rsi-night-{sec.id}", text) is not None or ET.pinned_sections(path, text):
+                    return "instruction section is pinned"
+        except (OSError, ValueError, RuntimeError):
+            return "writer target readiness unavailable"
+        return None
 
     def _baselines(self, cases: Sequence[str]) -> dict[str, dict[str, tuple[int, int]]]:
         """Per case, per replay suite label, the last recorded arm-A result (passed, pairs): the newest
@@ -2397,18 +2481,20 @@ class Night:
             self._poll()
             hist = self._history(c["dedupe_key"])
             in_scope = self._in_scope(c.get("target"))
-            tests = self._test_cases(c.get("target"))
+            section_key = (c.get("meta") or {}).get("last_tested_rule_key") or c.get("rule_key")
+            tests = self._test_cases(c.get("target"), section_key) if isinstance(self.ad.implementer, WriterImplementer) else self._test_cases(c.get("target"))
+            writer_block = self._writer_block(c)
             ans = None
             # No replay case uses the file: no paid triage call, the deterministic heuristic ranks it for the report.
-            if tests and self.execution_ready and (not self.dry_run or self.cfg.stages["triage"] == "fixture"):
+            if tests and not writer_block and self.execution_ready and (not self.dry_run or self.cfg.stages["triage"] == "fixture"):
                 state = triage_state(c, hist, in_scope, tests, self._baselines(tests))
                 ans = self.ad.triage.assess(c, state=state, budget=self.budget)
             if ans is None:
                 ans = heuristic_answers(c, hist, in_scope)
             r = rank(ans, recurrence(c), hist, self.cfg.weights)
             explore = self.cfg.experiment_goal[0] > 0
-            eligible = in_scope and bool(tests) and (explore or (ans.action == "experiment" and r >= self.cfg.min_rank))
-            why = ("eligible" if eligible else "no in-scope target" if not in_scope else NO_TEST_CASE if not tests
+            eligible = in_scope and bool(tests) and not writer_block and (explore or (ans.action == "experiment" and r >= self.cfg.min_rank))
+            why = (writer_block if writer_block else "eligible" if eligible else "no in-scope target" if not in_scope else NO_TEST_CASE if not tests
                    else "triage: wait" if ans.action != "experiment" else "rank below the minimum")
             results.append((c, ans, r, eligible, why, hist))
         self.health["jev"] = getattr(self.ad.triage, "health", self.health["jev"])
@@ -2488,6 +2574,13 @@ class Night:
 
     def _investigate(self, c: dict[str, Any]) -> None:
         assert self.conn is not None
+        blocker = self._writer_block(c)
+        if blocker:
+            self._update_candidate(c.get("id"), status="deferred", reason=blocker)
+            for entry in self.report["candidates"]:
+                if entry["key"] == c["dedupe_key"]:
+                    entry.update(selected=False, reason=blocker, skip_reason=blocker)
+            return
         cand = {k: c.get(k) for k in ("id", "dedupe_key", "source", "kind", "target", "rule_key", "evidence_refs",
                                       "metrics", "seen_count")}
         cand['rule_key'] = (c.get('meta') or {}).get('last_tested_rule_key') or cand.get('rule_key')
@@ -2538,6 +2631,11 @@ class Night:
         meta = dict(c.get("meta") or {})
         cap = self.budget.hypothesis_cap()
         pending = [h for h in meta.get("pending_hypotheses") or [] if isinstance(h, dict)]
+        if isinstance(self.ad.implementer, WriterImplementer):
+            unbound = [h for h in pending if not isinstance(h.get("edit"), dict)]
+            if unbound:
+                self._update_candidate(c.get("id"), meta={"unbound_pending_hypotheses": unbound})
+            pending = [h for h in pending if isinstance(h.get("edit"), dict)]
         if pending:
             reply = json.dumps({"hypotheses": pending[:cap]})
         else:
@@ -2581,20 +2679,38 @@ class Night:
                                    meta={"pending_hypotheses": [], "attempts": int(meta.get('attempts') or 0)+1,
                                          **({'generation_attempts':attempts} if generation else {})})
             return
+        attempted = False
         for i, h in enumerate(hyps):
             later = hyps[i + 1:]
             # One experiment per candidate per night. Triage gave each selected candidate one of tonight's slots, so
             # a candidate's second hypothesis never takes another candidate's slot; it stays pending (stored by
             # _experiment) and runs on a later night without a new model call.
-            if i > 0:
+            if i > 0 and attempted:
                 self.report["experiments"].append(self._skipped_entry(
                     c, h, refs, policy="one_experiment_per_candidate"))
                 continue
+            if isinstance(self.ad.implementer, WriterImplementer):
+                reason = None
+                if h.edit is None:
+                    reason = "missing exact edit contract"
+                elif not self._test_cases(h.target, section_id=h.edit["section_id"]):
+                    reason = "no replay case covers the declared instruction section"
+                elif ET.pinned_sections(rsi_targets.untilde(h.target), h.edit["before"]) or ET.pinned_rule(
+                        f"rsi-night-{h.edit['section_id']}", h.edit["before"]) is not None:
+                    reason = "declared instruction section is pinned"
+                if reason:
+                    self.report["experiments"].append(self._skipped_entry(c, h, refs, policy=reason))
+                    self._update_candidate(c.get("id"), status="deferred", reason=reason)
+                    for candidate_entry in self.report["candidates"]:
+                        if candidate_entry["key"] == c["dedupe_key"]:
+                            candidate_entry.update(selected=False, reason="deferred: " + reason, skip_reason=reason)
+                    continue
             if self.budget.experiments_left() <= 0:
                 self.report["experiments"].append(self._skipped_entry(c, h, refs, resource="experiments"))
                 continue
             try:
                 self.budget.take_experiment()
+                attempted = True
             except BudgetExhausted as exc:
                 for x in hyps[i:]:
                     self.report["experiments"].append(self._skipped_entry(c, x, refs, resource=exc.kind,
@@ -2644,7 +2760,7 @@ class Night:
     def _entry(self, exp_id: str | None, c: Mapping[str, Any], h: Hypothesis, refs: list[str], *,
                status: str) -> dict[str, Any]:
         detail = self._evidence.get(str(c["dedupe_key"])) or evidence_detail([])
-        return {"experiment_id": exp_id, "candidate_key": c["dedupe_key"], "hypothesis": {"what": h.what, "why": h.why},
+        return {"experiment_id": exp_id, "candidate_key": c["dedupe_key"], "hypothesis": {"what": h.what, "why": h.why, **({"edit": h.edit} if h.edit else {})},
                 "target": h.target, "artifact_hash": None, "baseline_id": None, "verdict": None, "verdict_reasons": [],
                 "arms": {"A": {}, "B": {}}, "risk": h.risk, "confidence": h.confidence, "cost_usd": 0.0,
                 "status": status, "proposal_id": None, "evidence_refs": refs[:20], "judge": None, "jev": None,
@@ -2678,7 +2794,31 @@ class Night:
             self.notes.append(f"experiment {exp_id}: attempt identities not recorded ({type(exc).__name__}); "
                               "amem coverage repair-links rebuilds them"[:300])
 
-    def _record_evaluations(self, exp_id: str, adir: Path, intended: bool) -> None:
+    def _export_current_replay(self, exp_id: str, entry: dict[str, Any]) -> None:
+        exporter = getattr(self.ad, "exporter", None)
+        if exporter is None:
+            return
+        try:
+            with self._interruptible():
+                result = dict(exporter(self.conn, exp_id, budget_s=min(90.0, self.budget.remaining_s())))
+            if result.get("experiment_id") != exp_id:
+                raise ValueError("export identity mismatch")
+        except (NightAborted, BudgetExhausted):
+            raise
+        except Exception as exc:
+            result = {"status": "failed", "experiment_id": exp_id, "rows": 0,
+                      "detail": f"current replay export: {type(exc).__name__}"}
+        entry["langfuse_export"] = result
+        self.conn.execute("update rsi_experiments set meta=meta || %s where id=%s",
+                          (Jsonb({"langfuse_export": result}), exp_id))
+        if result.get("status") not in ("ok", "off"):
+            self.degraded = True
+            self.health["langfuse"] = "unavailable"
+            reason = _one_line(f"current replay export {exp_id}: {result.get('status')}: {result.get('detail', '')}", 200)
+            self.health_reasons.setdefault("langfuse", []).append(reason)
+            self.notes.append(reason)
+
+    def _record_evaluations(self, exp_id: str, adir: Path, intended: bool) -> bool:
         from agent_memory import replay_evidence
         assert self.conn is not None
         try:
@@ -2686,8 +2826,10 @@ class Night:
                 result = replay_evidence.register_evaluations(self.conn, adir, exp_id)
                 self.conn.execute("update rsi_experiments set meta=meta || %s where id=%s",
                                   (Jsonb({'replay_ingestion': result, 'intended_intervention': intended}), exp_id))
+            return True
         except (OSError, ValueError, psycopg.Error, RA.ArtifactError) as exc:
             self.notes.append(f"experiment {exp_id}: replay evaluation evidence not ingested ({type(exc).__name__})"[:300])
+            return False
 
     def _experiment(self, c: dict[str, Any], h: Hypothesis, refs: list[str], later: list[Hypothesis]) -> None:
         assert self.conn is not None
@@ -2729,20 +2871,19 @@ class Night:
             # then stops the night (fail closed) right after this experiment's fallback.
             self._record_implementation(exp_id, entry, impl)
             self._poll()
+            if isinstance(self.ad.implementer, WriterImplementer) and (
+                    impl.implementer == "stub-fallback" or not impl.contract_verified):
+                raise ExperimentFailed("writer intervention deferred: " + (impl.fallback_reason or "unverified edit contract"))
 
             def stage(text: str) -> StageResult:
                 return self.ad.stager.stage(experiment_id=exp_id, baseline_dir=Path(bdir), key=h.target, new_text=text,
-                                            rule_id=f"rsi-night-{_sha16(c['dedupe_key'])[:10]}",
+                                            rule_id=("rsi-section-" + impl.section_id.replace("/", "--") if impl.section_id and h.edit else
+                                                     f"rsi-night-{_sha16(c['dedupe_key'])[:10]}"),
                                             timeout=max(1.0, min(float(self.cfg.staging.get("timeout_s") or 600),
                                                                  self.budget.remaining_s())))
             st = stage(new)
             if (st.status != "staged" or not st.artifact_hash) and impl.implementer == "writer":
-                # improve's own checks (its content guard: pasted ids, paths, code, failure output) refused the
-                # writer's text: this experiment tests the stub's change instead.
-                impl = Implementation(stub_change(old, h), "stub-fallback",
-                                      f"improve stage refused the writer's change: {_one_line(st.reason, 200)}")
-                new = impl.text
-                st = stage(new)
+                raise ExperimentFailed(f"writer intervention refused by staging: {_one_line(st.reason, 200)}")
             self._record_implementation(exp_id, entry, impl)
             if st.status != "staged" or not st.artifact_hash:
                 raise ExperimentFailed(f"improve stage refused: {st.reason}")
@@ -2757,7 +2898,7 @@ class Night:
             self._record_attempts(exp_id, rr)
             verdict = rr.verdict if rr.verdict in VERDICTS else "INCONCLUSIVE"
             reasons = list(rr.reasons)
-            intended = impl.implementer != "stub-fallback"
+            intended = impl.contract_verified if isinstance(self.ad.implementer, WriterImplementer) else impl.implementer != "stub-fallback"
             # A fallback tests other bytes than the hypothesizer asked the writer to produce. It can inform
             # diagnostics, but an improving fallback is not evidence for that intended intervention.
             replay_verdict = verdict
@@ -2765,7 +2906,8 @@ class Night:
                 verdict = "INCONCLUSIVE"
                 reasons = ["fallback_intervention:not_the_intended_writer_change", *reasons]
             entry["implementation"].update(intended_intervention=intended, replay_verdict=replay_verdict)
-            self._record_evaluations(exp_id, Path(st.artifact_dir or RA.artifacts_dir()/st.artifact_hash), intended)
+            if self._record_evaluations(exp_id, Path(st.artifact_dir or RA.artifacts_dir()/st.artifact_hash), intended):
+                self._export_current_replay(exp_id, entry)
             tested = {'last_tested_instruction_sha256': hashlib.sha256(old.encode()).hexdigest()}
             if impl.section_id:
                 tested['last_tested_rule_key'] = (str(c.get('rule_key') or c.get('dedupe_key'))+':'+impl.section_id
