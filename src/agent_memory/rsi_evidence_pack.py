@@ -483,7 +483,7 @@ class _Runner:
         self.used: dict[str, float] = defaultdict(float)
         self.dead: set[str] = set()
         self.log: list[dict[str, Any]] = []
-        self.observations: dict[str, dict[str, Any]] = {}
+        self.observations: dict[int, dict[str, Any]] = {}
 
     def budget(self, retr: str) -> float:
         return self.timeout_s + self.extra.get(retr, 0.0)
@@ -565,7 +565,7 @@ class _Runner:
             result.detail.startswith("policy-excluded:") or _owner_off(r._r))
         state = ("recovered" if failures else "healthy") if result.status == "ok" else (
             "excluded" if excluded else "failed")
-        self.observations[st.name] = {
+        self.observations[id(st)] = {
             "attempts": attempts or None, "recovery_status": state,
             "checked_at": datetime.now(UTC).isoformat(timespec="seconds"),
             "elapsed_ms": round(max(0.0, self.clock() - started) * 1000, 3),
@@ -617,7 +617,7 @@ class _Runner:
         out = [(st, results[id(st)]) for st in steps]
         self.log += [{"step": st.name, "status": res.status, "found": len(res.refs),
                       "detail": _free(res.detail, 120) or "",
-                      **self.observations.get(st.name, {})} for st, res in out]
+                      **self.observations.get(id(st), {})} for st, res in out]
         return out
 
 
