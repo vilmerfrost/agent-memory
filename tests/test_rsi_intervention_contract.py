@@ -31,7 +31,7 @@ def reply(section):
         summary='changes only the summary shape',kind='contract',kind_reason='one required output shape'))
 
 
-def implement(h, answer):
+def implement(h, answer, **context):
     calls=[]
     def writer(prompt):
         calls.append(prompt)
@@ -39,7 +39,7 @@ def implement(h, answer):
     budget=Budget(BudgetConfig.from_dict({'max_usd':0,'model_calls':{'claude-opus-5-5':1},
         'subscription_models':['claude-opus-5-5'],'max_subscription_tokens':10000}))
     result=N.WriterImplementer({},call=writer).implement(h,old_text=OLD,experiment_id='exp-test',baseline_id='bl-test',
-        budget=budget,context={'rule_key':'dev:summary'})
+        budget=budget,context={'rule_key':'dev:summary', **context})
     return result,calls
 
 
@@ -77,9 +77,9 @@ def test_subsection_artifact_requires_declared_behavior_coverage():
     cases=[SimpleNamespace(id='summary',targets=[dict(path=TARGET,kind='instruction',behavior='summary',sections=['summary'])]),
         SimpleNamespace(id='other',targets=[dict(path=TARGET,kind='instruction',behavior='other',sections=['other'])]),
         SimpleNamespace(id='legacy',targets=[dict(path=TARGET,kind='instruction',behavior='unspecified')])]
-    evidence=REL.select({'files':[dict(path=TARGET,kind='instruction',rule_id='rsi-section-summary')]},cases)
+    evidence=REL.select({'files':[dict(path=TARGET,kind='instruction',rule_id=REL.section_rule_id(TARGET,'summary'))]},cases)
     assert evidence['eligible_cases']=={'summary':[TARGET]}
-    missing=REL.select({'files':[dict(path=TARGET,kind='instruction',rule_id='rsi-section-uncovered')]},cases)
+    missing=REL.select({'files':[dict(path=TARGET,kind='instruction',rule_id=REL.section_rule_id(TARGET,'uncovered'))]},cases)
     assert missing['eligible_cases']=={} and missing['uncovered_targets']==[TARGET]
 
 
@@ -150,3 +150,23 @@ def test_legacy_unbound_hypothesis_cannot_reach_writer_or_replay(tmp_path,monkey
     assert result['experiments']==[] and ad.replayer.calls==[]
     assert result['candidates'][0]['hypotheses_accepted']==0
     assert any(r['code']=='bad_edit_contract' for r in result['candidates'][0]['hypotheses_rejected'])
+
+
+def test_explicit_file_section_rule_pin_is_checked_before_writer(monkeypatch):
+    monkeypatch.setattr(N.ET,'pinned_rule',lambda identity,text: ('pinned','human pin') if identity==REL.section_rule_id(TARGET,'summary') else None)
+    got,calls=implement(hyp(),reply(AFTER))
+    assert calls==[] and got.fallback_reason=='the rule is pinned: no writer call'
+
+
+def test_equal_section_headings_in_different_files_have_distinct_identity():
+    first=REL.section_rule_id(TARGET,'intro')
+    second=REL.section_rule_id('~/agent-config/parent/PARENT.md','intro')
+    assert first != second and first == REL.section_rule_id(TARGET,'intro')
+
+
+def test_legacy_candidate_rule_pin_survives_section_identity_upgrade(monkeypatch):
+    candidate='dev:summary-rule'
+    old_identity='rsi-night-'+N._sha16(candidate)[:10]
+    monkeypatch.setattr(N.ET,'pinned_rule',lambda identity,text: ('pinned','old human pin') if identity==old_identity else None)
+    got,calls=implement(hyp(),reply(AFTER),dedupe_key=candidate)
+    assert calls==[] and got.fallback_reason=='the rule is pinned: no writer call'

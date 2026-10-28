@@ -36,7 +36,7 @@ EXP = "exp-20261027-01"
 def manifest(path):
     item = {"path": path, "kind": "instruction"}
     if path == PARENT:
-        item["rule_id"] = "rsi-section-repo-profile"
+        item["rule_id"] = REL.section_rule_id(PARENT, "repo-profile")
     return {"files": [item]}
 
 
@@ -50,7 +50,7 @@ def bind_synthetic_section(root, digest, path):
         return digest
     original = root / "artifacts" / digest
     body = json.loads((original / "manifest.json").read_text())
-    body["files"][0]["rule_id"] = "rsi-section-repo-profile"
+    body["files"][0]["rule_id"] = REL.section_rule_id(PARENT, "repo-profile")
     bound = RA.artifact_hash(body)
     directory = root / "artifacts" / bound
     shutil.copytree(original, directory)

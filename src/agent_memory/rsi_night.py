@@ -54,6 +54,7 @@ from psycopg.types.json import Jsonb
 
 from agent_memory import config, edits_targets as ET, night_coverage as NC, rsi_approval as AP, rsi_artifact as RA
 from agent_memory import rsi_targets
+from agent_memory.rsi_relevance import section_rule_id
 from agent_memory.rsi_budget import Budget, BudgetConfig, BudgetConfigError, BudgetExhausted, Usage
 
 FORMAT = "rsi-night/1"
@@ -1248,6 +1249,16 @@ def section_for_hypothesis(text: str, what: str) -> Any:
     return None
 
 
+def writer_rule_pin(target: str, section: str, text: str, rule_key: str | None = None,
+                    candidate_key: str | None = None) -> bool:
+    identifiers = [section_rule_id(target, section), f"rsi-night-{section}"]
+    if candidate_key:
+        identifiers.append(f"rsi-night-{_sha16(candidate_key)[:10]}")
+    if rule_key:
+        identifiers.extend((rule_key, rule_key.removeprefix("dev:")))
+    return any(ET.pinned_rule(identity, text) is not None for identity in identifiers)
+
+
 class WriterImplementer:
     """S6 by default under the subscription profile: the morning edit loop's writer (edits_writer: its strategy,
     policy, reply shape and `parse_proposal`, which splices exactly one section and refuses ids, code blocks,
@@ -1331,7 +1342,7 @@ class WriterImplementer:
                         hyp.what, re.I):
                     return fallback("hypothesis placement conflicts with the declared section: no writer call")
         section_text = edits_sections.section_text(old_text, sec.id)
-        if ET.pinned_rule(f"rsi-night-{sec.id}", section_text) is not None:
+        if writer_rule_pin(hyp.target, sec.id, section_text, ctx.get("rule_key"), ctx.get("dedupe_key")):
             return fallback("the rule is pinned: no writer call")
         if ET.pinned_sections(path, section_text):
             return fallback("the rule's section was edited by hand recently (section pin): no writer call")
@@ -2427,7 +2438,7 @@ class Night:
             if sec is not None:
                 from agent_memory.edits_sections import section_text
                 text = section_text(path.read_text(), sec.id)
-                if ET.pinned_rule(f"rsi-night-{sec.id}", text) is not None or ET.pinned_sections(path, text):
+                if writer_rule_pin(c["target"], sec.id, text, c.get("rule_key"), c.get("dedupe_key")) or ET.pinned_sections(path, text):
                     return "instruction section is pinned"
         except (OSError, ValueError, RuntimeError):
             return "writer target readiness unavailable"
@@ -2701,8 +2712,8 @@ class Night:
                     reason = "missing exact edit contract"
                 elif not self._test_cases(h.target, section_id=h.edit["section_id"]):
                     reason = "no replay case covers the declared instruction section"
-                elif ET.pinned_sections(rsi_targets.untilde(h.target), h.edit["before"]) or ET.pinned_rule(
-                        f"rsi-night-{h.edit['section_id']}", h.edit["before"]) is not None:
+                elif ET.pinned_sections(rsi_targets.untilde(h.target), h.edit["before"]) or writer_rule_pin(
+                        h.target, h.edit['section_id'], h.edit["before"], c.get("rule_key"), c.get("dedupe_key")):
                     reason = "declared instruction section is pinned"
                 if reason:
                     self.report["experiments"].append(self._skipped_entry(c, h, refs, policy=reason))
@@ -2891,7 +2902,7 @@ class Night:
 
             def stage(text: str) -> StageResult:
                 return self.ad.stager.stage(experiment_id=exp_id, baseline_dir=Path(bdir), key=h.target, new_text=text,
-                                            rule_id=("rsi-section-" + impl.section_id.replace("/", "--") if impl.section_id and h.edit else
+                                            rule_id=(section_rule_id(h.target, impl.section_id) if impl.section_id and h.edit else
                                                      f"rsi-night-{_sha16(c['dedupe_key'])[:10]}"),
                                             timeout=max(1.0, min(float(self.cfg.staging.get("timeout_s") or 600),
                                                                  self.budget.remaining_s())))

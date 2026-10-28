@@ -10,6 +10,7 @@ unknown. No command or target code is executed, and no path is resolved, by this
 from __future__ import annotations
 
 import json
+import hashlib
 import re
 import shlex
 from collections.abc import Mapping, Sequence
@@ -90,6 +91,11 @@ def case_targets(raw: Any) -> tuple[dict[str, Any], ...]:
     return tuple(out)
 
 
+def section_rule_id(path: str, section: str) -> str:
+    """Stable file+section identity; equal heading names in different files never share a pin."""
+    return "rsi-section-" + hashlib.sha256((path + "\0" + section).encode()).hexdigest()[:20]
+
+
 def select(manifest: Mapping[str, Any], cases: Sequence[Any]) -> dict[str, Any]:
     targets = {f["path"]: f["kind"] for f in manifest.get("files", [])}
     eligible = {}
@@ -101,7 +107,7 @@ def select(manifest: Mapping[str, Any], cases: Sequence[Any]) -> dict[str, Any]:
             file = next(f for f in manifest.get("files", []) if f["path"] == t["path"])
             rule = file.get("rule_id", "")
             if isinstance(rule, str) and rule.startswith("rsi-section-"):
-                if not any(rule == "rsi-section-" + sid.replace("/", "--") for sid in t.get("sections", [])):
+                if not any(rule == section_rule_id(t["path"], sid) for sid in t.get("sections", [])):
                     continue
             matching.append(t["path"])
         if matching:

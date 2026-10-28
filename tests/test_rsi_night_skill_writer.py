@@ -343,7 +343,7 @@ def test_intended_skill_intervention_reaches_exact_bound_artifact(env: SimpleNam
     assert digest == e["artifact_hash"] == RA.artifact_hash(manifest)
     assert manifest["experiment_id"] == e["experiment_id"] and manifest["baseline_id"] == e["baseline_id"]
     # The staging identity is synthetic; implementation.section_id names the actual source rule section.
-    assert file["rule_id"] == "rsi-section-" + e["implementation"]["section_id"].replace("/", "--")
+    assert file["rule_id"] == N.section_rule_id(c["target"], e["implementation"]["section_id"])
     assert e["implementation"]["section_id"] == c["section"]
     assert _one_section_changed(old.decode(), after.decode()) == [c["section"]]
     assert INTENDED_LINES[key] in edits_sections.section_text(after.decode(), c["section"])

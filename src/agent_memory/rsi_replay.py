@@ -216,7 +216,7 @@ def largest_auto_plan(cases: Sequence[ReplayCase], *, min_pairs: int, max_pairs:
     for path, kind, section in sorted(targets):
         target = {"path": path, "kind": kind}
         if section:
-            target["rule_id"] = "rsi-section-" + section.replace("/", "--")
+            target["rule_id"] = REL.section_rule_id(path, section)
         chosen, r = plan_cases({"files": [target]}, cases,
                                min_pairs=min_pairs, max_pairs=max_pairs, reps=reps)
         if len(chosen) * r > best[0] * best[1]:
