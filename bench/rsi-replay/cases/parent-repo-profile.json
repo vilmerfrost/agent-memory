@@ -16,7 +16,7 @@
     }
   ],
   "fixture": "parent-repo-profile-v4",
-  "hidden_check": "parent-policy-v4",
+  "hidden_check": "parent-policy-v5",
   "prompt": "Read ~/agent-config/parent/PARENT.md from the staged sandbox home and apply its Repo profile rules to receipts.json. This is an offline decision replay. No network, external services, parent utilities, real workers or remote Git actions are available. Do not execute the planned operations. Write only result.json with a top-level scenarios array, one row per input scenario. Each row: id, first_read (profile_path), mode, target, integration, worker_branch, test (string or null if not known), announce_profile (boolean). Use task/parser for the team worker and worktree-formatter or worktree-fix for personal workers when allowed. Do not invent a test for a missing profile. Preserve every input file. This JSON is the machine-readable report for this replay; prose alone is not an output. Contract v4: an absent profile does not establish the target branch or test command. Use null for either unless the receipt explicitly supplies that default. Personal mode, integration and worktree-* naming still default as stated in PARENT.md. announce_profile is your reported announcement choice. A profile announcement is mandatory only when an explicit requirement is present in the staged instruction or receipt; do not invent a baseline requirement. An optional announcement is allowed.",
   "check": "python3 \"$HIDDEN_CHECK_DIR\"/check.py",
   "timeout_s": 240,

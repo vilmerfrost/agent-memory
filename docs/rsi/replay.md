@@ -75,6 +75,59 @@ $0. The pre-call estimate of a paid model without a configured `cost_estimate_us
 A case is `cases/<id>.json` (prompt, check command, timeout, the stub's plan), `fixtures/<id>/` and optional
 `checks/<id>/` (mounted as `$HIDDEN_CHECK_DIR`; `$FIXTURE_DIR` is the untouched original).
 
+### Scenario results (28 October 2026)
+
+A check that grades several scenarios grades every one of them, then prints one line as the last line of its
+stdout:
+
+```
+RSI-SCENARIOS {"passed": 2, "total": 3, "scenarios": [{"id": "red", "passed": false, "reason": "..."}, ...]}
+```
+
+- The exit code keeps its meaning: 0 only when every scenario and every global check (unchanged inputs, no extra
+  output, result shape) passes. `check_passed` is therefore exactly as strict as before.
+- `sandbox/stub_agent/check_entry.py` adds two fields to the run record: `check_scenarios` `{passed, total}` and
+  `check_score` = passed / total (0..1). Only stdout is read, and only the last `RSI-SCENARIOS ` line.
+- No line, a malformed line (bad JSON, counts that disagree with the rows, duplicate ids, non-boolean `passed`,
+  total 0) or a line that disagrees with the exit code counts as one scenario: `{1, 1}` and 1.0 when the check
+  passed, `{0, 1}` and 0.0 when it failed. So a global failure after all scenarios passed earns no partial credit.
+- Single-output checks (anatomy, meltdown, pepe, report-todos) print no line and score 1.0 or 0.0.
+- Each check directory is mounted alone, so every check inlines its own few-line printer.
+
+### Checker versions
+
+A changed prompt or checker gets a new checker directory; the old directory stays in place, unchanged, so
+historical records stay readable (the same pattern as `parent-policy-v4` in 128909d).
+
+| Case(s) | Checker now | Previous (kept) | Change |
+|---|---|---|---|
+| worker-final-report | `worker-report-v5` | `parent-policy` (V3 oracle) | per-scenario grading; report format split from substance; prompt de-leaked |
+| parent-authority, parent-merge-cleanup, parent-repo-profile, parent-safety-guards | `parent-policy-v5` | `parent-policy-v4` | per-scenario grading only (same rules); parent-authority prompt de-leaked |
+| worker-helper-lifecycle, worker-server-launch | `worker-behavior-v2` | `worker-behavior` | per-scenario grading; a solution that calls `sys.exit` can no longer end the check early |
+| pepe-lock | `pepe-lock-v2` | `pepe-lock` | caveat line allowed (format) |
+| anatomy-plan | `anatomy-plan-v2` | `anatomy-plan` | extra part groups allowed (format) |
+
+The suite version (`SUITE_VERSION` in `src/agent_memory/rsi_replay.py`) should move to 5 with these checkers; the
+case digest already changes because it covers the check directory.
+
+### Content and format
+
+Substance stays exactly as strict. Format checks only what the output contract requires. Loosened format rules:
+
+| Checker | Old rule | Now | Why it was format only |
+|---|---|---|---|
+| worker-report-v5 | every `Name: value` line had to be a contract field | extra fields (for example `Tests:`, `API:`, `Brief DoD:`, `Note:`) are allowed and not graded | an edit may ask for more report lines; the contract fields are still all required and graded |
+| worker-report-v5 | text before the first field failed | ignored | a heading carries no claim |
+| worker-report-v5 | continuation lines only after some fields | after any contract field; a line after an extra field is ignored | wrapping is layout; field values are still compared |
+| worker-report-v5 | evidence needed the literal `exit=<code>` | `exit=1`, `exit 1`, `exit: 1`, `exit code 1` (no other number) | same claim, other spelling; the exact command and every failed test are still required |
+| worker-report-v5 | `Denied:` had to equal the receipts or `none` exactly | every exact receipt must appear (extra words allowed); with no denial it must start with `none` or `n/a` | an explanation after the receipt does not change it; an invented or lost denial still fails |
+| worker-report-v5 | `Baseline needed` on a green report failed | allowed only as `none`/`n/a` | an empty field is no claim; a real baseline claim on green still fails |
+| pepe-lock-v2 | every non-heading line in parked.md had to name a session idea | a prose line that is not a list item and names no idea is allowed | a caveat ("Revisit triggers below are suggestions") parks nothing; every list item must still name a session idea, once, with a revisit trigger |
+| anatomy-plan-v2 | part groups had to be exactly the five | all five must be present; extra group labels allowed | the skill names the groups to cover, not a closed set; part count, unique names and the lit subject part are unchanged |
+
+Kept strict on purpose: duplicate contract fields (two values are ambiguous), the exact result.json rows, the
+`Branch + commit` claim, unrequested extra files, changed inputs and the parent-policy row key sets.
+
 The stub agent (`sandbox/stub_agent/stub_agent.py`) reads the instruction files a real agent loads
 (`~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`, agents, used skills), reports each file's sha256, recognizes a small
 rule vocabulary (closing line, never edit existing files, max lines) and carries out the case's scripted plan
