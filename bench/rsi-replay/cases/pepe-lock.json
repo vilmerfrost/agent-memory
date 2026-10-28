@@ -1,18 +1,48 @@
 {
   "id": "pepe-lock",
   "title": "Lock the ideas the user chose and park the rest",
-  "tags": ["skill", "pepe", "lock"],
-  "targets": [{"path": "~/.agents/skills/pepe/SKILL.md", "kind": "skill", "behavior": "Apply Phase 3 (Lock): accept the user's choice after one suggestion and park every other session idea, one line each with a revisit trigger, in the idea folder."}],
+  "tags": [
+    "skill",
+    "pepe",
+    "lock"
+  ],
+  "targets": [
+    {
+      "path": "~/.agents/skills/pepe/SKILL.md",
+      "kind": "skill",
+      "behavior": "Apply Phase 3 (Lock): accept the user's choice after one suggestion and park every other session idea, one line each with a revisit trigger, in the idea folder.",
+      "sections": [
+        "phase-3-lock"
+      ]
+    }
+  ],
   "fixture": "pepe-lock",
-  "hidden_check": "pepe-lock",
+  "hidden_check": "pepe-lock-v2",
   "prompt": "Continue the pepe session in session.md with the pepe skill (~/.agents/skills/pepe/SKILL.md). The user's last message answers your lock proposal. This workspace has no network and no external services. Do not render, generate audio, search the web or call any API; do the Lock step only and stop before Phase 4. Record the locked ideas in lock.json as {\"locked\": [\"<idea name>\", ...]}, with the names exactly as the session writes them, and write any other files the skill's Lock step requires. Do not change session.md.",
   "check": "python3 \"$HIDDEN_CHECK_DIR\"/check.py && cmp -s session.md \"$FIXTURE_DIR\"/session.md",
   "timeout_s": 240,
   "stub": [
-    {"op": "skill", "name": "pepe"},
-    {"op": "read", "path": "session.md"},
-    {"op": "write", "path": "docs/ideas/parked.md", "text": "# Parked ideas (shipit)\n\n- Flake Hunter: rerun flaky tests and name the flake. Revisit when flaky failures block a merge twice in a week.\n- Ghost Hunter: Ghost Reviewer × Flake Hunter in one review. Revisit once Ghost Reviewer has shipped.\n- PR Weather: a one-line merge forecast per PR. Revisit when the review queue passes 20 open PRs.\n- Standup Radio: Diff Diary as a 60-second audio briefing. Revisit if Diff Diary gets read every day.\n- Merge Concierge: auto-merge green, approved PRs. Revisit when you trust the checks enough to sleep through a merge.\n- Commit Haiku: squash messages as haiku. Revisit never, unless a release needs a joke.\n"},
-    {"op": "write", "path": "lock.json", "text": "{\"locked\": [\"Ghost Reviewer\", \"Diff Diary\"]}\n"},
-    {"op": "final", "text": "Locked Ghost Reviewer and Diff Diary; parked the other six."}
+    {
+      "op": "skill",
+      "name": "pepe"
+    },
+    {
+      "op": "read",
+      "path": "session.md"
+    },
+    {
+      "op": "write",
+      "path": "docs/ideas/parked.md",
+      "text": "# Parked ideas (shipit)\n\n- Flake Hunter: rerun flaky tests and name the flake. Revisit when flaky failures block a merge twice in a week.\n- Ghost Hunter: Ghost Reviewer \u00d7 Flake Hunter in one review. Revisit once Ghost Reviewer has shipped.\n- PR Weather: a one-line merge forecast per PR. Revisit when the review queue passes 20 open PRs.\n- Standup Radio: Diff Diary as a 60-second audio briefing. Revisit if Diff Diary gets read every day.\n- Merge Concierge: auto-merge green, approved PRs. Revisit when you trust the checks enough to sleep through a merge.\n- Commit Haiku: squash messages as haiku. Revisit never, unless a release needs a joke.\n"
+    },
+    {
+      "op": "write",
+      "path": "lock.json",
+      "text": "{\"locked\": [\"Ghost Reviewer\", \"Diff Diary\"]}\n"
+    },
+    {
+      "op": "final",
+      "text": "Locked Ghost Reviewer and Diff Diary; parked the other six."
+    }
   ]
 }

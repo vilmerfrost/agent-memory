@@ -18,7 +18,7 @@ It runs inside the real worker container like a live agent would, and stands in 
 Same home + same case -> byte-identical workspace and output. No clock, no randomness.
 
 Plan ops (each a JSON object with "op"):
-    read   {path}                       Read a workspace file (tool call only).
+    read   {path}                       Read a workspace file, or an exact ~/ instruction in the staged home.
     edit   {path, old, new}             Replace `old` with `new` in an existing file.
     write  {path, text}                 Create a file.
     report {path, title, source, pattern}
@@ -147,6 +147,15 @@ class Agent:
     def do(self, step: dict) -> str | None:
         op = step.get("op")
         if op == "read":
+            if step["path"].startswith("~/"):
+                rel = step["path"][2:]
+                if any(x in ("", ".", "..") for x in rel.split("/")):
+                    raise StubError("invalid home instruction path")
+                p = self.home / rel
+                if not p.resolve().is_relative_to(self.home.resolve()):
+                    raise StubError("instruction path leaves staged home")
+                self.read_instruction(step["path"], p)
+                return None
             p = self.ws(step["path"])
             self.tool("Read", {"file_path": step["path"]}, ok=p.is_file(), note="" if p.is_file() else "not found")
         elif op == "edit":

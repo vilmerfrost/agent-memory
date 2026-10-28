@@ -81,6 +81,23 @@ NO_RAW = "No transcript text, secrets or raw private content: only redacted, cap
 
 FAMILIES: tuple[Family, ...] = (
     Family(
+        key="connection_diagnostics",
+        title="Manual subscription connection diagnostics",
+        purpose="Verify one owner-requested real subscription call without automatic inference retries",
+        producers=("Night Desk owner-authenticated amem-health model-start", "Night Desk management/model-probe.py"),
+        owner_job="com.vilmerfrost.night-desk-model-probe (manual requests only)",
+        tables=("amem_private.model_connection_tests", "amem_private.model_connection_receipts"),
+        consumers=(_c("Night Desk Connections (fixed status function)",
+                      "supabase/migrations/20261027200215_model_connection.sql", "report"),
+                   _c("exclusive claims and request replay prevention",
+                      "supabase/migrations/20261027200215_model_connection.sql", "operational")),
+        retention="Latest result per provider; request-ID replay receipts kept indefinitely. "
+                  "Requests expire after 3 minutes; verification after 15 minutes; cooldown is 5 minutes.",
+        exclusion="Never a learning input. Private records expose only fixed status, model, time, latency "
+                  "and token totals through owner-authenticated status. No prompts, replies, secrets or native session IDs.",
+        learning_input=False,
+    ),
+    Family(
         key="sessions",
         title="Sessions, outcomes and summaries",
         purpose="Find recurring problems and assess task results",
@@ -141,6 +158,7 @@ FAMILIES: tuple[Family, ...] = (
         local=("~/.claude/parent/**/timing-events.jsonl (spool)", "timing cursor file next to the spool"),
         consumers=(_c("profile refresh (sessions.api_seconds / tool_seconds)", "src/agent_memory/timing_store.py",
                       "operational"),
+                   _c("amem-daily deterministic telemetry review", "src/agent_memory/telemetry_analysis.py", "analysis"),
                    _c("amem timing report / coverage", "src/agent_memory/cli_timing.py", "manual")),
         retention="No pruning found: spans are kept indefinitely.",
         exclusion="Operation names and categories only; no command text or output. Reconstructed and "
@@ -156,6 +174,7 @@ FAMILIES: tuple[Family, ...] = (
         tables=("test_timing_runs", "test_timing_cases"),
         local=("<git dir>/test-logs/*.timings.json (batches beside each log)", "timing upload queue run-*.json"),
         consumers=(_c("retention prune", "src/agent_memory/timing_collector.py", "operational"),
+                   _c("amem-daily deterministic test review", "src/agent_memory/telemetry_analysis.py", "analysis"),
                    _c("amem timing tests", "src/agent_memory/test_timings.py", "manual")),
         retention="Case rows 30 days (test_timings.prune, run by the collector); run summaries kept "
                   "(details_retained=false after pruning).",
@@ -173,6 +192,7 @@ FAMILIES: tuple[Family, ...] = (
         local=("~/.agents/skill-usage/log.jsonl",),
         external=("ClickHouse skill_calls",),
         consumers=(_c(NIGHT + " discovery", "src/agent_memory/rsi_night.py", "analysis"),
+                   _c(NIGHT + " validated production observations via rsi_evidence", "src/agent_memory/production_feedback.py", "analysis"),
                    _c(NIGHT + " skill_refresh prerequisite", "src/agent_memory/skill_refresh.py", "analysis"),
                    _c(SYNC_CH, "src/agent_memory/integrations/clickhouse.py", "export"),
                    _c("amem skills scores / suggest", "src/agent_memory/skills.py", "manual")),
@@ -324,6 +344,7 @@ FAMILIES: tuple[Family, ...] = (
         tables=("rsi_checkpoints", "rsi_nights", "report_snapshots", "ledger_events"),
         local=("~/.claude/parent/reports/*", "<RSI sandbox>/nights/<night>/report.json"),
         consumers=(_c("night/brief dependency checks", "src/agent_memory/rsi_night.py", "operational"),
+                   _c("amem-daily checkpoint freshness review", "src/agent_memory/telemetry_analysis.py", "analysis"),
                    _c("sync cursors", "src/agent_memory/integrations/sync.py", "operational"),
                    _c(NIGHT_DESK, "supabase/migrations/20261024230827_night_desk.sql", "report")),
         retention="Checkpoints and nights kept indefinitely; report_snapshots one row per kind and date.",
@@ -365,7 +386,7 @@ FAMILIES: tuple[Family, ...] = (
         title="External evidence links",
         purpose="Confirm identity, relevance and current availability",
         producers=("amem sync run (evidence links per pushed batch)", "evidence providers (rsi_evidence_providers)",
-                   "amem integrations ncm record"),
+                   "amem integrations ncm record", "amem rsi outcome (immutable advisory production observations)"),
         owner_job=NIGHT,
         tables=("rsi_evidence",),
         external=("ClickHouse", "Langfuse", "past.dev", "NCM"),

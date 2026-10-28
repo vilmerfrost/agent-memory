@@ -18,12 +18,34 @@ def required_providers(files):
 
 
 def combined_verdict(outcomes):
+    """One verdict from each required provider's own verdict; scores are never pooled across providers.
+
+    Any INCONCLUSIVE (or unknown) -> INCONCLUSIVE; else any WORSE -> WORSE; IMPROVES only when every provider
+    IMPROVES; else NO_EFFECT. A provider's WORSE already needs rsi_verdict's score margin (policy/2: 2.0 over
+    5 pairs), so one flipped run on one provider no longer sinks the change."""
     verdicts = [r.verdict for r in outcomes]
     if not verdicts or any(v == "INCONCLUSIVE" or v not in ("IMPROVES", "NO_EFFECT", "WORSE") for v in verdicts):
         return "INCONCLUSIVE"
     if "WORSE" in verdicts:
         return "WORSE"
     return "IMPROVES" if all(v == "IMPROVES" for v in verdicts) else "NO_EFFECT"
+
+
+def _replayer(N):
+    """N.SandboxReplayer whose ReplayConfig also carries the planned pair count (`pairs`): the replay stops at
+    exactly that many A/B pairs, repetition-major, so 2 cases x 3 reps run 3 + 2 pairs, not 6."""
+    base = N.SandboxReplayer
+
+    class PairsReplayer(base):
+        def replay_config(self):
+            rc = super().replay_config()
+            pairs = self.cfg.get("pairs")
+            if pairs is None or not hasattr(rc, "pairs"):
+                return rc
+            from dataclasses import replace
+            return replace(rc, pairs=int(pairs))
+
+    return PairsReplayer
 
 
 def replay(stages, settings, *, artifact_hash, experiment_id, baseline_id, budget):
@@ -36,14 +58,19 @@ def replay(stages, settings, *, artifact_hash, experiment_id, baseline_id, budge
     if not required or any(p not in profiles for p in required):
         raise N.ExperimentFailed("missing required provider profile")
     if settings.get("cases") is None:
-        # No explicit case list: the target's own cases, repeated up to the verdict's minimum pairs, within each
-        # provider's share of the night's A/B pairs. Every provider runs the same plan.
-        plan = R.auto_cases(artifact_hash, R.load_cases(), root=RA.sandbox_dir(),
+        # No explicit case list: the target's own cases, spread to exactly each provider's share of the night's
+        # A/B pairs (rsi_replay.plan_pairs: 1 case x 5, 2 cases 3 + 2, 5+ cases once each up to 5). Every
+        # provider runs the same plan.
+        plan = R.auto_pairs(artifact_hash, R.load_cases(), root=RA.sandbox_dir(),
                             reps=int(settings.get("reps") or 1),
                             max_pairs=max(1, budget.cfg.max_ab_pairs // len(required)))
         if plan is not None:
-            settings = {**settings, "cases": [c.id for c in plan[0]], "reps": plan[1]}
-    pairs = len(R.load_cases(settings.get("cases"))) * int(settings.get("reps") or 1) * len(required)
+            settings = {**settings, "cases": [c.id for c in plan[0]], "reps": plan[1], "pairs": plan[2]}
+    n_cases = len(R.load_cases(settings.get("cases")))
+    per_provider = n_cases * int(settings.get("reps") or 1)
+    if settings.get("pairs") is not None:
+        per_provider = min(per_provider, int(settings["pairs"]))
+    pairs = per_provider * len(required)
     if pairs > budget.cfg.max_ab_pairs:
         raise N.BudgetExhausted("ab_pairs", f"{pairs} provider-specific pairs exceed {budget.cfg.max_ab_pairs}")
     old = box.artifacts / artifact_hash / "evals" / "sandbox-replay.json"
@@ -53,7 +80,7 @@ def replay(stages, settings, *, artifact_hash, experiment_id, baseline_id, budge
     for provider in required:
         cfg = {k: v for k, v in settings.items() if k != "provider_profiles"}
         cfg.update(profiles[provider], profile=provider)
-        outcome = N.SandboxReplayer({**stages, "replay_agent": provider}, cfg).replay(
+        outcome = _replayer(N)({**stages, "replay_agent": provider}, cfg).replay(
             artifact_hash=artifact_hash, experiment_id=experiment_id, baseline_id=baseline_id, budget=budget)
         results.append(outcome)
         views.append({"provider": provider, "verdict": outcome.verdict, "reasons": outcome.reasons,
@@ -72,7 +99,7 @@ def replay(stages, settings, *, artifact_hash, experiment_id, baseline_id, budge
     eval_path = None
     try:
         eval_path = box.record_eval(artifact=artifact_hash, experiment=experiment_id, arm="B", suite="sandbox-replay",
-            suite_version="3", verdict={"IMPROVES":"improves","WORSE":"worse","NO_EFFECT":"no-effect"}.get(verdict,"inconclusive"),
+            suite_version=R.SUITE_VERSION, verdict={"IMPROVES":"improves","WORSE":"worse","NO_EFFECT":"no-effect"}.get(verdict,"inconclusive"),
             results={"required_providers": required, "provider_results": views, "verdict": verdict, "reasons": reasons},
             model="provider-specific", effort="high", control_arm="A", replace=True)
     except (rs.SandboxError, OSError, ValueError):

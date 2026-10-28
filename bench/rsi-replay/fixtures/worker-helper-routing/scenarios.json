@@ -1,0 +1,63 @@
+{
+  "case": "worker-helper-routing",
+  "you": {"name": "worker-search", "depth": 1, "supervisor": "root", "root_session": "6ee800cf"},
+  "action_codes": [
+    "do_it_yourself",
+    "launch_reader_background",
+    "launch_reader_foreground",
+    "launch_subworker_background",
+    "launch_subworker_foreground",
+    "request_root_launch",
+    "start_cli_agent"
+  ],
+  "next_codes": [
+    "continue_independent_work",
+    "none",
+    "poll_child_status",
+    "report_partial",
+    "wait_for_result"
+  ],
+  "helper_id_from_codes": ["none", "root", "self"],
+  "scenarios": [
+    {
+      "id": "docs-research",
+      "app": "claude",
+      "need": "Read the vendor SDK docs and about 30 source files to find which retry options exist. No file changes.",
+      "helper_writes_files": false,
+      "isolation_and_registration_available": true,
+      "independent_work_left": false
+    },
+    {
+      "id": "long-research-while-coding",
+      "app": "claude",
+      "need": "A 10-minute survey of how three other services paginate. No file changes. You would like to keep editing the handler meanwhile.",
+      "helper_writes_files": false,
+      "isolation_and_registration_available": true,
+      "independent_work_left": true
+    },
+    {
+      "id": "parallel-migration",
+      "app": "claude",
+      "need": "Write the database migration and its tests in parallel while you finish the API handler.",
+      "helper_writes_files": true,
+      "isolation_and_registration_available": true,
+      "independent_work_left": true
+    },
+    {
+      "id": "blocked-on-migration",
+      "app": "claude",
+      "need": "Write the database migration. Every remaining step of your task depends on it.",
+      "helper_writes_files": true,
+      "isolation_and_registration_available": true,
+      "independent_work_left": false
+    },
+    {
+      "id": "other-app-no-isolation",
+      "app": "other",
+      "need": "Write a fixture generator script in a separate workspace.",
+      "helper_writes_files": true,
+      "isolation_and_registration_available": false,
+      "independent_work_left": true
+    }
+  ]
+}

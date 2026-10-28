@@ -447,7 +447,7 @@ def test_paid_rehearsal_refuses_without_the_approved_cap(tmp_path: Path, monkeyp
         err = capsys.readouterr().err
         assert "needs Vilmer's approval" in err and "--approve-max-usd 1" in err and "Nothing ran." in err
     assert ran == [] and not (tmp_path / "w").exists()
-    assert R.main(["--paid-plan"]) == 0 and "worst case $0.9100" in capsys.readouterr().out and ran == []
+    assert R.main(["--paid-plan"]) == 0 and "planned API estimate $0.9100" in capsys.readouterr().out and ran == []
 
 
 def test_live_jev_triage_is_booked_as_an_estimate_not_as_reported(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -474,7 +474,9 @@ def test_paid_plan_lists_every_paid_call_and_fits_the_cap() -> None:
     assert plan["ab_pairs_per_experiment"] == 3 and plan["within_cap"] and plan["worst_case_usd"] == 0.91
     assert plan["expected_usd"] == pytest.approx(0.0734, abs=1e-4) and plan["expected_incomplete"]   # Sonnet unmeasured
     text = S.render_plan(plan)
-    assert "worst case $0.9100, hard cap max_usd $1.00 (the worst case fits)" in text
+    assert "planned API estimate $0.9100, accounting cap max_usd $1.00 (the API estimates fit)" in text
+    assert plan['currency']=='USD' and plan['invoice_cap_verified'] is False
+    assert 'not invoices' in text and 'Subscription billing is separate and unknown' in text
     lean = S.paid_plan(N.load_config())
     assert lean["calls"] == [] and lean["expected_usd"] == 0 and "No paid call" in S.render_plan(lean)
 
@@ -498,27 +500,32 @@ def room_needs(plan: dict[str, Any]) -> dict[str, tuple[float, float]]:
 def test_subscription_plan_has_room_for_three_experiments() -> None:
     plan = S.paid_plan(N.load_config(SUBSCRIPTION))
     one = plan["room"]["per_experiment"]
-    # one shared-skill experiment: 3 pairs per provider, each agent run 8 tool + 1 check containers, judge on subscription
-    # the section writer (S6) adds one Opus call and its 300 s timeout per experiment
-    assert one["calls"] == {"claude-opus-5-5": 8, "gpt-6.1-sol": 12, "jev-1.14.0": 2}
-    assert (one["ab_pairs"], one["sandbox_runs"], one["case_timeout_s"]) == (6, 108, 240)
+    # one shared-skill experiment: 5 pairs per provider (Vilmer 2026-10-28), each agent run 8 tool + 1 check
+    # containers, judge on subscription; the section writer (S6) adds one Opus call and its 300 s timeout
+    assert one["calls"] == {"claude-opus-5-5": 12, "gpt-6.1-sol": 20, "jev-1.14.0": 2}
+    assert (one["ab_pairs"], one["sandbox_runs"], one["case_timeout_s"]) == (10, 180, 240)
     assert one["wall_clock_parts_s"] == {"hypothesize": 300, "implement": 300, "stage": 300,
-                                         "replay": 2 * (6 * (240 + S.CHECK_RUN_S) + 3 * 300 + S.JEV_CALL_S)}
-    assert one["wall_clock_s"] == 5760
+                                         "replay": 2 * (10 * (240 + S.CHECK_RUN_S) + 5 * 300 + S.JEV_CALL_S)}
+    assert one["wall_clock_s"] == 8960
     assert room_needs(plan) == {
-        "calls claude-opus-5-5": (24, 26), "calls gpt-6.1-sol": (36, 40), "calls jev-1.14.0": (5 + 6, 12),
-        "A/B pairs per experiment": (6, 6), "sandbox runs": (324, 360), "wall clock": (600 + 3 * 5760, 17940),
+        "calls claude-opus-5-5": (36, 40), "calls gpt-6.1-sol": (60, 64), "calls jev-1.14.0": (5 + 6, 12),
+        "A/B pairs per experiment": (10, 10), "sandbox runs": (540, 540), "wall clock": (600 + 3 * 8960, 17940),
         "subscription tokens": (6_000_000, 6_000_000)}
-    assert plan["room"]["fits"] and plan["max_experiments"] == 3 and plan["within_cap"]
+    assert plan["max_experiments"] == 3 and plan["within_cap"]
+    # Every cap fits except the worst-case wall clock, which the room reports instead of hiding: at every
+    # timeout one experiment finishes inside the night; the night stops cleanly at the wall clock.
+    assert [c["limit"] for c in plan["room"]["checks"] if not c["fits"]] == ["wall clock"]
+    assert plan["room"]["worst_case_experiments_in_wall_clock"] == 1
     text = S.render_plan(plan)
-    assert "Room for 3 experiment(s) (every limit fits):" in text and "- wall clock: need 17,880s of 17,940s fits" in text
+    assert "- wall clock: need 27,480s of 17,940s DOES NOT FIT" in text
+    assert "worst-case wall clock 27,480s is over the code's hard maximum 18,000s" in text
     assert "- subscription tokens: need 6,000,000 of 6,000,000 fits" in text
 
 
 def test_room_flags_caps_sized_for_one_experiment(tmp_path: Path) -> None:
     d = json.loads(SUBSCRIPTION.read_text())
-    d["budget"].update(max_sandbox_runs=128, wall_clock_s=2700, max_subscription_tokens=2_000_000,
-                       model_calls={"jev-1.14.0": 7, "claude-opus-5-5": 8, "gpt-6.1-sol": 12})
+    d["budget"].update(max_sandbox_runs=180, wall_clock_s=2700, max_subscription_tokens=2_000_000,
+                       model_calls={"jev-1.14.0": 7, "claude-opus-5-5": 12, "gpt-6.1-sol": 20})
     p = tmp_path / "old.json"
     p.write_text(json.dumps(d))
     plan = S.paid_plan(N.load_config(p))
@@ -527,6 +534,7 @@ def test_room_flags_caps_sized_for_one_experiment(tmp_path: Path) -> None:
                        "subscription tokens", "wall clock"]
     assert not plan["room"]["fits"] and "DOES NOT FIT" in S.render_plan(plan)
     d["budget"]["max_experiments"] = 1                   # the same caps did fit one experiment, except the wall clock
+    d["triage"]["target_experiments"] = 1                # keep this one-experiment calibration profile consistent
     p.write_text(json.dumps(d))
     one = S.paid_plan(N.load_config(p))
     assert [c["limit"] for c in one["room"]["checks"] if not c["fits"]] == ["wall clock"]
@@ -548,7 +556,8 @@ def test_cli_plan_prints_the_room(tmp_path: Path) -> None:
                        capture_output=True, text=True, timeout=60)
     assert r.returncode == 0, r.stderr
     room = json.loads(r.stdout)["room"]
-    assert room["fits"] and room["experiments"] == 3
+    assert room["experiments"] == 3 and room["per_experiment"]["ab_pairs"] == 10
+    assert [c["limit"] for c in room["checks"] if not c["fits"]] == ["wall clock"]   # reported, not hidden
     assert not (tmp_path / "sandbox").exists()
 
 

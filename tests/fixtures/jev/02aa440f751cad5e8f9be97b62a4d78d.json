@@ -1,0 +1,41 @@
+{
+  "_note": "Hand-written fixture for the sandbox-replay WORSE scenario (questions/rsi-replay.toml, bench/rsi-replay scenario 'worse', stub agent, reps 3). Not a live response.",
+  "_replay_state": "suite: sandbox-replay/1\nagent: stub\nmodel: default\nreps: 3\ncases:\n- docs-typo: pairs=3 A_pass=3 B_pass=0 checks: A passed more\nchecks overall: A passed more\njudge: mode=stub judged=3 A_wins=3 B_wins=0 ties=0 unfired_B=0 errors=0\nruns: expected=6 done=6 errors=0",
+  "model": "jev-1.14.0",
+  "usage": {
+    "input_tokens": 0,
+    "output_tokens": 0
+  },
+  "answers": {
+    "effect": {
+      "type": "choice",
+      "choice": "worse",
+      "confidence": 0.93,
+      "probabilities": {
+        "improves": 0.01,
+        "no_effect": 0.02,
+        "worse": 0.95,
+        "unclear": 0.02
+      }
+    },
+    "harness_problem": {
+      "type": "noul",
+      "noul": 0.05
+    },
+    "evidence_strength": {
+      "type": "score",
+      "score": 1.86,
+      "confidence": 0.84,
+      "legend": {
+        "0": "Weak",
+        "1": "Moderate",
+        "2": "Strong"
+      },
+      "probabilities": {
+        "0": 0.02,
+        "1": 0.1,
+        "2": 0.88
+      }
+    }
+  }
+}

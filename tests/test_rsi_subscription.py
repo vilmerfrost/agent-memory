@@ -1,5 +1,6 @@
 """Offline protocol and isolation-contract tests. No real clients or credentials."""
 import hashlib
+import copy
 import json
 import os
 from pathlib import Path
@@ -172,6 +173,9 @@ def test_only_fixed_bridge_schema_accepted(setup):
 def test_verified_read_requires_fixed_read_tool_success_and_matching_bytes(setup):
     content = "Follow these experimental instructions.\n"
     expected = hashlib.sha256(content.encode()).hexdigest()
+    source = setup[2] / ".claude" / "CLAUDE.md"
+    source.parent.mkdir()
+    source.write_text(content)
     calls = []
     def process(argv, **kwargs):
         calls.append(argv)
@@ -252,7 +256,8 @@ class FakeRpc:
                                "default_permissions": S.CODEX_PERMISSION_PROFILE,
                                "permissions": {S.CODEX_PERMISSION_PROFILE: {"filesystem": {"glob_scan_max_depth": None}, "network": {"enabled": False}}},
                                "agents": {"enabled": False}, "mcp_servers": {}, "web_search": "disabled",
-                               "forced_login_method": "chatgpt", "model_provider": "openai"}}
+                               "forced_login_method": "chatgpt", "model_provider": "openai",
+                               "otel": copy.deepcopy(S.CODEX_OTEL)}}
         if method == "account/read":
             return {"account": {"type": self.auth_type, "planType": "pro"}}
         if method == "permissionProfile/list":
@@ -346,10 +351,12 @@ def test_auth_child_symlink_refused(setup, tmp_path):
 
 
 def test_read_hash_mismatch_cannot_become_verified_evidence(setup):
+    (setup[2] / "CLAUDE.md").write_text("x")
     bridge, tool = tool_setup(setup, lambda *a, **k: (0, json.dumps({"content": "x", "sha256": "0" * 64}), ""))
     with pytest.raises(bridge.ToolError, match="read_result_invalid"):
         tool.call("task_read_arm", {"path": "~/CLAUDE.md"})
-    assert not tool.records
+    assert tool.records[0]["error"] == "read_result_invalid"
+    assert "verified_read" not in tool.records[0]
 
 
 
@@ -380,3 +387,14 @@ def test_named_codex_profile_must_not_grant_any_host_path():
     cfg["permissions"][S.CODEX_PERMISSION_PROFILE]["filesystem"]["/"] = "read"
     with pytest.raises(S.SubscriptionError, match="isolation_unverified"):
         S._check_codex_config(cfg)
+
+
+@pytest.mark.parametrize('value,expected', [(1234, 1234.0), (0, 0.0), (None, None),
+                                           (True, None), (-1, None), (float('nan'), None)])
+def test_claude_preserves_only_numeric_client_api_time(value, expected):
+    rows = [json.loads(line) for line in response().splitlines()]
+    rows[-1]['duration_api_ms'] = value
+    _, _, evidence = S._parse_claude('\n'.join(json.dumps(r) for r in rows),
+                                    model=S.MODELS['claude'], tools_allowed=False)
+    assert evidence['api_duration_ms'] == expected
+    assert evidence['api_duration_source'] == 'client_result_duration_api_ms'

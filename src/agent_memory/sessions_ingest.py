@@ -934,6 +934,9 @@ _ALL_COLS = ("session_id", "tool", "kind", "repo", "project_dir", "started_at", 
              "experiment_id", *_KEEP_COLS, "instruction_sources")
 _FACT_COLS = ("tool", "kind", "repo", "project_dir", "started_at", "ended_at", "transcript_bytes", "skills",
               "instructions", "category", "project", "env", "experiment_id")
+_FACT_ASSIGNMENTS = [
+    (f"{c} = case when sessions.meta->>'rsi_native_observation'='true' then sessions.{c} else excluded.{c} end"
+     if c in ("env", "experiment_id") else f"{c} = excluded.{c}") for c in _FACT_COLS]
 _TOKENS_DIFFER = (f"({', '.join('sessions.' + c for c in _TOKEN_COLS)}) is distinct from "
                   f"({', '.join('excluded.' + c for c in _TOKEN_COLS)})")
 _KEPT_DIFFER = (f"({', '.join(f'coalesce(excluded.{c}, sessions.{c})' for c in _KEEP_COLS)}) is distinct from "
@@ -946,8 +949,10 @@ values ({', '.join(f'%({c})s' for c in _ALL_COLS)},
         case when %(title)s::text is null then null else now() end,
         case when %(outcome)s::text is null then null else now() end)
 on conflict (session_id) do update
-    set {', '.join(f'{c} = excluded.{c}' for c in _FACT_COLS)},
-        meta = sessions.meta || excluded.meta,
+    set {', '.join(_FACT_ASSIGNMENTS)},
+        meta = sessions.meta || excluded.meta || case
+          when sessions.meta->>'rsi_native_observation'='true' and excluded.transcript_bytes>0
+          then jsonb_build_object('transcript_available',true) else '{{}}'::jsonb end,
         {', '.join(f'{c} = coalesce(excluded.{c}, sessions.{c})' for c in (*_TOKEN_COLS, *_KEEP_COLS))},
         instruction_sources = coalesce(excluded.instruction_sources, sessions.instruction_sources),
         last_activity_at = greatest(sessions.last_activity_at, excluded.last_activity_at),
@@ -993,11 +998,14 @@ def profile_values(profile: dict[str, Any] | None) -> dict[str, Any]:
 
 def outcome_values(signals: dict[str, int] | None, end: str | None, last: datetime | None,
                    now: datetime | None, kind: str | None = None,
-                   commits: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+                   commits: list[dict[str, Any]] | None = None, method_version: int = 2) -> dict[str, Any]:
     """`outcome` and `outcome_evidence`. The evidence gets `commits` (session_commits) when the
     session made any; the signal keys and `end` stay as outcome_of builds them."""
     if signals is None:
         return {"outcome": None, "outcome_evidence": None}
+    if method_version != 2:
+        return {"outcome": None, "outcome_evidence": Jsonb({"method_version": 1,
+                "legacy_signals": signals, "end": end, "acceptance": "unverified"})}
     name, evidence = session_tokens.outcome_of(signals, end, last, now, kind)
     if commits:
         evidence["commits"] = commits
@@ -1043,7 +1051,8 @@ def _params(r: SessionRow, now: datetime | None = None,
             "last_activity_at": last, "category": category, "project": project, "title": r.title,
             "instruction_sources": Jsonb(sources) if sources is not None else None,
             **env_values(r),
-            **profile_values(r.profile), **outcome_values(r.signals, r.end, last, now, r.kind, r.commits)}
+            **profile_values(r.profile), **outcome_values(r.signals, r.end, last, now, r.kind, r.commits,
+                                                        r.meta.get("outcome_method_version", 2))}
 
 
 def instruction_params(conn: Any, rows: list[SessionRow]) -> dict[str, tuple[list[dict[str, Any]], list[Any]]]:
@@ -1086,6 +1095,10 @@ def upsert(rows: list[SessionRow], *, db_url: str | None = None, now: datetime |
         from agent_memory import timing_store
         timing_store.upsert_conn(conn, (span for r in rows for span in r.timing_spans))
         timing_store.refresh_profiles(conn, (r.session_id for r in rows if r.tool=='codex'))
+        # A native client transcript may arrive after its replay sidecar. The
+        # join uses only the captured client id and sandbox experiment scope.
+        from agent_memory import attempt_links
+        attempt_links.reconcile_native_sessions(conn)
     return new, updated
 
 
@@ -1153,6 +1166,7 @@ def cloud_row(rec: dict[str, Any]) -> SessionRow | None:
         row.profile = cloud_profile(prof)
     out = src.get("outcome") if isinstance(src.get("outcome"), dict) else None
     if out is not None and isinstance(out.get("signals"), dict):
+        row.meta["outcome_method_version"] = 2 if out.get("method_version") == 2 else 1
         row.signals = {str(k): v for k, v in out["signals"].items()
                        if isinstance(v, int) and not isinstance(v, bool) and v > 0 and re.fullmatch(r"[a-z_]{1,30}", str(k))}
         row.end = out.get("end") if out.get("end") in ("reply", "user", "tool", "result", "error", "interrupt") else None
@@ -1247,9 +1261,8 @@ def ingest_cloud(*, db_url: str | None = None, now: datetime | None = None) -> C
 
 
 # ---------------------------------------------------------------- stored rows
-# Every ingest also fixes stored rows outside its window (docs/sessions-live.md, "Outcome"):
-# the outcome is recomputed from the stored evidence (signal names and counts plus `end`) with
-# today's rules and time, and a null category / project is filled from the stored kind and cwd.
+# Recompute only version-2 evidence outside the ingest window. Unversioned historical
+# outcomes retain their recorded semantics. Null category/project can still be filled.
 
 _STORED_SQL = """
 select session_id, kind, repo, project_dir, meta, category, project, outcome, outcome_evidence,
@@ -1266,8 +1279,20 @@ def stored_outcome(evidence: Any, last_at: datetime | None, now: datetime | None
     no background commit, the ingest's commits list does)."""
     if not isinstance(evidence, dict):
         return None
+    if evidence.get("method_version") != 2:
+        # Preserve the existing independently captured commit contract, but
+        # never reinterpret old push/deploy invocation counters as success.
+        commits = evidence.get("commits")
+        if isinstance(commits, list) and any(isinstance(c, dict) and
+                re.fullmatch(r"[0-9a-f]{7,40}", str(c.get("sha", ""))) for c in commits):
+            return "committed"
+        if not any(evidence.get(k) for k in ("commit", "push", "push_main", "pr_create", "pr_merge", "deploy", "merge_main")):
+            neutral = {k:v for k,v in evidence.items() if k not in ("method_version", "end")
+                       and isinstance(v,int) and not isinstance(v,bool)}
+            return session_tokens.outcome_of(neutral, evidence.get("end"), last_at, now, kind)[0]
+        return None
     signals = {str(k): v for k, v in evidence.items()
-               if k != "end" and isinstance(v, int) and not isinstance(v, bool)}
+               if k not in ("end", "method_version") and isinstance(v, int) and not isinstance(v, bool)}
     if not signals.get("commit") and isinstance(evidence.get("commits"), list) and evidence["commits"]:
         signals["commit"] = 1
     end = evidence.get("end") if isinstance(evidence.get("end"), str) else None
@@ -1285,7 +1310,9 @@ def refresh_stored(*, db_url: str | None = None, now: datetime | None = None) ->
             cur.execute(_STORED_SQL)
             recs = cur.fetchall()
         for rec in recs:
-            name = stored_outcome(rec["outcome_evidence"], rec["last_at"], now, rec["kind"])
+            evidence = rec["outcome_evidence"]
+            name = (stored_outcome(evidence, rec["last_at"], now, rec["kind"])
+                    if isinstance(evidence, dict) and evidence.get("method_version") == 2 else None)
             if name is not None and name != rec["outcome"]:
                 conn.execute("update sessions set outcome = %s, outcome_at = now() where session_id = %s",
                              (name, rec["session_id"]))

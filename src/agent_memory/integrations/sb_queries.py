@@ -201,19 +201,22 @@ def evals_for(conn: psycopg.Connection, p: Mapping[str, str]) -> list[EvidenceRe
     if not (exp or art):
         raise ValueError("evals_for: give experiment or artifact")
     rows = conn.execute(
-        """select id::text, artifact_hash, experiment_id, suite, suite_version, model, effort, verdict, created_at
-           from rsi_eval_results
+        """select r.id::text, r.artifact_hash, r.experiment_id, r.suite, r.suite_version, r.model, r.effort, r.verdict, r.created_at,
+                  (select case when e.meta->>'implementer'='stub-fallback' then 'false'::jsonb
+                               else e.meta->'intended_intervention' end from rsi_experiments e where e.id=r.experiment_id)
+           from rsi_eval_results r
            where (%(exp)s::text is not null and experiment_id = %(exp)s) or (%(art)s::text is not null and artifact_hash = %(art)s)
            order by created_at desc limit %(limit)s""",
         {"exp": exp, "art": art, "limit": int(p.get("limit", "50"))}).fetchall()
     out = []
-    for eid, art_, exp_, suite, version, model, effort, verdict, created in rows:
+    for eid, art_, exp_, suite, version, model, effort, verdict, created, intended in rows:
         subjects = [refs.amem("eval_result", eid), refs.amem("artifact", art_)]
         if exp_:
             subjects.append(refs.amem("experiment", exp_))
         out.append(EvidenceRef(refs.amem("eval_result", eid), "sb", "eval", subjects,
                                _clean({"suite": suite, "suite_version": version, "model": model, "effort": effort,
-                                       "verdict": verdict, "failed": verdict in ("fail", "worse")}),
+                                       "verdict": verdict, "failed": verdict in ("fail", "worse"),
+                                       "intended_intervention": intended}),
                                None, _iso(created)))
     return out
 
@@ -224,7 +227,9 @@ def eval_by_model(conn: psycopg.Connection, p: Mapping[str, str]) -> list[Eviden
                   count(*) filter (where verdict in ('pass', 'improves')) as good,
                   count(*) filter (where verdict in ('fail', 'worse')) as bad, max(created_at),
                   (array_agg(id::text order by created_at desc))[1:5]
-           from rsi_eval_results where created_at >= now() - make_interval(days => %s)
+           from rsi_eval_results r where created_at >= now() - make_interval(days => %s)
+             and not exists(select 1 from rsi_experiments e where e.id=r.experiment_id
+                            and (e.meta->>'intended_intervention'='false' or e.meta->>'implementer'='stub-fallback'))
            group by suite, model, effort order by n desc limit %s""",
         (int(p.get("days", "90")), int(p.get("limit", "50")))).fetchall()
     out = []

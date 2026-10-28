@@ -83,7 +83,9 @@ def test_happy_path_stages_one_proposal_and_defers_the_rest(env: SimpleNamespace
     staged, skipped = rep["experiments"]                                          # 2 hypotheses, 1 experiment
     assert staged["status"] == "staged" and staged["verdict"] == "IMPROVES" and staged["proposal_id"]
     assert staged["target"] == "~/.claude/CLAUDE.md" and staged["artifact_hash"] and staged["baseline_id"]
-    assert skipped["status"] == "skipped_budget" and skipped["experiment_id"] is None
+    assert skipped["status"] == "deferred_policy" and skipped["experiment_id"] is None
+    assert skipped["skip_reason"] == "one_experiment_per_candidate"
+    assert skipped["budget_decision"]["resource"] is None
     assert rep["pending_decisions"] == [staged["proposal_id"]]
     assert rep["checkpoint"]["advanced"] and rep["checkpoint"]["before"] is None and rep["checkpoint"]["after"]
     assert rep["costs"]["sandbox_runs"] == 4 and rep["costs"]["total_usd"] == 0.0
@@ -146,7 +148,7 @@ def test_pending_hypothesis_is_tried_next_night_without_a_model_call(env: Simple
     seed_rule(env.url, RULE_A, "a")
     r1 = run(env, replayer=FakeReplayer("NO_EFFECT"))
     first, second = (e["hypothesis"]["what"] for e in r1["experiments"])
-    assert r1["experiments"][1]["status"] == "skipped_budget"
+    assert r1["experiments"][1]["status"] == "deferred_policy"
     r2 = run(env, N2, replayer=FakeReplayer("NO_EFFECT"))
     assert [c["key"] for c in r2["candidates"] if c["selected"]] == [KEY_A]
     assert [e["hypothesis"]["what"] for e in r2["experiments"]] == [second]
@@ -373,11 +375,14 @@ def test_candidate_under_a_symlink_of_an_allowlisted_file_is_in_scope(env: Simpl
                      "('dev:agent:worker:rules', 'deviations', 'edit_instruction', '~/.claude/agents/worker.md', %s)",
                      (json.dumps({"sessions": 9}),))
     rep = run(env, dry_run=True, config_path=write_config(env.tmp, candidates={"max_considered": 1}))
-    # In scope through the symlink. No replay case uses worker.md, so it is listed with that reason, after the
-    # covered CLAUDE.md candidate that takes the one triage slot (tests/test_rsi_night_coverage.py).
+    # In scope through the symlink. Its new final-report case makes this recurring worker candidate testable,
+    # so it takes the triage slot ahead of the less recurrent CLAUDE.md candidate.
     worker = [c for c in rep["candidates"] if c["key"] == "dev:agent:worker:rules"]
     assert len(worker) == 1 and worker[0]["target"] == "~/agent-config/agents/worker.md"
-    assert worker[0]["reason"] == "deferred: no test case uses this file"
+    assert worker[0]["selected"] and worker[0]["reason"].startswith("selected: rank ")
+    assert worker[0]["test_cases"] == ["worker-credential-runner", "worker-dod-gaps", "worker-final-report",
+                                       "worker-helper-lifecycle", "worker-helper-routing", "worker-server-launch"]
+    assert worker[0]["skip_reason"] is None
     assert "candidates:" not in " ".join(rep["notes"])
     assert candidate(env.url, "dev:agent:worker:rules")["target"] == "~/.claude/agents/worker.md"   # dry: unchanged
     run(env, config_path=write_config(env.tmp, candidates={"max_considered": 1}))
@@ -548,12 +553,15 @@ def test_lock_contention_and_stale_lock_recovery(env: SimpleNamespace) -> None:
     assert rep["status"] == "ok" and not held.exists()
 
 
-def test_sandbox_unavailable_fails_preflight(env: SimpleNamespace) -> None:
+def test_sandbox_unavailable_preserves_collection_without_paid_stages(env: SimpleNamespace) -> None:
     seed_ab(env)
     rep = run(env, replayer=FakeReplayer(health="unavailable"))
-    assert rep["status"] == "preflight_failed" and rep["health"]["sandbox"] == "unavailable"
-    assert rows(env.url, "select count(*) from rsi_candidates") == [(0,)]
-    assert read_report(N1)["status"] == "preflight_failed"
+    assert rep["status"] == "partial" and rep["health"]["sandbox"] == "unavailable"
+    assert rows(env.url, "select count(*) from rsi_candidates") == [(2,)]
+    assert rows(env.url, "select count(*) from rsi_candidates where status = 'selected'") == [(0,)]
+    assert rep["experiments"] == [] and rep["costs"]["by_model"] == {}
+    assert rep["delta"]["sessions"] == 5 and rep["delta"]["deviations"] == 5
+    assert read_report(N1)["status"] == "partial"
 
 
 # --------------------------------------------------------------------------- providers, injection, safety
@@ -669,7 +677,7 @@ def test_the_investigator_cannot_approve_or_promote(env: SimpleNamespace, monkey
         monkeypatch.setattr(AP, name, tripwire)
     seed_ab(env)
     rep = run(env)
-    assert rep["status"] == "ok" and [e["status"] for e in rep["experiments"]] == ["staged", "skipped_budget"]
+    assert rep["status"] == "ok" and [e["status"] for e in rep["experiments"]] == ["staged", "deferred_policy"]
     assert rows(env.url, "select count(*) from rsi_decisions") == [(0,)]
     assert rows(env.url, "select count(*) from rsi_decision_tokens") == [(0,)]
     assert rows(env.url, "select status from rsi_proposals") == [("staged",)]
@@ -708,9 +716,12 @@ def test_jev_fixture_triage_ranks_with_the_typed_answers(env: SimpleNamespace) -
     assert "rsi-triage" not in questions.QuestionCache().routines()               # not a routine for `amem score`
     seed_ab(env)
     for key, (rid, _ref, n, grade) in ((KEY_A, RULE_A), (KEY_B, RULE_B)):         # the committed fixtures match
+        # as the night builds it: recurrence(c) from the sessions, the deviations' result grade (seed_rule: 0.5), the
+        # generic cases that use CLAUDE.md, no replay history yet (baselines unknown)
         c = {"source": "deviations", "kind": "edit_instruction", "target": "~/.claude/CLAUDE.md",
-             "rule_key": f"claude-md:global:{rid}", "seen_count": 1, "metrics": {"sessions": n, "followed_grade_mean": grade}}
-        state = N.triage_state(c, [], True)
+             "rule_key": f"claude-md:global:{rid}", "seen_count": 1,
+             "metrics": {"sessions": n, "followed_grade_mean": grade, "result_grade_mean": 0.5}}
+        state = N.triage_state(c, [], True, ["docs-typo", "fix-add", "report-todos"], {})
         k = jev.fixture_key(state, qset.jev_questions())
         assert (config.JEV_FIXTURES_DIR / f"{k}.json").is_file(), (key, k)
         fx = json.loads((config.JEV_FIXTURES_DIR / f"{k}.json").read_text())
@@ -870,11 +881,11 @@ def test_an_earlier_hard_killed_night_is_reconciled_under_the_lock(env: SimpleNa
     assert rows(env.url, "select count(*) from rsi_candidates where status = 'selected'") == [(0,)]
 
 
-def test_docker_unavailable_fails_closed_with_the_real_sandbox_check(env: SimpleNamespace, tmp_path: Path,
+def test_docker_unavailable_defers_paid_work_with_the_real_sandbox_check(env: SimpleNamespace, tmp_path: Path,
                                                                     monkeypatch: pytest.MonkeyPatch) -> None:
     """Mission 005.6: Docker Desktop does not auto-start after a reboot. The REAL SandboxReplayer.preflight (docker
-    info against an unreachable daemon) must fail the night before any paid call: preflight_failed, $0, nothing
-    written, the lock released, and the night-job's routines.log status FAIL naming the sandbox."""
+    info against an unreachable daemon) must block paid work, preserve deterministic collection,
+    release the lock, and retain a FAIL diagnostic naming the sandbox."""
     from agent_memory import rsi_schedule as S
     monkeypatch.setenv("DOCKER_HOST", f"unix://{tmp_path / 'no-docker.sock'}")
     monkeypatch.delenv("DOCKER_CONTEXT", raising=False)
@@ -882,7 +893,9 @@ def test_docker_unavailable_fails_closed_with_the_real_sandbox_check(env: Simple
     replayer = N.SandboxReplayer({"replay_agent": "stub", "judge": "stub", "replay_jev": "fixture"}, {})
     assert replayer.preflight() == "unavailable"
     rep = run(env, replayer=replayer)
-    assert rep["status"] == "preflight_failed" and rep["health"]["sandbox"] == "unavailable"
+    assert rep["status"] == "partial" and rep["health"]["sandbox"] == "unavailable"
+    assert rep["costs"]["by_model"] == {}
+    assert rep["delta"]["sessions"] == 5
     assert any("sandbox unavailable" in n for n in rep["notes"]), rep["notes"]
     assert rep["experiments"] == [] and float(rep["costs"]["total_usd"]) == 0.0
     assert rows(env.url, "select count(*) from rsi_experiments") == [(0,)]
@@ -939,3 +952,40 @@ def test_target_outside_improves_allowed_targets_is_dropped(env: SimpleNamespace
     rep = run(env)
     assert rep["candidates"] == [] and rep["experiments"] == []
     assert any("on a target improve refuses" in n and "CLAUDE.md" in n for n in rep["notes"]), rep["notes"]
+
+
+def test_manual_verification_keeps_scheduled_report_checkpoint_and_coverage(env: SimpleNamespace) -> None:
+    seed_ab(env)
+    scheduled = run(env)
+    original = N.report_path(N1).read_bytes()
+    checkpoint = rows(env.url, "select status,meta from rsi_checkpoints where job='rsi-night' and run_key=%s", N1)
+    manual_id = 'manual-20261028-test-a'
+    manual = run(env, manual_run_id=manual_id)
+    assert manual['manual_run']['id'] == manual_id
+    assert N.report_path(N1).read_bytes() == original
+    assert rows(env.url, "select status,meta from rsi_checkpoints where job='rsi-night' and run_key=%s", N1) == checkpoint
+    assert manual['checkpoint']['before'] == scheduled['checkpoint']['after']
+    assert manual['checkpoint']['advanced'] is False
+    assert manual['coverage']['run_key'] == manual_id
+    assert (env.sandbox / 'manual-runs' / manual_id / 'nights' / N1 / 'report.json').exists()
+    assert rows(env.url, "select count(*) from rsi_experiments where night=%s", manual_id)[0][0] > 0
+    assert all(e.get('proposal_id') is None for e in manual['experiments'])
+    assert rows(env.url, "select meta->>'manual_run_id' from rsi_checkpoints where run_key=%s", manual_id) == [(manual_id,)]
+    manual_path = env.sandbox / 'manual-runs' / manual_id / 'nights' / N1 / 'report.json'
+    manual_bytes = manual_path.read_bytes()
+    duplicate = run(env, manual_run_id=manual_id)
+    assert duplicate['status'] == 'preflight_failed'
+    assert 'already done' in ' '.join(duplicate['notes'])
+    assert manual_path.read_bytes() == manual_bytes
+    # A following scheduled night reads the scheduled cursor, not the manual cursor.
+    next_scheduled = run(env, night=N2)
+    assert next_scheduled['checkpoint']['before'] == scheduled['checkpoint']['after']
+    assert 'already done' not in ' '.join(next_scheduled['notes'])
+
+
+def test_manual_identity_rejects_path_traversal_before_any_write(env: SimpleNamespace) -> None:
+    import pytest
+    with pytest.raises(N.ConfigError, match='manual_run_id'):
+        run(env, manual_run_id='../scheduled')
+    assert not N.report_path(N1).exists()
+    assert rows(env.url, "select count(*) from rsi_checkpoints") == [(0,)]

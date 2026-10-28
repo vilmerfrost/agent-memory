@@ -1,0 +1,42 @@
+{
+  "_note": "Synthetic 5-pair counterpart of c5981c46c77dffd5d7620cce8511e234.json (5 A + 5 B per provider, 2026-10-28): the same improving outcome at 5 pairs. Not a live response.",
+  "model": "jev-1.14.0",
+  "usage": {
+    "input_tokens": 0,
+    "output_tokens": 0
+  },
+  "answers": {
+    "effect": {
+      "type": "choice",
+      "choice": "improves",
+      "confidence": 0.71,
+      "probabilities": {
+        "improves": 0.78,
+        "no_effect": 0.14,
+        "worse": 0.01,
+        "unclear": 0.07
+      }
+    },
+    "harness_problem": {
+      "type": "noul",
+      "noul": 0.07
+    },
+    "evidence_strength": {
+      "type": "score",
+      "score": 1.05,
+      "confidence": 0.55,
+      "legend": {
+        "0": "Weak",
+        "1": "Moderate",
+        "2": "Strong"
+      },
+      "probabilities": {
+        "0": 0.2,
+        "1": 0.55,
+        "2": 0.25
+      }
+    }
+  },
+  "_replay_state": "suite: sandbox-replay/5\nagent: stub\nmodel: default\nreps: 5\ncases:\n- report-todos: pairs=5 A_pass=0 B_pass=5 checks: B passed more\nchecks overall: B passed more\njudge: mode=stub judged=5 A_wins=0 B_wins=5 ties=0 unfired_B=0 errors=0\nruns: expected=10 done=10 errors=0",
+  "_source_fixture": "c5981c46c77dffd5d7620cce8511e234.json"
+}

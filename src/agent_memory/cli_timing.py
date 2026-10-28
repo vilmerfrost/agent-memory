@@ -28,6 +28,9 @@ def run(args: argparse.Namespace) -> int:
             return 3
         if args.timing_action == "coverage":
             result = timing_store.coverage()
+        elif args.timing_action == "analyze":
+            from agent_memory import telemetry_analysis
+            result = telemetry_analysis.run(days=args.days, limit=args.limit)
         elif args.timing_action == "tests":
             from agent_memory import test_timings
             result = test_timings.report(run_id=args.run, session_id=args.session, limit=args.limit)
@@ -60,11 +63,14 @@ def run(args: argparse.Namespace) -> int:
 def register(sub: argparse._SubParsersAction) -> None:
     parser = sub.add_parser("timing", help="measured session timing and coverage")
     actions = parser.add_subparsers(dest="timing_action", required=True)
-    for name in ("coverage", "report", "tests", "ingest", "sync", "flush", "collect"):
+    for name in ("coverage", "report", "tests", "analyze", "ingest", "sync", "flush", "collect"):
         p = actions.add_parser(name)
         p.set_defaults(func=run)
         if name == "report":
             p.add_argument("--session", required=True)
+        elif name == "analyze":
+            p.add_argument("--days", type=int, choices=range(1,31), default=7)
+            p.add_argument("--limit", type=int, choices=range(1,21), default=5)
         elif name == "tests":
             p.add_argument("--run")
             p.add_argument("--session")

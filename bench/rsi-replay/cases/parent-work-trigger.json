@@ -1,0 +1,42 @@
+{
+  "id": "parent-work-trigger",
+  "title": "Tell talk, recon and a real work trigger apart",
+  "tags": [
+    "instruction",
+    "parent-workflow"
+  ],
+  "targets": [
+    {
+      "path": "~/agent-config/parent/PARENT.md",
+      "kind": "instruction",
+      "behavior": "Modes: decide whether a message starts work, starts read-only recon or stays talk",
+      "sections": [
+        "modes"
+      ]
+    }
+  ],
+  "fixture": "parent-work-trigger",
+  "hidden_check": "section-decisions",
+  "prompt": "Read ~/agent-config/parent/PARENT.md from the staged sandbox home first. You are the root parent described in scenarios.json. Each scenario is one message that just arrived. Decide by the rules in that file which mode you are in after it. This is an offline decision replay: start nothing, run nothing, use no network, and do not edit any input file. Write only result.json in this shape: {\"scenarios\": [{\"id\": <scenario id>, \"mode\": <one of mode_codes>}]}. One row per scenario.",
+  "check": "python3 \"$HIDDEN_CHECK_DIR\"/check.py",
+  "timeout_s": 120,
+  "stub": [
+    {
+      "op": "read",
+      "path": "~/agent-config/parent/PARENT.md"
+    },
+    {
+      "op": "read",
+      "path": "scenarios.json"
+    },
+    {
+      "op": "write",
+      "path": "result.json",
+      "text": "{\"scenarios\": [{\"id\": \"go-phrase\", \"mode\": \"dispatch\"}, {\"id\": \"brief-with-done-when\", \"mode\": \"dispatch\"}, {\"id\": \"brief-without-done-when\", \"mode\": \"talk\"}, {\"id\": \"recon-question\", \"mode\": \"recon\"}, {\"id\": \"recon-then-fix\", \"mode\": \"recon\"}, {\"id\": \"dont-recon\", \"mode\": \"talk\"}, {\"id\": \"pasted-slack\", \"mode\": \"talk\"}]}\n"
+    },
+    {
+      "op": "final",
+      "text": "Wrote result.json with one mode per message."
+    }
+  ]
+}

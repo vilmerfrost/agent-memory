@@ -19,8 +19,21 @@ from agent_memory import rsi_verdict as V
 EXP = "exp-20261017-01"
 
 
+def _stub_size_policy() -> V.VerdictPolicy:
+    """The runner tests' named stub-size policy: the stub agent is deterministic, so 3 pairs (and 1 pair per case
+    in the mixed replay) are enough to exercise the runner. A one-run score margin keeps each scenario's expected
+    verdict; the night's real policy (config/rsi-verdict-policy.json) is tested in tests/test_rsi_verdict.py."""
+    from dataclasses import fields
+    known = {f.name for f in fields(V.VerdictPolicy)}
+    return V.VerdictPolicy(**{k: v for k, v in {"min_pairs": 3, "min_score_margin": 1.0}.items() if k in known})
+
+
+STUB_POLICY = _stub_size_policy()
+
+
 def replay(root: Path, h: str, cases: list[str], *, reps: int = 3, sandbox=None, **kw):
     sb = sandbox or HostSandbox(root)
+    kw.setdefault("policy", STUB_POLICY)
     res = R.run_replay(h, R.load_cases(cases), R.ReplayConfig(reps=reps), root=root, experiment_id=kw.pop("exp", EXP),
                        sandbox=sb, **kw)
     return res, sb
@@ -39,8 +52,12 @@ def record(root: Path, h: str) -> dict:
 
 def test_shipped_cases_load_and_are_stable():
     cases = R.load_cases()
-    assert [c.id for c in cases] == ["anatomy-plan", "docs-typo", "fix-add", "meltdown-brief", "pepe-lock",
-                                     "report-todos"]
+    assert [c.id for c in cases] == ["anatomy-plan", "docs-typo", "fix-add", "meltdown-brief", "parent-authority",
+                                     "parent-dod-review", "parent-merge-cleanup",
+                                     "parent-repo-profile", "parent-safety-guards", "parent-work-trigger", "pepe-lock",
+                                     "report-todos", "worker-credential-runner", "worker-dod-gaps",
+                                     "worker-final-report", "worker-helper-lifecycle", "worker-helper-routing",
+                                     "worker-server-launch"]
     assert all(c.fixture.is_dir() and c.stub and c.check for c in cases)
     assert R.load_cases(["report-todos"])[0].hidden_check.name == "report-todos"
     assert cases[1].digest() == R.load_cases(["docs-typo"])[0].digest()
@@ -104,8 +121,10 @@ def test_replay_jev_fixtures_match_their_states():
             versions[version] = versions.get(version, 0) + 1
             assert jev.fixture_key(body["_replay_state"], qs) == p.stem and "_state" not in body
             assert set(body["answers"]) == {"effect", "harness_problem", "evidence_strength"}
-    # Keep the six historical V1 outcomes and six explicit V2 counterparts.
-    assert versions == {"suite: sandbox-replay/1": 6, "suite: sandbox-replay/2": 6}
+    # Keep the six historical V1 outcomes and six explicit V2 counterparts, plus the recorded 2026-10-26 codex
+    # replay (both arms failed every check; tests/test_rsi_jev_inputs.py).
+    assert versions == {"suite: sandbox-replay/1": 6, "suite: sandbox-replay/2": 7, "suite: sandbox-replay/3": 7,
+                        "suite: sandbox-replay/4": 7, "suite: sandbox-replay/5": 8}   # /5: + the 5-pair report-todos
 
 
 def test_jev_state_is_numbers_only_and_fixture_mode_never_goes_live(monkeypatch):
@@ -250,7 +269,7 @@ def test_run_errors_and_timeouts_are_inconclusive(tmp_path, monkeypatch):
     case["stub"] = [{"op": "fail", "message": "boom"}]
     (bench / "cases" / "fix-add.json").write_text(json.dumps(case))
     res = R.run_replay(h, R.load_cases(["fix-add"], bench=bench), R.ReplayConfig(reps=3), root=root,
-                       experiment_id=EXP, sandbox=HostSandbox(root))
+                       experiment_id=EXP, sandbox=HostSandbox(root), policy=STUB_POLICY)
     assert res.verdict.verdict == "INCONCLUSIVE" and "agent exit 1" in " ".join(res.verdict.reasons)
 
 
@@ -300,7 +319,7 @@ def test_arm_homes_are_prepared_once_and_reset_when_an_agent_changes_them(tmp_pa
     bench = _bench_with(tmp_path, "fix-add", stub=[{"op": "run", "argv": ["sh", "-c", "echo x > $HOME/planted"]},
                                                    *case["stub"]])
     res = R.run_replay(h, R.load_cases(["fix-add"], bench=bench), R.ReplayConfig(reps=3), root=root,
-                       experiment_id=EXP, sandbox=HostSandbox(root))
+                       experiment_id=EXP, sandbox=HostSandbox(root), policy=STUB_POLICY)
     assert res.verdict.verdict == "NO_EFFECT", res.verdict.reasons
     events = [json.loads(x) for x in (res.evidence_dir / "log.jsonl").read_text().splitlines()]
     assert [e["arms"] for e in events if e["event"] == "home-reset"] == [["A", "B"], ["A", "B"]]
@@ -316,7 +335,7 @@ def test_a_check_that_writes_into_its_home_is_not_trusted(tmp_path, monkeypatch)
     case = json.loads((R.BENCH_DIR / "cases" / "fix-add.json").read_text())
     bench = _bench_with(tmp_path, "fix-add", check='touch "$HOME/.planted" && ' + case["check"])
     res = R.run_replay(h, R.load_cases(["fix-add"], bench=bench), R.ReplayConfig(reps=3), root=root,
-                       experiment_id=EXP, sandbox=HostSandbox(root))
+                       experiment_id=EXP, sandbox=HostSandbox(root), policy=STUB_POLICY)
     assert res.verdict.verdict == "INCONCLUSIVE"
     assert all(r.error == "check-home-modified: .planted" for r in res.runs)
     assert list(rs.Sandbox(root).arm_home(EXP, "K").iterdir()) != [] and \
@@ -429,7 +448,9 @@ def test_cli_dry_run_writes_nothing(tmp_path, monkeypatch):
     assert R.main(["run", "--root", str(root), "--artifact", h, "--experiment", EXP, "--dry-run", "--json"],
                   out=out.append) == 0
     plan = json.loads(out[0])
-    assert plan["dry_run"] and plan["artifact"]["ok"] and plan["agent_runs"] == 6 and plan["paid_calls"] is False
+    # The CLI's automatic plan: the artifact's one case, repeated up to the verdict policy's minimum pairs
+    assert plan["dry_run"] and plan["artifact"]["ok"] and plan["paid_calls"] is False
+    assert plan["agent_runs"] == 2 * V.load_policy().min_pairs
     assert plan["run_ids"][0] == R.run_id_for(EXP, "docs-typo", "A", 0)
     assert sorted(p.relative_to(root) for p in root.rglob("*")) == before
     monkeypatch.delenv("RSI_SANDBOX_DIR")
@@ -443,5 +464,7 @@ def test_cli_run_with_host_double(tmp_path, monkeypatch):
     monkeypatch.setattr(rs, "Sandbox", HostSandbox)
     out: list[str] = []
     code = R.main(["run", "--root", str(root), "--artifact", h, "--experiment", EXP, "--cases", "report-todos",
-                   "--reps", "3", "--json"], out=out.append)
-    assert code == 0 and json.loads(out[0])["verdict"]["verdict"] == "IMPROVES"
+                   "--reps", "5", "--json"], out=out.append)          # 5 A + 5 B: the night's pair count
+    res = json.loads(out[0])
+    assert code == 0 and res["verdict"]["verdict"] == "IMPROVES", res["verdict"]["reasons"]
+    assert len(res["runs"]) == 10

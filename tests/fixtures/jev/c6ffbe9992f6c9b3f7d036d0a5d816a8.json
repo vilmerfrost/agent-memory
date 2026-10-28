@@ -1,0 +1,42 @@
+{
+  "_note": "Synthetic V3 wiring fixture counterpart; not a new live assessment. Hand-written sandbox-replay/2 fixture. Preserves the synthetic expected answer from ca582a6e52b17d427bdc1d55caa32b96.json for the same structured outcomes after exact-target and both-arm relevance checks. Not a live response.",
+  "_replay_state": "suite: sandbox-replay/3\nagent: stub\nmodel: default\nreps: 3\ncases:\n- report-todos: pairs=3 A_pass=0 B_pass=3 checks: B passed more\nchecks overall: B passed more\njudge: mode=stub judged=3 A_wins=0 B_wins=3 ties=0 unfired_B=0 errors=0\nruns: expected=6 done=6 errors=0",
+  "model": "jev-1.14.0",
+  "usage": {
+    "input_tokens": 0,
+    "output_tokens": 0
+  },
+  "answers": {
+    "effect": {
+      "type": "choice",
+      "choice": "improves",
+      "confidence": 0.9,
+      "probabilities": {
+        "improves": 0.92,
+        "no_effect": 0.03,
+        "worse": 0.01,
+        "unclear": 0.04
+      }
+    },
+    "harness_problem": {
+      "type": "noul",
+      "noul": 0.04
+    },
+    "evidence_strength": {
+      "type": "score",
+      "score": 1.82,
+      "confidence": 0.8,
+      "legend": {
+        "0": "Weak",
+        "1": "Moderate",
+        "2": "Strong"
+      },
+      "probabilities": {
+        "0": 0.03,
+        "1": 0.12,
+        "2": 0.85
+      }
+    }
+  },
+  "_source_fixture": "ca582a6e52b17d427bdc1d55caa32b96.json"
+}

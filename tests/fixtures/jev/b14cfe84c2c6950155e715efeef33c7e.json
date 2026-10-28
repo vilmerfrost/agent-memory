@@ -1,0 +1,42 @@
+{
+  "_note": "Synthetic V3 wiring fixture counterpart; not a new live assessment. Hand-written sandbox-replay/2 fixture. Preserves the synthetic expected answer from 17666753b4e1e7c54ce302ba4be3e5a8.json for the same structured outcomes after exact-target and both-arm relevance checks. Not a live response.",
+  "_replay_state": "suite: sandbox-replay/3\nagent: stub\nmodel: default\nreps: 1\ncases:\n- docs-typo: pairs=1 A_pass=1 B_pass=1 checks: both arms passed every check\n- fix-add: pairs=1 A_pass=1 B_pass=1 checks: both arms passed every check\n- report-todos: pairs=1 A_pass=0 B_pass=0 checks: both arms failed every check\nchecks overall: both arms passed the same number\njudge: mode=stub judged=3 A_wins=0 B_wins=0 ties=3 unfired_B=0 errors=0\nruns: expected=6 done=6 errors=0",
+  "model": "jev-1.14.0",
+  "usage": {
+    "input_tokens": 0,
+    "output_tokens": 0
+  },
+  "answers": {
+    "effect": {
+      "type": "choice",
+      "choice": "no_effect",
+      "confidence": 0.83,
+      "probabilities": {
+        "improves": 0.04,
+        "no_effect": 0.86,
+        "worse": 0.03,
+        "unclear": 0.07
+      }
+    },
+    "harness_problem": {
+      "type": "noul",
+      "noul": 0.08
+    },
+    "evidence_strength": {
+      "type": "score",
+      "score": 1.2,
+      "confidence": 0.6,
+      "legend": {
+        "0": "Weak",
+        "1": "Moderate",
+        "2": "Strong"
+      },
+      "probabilities": {
+        "0": 0.15,
+        "1": 0.5,
+        "2": 0.35
+      }
+    }
+  },
+  "_source_fixture": "17666753b4e1e7c54ce302ba4be3e5a8.json"
+}

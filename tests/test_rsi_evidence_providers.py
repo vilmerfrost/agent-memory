@@ -86,14 +86,15 @@ class Mocks:
         self.lf.route("GET", "/api/public/projects", lambda r: (200, {"data": [{"id": "p1"}]}))
         self.lf.route("GET", "/api/public/v2/datasets/", lambda r: (404, {"message": "not found"}))
         self.lf.route("GET", "/api/public/v2/observations", self._lf_obs)
-        self.lf.route("GET", "/api/public/v3/scores", lambda r: (200, {"data": [
-            {"name": "check_passed", "value": 0}, {"name": "eval_verdict", "stringValue": "worse"}], "meta": {}}))
+        self.lf.route("GET", "/api/public/v3/scores", self._lf_scores)
         self.pd.route("GET", f"/api/v1/ingest/{PD.NIL_INGESTION}", lambda r: (404, {"code": "not-found"}))
         self.pd.route("POST", "/api/v1/recall", lambda r: (200, {"results": [{"rank": 1, "sources": [
             {"sourceId": f"amem:proposal/{PROPOSAL}", "occurredAt": "2026-10-14T08:00:00Z", "label": "proposal"}]}]}))
 
     def _ch_post(self, req: Request) -> tuple[int, str]:
         text = req.body.decode()
+        if text == "SELECT 1 AS ok FORMAT JSONEachRow":
+            return 200, _jsonl([{"ok": 1}])
         if "objective_avg - followed_avg AS gap" in text:
             rows = [{"rule_key": self.rule_key, "n_deviations": 10, "n_sessions": 7, "followed_avg": 0.25,
                      "result_avg": 0.4, "objective_avg": 0.9, "objective_n": 6, "gap": 0.65, "sample_ids": [DEV0_ID]}]
@@ -112,6 +113,20 @@ class Mocks:
         return {"id": f"o-{tid[:8]}", "traceId": tid, "type": "AGENT", "parentObservationId": None, "sessionId": EXP,
                 "startTime": "2026-10-16T10:00:00.000Z", "level": "ERROR", "tags": [arm, "sandbox"],
                 "metadata": {"arm": arm, "amem_session_id": TRACES[arm]["session_id"]}}
+
+    @staticmethod
+    def _lf_scores(req: Request) -> tuple[int, dict[str, Any]]:
+        # Scores API v3 OR-filters explicit trace IDs and carries subject
+        # identity when requested, including for the new bulk path.
+        tids = req.q("traceId").split(",")
+        rows = []
+        for tid in tids:
+            if tid not in {t["trace_id"] for t in TRACES.values()}:
+                continue
+            subject = {"subject": {"kind": "trace", "id": tid}} if req.q("fields") == "subject" else {}
+            rows += [{"name": "check_passed", "value": 0, "dataType": "BOOLEAN", **subject},
+                     {"name": "eval_verdict", "value": "worse", "dataType": "CATEGORICAL", **subject}]
+        return 200, {"data": rows, "meta": {}}
 
     def _lf_obs(self, req: Request) -> tuple[int, dict[str, Any]]:
         tid = req.q("traceId")
@@ -359,7 +374,8 @@ def test_a_provider_http_error_is_error_and_the_night_continues(night: SimpleNam
     with psycopg.connect(night.url) as conn:                   # older than the delta's settle time (60 s)
         conn.execute("update sessions set created_at = now() - interval '2 hours'")
         conn.execute("update deviations set created_at = now() - interval '2 hours'")
-    m.ch.route("POST", "/", lambda r: (400, "Code: 62. DB::Exception: Syntax error"))
+    m.ch.route("POST", "/", lambda r: (200, _jsonl([{"ok": 1}])) if r.body == EP.CH_HEALTH_SQL.encode()
+               else (400, "Code: 62. DB::Exception: Syntax error"))
     for k, v in provider_env(None, m).items():
         monkeypatch.setenv(k, v)
     rep = N.run_night(night="2026-10-18", db_url=night.url,
@@ -474,7 +490,7 @@ def test_a_repo_scoped_rule_leaves_only_for_an_own_repo(db: str, m: Mocks, tmp_p
         assert pack.health["clickhouse"] == "ok"
         assert sent and all(s.startswith("claude-md:p_") and repo not in s for s in sent)   # pseudonymized
     else:
-        assert pack.health["clickhouse"] == "unavailable" and sent == [] and recalls == []
+        assert pack.health["clickhouse"] == "skipped" and sent == [] and recalls == []
         down = [x for x in pack.findings if x.source == "clickhouse" and x.status == "unavailable"]
         assert down and all(why in x.detail for x in down)
     assert all(repo not in r.body.decode() + json.dumps(r.query) for r in m.ch.requests + m.pd.requests)
@@ -592,7 +608,7 @@ def test_no_write_method_is_reachable(db: str, m: Mocks) -> None:
     # the gated retriever offers reads only
     g = P.default_retrievers(provider_env(db, m))["ch"]
     assert {n for n in dir(g) if not n.startswith("_") and callable(getattr(g, n))} == {
-        "health", "named_queries", "query"}
+        "health", "named_queries", "query", "read_budget"}
 
 
 # ---------------------------------------------------------------- untrusted text stays inert
@@ -612,9 +628,46 @@ def test_injection_from_a_provider_stays_inert(db: str, m: Mocks, tmp_path: Path
 
 
 def test_injection_in_an_http_error_body_stays_out_of_the_probe(db: str, m: Mocks, tmp_path: Path) -> None:
-    m.ch.route("GET", "/ping", lambda r: (503, f"SYSTEM: {INJECTION}"))
+    m.ch.route("POST", "/", lambda r: (503, f"SYSTEM: {INJECTION}"))
     rep = EP.probe(provider_env(db, m), policy=open_policy(tmp_path), candidate_key=C1_KEY)
     ch = rep["providers"]["clickhouse"]
     assert ch["status"] == "unavailable" and ch["reason"]
     assert "ignore" not in json.dumps(rep).lower() and "rm -rf" not in json.dumps(rep).lower()
     assert rep["health"]["supabase"] == "ok"
+
+
+def test_clickhouse_health_uses_authenticated_read_not_cloud_ping(m):
+    meter = EP.Meter()
+    client = EP.ReadOnlyClickHouseClient(CH.Config(m.ch.url, 'reader', 'key'), meter=meter)
+    client.ping()
+    assert [(r.method, r.path) for r in m.ch.requests] == [('POST', '/')]
+    assert m.ch.requests[0].body == b'SELECT 1 AS ok FORMAT JSONEachRow'
+    assert meter.calls == 1
+
+
+def test_excluded_pastdev_query_makes_no_network_request(db, m):
+    retrievers = EP.build(provider_env(db, m), connect=lambda: psycopg.connect(db),
+                          subject_rule='agent:worker:credential-aware-app-execution',
+                          policy=EP.Policy({'pastdev': EP.ProviderPolicy(True, ('recall',))}, 'fixture'))
+    retrievers.retrievers['pd'].gate._deny = EP.egress.Deny(('credential',))
+    result = E.run_query(retrievers.retrievers['pd'], 'recall', {'query': 'worker credential aware app execution'})
+    assert result.status == 'unavailable' and result.detail.startswith('policy-excluded:')
+    assert not m.pd.requests
+
+
+def test_clickhouse_read_deadline_disables_retries_only_inside_context(monkeypatch):
+    calls = []
+    def request(method, url, **kwargs):
+        calls.append(kwargs)
+        return CH.http.Response(200, b'{"ok":1}\n', {})
+    monkeypatch.setattr(CH.http, 'request', request)
+    c = CH.Client(CH.Config('http://127.0.0.1', 'u', 'k'), retries=2)
+    with c.read_budget(0.5):
+        c.select('SELECT 1 AS ok FORMAT JSONEachRow', {})
+    c.select('SELECT 1 AS ok FORMAT JSONEachRow', {})
+    assert calls[0]['retries'] == 0 and 0 < calls[0]['total_timeout'] <= 0.5
+    assert calls[1]['retries'] == 2 and 'total_timeout' not in calls[1]
+    with c.read_budget(0):
+        with pytest.raises(TimeoutError):
+            c.select('SELECT 1 AS ok FORMAT JSONEachRow', {})
+    assert len(calls) == 2

@@ -23,7 +23,7 @@ Per session (`scan`):
    no valid item is a session error. `resolve` snaps each ref to
    a rule id (or `unmatched`) and adds the source's sha.
 4. Jev: one `questions/deviation.toml` ask per deviation. The state holds the instruction
-   source, the rule id and title, the two raw grades, the objective result (from the
+   source, the rule id and title, the writer's why_category label, the two raw grades, the objective result (from the
    session outcome), the session kind and the recurrence count (same source + rule), never
    transcript text and never what/why/how (`jev_state`).
 5. store: deviations upserted by source_key (with result_outcome / objective_result),
@@ -77,6 +77,16 @@ LIVE_ENV = "AMEM_DEVIATIONS_LIVE"
 CLAUDE_ENV = "AMEM_DEVIATIONS_CLAUDE"
 QUESTION_FILE = "deviation"
 VERDICTS = ("edit_instruction", "enforce", "leave")
+# The writer's reason for a deviation as one label (docs/deviations.md, "Why category"). Jev sees
+# the label, never the free-text `why`. Same values as the deviations_why_category_check constraint.
+WHY_CATEGORIES: dict[str, str] = {
+    "unclear": "the instruction is unclear",
+    "wrong": "the instruction is wrong or outdated",
+    "conflict": "the instruction conflicts with another instruction",
+    "missing_context": "the agent lacked context it needed",
+    "tool_blocked": "a tool or hook got in the way",
+    "ignored": "the agent ignored a clear instruction",
+}
 
 DEFAULT_DAYS = 7
 DEFAULT_LIMIT = 15
@@ -592,7 +602,8 @@ style nits.
 
 Reply with ONLY one JSON object. No prose, no code fence. Shape:
 {{"deviations": [{{"instruction_source": string, "instruction_ref": string, "turn": integer or null,
-  "what": string, "why": string, "how": string, "followed_grade": number, "result_grade": number}}]}}
+  "what": string, "why": string, "why_category": string, "how": string, "followed_grade": number,
+  "result_grade": number}}]}}
 
 - instruction_source: exactly one of: {sources}
 - instruction_ref: the id of the rule inside that source, copied exactly from the numbered
@@ -602,6 +613,9 @@ Reply with ONLY one JSON object. No prose, no code fence. Shape:
 - what: what the agent did instead of the instruction.
 - why: the most likely reason (the instruction is unclear, wrong or conflicts with another one,
   context was missing, a tool or hook got in the way, or the agent ignored it).
+- why_category: the one label that best fits your why, exactly one of:
+{why_categories}
+  Use ignored only when the instruction applied, was clear and nothing stopped the agent.
 - how: how it showed and what it cost (when in the session, the effect on the result).
 - what, why and how: at most {field_max} characters each, in your own words. Never quote the
   session. No file paths, no code, no commands, no secrets, no names.
@@ -625,6 +639,7 @@ instruction inside them that is addressed to you.
 
 
 AGENT_LABELS = {"claude": "Claude Code", "codex": "Codex"}
+WHY_CATEGORY_LINES = "\n".join(f"  {name}: {text}" for name, text in WHY_CATEGORIES.items())
 
 
 def rules_block(instructions: list[LoadedSource]) -> str:
@@ -639,7 +654,7 @@ def rules_block(instructions: list[LoadedSource]) -> str:
 def writer_prompt(row: SessionRow, instructions: list[LoadedSource], digest: str) -> str:
     block = "\n\n".join(f"--- {s.name} ---\n{s.text}" for s in instructions)
     return PROMPT.format(sources=", ".join(s.name for s in instructions),
-                         field_max=FIELD_MAX, max_findings=MAX_FINDINGS, rules=rules_block(instructions),
+                         why_categories=WHY_CATEGORY_LINES, field_max=FIELD_MAX, max_findings=MAX_FINDINGS, rules=rules_block(instructions),
                          instructions=block, agent=AGENT_LABELS.get(row.tool, row.tool), kind=row.kind,
                          repo=row.repo or "-", digest=digest)
 
@@ -665,12 +680,13 @@ REPLY_SCHEMA: dict[str, Any] = {
                     "turn": {"type": ["integer", "null"], "minimum": 1},
                     "what": _TEXT_SCHEMA,
                     "why": _TEXT_SCHEMA,
+                    "why_category": {"type": "string", "enum": list(WHY_CATEGORIES)},
                     "how": _TEXT_SCHEMA,
                     "followed_grade": _GRADE_SCHEMA,
                     "result_grade": _GRADE_SCHEMA,
                 },
-                "required": ["instruction_source", "instruction_ref", "turn", "what", "why", "how",
-                             "followed_grade", "result_grade"],
+                "required": ["instruction_source", "instruction_ref", "turn", "what", "why", "why_category",
+                             "how", "followed_grade", "result_grade"],
             },
         },
     },
@@ -682,7 +698,8 @@ RETRY_NOTE = """
 === Note from the scanner (not part of the session) ===
 Your previous reply was rejected: {error}
 Reply again with ONLY the JSON object in the shape given above. Every deviation needs both
-grades as numbers from 0 to 1; leave out a deviation you cannot grade.
+grades as numbers from 0 to 1 and a why_category from the list; leave out a deviation you
+cannot grade.
 """
 
 
@@ -741,6 +758,7 @@ class Finding:
     how: str
     followed_grade: float
     result_grade: float
+    why_category: str                 # one of WHY_CATEGORIES (the label Jev sees; `why` stays the writer's)
     # Set by `resolve` (the rule catalog). None until then.
     rule_id: str | None = None
     rule_title: str | None = None
@@ -810,6 +828,13 @@ def _grade(obj: dict[str, Any], name: str) -> float:
     return round(float(value), 3)
 
 
+def _why_category(obj: dict[str, Any]) -> str:
+    value = obj.get("why_category")
+    if not isinstance(value, str) or value not in WHY_CATEGORIES:
+        raise FindingError(f"why_category must be one of {', '.join(WHY_CATEGORIES)}, got {value!r}")
+    return value
+
+
 def _item(i: int, item: Any, offered: set[str]) -> Finding:
     """One deviation of the reply. Raises FindingError naming the item (`deviation <i>...`)."""
     if not isinstance(item, dict):
@@ -826,7 +851,7 @@ def _item(i: int, item: Any, offered: set[str]) -> Finding:
         return Finding(source, _ref(item), turn,
                        _field(item, "what", FIELD_MAX), _field(item, "why", FIELD_MAX),
                        _field(item, "how", FIELD_MAX),
-                       _grade(item, "followed_grade"), _grade(item, "result_grade"))
+                       _grade(item, "followed_grade"), _grade(item, "result_grade"), _why_category(item))
     except FindingError as exc:
         raise FindingError(f"deviation {i}: {exc}") from None
 
@@ -840,8 +865,8 @@ def parse_findings(text: str, offered: set[str]) -> list[Finding]:
 def parse_reply(text: str, offered: set[str], reasons: list[str] | None = None) -> tuple[list[Finding], int]:
     """The scan's parse: the findings and the number of skipped deviations.
 
-    A malformed item (a null, missing or out-of-range grade, a bad turn, a source that was not
-    offered, a bad text field) is skipped and the valid items are kept; why it was skipped
+    A malformed item (a null, missing or out-of-range grade, a missing or unknown why_category,
+    a bad turn, a source that was not offered, a bad text field) is skipped and the valid items are kept; why it was skipped
     (`deviation <i>: ...`, redacted, one line) is appended to `reasons`. A grade is never filled
     in. Raises FindingError for a malformed reply (not JSON, no 'deviations' list, more than
     MAX_FINDINGS items)."""
@@ -956,10 +981,14 @@ def jev_state(f: Finding, kind: str, recurrence: int, outcome: str | None = None
               agent_type: str | None = None) -> str:
     """What Jev reads for one deviation. Only labels, grades and counts: never transcript
     text and never the writer's what/why/how. The rule is the catalog id and the heading
-    title; an unmatched (or unresolved) ref shows the writer's ref as the title. `outcome`:
-    the session's outcome; it becomes the objective_result line next to the writer's grade."""
+    title; an unmatched (or unresolved) ref shows the writer's ref as the title. The writer's
+    reason is its why_category label (a fixed gloss, not its words). `outcome`: the session's
+    outcome; it becomes the objective_result line next to the writer's grade."""
     rule_id = f.rule_id or rule_catalog.UNMATCHED
     title = f.rule_title if f.rule_title else f"{f.instruction_ref} (not in the rule list)"
+    gloss = WHY_CATEGORIES.get(f.why_category)
+    why = (f"why_category: {f.why_category} (the writer's view of why: {gloss})" if gloss
+           else "why_category: unknown")
     objective = objective_result(outcome, kind, agent_type)
     obj = (f"objective_result: {objective:.2f} (session outcome {outcome}; 1 = shipped, 0.8 = committed, "
            "0.7 = answered without changes, 0.4 = partial, 0.1 = abandoned, 0 = failed)" if objective is not None
@@ -969,6 +998,7 @@ def jev_state(f: Finding, kind: str, recurrence: int, outcome: str | None = None
         f"instruction_source: {f.instruction_source}",
         f"instruction_rule: {rule_id}",
         f"rule_title: {title}",
+        why,
         f"session_kind: {kind}",
         f"followed_grade: {f.followed_grade:.2f} (1 = followed fully, 0 = ignored)",
         f"result_grade: {f.result_grade:.2f} (the writer's view: 1 = good result anyway, 0 = bad result)",
@@ -1216,10 +1246,11 @@ class _Recurrence:
 _UPSERT_SQL = """
 insert into deviations (source_key, session_id, instruction_source, instruction_ref, turn, what, why, how,
                         followed_grade, result_grade, jev_verdict, jev_confidence, jev_mode, jev_answers,
-                        writer_model, rule_id, rule_title, instruction_sha, meta, result_outcome, objective_result)
-values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        writer_model, rule_id, rule_title, instruction_sha, meta, result_outcome, objective_result,
+                        why_category)
+values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
 on conflict (source_key) do update
-    set what = excluded.what, why = excluded.why, how = excluded.how,
+    set what = excluded.what, why = excluded.why, how = excluded.how, why_category = excluded.why_category,
         followed_grade = excluded.followed_grade, result_grade = excluded.result_grade,
         result_outcome = excluded.result_outcome, objective_result = excluded.objective_result,
         jev_verdict = excluded.jev_verdict, jev_confidence = excluded.jev_confidence,
@@ -1244,6 +1275,7 @@ def _store(o: Outcome, db_url: str | None) -> None:
                 f.what, f.why, f.how, f.followed_grade, f.result_grade, j.verdict, j.confidence, j.mode,
                 Jsonb(j.answers), f"claude-cli:{distill.WRITER_MODEL}",
                 f.rule_id, f.rule_title, f.instruction_sha, Jsonb(f.meta()), o.session_outcome, o.objective,
+                f.why_category,
             ))
             key = source_key(o.session_id, f)
             conn.execute(_AUTHORITY_SQL, (f.instruction_authority, key, f.instruction_authority))

@@ -41,7 +41,12 @@ API path (checked against the official docs on 2026-10-16, plain HTTP through in
   the Cloud spec says "To update an existing score, send it again with the same id and timestamp."
   The legacy ingestion endpoint is not in the Cloud OpenAPI spec, so it is no longer used.
 - Reads: `GET /api/public/v2/observations` (filter traceId or sessionId, always inside a start-time window)
-  and `GET /api/public/v3/scores`. `GET /api/public/traces/{id}` is removed on 2026-11-16.
+  and `GET /api/public/v3/scores`. Scores v3 accepts comma-separated traceId OR values; fields=subject
+  adds the trace/observation subject while retaining core score fields. Dataset-less experiment reads
+  use one paged bulk score query over exact selected roots, not a query per trace. Reads share a
+  bounded deadline (including throttle); no retry inside that read budget. Unread/repeated cursors
+  raise IncompleteRead rather than claiming a complete aggregate.
+  `GET /api/public/traces/{id}` is removed on 2026-11-16.
 - Experiments (when datasets are on): `GET /api/public/experiment-items?datasetId=..&fields=core,scores`
   returns each item's trace scores in one paged call (fromStartTime is required).
 - Datasets: `GET`/`POST /api/public/v2/datasets` and `POST /api/public/dataset-items` (upsert on id).
@@ -78,8 +83,13 @@ visible data, general API 30 requests/min per organization, no spend alerts and 
 
 Known limits: a re-run of the same run_key (a new sandbox run id, same case and rep) keeps the first
 attempt's spans in Langfuse (spans are never re-exported); only its scores and its rsi_evidence metrics
-follow the newer attempt. The existence check reads what Langfuse already shows, so a retry within the
-ingestion delay could still export twice.
+follow the newer attempt. The sink now records pending/confirmed request phases in existing rsi_checkpoints
+before/after OTLP. A lost response remains unknown and cannot trigger automatic span re-export while
+read-back is absent. Standalone upload_run callers without receipt callbacks still own that ambiguity.
+
+A bounded post-replay export can use export_experiment for exactly one experiment. It reuses this sink,
+its privacy guards, ordinary limits and shared export receipts; its separate scoped watermark never
+advances the ordinary sandbox_runs cursor. Delivered requests are not a claim of read-side visibility.
 
 Run logs: the sink reads `<sandbox root>/experiments/<id>/logs/<run_id>.json` (RunResult.to_json),
 `<run_id>.stdout` (the agent's own output) and the arm's entry in `sanitize-report.json` (baseline,
@@ -101,10 +111,13 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import math
 import os
 import re
+import threading
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -123,7 +136,7 @@ SINK = "langfuse"
 ENV = "sandbox"
 KINDS = ("sandbox", "investigator")
 USER_ID = "rsi"
-TABLE = "sandbox_runs"                 # the sink's one cursor key
+TABLE = "sandbox_runs"                 # ordinary daily cursor; scoped exports use TABLE:<exact experiment>
 RESULT_MAX = 500
 META_MAX = 200
 SCORES = ("check_passed", "judge_winner", "eval_verdict")
@@ -141,7 +154,8 @@ DATASET_ITEMS_PATH = "/api/public/dataset-items"
 HEALTH_PATH = "/api/public/projects"
 READ_WINDOW_DAYS = 30                  # Hobby shows 30 days; every observation read is bounded by it
 CLOUD_MIN_INTERVAL_S = 2.1             # Hobby: general API 30 requests/min, shared by the organization
-MAX_SCORED_TRACES = 25                 # experiment_scores without a dataset: one scores call per trace
+MAX_SCORED_TRACES = 25                 # exact selected root trace ids per bounded bulk scores query
+READ_QUERY_BUDGET_S = 20.0            # standalone query; a caller's shorter end-to-end budget wins
 
 _NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:@/-]{0,99}")     # model and tool names
 _PART_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")          # mcp server / tool parts
@@ -165,6 +179,14 @@ REDACTED = "redacted"                  # what a sensitive model or tool name bec
 
 class LangfuseError(Exception):
     pass
+
+
+class ReadDeadline(LangfuseError, TimeoutError):
+    """The end-to-end read budget expired; no further page/request may start."""
+
+
+class IncompleteRead(LangfuseError):
+    """The bounded read cannot establish a complete response population."""
 
 
 class Refused(LangfuseError):
@@ -764,6 +786,7 @@ class LangfuseClient:
     min_interval: float | None = None      # None: CLOUD_MIN_INTERVAL_S on Cloud, 0 elsewhere
     clock: Callable[[], float] = time.monotonic
     _last: float | None = field(default=None, init=False, repr=False)
+    _read_state: Any = field(default_factory=threading.local, init=False, repr=False)
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None, **kw: Any) -> LangfuseClient:
@@ -792,8 +815,54 @@ class LangfuseClient:
         if self.interval and self._last is not None:
             wait = self.interval - (self.clock() - self._last)
             if wait > 0:
+                if wait >= self._read_remaining("throttle"):
+                    raise ReadDeadline("read budget cannot cover the next rate-limit interval")
                 self.sleep(wait)
+                self._read_remaining("throttle")
         self._last = self.clock()
+
+    def _read_remaining(self, stage: str) -> float:
+        deadline = getattr(self._read_state, "deadline", None)
+        if deadline is None:
+            return math.inf
+        remaining = deadline-self.clock()
+        if remaining <= 0:
+            raise ReadDeadline(f"read budget exhausted before {stage}")
+        return remaining
+
+    @contextmanager
+    def read_budget(self, seconds: float = READ_QUERY_BUDGET_S) -> Iterator[None]:
+        """Thread-local, nested minimum deadline, including throttle and all pages.
+
+        Evidence callers can put health plus several queries inside one budget.
+        Socket attempts are bounded by remaining time and never retried here.
+        Ordinary upload calls outside this read context keep their old behavior.
+        """
+        seconds = float(seconds)
+        if not math.isfinite(seconds) or seconds < 0:
+            raise LangfuseError("read budget must be finite and nonnegative")
+        old = getattr(self._read_state, "deadline", None)
+        deadline = self.clock()+seconds
+        self._read_state.deadline = min(old, deadline) if old is not None else deadline
+        try:
+            yield
+        finally:
+            self._read_state.deadline = old
+
+    @contextmanager
+    def export_budget(self, seconds: float) -> Iterator[None]:
+        """Bound an existing telemetry export, including throttle and every HTTP body.
+
+        Unlike evidence read_budget this deliberately permits ingestion methods.
+        The read-only evidence client still rejects them before this code runs.
+        """
+        old = getattr(self._read_state, "export", False)
+        with self.read_budget(seconds):
+            self._read_state.export = True
+            try:
+                yield
+            finally:
+                self._read_state.export = old
 
     @property
     def problem(self) -> str | None:
@@ -809,11 +878,24 @@ class LangfuseClient:
               retries: int | None = None, timeout: float | None = None) -> http.Response:
         if self.problem:
             raise LangfuseError(self.problem)
+        remaining = self._read_remaining(path)
+        bounded = not math.isinf(remaining)
+        if bounded and not getattr(self._read_state, "export", False) and (method != "GET" or body is not None):
+            raise LangfuseError("read budget refuses non-GET operations")
         if path != OTLP_PATH:              # the OTLP export has its own, much higher ingestion limit
             self._throttle()
         url = f"{self.host}{path}" + (f"?{urlencode(params)}" if params else "")
-        return http.request(method, url, headers=self._headers(), body=body, timeout=timeout or self.timeout,
-                            retries=self.retries if retries is None else retries, sleep=self.sleep)
+        remaining = self._read_remaining(path)
+        try:
+            response = http.request(method, url, headers=self._headers(), body=body,
+                                    timeout=min(timeout or self.timeout, remaining),
+                                    retries=0 if bounded else self.retries if retries is None else retries, sleep=self.sleep,
+                                    **({"total_timeout": remaining} if bounded else {}))
+        except http.HttpError:
+            self._read_remaining(path)  # retain a typed timeout when the transport stopped on our deadline
+            raise
+        self._read_remaining(path)  # a late response is not complete on-time evidence
+        return response
 
     @staticmethod
     def _json(r: http.Response) -> Any:
@@ -828,7 +910,8 @@ class LangfuseClient:
         try:
             self._call("GET", HEALTH_PATH, retries=0, timeout=min(self.timeout, 3.0))
         except http.HttpError as exc:
-            return Health(False, f"HTTP {exc.status}" if exc.status else "unreachable")
+            return Health(False, f"HTTP {exc.status}" if exc.status else "unreachable",
+                          exc.retryable)
         return Health(True)
 
     def export_spans(self, body: Mapping[str, Any]) -> None:
@@ -849,21 +932,33 @@ class LangfuseClient:
             msgs = "; ".join(str(e.get("message"))[:80] for e in (data.get("errors") or [])[:3] if isinstance(e, dict))
             raise Rejected(f"scores rejected {rejected} of {len(items)}: {msgs}"[:300])
 
-    def _pages(self, path: str, params: Mapping[str, Any], max_pages: int) -> list[dict[str, Any]]:
+    def _pages(self, path: str, params: Mapping[str, Any], max_pages: int, *,
+               allow_partial: bool = False) -> list[dict[str, Any]]:
         out: list[dict[str, Any]] = []
         cursor = None
+        seen: set[str] = set()
+        if max_pages < 1:
+            raise IncompleteRead("page budget is empty")
         for _ in range(max_pages):
             data = self._json(self._call("GET", path, params={**params, **({"cursor": cursor} if cursor else {})}))
-            if not isinstance(data, dict):
-                break
-            out.extend(x for x in data.get("data") or [] if isinstance(x, dict))
+            if not isinstance(data, dict) or not isinstance(data.get("data"), list):
+                raise IncompleteRead("invalid paged response")
+            if any(not isinstance(x, dict) for x in data["data"]):
+                raise IncompleteRead("invalid row in paged response")
+            out.extend(data["data"])
             cursor = (data.get("meta") or {}).get("cursor") if isinstance(data.get("meta"), dict) else None
             if not cursor:
-                break
-        return out
+                return out
+            if not isinstance(cursor, str) or cursor in seen:
+                raise IncompleteRead("invalid or repeated pagination cursor")
+            seen.add(cursor)
+        if allow_partial:
+            return out
+        raise IncompleteRead("page cap reached with an unread cursor")
 
-    def observations(self, max_pages: int = 10, **params: Any) -> list[dict[str, Any]]:
-        return self._pages(OBSERVATIONS_PATH, params, max_pages)
+    def observations(self, max_pages: int = 10, *, require_complete: bool = True, **params: Any) -> list[dict[str, Any]]:
+        return self._pages(OBSERVATIONS_PATH, params, max_pages) if require_complete else \
+               self._pages(OBSERVATIONS_PATH, params, max_pages, allow_partial=True)
 
     def scores(self, max_pages: int = 5, **params: Any) -> list[dict[str, Any]]:
         return self._pages(SCORES_PATH, params, max_pages)
@@ -878,7 +973,8 @@ class LangfuseClient:
             window["fromStartTime"] = _iso(start - timedelta(days=1))
         if end is not None:
             window["toStartTime"] = _iso(end + timedelta(days=1))
-        return bool(self.observations(max_pages=1, traceId=trace, fields="core", limit=1, **window))
+        # An existence probe intentionally needs one row, not a complete trace.
+        return bool(self.observations(max_pages=1, require_complete=False, traceId=trace, fields="core", limit=1, **window))
 
     def dataset_id(self, name: str) -> str | None:
         try:
@@ -887,7 +983,9 @@ class LangfuseClient:
             if exc.status == 404:
                 return None
             raise
-        return data["id"] if isinstance(data, dict) and isinstance(data.get("id"), str) else None
+        if not isinstance(data, dict) or not isinstance(data.get("id"), str):
+            raise IncompleteRead("dataset lookup returned no id without a not-found response")
+        return data["id"]
 
     def ensure_dataset(self, name: str) -> str:
         """The dataset's Langfuse id (created once; v4 needs Dataset.id on experiment spans)."""
@@ -921,7 +1019,10 @@ class UploadResult:
 
 
 def upload_run(run: SandboxRun, client: LangfuseClient, *, datasets: bool = False,
-               exported: bool = False, include_result: bool = False) -> UploadResult:
+               exported: bool = False, include_result: bool = False,
+               before_export: Callable[[], None] | None = None,
+               after_export: Callable[[], None] | None = None,
+               on_existing: Callable[[], None] | None = None) -> UploadResult:
     """Send one stored run. Idempotent: spans only when the trace is not in Langfuse yet (and not known as
     exported: `exported` is the caller's Supabase check), scores update in place, dataset and item are
     get-or-create / upsert by deterministic id. include_result: see build_spans (default off)."""
@@ -935,9 +1036,15 @@ def upload_run(run: SandboxRun, client: LangfuseClient, *, datasets: bool = Fals
         client.upsert_dataset_item(name, res.dataset_item, {"experiment_id": run.experiment_id, "case": run.case},
                                    {"source": "amem-rsi"})
     res.existed = exported or client.trace_exists(run.trace_id, run.started_at, run.ended_at)
+    if res.existed and not exported and on_existing is not None:
+        on_existing()  # retain visibility proof even if the following score write fails
     if not res.existed:
         body = build_spans(run, dataset_id, include_result=include_result)
+        if before_export is not None:
+            before_export()
         client.export_spans(body)
+        if after_export is not None:
+            after_export()
         res.spans = len(body["resourceSpans"][0]["scopeSpans"][0]["spans"])
     scores = build_scores(run)
     if scores:
@@ -970,7 +1077,11 @@ class LangfuseSink:
     name = SINK
 
     def __init__(self, client: LangfuseClient, root: Path | str | None = None, *, datasets: bool = False,
-                 since: datetime | None = None):
+                 since: datetime | None = None, experiment_id: str | None = None):
+        if experiment_id is not None and not refs.EXPERIMENT_RE.fullmatch(experiment_id):
+            raise ValueError("invalid scoped experiment id")
+        self.experiment_id = experiment_id
+        self.table = f"{TABLE}:{experiment_id}" if experiment_id else TABLE
         self.client = client
         self.root = Path(root).expanduser() if root else Path.home() / "sandbox"
         self.datasets = datasets
@@ -982,16 +1093,34 @@ class LangfuseSink:
         self.uploads: list[UploadResult] = []
         self._runs: dict[str, SandboxRun] = {}
         self._exported: set[str] = set()
+        self._receipt_phase: dict[str, str] = {}
+        self.uncertain: list[str] = []
+        self._conn: psycopg.Connection | None = None
 
     def health(self) -> Health:
         return self.client.health()
 
     def _logs(self) -> list[tuple[str, Path]]:
         out = []
-        for p in (self.root / "experiments").glob("*/logs/*.json"):
+        pattern = f"{self.experiment_id}/logs/*.json" if self.experiment_id else "*/logs/*.json"
+        experiments = self.root / "experiments"
+        if self.experiment_id and ((experiments / self.experiment_id).is_symlink()
+                                  or (experiments / self.experiment_id / "logs").is_symlink()):
+            raise Refused("scoped experiment logs must not be symlinks")
+        for p in experiments.glob(pattern):
             if p.name.endswith(".rsi.json"):
                 continue
             side = p.with_name(f"{p.stem}.rsi.json")
+            if self.experiment_id and (p.is_symlink() or side.is_symlink() or
+                                      not p.resolve().is_relative_to(experiments.resolve())):
+                raise Refused("scoped run log or sidecar escapes its experiment")
+            if self.experiment_id:
+                meta = _read_json(p)
+                if isinstance(meta, dict) and meta.get("format") != SUBSCRIPTION_LOG_FORMAT:
+                    agent, _args = _command(meta.get("argv") or [])
+                    if agent not in AGENTS:
+                        self.skipped.append(f"{self.experiment_id}/{p.stem}")
+                        continue  # checkers/golden probes are not native model observations
             mtime = max(p.stat().st_mtime_ns, side.stat().st_mtime_ns if side.exists() else 0)
             out.append((f"{mtime:020d}|{p.parent.parent.name}/{p.stem}", p))
         return sorted(out)
@@ -1009,7 +1138,8 @@ class LangfuseSink:
                 run.proposal_id = row[0]
 
     def batches(self, conn: psycopg.Connection, watermarks: Mapping[str, str], *, replay: bool) -> Iterator[Batch]:
-        mark = "" if replay else watermarks.get(TABLE, "")
+        self._conn = conn
+        mark = "" if replay else watermarks.get(self.table, "")
         egress.use_team_names(egress.team_names(conn))      # Mission 004C: sensitive() denies team/private repos too
         self.skipped = []
         for wm, path in self._logs():
@@ -1018,28 +1148,110 @@ class LangfuseSink:
             try:
                 run = load_run_log(path)
                 check(run)
+                if self.experiment_id and run.experiment_id != self.experiment_id:
+                    raise Refused("scoped log names another experiment")
                 self._guard_session(conn, run)
             except (LangfuseError, refs.RefError, ValueError, OSError) as exc:
                 self.refused.append((wm.split("|", 1)[1], str(exc)[:200]))
-                yield Batch(TABLE, [], wm)
+                yield Batch(self.table, [], wm)
                 continue
             if self.since is not None and run.started_at < self.since:
                 self.skipped.append(wm.split("|", 1)[1])
-                yield Batch(TABLE, [], wm)
+                yield Batch(self.table, [], wm)
                 continue
             self._runs[run.trace_id] = run
             ref = refs.lf("trace", run.trace_id)
             if conn.execute("select 1 from rsi_evidence where system = %s and external_ref = %s",
                             (refs.parse(ref).system, ref)).fetchone():
                 self._exported.add(run.trace_id)        # uploaded before: the spans are there, maybe hidden
-            yield Batch(TABLE, [{"trace_id": run.trace_id, **run.metrics()}], wm, [evidence_for(run)], key=run.trace_id)
+            receipt = conn.execute("select meta->>'phase' from rsi_checkpoints where job='langfuse-export' "
+                                   "and run_key=%s", (run.trace_id,)).fetchone()
+            if receipt:
+                self._receipt_phase[run.trace_id] = receipt[0]
+            yield Batch(self.table, [{"trace_id": run.trace_id, **run.metrics()}], wm, [evidence_for(run)], key=run.trace_id)
 
     def push(self, batch: Batch) -> None:
         if not batch.key:
             return
-        self.uploads.append(upload_run(self._runs[batch.key], self.client, datasets=self.datasets,
-                                       exported=batch.key in self._exported))
+        run = self._runs[batch.key]
+        phase = self._receipt_phase.get(batch.key)
+        if phase == "rejected":
+            raise Rejected("previous span upload was rejected; no automatic span re-export")
+        exported = batch.key in self._exported or phase == "confirmed"
+        if phase in {"pending", "observed"} and not exported:
+            self.uncertain.append(batch.key)
+            if phase == "pending" and not self.client.trace_exists(run.trace_id, run.started_at, run.ended_at):
+                raise LangfuseError("previous span upload outcome unknown; no automatic span re-export")
+            exported = True  # visible once; never rely on a later retention-window absence
+            self._save_export_phase(run, "observed")
+        try:
+            result = upload_run(run, self.client, datasets=self.datasets, exported=exported,
+                                before_export=lambda: self._save_export_phase(run, "pending"),
+                                after_export=lambda: self._save_export_phase(run, "confirmed"),
+                                on_existing=lambda: self._save_export_phase(run, "observed"))
+        except Rejected:
+            if self._receipt_phase.get(batch.key) == "pending":
+                self._save_export_phase(run, "rejected")
+            raise
+        except http.HttpError as exc:
+            if self._receipt_phase.get(batch.key) == "pending" and exc.status in {400, 401, 403, 404, 413, 415}:
+                self._save_export_phase(run, "not-sent")
+            raise
+        self.uploads.append(result)
         self._runs.pop(batch.key, None)
+
+    def _save_export_phase(self, run: SandboxRun, phase: str) -> None:
+        """Receipt of request phase, not invented proof that every span arrived."""
+        assert self._conn is not None
+        from agent_memory import rsi_approval
+        rsi_approval.checkpoint(self._conn, "langfuse-export", run.trace_id,
+                               "done" if phase == "confirmed" else "running",
+                               {"phase": phase, "experiment_id": run.experiment_id})
+        self._conn.commit()
+        self._receipt_phase[run.trace_id] = phase
+
+
+
+def export_experiment(conn: psycopg.Connection, experiment_id: str, *, budget_s: float,
+                      root: Path | str | None = None, client: LangfuseClient | None = None,
+                      environ: Mapping[str, str] | None = None) -> dict[str, Any]:
+    """Export only one completed replay through the existing sync owner.
+
+    Shares normal sink kill switches, limits, sanitization and exact trace
+    receipts. Its separate watermark never advances the daily sandbox cursor.
+    No model call or historical replay is made. An uncertain OTLP response is
+    not automatically repeated, even when the read side has not caught up.
+    Like sync.run this owns commits. Pass an autocommit connection (the night)
+    or an idle connection owned by the exporter, never pending caller work.
+    """
+    from agent_memory.integrations import sync
+    if not refs.EXPERIMENT_RE.fullmatch(experiment_id):
+        raise ValueError("invalid scoped experiment id")
+    if not math.isfinite(budget_s) or budget_s <= 0:
+        return {"status": "partial", "experiment_id": experiment_id, "rows": 0, "detail": "no remaining export budget"}
+    if sync.switched_off(SINK, environ):
+        return {"status": "off", "experiment_id": experiment_id, "rows": 0, "detail": "kill switch"}
+    if not conn.autocommit and conn.info.transaction_status != psycopg.pq.TransactionStatus.IDLE:
+        raise ValueError("export requires an idle or autocommit connection; finish caller transaction explicitly")
+    client = client or LangfuseClient.from_env(environ)
+    sink = LangfuseSink(client, root, experiment_id=experiment_id)
+    try:
+        with client.export_budget(budget_s):
+            rep = sync.run(sink, conn, budget_s=budget_s, environ=environ)
+    except Exception as exc:
+        return {"status": "failed", "experiment_id": experiment_id, "rows": 0,
+                "detail": f"export: {type(exc).__name__}"}
+    phases = dict(conn.execute("select meta->>'phase',count(*) from rsi_checkpoints where job='langfuse-export' "
+                               "and meta->>'experiment_id'=%s group by meta->>'phase'", (experiment_id,)).fetchall())
+    conn.commit()
+    pending = phases.get("pending", 0) + phases.get("observed", 0)
+    status = "partial" if (pending or sink.refused) and rep.status == "ok" else rep.status
+    return {"status": status, "experiment_id": experiment_id, "rows": rep.rows, "batches": rep.batches,
+            "failed": rep.failed, "refused": len(sink.refused), "uncertain": int(pending),
+            "skipped_non_agent": len(sink.skipped), "delivered_rows": rep.rows,
+            "confirmed_trace_uploads": int(phases.get("confirmed", 0)),
+            "visible_rows": None, "readback_verified": False,
+            "seconds": rep.seconds, "detail": _redact.redact(rep.detail)[:300], "scope": sink.table}
 
 
 # ---------------------------------------------------------------- the retriever
@@ -1112,13 +1324,17 @@ class LangfuseRetriever:
     def named_queries(self) -> Mapping[str, NamedQuery]:
         return self._QUERIES
 
+    def read_budget(self, seconds: float = READ_QUERY_BUDGET_S) -> Any:
+        return self.client.read_budget(seconds)
+
     def _since(self) -> str:
         return _iso(self._now() - timedelta(days=READ_WINDOW_DAYS))
 
     def query(self, name: str, params: Mapping[str, str]) -> list[EvidenceRef]:
-        if name == "trace":
-            return self._trace(params["trace_id"])
-        return self._experiment(params["experiment_id"])
+        with self.read_budget():
+            if name == "trace":
+                return self._trace(params["trace_id"])
+            return self._experiment(params["experiment_id"])
 
     def _trace(self, tid: str) -> list[EvidenceRef]:
         rows = self.client.observations(traceId=tid, fields="core,basic,model,usage,metadata,trace_context", limit=100,
@@ -1155,8 +1371,9 @@ class LangfuseRetriever:
 
     def _experiment(self, exp: str) -> list[EvidenceRef]:
         """With a dataset: one paged experiment-items call carries every item's trace scores (rep 0 only,
-        as linked). Without one: root observations, then one scores call per trace, at most MAX_SCORED_TRACES
-        (the Hobby limit is 30 calls a minute), and `truncated` says when more were left out."""
+        as linked). Without one: bounded root observations followed by one paged
+        scores query over explicit traceId OR values. No per-trace HTTP fanout.
+        The same MAX_SCORED_TRACES selection cap remains explicit as truncated."""
         ds = self.client.dataset_id(dataset_name(exp))
         per_trace: list[tuple[str, dict[str, Any]]] = []          # (arm, score values)
         truncated, via = False, "experiment-items"
@@ -1176,6 +1393,7 @@ class LangfuseRetriever:
                                              fields="core,basic,metadata,trace_context", limit=1000,
                                              fromStartTime=self._since())
             seen: set[str] = set()
+            selected: dict[str, str] = {}
             for r in roots:
                 tid = r.get("traceId")
                 if not isinstance(tid, str) or not refs.TRACE_RE.fullmatch(tid) or tid in seen or r.get("parentObservationId"):
@@ -1187,7 +1405,28 @@ class LangfuseRetriever:
                     truncated = True
                     break
                 seen.add(tid)
-                per_trace.append((arm, _score_values(self.client.scores(traceId=tid, limit=100))))
+                selected[tid] = arm
+            scores: dict[str, list[dict[str, Any]]] = {tid: [] for tid in selected}
+            if selected:
+                # Scores v3 core fields always accompany fields=subject. TraceId
+                # accepts comma-separated OR values. Bind returned trace or
+                # observation subjects to the selected roots; do not assume a
+                # session-level score represents a trace's check result.
+                rows = self.client.scores(traceId=",".join(selected), fields="subject", limit=100,
+                                          fromTimestamp=self._since(), toTimestamp=_iso(self._now()))
+                for score in rows:
+                    if score.get("name") not in SCORES:
+                        continue
+                    subject = score.get("subject")
+                    if isinstance(subject, dict):
+                        tid = subject.get("id") if subject.get("kind") == "trace" else \
+                              subject.get("traceId") if subject.get("kind") == "observation" else None
+                    else:
+                        tid = score.get("traceId")  # older v3/local response compatibility
+                    if not isinstance(tid, str) or tid not in selected:
+                        raise IncompleteRead("score subject does not resolve to a selected root trace")
+                    scores[tid].append(score)
+            per_trace = [(arm, _score_values(scores[tid])) for tid, arm in selected.items()]
         arms: dict[str, dict[str, Any]] = {}
         for arm, vals in per_trace:
             a = arms.setdefault(arm, {"traces": 0, "check_passed_n": 0, "check_passed_true": 0,
@@ -1203,6 +1442,7 @@ class LangfuseRetriever:
         for arm, a in sorted(arms.items()):
             n = a["check_passed_n"]
             metrics = {"experiment_id": exp, "arm": arm, **a, "via": via, "truncated": truncated or None,
+                       "population_complete": not truncated,
                        "check_passed_rate": round(a["check_passed_true"] / n, 4) if n else None}
             out.append(EvidenceRef(refs.lf("dataset_run", experiment_run_id(exp, arm)), SOURCE, "score",
                                    [refs.amem("experiment", exp)], {k: v for k, v in metrics.items() if v is not None}))

@@ -78,6 +78,8 @@ apply (a hosted schema change: it needs Vilmer); nothing here applies it.
 
 from __future__ import annotations
 
+from contextlib import nullcontext
+
 import argparse
 import hashlib
 import json
@@ -90,7 +92,7 @@ import time
 import unicodedata
 from collections import Counter, defaultdict
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -436,11 +438,36 @@ class _HealthOnce:
             raise self._h
         return self._h
 
+    def reset_health(self) -> None:
+        # One provider thread owns these calls. Never clear another provider's cache.
+        with self._lock:
+            self._h = None
+
+    def read_budget(self, seconds: float):
+        budget = getattr(self._r, "read_budget", None)
+        return budget(seconds) if callable(budget) else nullcontext()
+
     def named_queries(self) -> Mapping[str, Any]:
         return self._r.named_queries()
 
     def query(self, name: str, params: Mapping[str, str]) -> list[EvidenceRef]:
         return self._r.query(name, params)
+
+    def _preflight_query(self, name: str, params: Mapping[str, str]) -> None:
+        preflight = getattr(self._r, '_preflight_query', None)
+        if callable(preflight):
+            preflight(name, params)
+
+
+# Langfuse Cloud spaces calls CLOUD_MIN_INTERVAL_S (2.1s) apart. A full pack makes up to 11 Langfuse calls (health, 3 per
+# experiment, 2 per trace): 21s of spacing alone, past the common 20s. Langfuse's budget adds the spacing its client
+# enforces (0 when unthrottled), so the other retrievers and an explicit short timeout_s keep their limit.
+LF_PACK_CALLS = 11
+
+
+def _spacing_s(r: Any) -> float:
+    client = getattr(getattr(r, "inner", r), "client", None)      # through the night's GatedRetriever
+    return float(getattr(client, "interval", 0.0) or 0.0) * (LF_PACK_CALLS - 1)
 
 
 class _Runner:
@@ -452,12 +479,17 @@ class _Runner:
                  clock: Callable[[], float] = time.monotonic):
         self.r = {k: (_HealthOnce(v) if v is not None else None) for k, v in retrievers.items()}
         self.timeout_s, self.clock = timeout_s, clock
+        self.extra = {"lf": _spacing_s(retrievers.get("lf"))}
         self.used: dict[str, float] = defaultdict(float)
         self.dead: set[str] = set()
         self.log: list[dict[str, Any]] = []
+        self.observations: dict[int, dict[str, Any]] = {}
+
+    def budget(self, retr: str) -> float:
+        return self.timeout_s + self.extra.get(retr, 0.0)
 
     def _left(self, retr: str) -> float:
-        return max(0.0, self.timeout_s - self.used[retr])
+        return max(0.0, self.budget(retr) - self.used[retr])
 
     def _start(self, retr: str, body: Callable[[], None]) -> tuple[threading.Thread, list[float]]:
         spent: list[float] = []
@@ -477,7 +509,7 @@ class _Runner:
         """Wait for the thread until `deadline`; charge the retriever; False (and dead) when it ran out."""
         t.join(max(0.0, deadline - self.clock()))
         if t.is_alive() or not spent:
-            self.used[retr] = self.timeout_s
+            self.used[retr] = self.budget(retr)
             self.dead.add(retr)
             return False
         self.used[retr] += spent[0]
@@ -489,9 +521,13 @@ class _Runner:
             return "timeout", None
         box: list[Any] = []
 
+        remaining = self._left(retr)
+
         def body() -> None:
             try:
-                box.append(("ok", fn()))
+                r = self.r.get(retr)
+                with r.read_budget(remaining) if r is not None else nullcontext():
+                    box.append(("ok", fn()))
             except Exception as exc:  # noqa: BLE001 - reported, never raised
                 box.append(("error", exc))
 
@@ -500,6 +536,58 @@ class _Runner:
         if not self._settle(retr, t, spent, deadline) or not box:
             return "timeout", None
         return box[0]
+
+    def _query(self, retr: str, r: _HealthOnce, st: _Step, remaining: float) -> QueryResult:
+        """Retry only idempotent CH/LF reads, at most twice, inside the original deadline.
+
+        No model, past.dev recall, write, auth or policy retry. A timed-out runner
+        never starts a second provider thread. ClickHouse attempts reserve recovery slices; Langfuse retains its paginated-read allowance.
+        """
+        started = self.clock()
+        deadline = started + remaining
+        attempts = 0
+        failures: list[str] = []
+        limit = 3 if retr in {"ch", "lf"} else 1
+        result = QueryResult(r.source, "error", detail="read budget exhausted")
+        while attempts < limit and self.clock() < deadline:
+            attempts += 1
+            left = max(0.0, deadline - self.clock())
+            # Reserve time for another completed attempt rather than allowing a
+            # single socket timeout to consume the complete provider deadline.
+            # The transport's nested read budget aborts the active socket before
+            # the next sequential attempt starts. Uncooperative calls are still
+            # stopped by the outer runner; no replacement thread is spawned.
+            # ClickHouse Cloud wake/read latency caused the observed starvation.
+            # Langfuse keeps its existing full paginated-read allowance; its
+            # explicit pacing can legitimately occupy most of that allowance.
+            remaining_attempts = limit - attempts + 1 if retr == "ch" else 1
+            retry_room = 0.25 * (remaining_attempts - 1)
+            attempt_budget = (left - retry_room) / remaining_attempts
+            if attempt_budget <= 0:
+                attempt_budget = left
+            with r.read_budget(attempt_budget):
+                result = run_query(r, st.query, st.params)
+            if result.status == "ok" or not result.retryable:
+                break
+            failures.append("temporary read failure")
+            if attempts >= limit or deadline - self.clock() <= 0.25:
+                break
+            time.sleep(0.25)
+            r.reset_health()
+        excluded = result.status == "unavailable" and (
+            result.detail.startswith("policy-excluded:") or _owner_off(r._r))
+        state = ("recovered" if failures else "healthy") if result.status == "ok" else (
+            "excluded" if excluded else "failed")
+        self.observations[id(st)] = {
+            "attempts": attempts or None, "recovery_status": state,
+            "checked_at": datetime.now(UTC).isoformat(timespec="seconds"),
+            "elapsed_ms": round(max(0.0, self.clock() - started) * 1000, 3),
+            "recovery_reason": "temporary read failure; recheck succeeded" if state == "recovered" else (
+                "policy exclusion; no repair attempted" if excluded else
+                "read succeeded" if state == "healthy" else
+                "read unavailable; inspect recorded step detail"),
+        }
+        return result
 
     def phase(self, steps: Sequence[_Step]) -> list[tuple[_Step, QueryResult]]:
         groups: dict[str, list[_Step]] = defaultdict(list)
@@ -516,17 +604,18 @@ class _Runner:
                 continue
             if retr in self.dead:
                 for st in sts:
-                    results[id(st)] = QueryResult(retr, "error", detail=f"timeout after {self.timeout_s:g}s")
+                    results[id(st)] = QueryResult(retr, "error", detail=f"timeout after {self.budget(retr):g}s")
                 continue
             box: list[tuple[_Step, QueryResult]] = []
             stop = threading.Event()
 
             def body(r: Any = r, sts: list[_Step] = sts, box: list[tuple[_Step, QueryResult]] = box,
-                     stop: threading.Event = stop) -> None:
+                     stop: threading.Event = stop,
+                     deadline_at: float = self.clock() + self._left(retr)) -> None:
                 for st in sts:
                     if stop.is_set():
                         return
-                    box.append((st, run_query(r, st.query, st.params)))
+                    box.append((st, self._query(st.retr, r, st, max(0.0, deadline_at - self.clock()))))
 
             deadline = self.clock() + self._left(retr)
             t, spent = self._start(retr, body)
@@ -537,10 +626,11 @@ class _Runner:
             for st, res in list(box):
                 results[id(st)] = res
             for st in groups[retr]:
-                results.setdefault(id(st), QueryResult(retr, "error", detail=f"timeout after {self.timeout_s:g}s"))
+                results.setdefault(id(st), QueryResult(retr, "error", detail=f"timeout after {self.budget(retr):g}s"))
         out = [(st, results[id(st)]) for st in steps]
         self.log += [{"step": st.name, "status": res.status, "found": len(res.refs),
-                      "detail": _free(res.detail, 120) or ""} for st, res in out]
+                      "detail": _free(res.detail, 120) or "",
+                      **self.observations.get(id(st), {})} for st, res in out]
         return out
 
 
@@ -737,7 +827,15 @@ def _finding(raw: _Raw, found: set[str] | None, lim: PackLimits, c: _Cand | None
         detail = "" if status == "ok" else f"{len(subjects) - len(resolved)} subject(s) no longer resolve"
     if raw.source == "pastdev" and status == "ok" and c is not None and not _about(c, subjects, scopes or {}):
         # a similar past record that is about another rule and another file: context, never support
-        status, authority, detail = "unlinked", None, "about another rule or target: context only"
+        comparable = any((c.rule and rs) or (c.target and ts)
+                         for rs, ts in ((scopes or {}).get(s, (set(), set())) for s in subjects))
+        detail = ("about another rule or target: context only; authoritative record resolved" if comparable else
+                  "authoritative record resolved, but rule/target binding is not recorded: context only")
+        status, authority = "unlinked", None
+    if ev.kind == "production-outcome":
+        status, authority, detail = "unlinked", None, "production observation needs current-version and coverage validation"
+    if ev.metrics.get("intended_intervention") is False:
+        status, authority, detail = "unlinked", None, "fallback tested other bytes; artifact evidence only"
     m = _measure(ev.metrics)
     return Finding(raw.source, ev.ref, ev.observed_at, m, _n(ev.metrics), status, ev.kind, authority, raw.step.name,
                    _free(ev.summary, lim.text_max), detail)
@@ -792,7 +890,8 @@ def _select(meta: list[Finding], evidence: dict[str, list[Finding]],
 def build_pack(candidate: Mapping[str, Any], *, retrievers: Mapping[str, Retriever | None] | None = None,
                limits: PackLimits = PackLimits(), environ: Mapping[str, str] | None = None,
                connect: Callable[[], psycopg.Connection] | None = None,
-               now: Callable[[], datetime] | None = None, clock: Callable[[], float] = time.monotonic) -> EvidencePack:
+               now: Callable[[], datetime] | None = None, clock: Callable[[], float] = time.monotonic,
+               current_instruction_sha256: str | None = None) -> EvidencePack:
     """The bounded evidence pack for one candidate. Never raises for a provider: an unconfigured, down, slow or
     broken one shows in `health` and as an unavailable/error finding. Writes nothing (read-only connections)."""
     c = _candidate(candidate)
@@ -821,7 +920,7 @@ def build_pack(candidate: Mapping[str, Any], *, retrievers: Mapping[str, Retriev
         if state == "ok":
             idle_health[retr] = ("ok", "") if val.ok else ("unavailable", val.detail)
         elif state == "timeout":
-            idle_health[retr] = ("error", f"timeout after {limits.timeout_s:g}s")
+            idle_health[retr] = ("error", f"timeout after {runner.budget(retr):g}s")
         else:
             idle_health[retr] = ("unavailable", f"health: {type(val).__name__}")
 
@@ -831,13 +930,19 @@ def build_pack(candidate: Mapping[str, Any], *, retrievers: Mapping[str, Retriev
     recalled = [s for raw in raws if raw.source == "pastdev" for s in raw.ev.subject_refs if s.startswith("amem:")]
     found: set[str] | None = None
     scopes: dict[str, tuple[set[str], set[str]]] = {}
+    production_refs: set[str] = set()
     sb_read = "skipped"
     if ro is not None and wanted:
-        def reread() -> tuple[set[str], dict[str, tuple[set[str], set[str]]]]:
+        def reread() -> tuple[set[str], dict[str, tuple[set[str], set[str]]], set[str]]:
             with ro() as conn:
-                return existing(conn, wanted), (subject_scopes(conn, recalled) if recalled else {})
+                ids = [refs.parse(r).id for r in c.evidence_refs if refs.is_ref(r)
+                       and refs.parse(r).kind == "evidence" and _UUID.fullmatch(refs.parse(r).id)]
+                prs = {refs.amem("evidence", str(row[0])) for row in conn.execute(
+                    "select id from rsi_evidence where id=any(%s::uuid[]) and kind='production-outcome'",
+                    (ids,)).fetchall()} if ids else set()
+                return existing(conn, wanted), (subject_scopes(conn, recalled) if recalled else {}), prs
         state, val = runner.call("sb", reread)
-        found, scopes = val if state == "ok" else (None, {})
+        found, scopes, production_refs = val if state == "ok" else (None, {}, set())
         sb_read = "ok" if state == "ok" else ("error" if state == "timeout" else "unavailable")
     elif ro is None and wanted:
         sb_read = "unavailable"
@@ -847,6 +952,9 @@ def build_pack(candidate: Mapping[str, Any], *, retrievers: Mapping[str, Retriev
     by_key: dict[tuple[str, str, str], Finding] = {}
     for raw in raws:
         f = _finding(raw, found, limits, c, scopes)
+        if f.ref in production_refs:
+            f = replace(f, status="unlinked", authority=None,
+                        detail="production observation requires current-version and coverage validation")
         old = by_key.get((f.source, f.kind, f.ref))
         if old is None or (raw.live and old.via.startswith("sb.")):
             by_key[(f.source, f.kind, f.ref)] = f
@@ -855,9 +963,44 @@ def build_pack(candidate: Mapping[str, Any], *, retrievers: Mapping[str, Retriev
         if r in cited or found is None:                 # already cited, or cannot be re-read (health says why)
             continue
         ok = r in found
+        production = r in production_refs
         by_key[("supabase", "candidate-evidence", r)] = Finding(
-            "supabase", r, None, {}, None, "ok" if ok else "stale", "candidate-evidence", r if ok else None,
-            "candidate.evidence_refs", None, "" if ok else "no longer resolves")
+            "supabase", r, None, {}, None, "unlinked" if production else "ok" if ok else "stale",
+            "candidate-evidence", r if ok and not production else None,
+            "candidate.evidence_refs", None, "requires production observation validation" if production
+            else "" if ok else "no longer resolves")
+    # Only the caller can supply a freshly measured target version. Merely
+    # resolving an old evidence ref never validates production observations.
+    if current_instruction_sha256 is not None and ro is not None and c.rule:
+        from agent_memory import production_feedback as PF
+
+        def production_read() -> list[dict[str, Any]]:
+            with ro() as conn:
+                return PF.for_candidate(conn, candidate, current_instruction_sha256,
+                                        now=(now or (lambda: datetime.now(UTC)))(), limit=limits.per_source)
+        state, observations = runner.call("sb", production_read)
+        if state != "ok":
+            sb_read = "error" if state == "timeout" else "unavailable"
+        elif sb_read == "skipped":
+            sb_read = "ok"
+        runner.log.append({"step": "sb.production_outcomes", "status": "ok" if state == "ok" else "error",
+                           "found": len(observations) if state == "ok" else 0})
+        if state == "ok":
+            for item in observations:
+                m = item["metrics"]
+                measures = {"rule_key": m.get("rule_key"), "verdict": m.get("verdict"),
+                            "advisory_only": True, "design": m.get("design"), "generation": m.get("generation"),
+                            "coverage_status": (m.get("coverage") or {}).get("status"),
+                            **(m.get("measurements") or {})}
+                n = min(measures.get("sessions_before", 0), measures.get("sessions_after", 0))
+                by_key[("supabase", PF.KIND, item["ref"])] = Finding(
+                    "supabase", item["ref"], item["observed_at"], _measure(measures), n, item["status"], PF.KIND,
+                    item["ref"] if item["status"] == "ok" else None, "sb.production_outcomes",
+                    "Advisory before/after production observation; not causal", item["reason"])
+        else:
+            by_key[("supabase", "query", "query:sb.production_outcomes")] = Finding(
+                "supabase", "query:sb.production_outcomes", None, {}, None, "error", "query",
+                via="sb.production_outcomes", detail="production observation read failed")
     evidence: dict[str, list[Finding]] = defaultdict(list)
     for f in by_key.values():
         evidence[f.source].append(f)
@@ -882,7 +1025,8 @@ def build_pack(candidate: Mapping[str, Any], *, retrievers: Mapping[str, Retriev
 
     per_source_status: dict[str, list[str]] = defaultdict(list)
     for st, res in done:
-        per_source_status[st.source].append(res.status)
+        if not (res.status == 'unavailable' and res.detail.startswith('policy-excluded:')):
+            per_source_status[st.source].append(res.status)
     for retr, (status, detail) in idle_health.items():
         per_source_status[SERVICE[retr]].append(status)
         runner.log.append(_health_step(retr, status, detail))   # the pack's steps then explain its health too
@@ -1209,13 +1353,20 @@ def _evidence_finding(row: tuple[Any, ...], found: set[str], lim_text: int) -> F
     source = SYSTEM_SOURCE.get(system, "supabase")
     if not subj:
         status, authority = "unlinked", None
+        detail = "no authoritative subject refs recorded; producer identity required, not inferred"
     else:
         resolved = [s for s in subj if s in found]
         status = "ok" if len(resolved) == len(subj) else "stale"
         authority = resolved[0] if resolved else None
+        detail = "" if status == "ok" else f"{len(subj) - len(resolved)} recorded authoritative subject(s) no longer resolve"
     m = dict(metrics or {}) if isinstance(metrics, Mapping) else {}
+    if kind == "production-outcome":
+        # Delta reads have no freshly measured target bytes. The dedicated
+        # consumer validates the full record before it becomes supporting input.
+        status, authority = "unlinked", None
     return Finding(source, ref, _ts_str(observed), _measure(m), _n(m), status, kind, authority, "sb.rsi_evidence",
-                   _free(summary, lim_text), "")
+                   _free(summary, lim_text), "requires current instruction version and complete coverage"
+                   if kind == "production-outcome" else detail)
 
 
 def delta_since(checkpoint_ts: str | datetime | None, *, conn: psycopg.Connection,
@@ -1271,11 +1422,12 @@ def delta_since(checkpoint_ts: str | datetime | None, *, conn: psycopg.Connectio
         done = runner.phase(steps)
         stat: dict[str, list[str]] = defaultdict(list)
         for st, res in done:
-            stat[st.source].append(res.status)
+            if not (res.status == "unavailable" and res.detail.startswith("policy-excluded:")):
+                stat[st.source].append(res.status)
         for retr in ("ch", "lf", "pd"):
             if retr not in retrievers:
                 continue
-            if SERVICE[retr] not in stat:
+            if SERVICE[retr] not in stat and not any(st.retr == retr for st, _ in done):
                 r = runner.r.get(retr)
                 if r is None:
                     stat[SERVICE[retr]].append("unavailable")
@@ -1284,7 +1436,7 @@ def delta_since(checkpoint_ts: str | datetime | None, *, conn: psycopg.Connectio
                     state, val = runner.call(retr, r.health)
                     st = ("ok" if state == "ok" and val.ok else "error" if state == "timeout" else "unavailable")
                     stat[SERVICE[retr]].append(st)
-                    runner.log.append(_health_step(retr, st, _health_detail(state, val, limits.timeout_s)))
+                    runner.log.append(_health_step(retr, st, _health_detail(state, val, runner.budget(retr))))
         for svc, sts in stat.items():
             d.health[svc] = _combine(sts)
         d.steps = list(runner.log)

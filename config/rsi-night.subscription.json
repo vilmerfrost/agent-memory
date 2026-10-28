@@ -2,11 +2,11 @@
   "format": "rsi-night-config/1",
   "_note": "Subscription qualification profile. Inactive until dedicated login, client isolation and live qualification pass. No API fallback. Promotion freeze unchanged.",
   "budget": {
-    "_limits_note": "3 experiments per night (Vilmer, 2026-10-25). Per night: model_calls, max_sandbox_runs, wall_clock_s, max_usd, max_subscription_tokens. Per candidate: max_hypotheses. Per replay: max_ab_pairs. One shared-skill experiment at most: Opus 8 (1 hypothesis, 1 section writer, 6 agent runs), Sol 12, Jev 2, 108 sandbox runs, 5760 s (the writer adds its 300 s timeout, Vilmer 2026-10-26: raise it); the night adds 5 Jev triage calls and 600 s: 600 + 3 x 5760 = 17880 s of 17940 s (4 h 59 min: the watchdog's hard exit at 06:41, 49 min before the 07:30 brief, which waits up to 90 min for the night). `amem rsi night-job --plan` prints the room check.",
+    "_limits_note": "3 experiments per night (Vilmer, 2026-10-25); 5 A + 5 B pairs per provider (Vilmer, 2026-10-28). Per night: model_calls, max_sandbox_runs, wall_clock_s, max_usd, max_subscription_tokens. Per candidate: max_hypotheses. Per replay: max_ab_pairs (10 = 2 providers x 5). One shared-skill experiment at most: Opus 12 (1 hypothesis, 1 section writer, 10 agent runs), Sol 20 (10 agent runs, 10 judge calls), Jev 2, 180 sandbox runs (10 x 2 x (8 tool containers + 1 check), unused tool reservations are given back after each run); the night adds 5 Jev triage calls. Calls: Opus 36 of 40, Sol 60 of 64, Jev 11 of 12; sandbox 540 of 540. Wall clock: 600 + 3 x 8960 = 27480 s if every stage and case ran to its timeout, over the 18000 s hard maximum: the night stops cleanly at 17940 s (watchdog hard exit 06:41) and records later experiments as not run. Observed 10-27 at 3 pairs: 1350 s and 1.42M tokens for the night. `amem rsi night-job --plan` prints the room check.",
     "max_hypotheses": 2,
     "max_experiments": 3,
-    "max_ab_pairs": 6,
-    "max_sandbox_runs": 360,
+    "max_ab_pairs": 10,
+    "max_sandbox_runs": 540,
     "wall_clock_s": 17940,
     "max_usd": 1.0,
     "model_retries": 0,
@@ -14,8 +14,8 @@
     "free_model_calls": 200,
     "model_calls": {
       "jev-1.14.0": 12,
-      "claude-opus-5-5": 26,
-      "gpt-6.1-sol": 40
+      "claude-opus-5-5": 40,
+      "gpt-6.1-sol": 64
     },
     "cost_estimate_usd": {
       "jev-1.14.0": 0.01,
@@ -46,6 +46,8 @@
     "max_finding_candidates": 5
   },
   "triage": {
+    "minimum_experiments": 1,
+    "target_experiments": 3,
     "weights": {
       "impact": 0.35,
       "recurrence": 0.25,

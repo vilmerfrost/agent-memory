@@ -36,6 +36,7 @@ import hashlib
 import json
 import math
 import time
+import threading
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -50,8 +51,10 @@ HARD_MAX_RETRIES = 2
 # and the watchdog's hard exit (+10 + 2 min, rsi_schedule) at 06:42. Each container keeps its own short timeout.
 HARD_MAX_WALL_CLOCK_S = 5 * 3600
 HARD_MAX_AB_PAIRS = 60           # rsi_replay: 3 cases x 20 reps
-# 3 experiments x 2 providers x 6 subscription runs x (8 reserved tool containers + 1 check) = 324, plus a margin.
-HARD_MAX_SANDBOX_RUNS = 400
+# Worst case of the 5 + 5 pair night (Vilmer, 2026-10-28): 3 experiments x 2 providers x 10 subscription agent runs
+# x (8 tool containers + 1 check) = 540, plus a margin. Unused tool reservations are given back after each run
+# (Budget.release_sandbox_runs), so the cap binds on containers that ran, plus at most one run's reservation.
+HARD_MAX_SANDBOX_RUNS = 600
 FREE_MODELS = ("stub", "fixture", "none")
 # What each price basis means for the human reading the costs (Mission 005.5: verified provider billing vs local
 # estimates). "reported": the provider's own CLI reported the cost of the call (Claude Code's total_cost_usd); it is
@@ -345,6 +348,12 @@ class Budget:
         self._taken_runs = 0
         self._experiments = 0
         self.exhausted: str | None = None
+        self._lock = threading.RLock()
+        self._next_reservation = 0
+        self._pending_calls: list[dict[str, Any]] = []
+        self._pending_runs: dict[str, dict[str, Any]] = {}
+        self.decisions: list[dict[str, Any]] = []
+        self.sandbox_releases: list[dict[str, Any]] = []   # release_sandbox_runs: unused reservations given back
 
     # -- time and money ------------------------------------------------------------------------------
     def elapsed_s(self) -> float:
@@ -354,19 +363,47 @@ class Budget:
         return max(0.0, self.cfg.wall_clock_s - self.elapsed_s())
 
     def spent_usd(self) -> float:
-        return round(sum(c["usd"] for c in self.calls) + sum(r["usd"] for r in self.runs)
-                     + sum(p["usd"] for p in self.provider_requests.values()), 6)
+        with self._lock:
+            return round(self._booked_amount(), 6)
+
+    def _booked_amount(self) -> float:
+        # Do not round before the admission check: many sub-microdollar charges must not disappear.
+        return math.fsum([*(c["usd"] for c in self.calls), *(r["usd"] for r in self.runs),
+                          *(p["usd"] for p in self.provider_requests.values())])
+
+    def _reserved_amount(self) -> float:
+        return math.fsum([*(r["estimate_usd"] for r in self._pending_calls),
+                          *(r["estimate_usd"] for r in self._pending_runs.values())])
+
+    def reserved_usd(self) -> float:
+        """Outstanding pre-call estimates, not completed spend or provider billing."""
+        with self._lock:
+            return round(self._reserved_amount(), 6)
+
+    def snapshot(self, *, resource: str | None = None) -> dict[str, Any]:
+        """Reproducible decision inputs; USD is separate from call/experiment/token/time caps."""
+        with self._lock:
+            spent, reserved = self._booked_amount(), self._reserved_amount()
+            return {"format": "rsi-budget-decision/1", "currency": "USD", "scope":
+                    "api-only" if self.cfg.subscription_models else "all-recorded", "resource": resource,
+                    "cap_usd": self.cfg.max_usd, "booked_usd": spent, "reserved_usd": reserved,
+                    "remaining_usd": round(max(0.0, self.cfg.max_usd - spent - reserved), 6),
+                    "experiments_taken": self._experiments, "experiment_cap": self.cfg.max_experiments,
+                    "calls_taken": dict(self._taken_calls), "sandbox_runs_taken": self._taken_runs,
+                    "sandbox_runs_released": sum(int(r["runs"]) for r in self.sandbox_releases),
+                    "sandbox_run_cap": self.cfg.max_sandbox_runs, "prices": self.prices.describe()}
 
     def _stop(self, kind: str, detail: str = "") -> BudgetExhausted:
         if self.exhausted is None:
             self.exhausted = kind
+        self.decisions.append({**self.snapshot(resource=kind), "decision": "refused", "detail": detail})
         return BudgetExhausted(kind, detail)
 
     def check(self) -> None:
         """Raise when the wall clock or the USD cap is used up. Called at every stage boundary."""
         if self.remaining_s() <= 0:
             raise self._stop("wall_clock", f"{self.cfg.wall_clock_s:g}s")
-        if self.spent_usd() > self.cfg.max_usd + _EPS:
+        if self._booked_amount() > self.cfg.max_usd + _EPS:
             raise self._stop("usd", f"spent {self.spent_usd():.4f} > cap {self.cfg.max_usd:.4f}")
         if self.cfg.subscription_models:
             records = [r for r in [*self.calls, *self.runs] if r.get("price_basis") == "subscription"]
@@ -381,6 +418,10 @@ class Budget:
         if model in self.cfg.subscription_models:
             return 0.0
         est = self.cfg.estimate(model)
+        price, named = self.prices.price(model)
+        if named and price.basis == "call":
+            # A stale configured estimate must not under-reserve a known fixed per-call price.
+            return max(est, price.per_call_usd)
         if est > 0 or is_free_model(model):
             return est
         return self.prices.estimate(model)
@@ -396,29 +437,70 @@ class Budget:
                                 tokens_cached=tokens_cached, tokens_cache_write=tokens_cache_write)
 
     # -- model calls ---------------------------------------------------------------------------------
-    def take_call(self, model: str, stage: str) -> None:
-        """Reserve one call of `model` before making it. Raises BudgetExhausted."""
-        self.check()
-        n = self._taken_calls.get(model, 0)
-        if n >= self.cfg.call_cap(model):
-            raise self._stop(f"calls:{model}", f"{stage}: cap {self.cfg.call_cap(model)}")
-        est = self.estimate(model)
-        if est > 0 and self.spent_usd() + est > self.cfg.max_usd + _EPS:
-            raise self._stop("usd", f"{stage}: {model} estimate {est:.4f} over the cap {self.cfg.max_usd:.4f}")
-        self._taken_calls[model] = n + 1
+    def take_call(self, model: str, stage: str) -> str:
+        """Atomically reserve a call and its estimate. The slot is consumed even if the call fails.
+
+        Returned identity is optional for legacy synchronous adapters; `call` uses it explicitly so concurrent
+        calls can settle out of order. An unstarted operation must use cancel_call, not fake zero-cost usage.
+        """
+        with self._lock:
+            self.check()
+            n = self._taken_calls.get(model, 0)
+            if n >= self.cfg.call_cap(model):
+                raise self._stop(f"calls:{model}", f"{stage}: cap {self.cfg.call_cap(model)}")
+            est = self.estimate(model)
+            before = self.snapshot(resource="usd")
+            if self._booked_amount() + self._reserved_amount() + est > self.cfg.max_usd + _EPS:
+                raise self._stop("usd", f"{stage}: {model} estimate {est:.4f}; booked {before['booked_usd']:.4f}, "
+                                 f"reserved {before['reserved_usd']:.4f}, remaining {before['remaining_usd']:.4f}, "
+                                 f"cap {self.cfg.max_usd:.4f}")
+            self._taken_calls[model] = n + 1
+            self._next_reservation += 1
+            rid = f"call-{self._next_reservation}"
+            self._pending_calls.append({"id": rid, "model": model, "stage": stage, "estimate_usd": est,
+                                        "before": before, "prices": self.prices})
+            return rid
+
+    def cancel_call(self, reservation_id: str) -> None:
+        """Release money only when the adapter proves inference never started; retain the consumed call slot."""
+        with self._lock:
+            found = next((r for r in self._pending_calls if r["id"] == reservation_id), None)
+            if found is None:
+                raise BudgetConfigError("unknown or already settled call reservation")
+            self._pending_calls.remove(found)
+            self.decisions.append({**self.snapshot(resource="usd"), "decision": "cancelled_unstarted",
+                                   "reservation_id": reservation_id, "released_usd": found["estimate_usd"]})
 
     def record_call(self, model: str, *, stage: str, tokens_in: int = 0, tokens_out: int = 0, usd: float = 0.0,
                     duration_s: float = 0.0, ok: bool = True, error: str | None = None, attempt: int = 1,
-                    tokens_cached: int = 0, tokens_cache_write: int = 0) -> None:
+                    tokens_cached: int = 0, tokens_cache_write: int = 0,
+                    reservation_id: str | None = None) -> None:
         """Record one model call and book its cost: `usd` as reported (0 = not reported), else the price table.
         A failed call is booked too: a call that died mid-turn was still billed."""
-        booked, basis = self.book(model, usd=usd, tokens_in=tokens_in or 0, tokens_out=tokens_out or 0,
-                                  tokens_cached=tokens_cached or 0, tokens_cache_write=tokens_cache_write or 0)
-        self.calls.append({"model": model, "stage": stage, "tokens_in": int(tokens_in or 0),
+        with self._lock:
+            pending = next((r for r in self._pending_calls if
+                            (r["id"] == reservation_id if reservation_id else
+                             (r["model"], r["stage"]) == (model, stage))), None)
+            if reservation_id and (pending is None or (pending["model"], pending["stage"]) != (model, stage)):
+                raise BudgetConfigError("unknown, mismatched or already settled call reservation")
+            price_table = pending["prices"] if pending else self.prices
+            if model in self.cfg.subscription_models:
+                booked, basis = 0.0, "subscription"
+            else:
+                booked, basis = price_table.book(model, reported_usd=usd, tokens_in=tokens_in or 0,
+                                                tokens_out=tokens_out or 0, tokens_cached=tokens_cached or 0,
+                                                tokens_cache_write=tokens_cache_write or 0)
+            if pending:
+                self._pending_calls.remove(pending)
+            self.calls.append({"model": model, "stage": stage, "tokens_in": int(tokens_in or 0),
                            "tokens_out": int(tokens_out or 0), "usd": float(booked), "price_basis": basis,
                            "tokens_cached": int(tokens_cached or 0), "tokens_cache_write": int(tokens_cache_write or 0),
                            "duration_s": round(float(duration_s or 0.0), 3), "ok": bool(ok),
-                           "error": (error or None) and str(error)[:200], "attempt": attempt})
+                           "error": (error or None) and str(error)[:200], "attempt": attempt,
+                           "reservation": ({"id": pending["id"], "estimate_usd": pending["estimate_usd"],
+                                            "before": pending["before"], "released_usd": pending["estimate_usd"],
+                                            "settled_booked_usd": booked, "prices": price_table.describe()}
+                                           if pending else None)})
 
     def call(self, model: str, stage: str, fn: Callable[[], tuple[T, Usage]], *,
              retry_on: tuple[type[BaseException], ...] = (), retries: int | None = None) -> T:
@@ -429,36 +511,74 @@ class Budget:
         attempt = 0
         while True:
             attempt += 1
-            self.take_call(model, stage)
+            reservation = self.take_call(model, stage)
             t0 = self._clock()
             try:
                 value, usage = fn()
             except BudgetExhausted:
+                # The callback may have started inference before a nested cap stopped it. Usage is unknown,
+                # not free; conservatively settle it once and release its outstanding estimate.
+                self.record_call(model, stage=stage, ok=False, error="nested budget stop",
+                                 duration_s=self._clock() - t0, attempt=attempt, reservation_id=reservation)
                 raise
             except BaseException as exc:
                 usage = getattr(exc, "usage", None) or Usage()
                 self.record_call(model, stage=stage, tokens_in=usage.tokens_in, tokens_out=usage.tokens_out,
                                  usd=usage.usd, duration_s=self._clock() - t0, ok=False,
                                  error=f"{type(exc).__name__}: {exc}", attempt=attempt,
-                                 tokens_cached=usage.tokens_cached, tokens_cache_write=usage.tokens_cache_write)
+                                 tokens_cached=usage.tokens_cached, tokens_cache_write=usage.tokens_cache_write,
+                                 reservation_id=reservation)
                 if isinstance(exc, retry_on) and attempt <= limit:
                     continue
                 raise
             self.record_call(model, stage=stage, tokens_in=usage.tokens_in, tokens_out=usage.tokens_out,
                              usd=usage.usd, duration_s=self._clock() - t0, attempt=attempt,
-                             tokens_cached=usage.tokens_cached, tokens_cache_write=usage.tokens_cache_write)
+                             tokens_cached=usage.tokens_cached, tokens_cache_write=usage.tokens_cache_write,
+                             reservation_id=reservation)
             return value
 
     # -- sandbox runs, experiments, hypotheses ---------------------------------------------------------
     def take_sandbox_run(self, run_id: str) -> None:
         """Reserve one container run before starting it. Raises BudgetExhausted."""
-        self.check()
-        if self._taken_runs >= self.cfg.max_sandbox_runs:
-            raise self._stop("sandbox_runs", f"cap {self.cfg.max_sandbox_runs} ({run_id})")
-        est = self.cfg.sandbox_run_estimate_usd
-        if est > 0 and self.spent_usd() + est > self.cfg.max_usd + _EPS:
-            raise self._stop("usd", f"sandbox run estimate {est:.4f} over the cap")
-        self._taken_runs += 1
+        with self._lock:
+            self.check()
+            if run_id in self._pending_runs:
+                raise BudgetConfigError("sandbox run already reserved")
+            if self._taken_runs >= self.cfg.max_sandbox_runs:
+                raise self._stop("sandbox_runs", f"cap {self.cfg.max_sandbox_runs} ({run_id})")
+            est = self.cfg.sandbox_run_estimate_usd
+            before = self.snapshot(resource="usd")
+            if self._booked_amount() + self._reserved_amount() + est > self.cfg.max_usd + _EPS:
+                raise self._stop("usd", f"sandbox run estimate {est:.4f}; remaining {before['remaining_usd']:.4f}")
+            self._taken_runs += 1
+            self._pending_runs[run_id] = {"estimate_usd": est, "before": before}
+
+    def release_sandbox_runs(self, run_ids: list[str] | tuple[str, ...], *, reason: str) -> int:
+        """Give back reserved container runs that never started (a subscription agent run reserves its maximum
+        tool containers up front and returns the ones it did not use). Only an outstanding, never-recorded
+        reservation can be released, and each one once: an unknown, recorded or already released id refuses the
+        whole call (BudgetConfigError) and changes nothing. Each release is a ledger row (`sandbox_releases`,
+        reported in costs() and the snapshot), so the report shows taken and released runs. Returns the count."""
+        ids = [str(r) for r in run_ids]
+        with self._lock:
+            if len(set(ids)) != len(ids):
+                raise BudgetConfigError("duplicate sandbox run in one release")
+            bad = [r for r in ids if r not in self._pending_runs]
+            if bad:
+                raise BudgetConfigError(f"sandbox run not reserved or already settled: {bad[0]}")
+            if not ids:
+                return 0
+            usd = math.fsum(self._pending_runs[r]["estimate_usd"] for r in ids)
+            for r in ids:
+                del self._pending_runs[r]
+            self._taken_runs -= len(ids)          # >= 0: each id was counted once when it was taken
+            self.sandbox_releases.append({"runs": len(ids), "first": ids[0], "last": ids[-1],
+                                          "reason": str(reason)[:200], "released_usd": usd,
+                                          "taken_after": self._taken_runs})
+            return len(ids)
+
+    def released_sandbox_runs(self) -> int:
+        return sum(int(r["runs"]) for r in self.sandbox_releases)
 
     def record_run(self, run_id: str, *, duration_s: float = 0.0, tokens_in: int = 0, tokens_out: int = 0,
                    usd: float = 0.0, model: str | None = None, exit_code: int | None = None,
@@ -467,24 +587,30 @@ class Budget:
         """Record one container run. A run of a paid model books its cost like record_call. cost_on_call: the
         run's model call was recorded with record_call (the live judge), so the run books no tokens and no USD
         (one cost, booked once). price_basis: the caller already priced `usd` (for example a CLI's per-run cap)."""
-        if cost_on_call:
-            tokens_in = tokens_out = tokens_cached = tokens_cache_write = 0
-            booked, basis = 0.0, "on-call"
-        else:
-            booked, basis = self.book(model, usd=usd, tokens_in=tokens_in or 0, tokens_out=tokens_out or 0,
-                                      tokens_cached=tokens_cached or 0, tokens_cache_write=tokens_cache_write or 0)
-            if price_basis and float(usd or 0.0) > 0:
-                basis = str(price_basis)[:40]
-        self.runs.append({"run_id": str(run_id), "duration_s": round(float(duration_s or 0.0), 3),
+        with self._lock:
+            pending = self._pending_runs.pop(run_id, None)
+            if cost_on_call:
+                tokens_in = tokens_out = tokens_cached = tokens_cache_write = 0
+                booked, basis = 0.0, "on-call"
+            else:
+                booked, basis = self.book(model, usd=usd, tokens_in=tokens_in or 0, tokens_out=tokens_out or 0,
+                                          tokens_cached=tokens_cached or 0, tokens_cache_write=tokens_cache_write or 0)
+                if price_basis and float(usd or 0.0) > 0:
+                    basis = str(price_basis)[:40]
+            self.runs.append({"run_id": str(run_id), "duration_s": round(float(duration_s or 0.0), 3),
                           "tokens_in": int(tokens_in or 0), "tokens_out": int(tokens_out or 0),
                           "usd": float(booked), "price_basis": basis, "model": model, "exit_code": exit_code,
-                          "error": (error or None) and str(error)[:200]})
+                          "error": (error or None) and str(error)[:200],
+                          "reservation": ({"estimate_usd": pending["estimate_usd"], "before": pending["before"],
+                                           "released_usd": pending["estimate_usd"], "settled_booked_usd": booked}
+                                          if pending else None)})
 
     def take_experiment(self) -> None:
-        self.check()
-        if self._experiments >= self.cfg.max_experiments:
-            raise self._stop("experiments", f"cap {self.cfg.max_experiments}")
-        self._experiments += 1
+        with self._lock:
+            self.check()
+            if self._experiments >= self.cfg.max_experiments:
+                raise self._stop("experiments", f"cap {self.cfg.max_experiments}")
+            self._experiments += 1
 
     def experiments_left(self) -> int:
         return max(0, self.cfg.max_experiments - self._experiments)
@@ -493,9 +619,10 @@ class Budget:
         return min(self.cfg.max_hypotheses, HARD_MAX_HYPOTHESES)
 
     def record_provider(self, name: str, requests: int = 1, usd: float = 0.0) -> None:
-        p = self.provider_requests.setdefault(name, {"requests": 0, "usd": 0.0})
-        p["requests"] += int(requests)
-        p["usd"] = round(p["usd"] + float(usd or 0.0), 6)
+        with self._lock:
+            p = self.provider_requests.setdefault(name, {"requests": 0, "usd": 0.0})
+            p["requests"] += int(requests)
+            p["usd"] = round(p["usd"] + float(usd or 0.0), 6)
 
     # -- summaries -----------------------------------------------------------------------------------
     def mark(self) -> tuple[int, int]:
@@ -528,7 +655,11 @@ class Budget:
                      for k, v in sorted(self.provider_requests.items())}
         subscriptions = [r for r in [*self.calls, *self.runs] if r.get("price_basis") == "subscription"]
         return {"by_model": dict(sorted(by_model.items())), "sandbox_runs": len(self.runs),
+                **({"sandbox_releases": {"released_runs": self.released_sandbox_runs(),
+                                         "taken_runs": self._taken_runs, "records": list(self.sandbox_releases)}}
+                   if self.sandbox_releases else {}),
                 "providers": providers, "total_usd": self.spent_usd(), "prices": self.prices.describe(),
+                "accounting": self.snapshot(), "budget_decisions": list(self.decisions),
                 **({"subscription": {"records": len(subscriptions),
                                  "tokens_in": sum(r["tokens_in"] for r in subscriptions),
                                  "tokens_out": sum(r["tokens_out"] for r in subscriptions),

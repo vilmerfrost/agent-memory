@@ -24,15 +24,28 @@ values (%(span_id)s,%(session_id)s,%(parent_span_id)s,%(tool)s,%(category)s,%(op
  %(started_at)s,%(ended_at)s,%(elapsed_ms)s,%(status)s,%(exit_code)s,%(measurement_kind)s,
  %(source)s,%(method_version)s,%(meta)s)
 on conflict(span_id) do update set
+ session_id=coalesce(execution_spans.session_id,excluded.session_id),
+ started_at=coalesce(excluded.started_at,execution_spans.started_at),
+ category=excluded.category,method_version=excluded.method_version,
  ended_at=excluded.ended_at,elapsed_ms=excluded.elapsed_ms,status=excluded.status,
  exit_code=excluded.exit_code,measurement_kind=excluded.measurement_kind,
- meta=execution_spans.meta || excluded.meta,updated_at=now()
-where (excluded.ended_at is not null or execution_spans.ended_at is null)
-  and (execution_spans.ended_at,execution_spans.elapsed_ms,execution_spans.status,
-       execution_spans.exit_code,execution_spans.measurement_kind,execution_spans.meta)
+ meta=(execution_spans.meta || excluded.meta) -
+      case when coalesce(execution_spans.session_id,excluded.session_id) is not null
+           then 'identity_unavailable' else '__no_key__' end,updated_at=now()
+where excluded.method_version >= execution_spans.method_version
+  and not (coalesce(excluded.meta->>'api_scope','')='client_control' and execution_spans.session_id is not null)
+  and (excluded.ended_at is not null or execution_spans.ended_at is null)
+  and (execution_spans.session_id is null or excluded.session_id is null
+       or execution_spans.session_id=excluded.session_id)
+  and (execution_spans.session_id,execution_spans.ended_at,execution_spans.elapsed_ms,execution_spans.status,
+       execution_spans.exit_code,execution_spans.measurement_kind,execution_spans.meta,
+       execution_spans.started_at,execution_spans.category,execution_spans.method_version)
       is distinct from
-      (excluded.ended_at,excluded.elapsed_ms,excluded.status,excluded.exit_code,
-       excluded.measurement_kind,execution_spans.meta || excluded.meta)
+      (coalesce(execution_spans.session_id,excluded.session_id),excluded.ended_at,excluded.elapsed_ms,excluded.status,excluded.exit_code,
+       excluded.measurement_kind,(execution_spans.meta || excluded.meta) -
+       case when coalesce(execution_spans.session_id,excluded.session_id) is not null
+            then 'identity_unavailable' else '__no_key__' end,
+       coalesce(excluded.started_at,execution_spans.started_at),excluded.category,excluded.method_version)
 returning (xmax=0) as inserted
 """
 
@@ -67,15 +80,16 @@ def refresh_profiles(conn: psycopg.Connection, session_ids: Iterable[str]) -> No
         # A missing API event remains NULL; model output is never substituted for API time.
         conn.execute("""
         update public.sessions s set
-          api_seconds=coalesce(t.api_seconds,s.api_seconds),
+          api_seconds=t.api_seconds,
           tool_seconds=coalesce(t.tool_seconds,s.tool_seconds),
-          meta=s.meta || jsonb_build_object('timing_method','execution_spans_v1')
+          meta=s.meta || jsonb_build_object('timing_method','execution_spans_v2')
         from (
           select session_id,
-            sum(elapsed_ms/1000) filter(where category='api' and measurement_kind='provider_reported') as api_seconds,
+            sum(elapsed_ms/1000) filter(where category='api' and measurement_kind='provider_reported'
+                and operation<>'codex.websocket_request') as api_seconds,
             sum(elapsed_ms/1000) filter(where source='codex.item' and category in ('tool','command','test_full','test_targeted')) as tool_seconds
           from public.execution_spans where session_id=any(%s) group by session_id
-        ) t where s.session_id=t.session_id and s.tool='codex'
+        ) t where s.session_id=t.session_id and s.tool in ('codex','claude')
         """, (sorted(touched),))
 
 

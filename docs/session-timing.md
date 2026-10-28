@@ -1,5 +1,17 @@
 # Session and parent timing
 
+## Integrity follow-up (2026-10-26)
+
+API attribution reads explicit thread/conversation IDs from resource, scope and record attributes. Conflicting or malformed IDs remain unassigned with a reason. Native request/trace identity is independent of actor/duration corrections, so exact late attribution updates one measurement rather than adding a second duration. A known actor cannot be reassigned. Without an explicit native ID, request time or the collector's environment never supplies one. The old sanitized payloads cannot recover discarded identity.
+
+RSI logical attempt UUIDs remain distinct from actual client session/thread IDs. Trusted Claude init/result and Codex thread/start responses carry native identity into replay records and sidecars. A native-session observation is explicitly sandbox-scoped, with zero transcript bytes and unverified task acceptance; it is not a fabricated full transcript. Missing historical client IDs remain unknown. Later real transcript ingestion preserves the proven experimental scope and fills the transcript-availability fact.
+
+The night and existing daily owner now ingest verified artifact/evaluation records for non-improving as well as improving replays. Artifact, baseline and experiment bindings must match. Raw fallback artifact verdicts remain artifact-only context, not evidence that the intended candidate improved. Existing immutable records are not rewritten into passing results.
+
+`amem timing analyze --days 7 --limit 5` reads a bounded deterministic report. The existing daily routine writes the same analysis beside other reports; the morning brief reads a recent bounded summary. It flags expensive captured operations, slow/setup-heavy test observations, repeated tests for review, parent unclassified time, missing links, stale checkpoints and completion/test contradictions. Each lead cites evidence and limitations. Repetition is not proved unnecessary; cumulative time is not wall time; stored rows are not the whole eligible source population. No new routine, model call or timing table is added.
+
+Night coverage also requires `experiments:replay-evidence` and `experiments:native-attempt-sessions` when the new report supplies them. Completed replays/provider run counts define expectations: an empty evaluation/attempt table cannot masquerade as no eligible work. New consumption gaps make the morning conclusion incomplete/findings, not an all clear. Historical reports stay compatible.
+
 Timing data lives in the existing agent-memory Supabase project. `execution_spans`
 stores one small record per observed operation. Session and parent links keep the
 existing identities. No prompt, reasoning text, command arguments or tool result
@@ -166,3 +178,18 @@ The collector must be healthy before the exporter or hooks are changed.
 Check `http://127.0.0.1:43927/health` for counts and database flush status. Health
 does not imply API measurements exist: coverage only increases when actual events
 arrive. The installer does not start a separate CLI agent or make paid model calls.
+
+
+## Native API scope after the 2026-10-27 scheduled check
+
+`codex.api_request` also names process-wide `/models` catalog requests. Those have no conversation ID or model. The collector preserves them as `unclassified` client-control observations with `api_scope=client_control`; they are excluded from task-session eligibility and inference time, not assigned to the collector's actor. Unknown endpoint/no-ID events remain genuine attribution gaps. Historical rows lack the discarded endpoint, so this does not retroactively relabel them.
+
+Timing method 3 also recognizes native `http.response.status_code` and timezone-qualified `event.timestamp`, retains explicit conversation IDs, and reports separate accepted/session/unattributed/control counters in health. The legacy `accepted_api_spans` counter counts API observations; `accepted_spans` counts all accepted timing records, including control traffic. No raw payload, prompt, auth field or unknown URL is persisted.
+
+The isolated nightly Codex client must explicitly route its native OTel logs to the existing loopback receiver; its dedicated auth home does not inherit the interactive user's exporter settings. Prompts remain disabled. Do not substitute client wall time or generated-token timing for missing API measurements. Natural inference capture still needs the next scheduled run; tests and a metadata-only `model/list` request are not a paid inference run.
+
+
+Anonymous event IDs retain the exact method2 hash seed. New scope/status fields do not create a second event when the same raw event is redelivered after an upgrade. Exact redelivery can enrich category, interval and method version in place; an older spool cannot downgrade the stronger semantics. This is evidence-backed redelivery, not a historical endpoint guess or backfill.
+
+
+Native Codex session registration also refreshes the existing exact-ID timing profile. If an API span arrived first, creating its verified sandbox session now populates api_seconds from that stored measurement. With no API observation the field remains NULL. Registration retries do not create another span or infer a duration from the client run's wall time.

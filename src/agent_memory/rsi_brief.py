@@ -54,7 +54,7 @@ REPORT_FORMAT = "rsi-night/1"
 BRIEF_FORMAT = "rsi-brief/1"
 NIGHT_STATUSES = ("ok", "partial", "aborted", "budget_exhausted", "preflight_failed")
 SKIP_REASONS = ("prerequisites", "credentials")                       # rsi_night.SKIP_REASONS
-EXPERIMENT_STATUSES = ("staged", "not_promotable", "failed", "interrupted", "skipped_budget")
+EXPERIMENT_STATUSES = ("staged", "not_promotable", "failed", "interrupted", "skipped_budget", "deferred_policy")
 VERDICTS = ("IMPROVES", "NO_EFFECT", "WORSE", "INCONCLUSIVE")        # rsi_verdict.VERDICTS (plan 2.1)
 RISKS = ("low", "medium", "high")
 HEALTHY = ("ok", "fixture", "live")
@@ -226,6 +226,15 @@ def validate_report(rep: Any) -> list[str]:
     if sk is not None and not (isinstance(sk, dict) and sk.get("reason") in SKIP_REASONS
                                and isinstance(sk.get("summary", ""), str) and isinstance(sk.get("items", []), list)):
         p.append(f"skipped: not an object with reason {' or '.join(SKIP_REASONS)}, a summary and items")
+    if "connection_recovery" in rep:
+        from agent_memory.rsi_night import connection_recovery_problems
+        p += connection_recovery_problems(rep["connection_recovery"])
+    manual = rep.get("manual_run")
+    if manual is not None and not (isinstance(manual, dict)
+            and re.fullmatch(r"manual-[a-z0-9-]{8,48}", str(manual.get("id", "")))
+            and manual.get("kind") == "verification" and manual.get("scheduled_checkpoint_unchanged") is True):
+        p.append("manual_run: invalid verification identity")
+        return p
     pw = rep.get("prerequisite_warnings")
     if pw is not None and not (isinstance(pw, list) and all(isinstance(w, str) for w in pw)):
         p.append("prerequisite_warnings: not a list of strings")
@@ -234,9 +243,12 @@ def validate_report(rep: Any) -> list[str]:
         p.append("prerequisites: not an object with a skill_refresh object")
     if rep.get("coverage") is not None:                   # optional (R4): the coverage rows the night wrote
         p += NC.report_problems(rep["coverage"])
-        if isinstance(rep["coverage"], dict) and rep["coverage"].get("run_key") != rep["night"]:
+        if isinstance(rep["coverage"], dict) and rep["coverage"].get("run_key") != (manual or {}).get("id", rep["night"]):
             p.append("coverage.run_key: not the report's night")
     _check_map(rep["delta"], "delta", COUNTS, p)
+    if "experiment_goal" in rep:
+        from agent_memory.rsi_night import experiment_goal_problems
+        p += experiment_goal_problems(rep["experiment_goal"], rep.get("experiments"))
     for name in ("patterns", "candidates"):
         p += [f"{name}[{i}]: not a JSON object" for i, x in enumerate(rep[name]) if not isinstance(x, dict)]
     for i, c in enumerate(rep["candidates"]):             # optional (2026-10-25): why each idea was thrown out
@@ -460,8 +472,9 @@ def coverage_verdict(rep: Mapping[str, Any], *, db_url: str | None = None) -> di
         reqs = NC.requirements(rep["coverage"].get("required") or [])
         with store.connect(db_url, connect_timeout=10) as conn:
             conn.read_only = True
-            v = CV.verdict(conn, job=NC.JOB, run_key=rep["night"], required=reqs)
-            rows = {r["dataset"]: r["status"] for r in CV.consumption(conn, job=NC.JOB, run_key=rep["night"], limit=200)}
+            run_key = _obj(rep.get("manual_run")).get("id", rep["night"])
+            v = CV.verdict(conn, job=NC.JOB, run_key=run_key, required=reqs)
+            rows = {r["dataset"]: r["status"] for r in CV.consumption(conn, job=NC.JOB, run_key=run_key, limit=200)}
     except (psycopg.Error, config.BackendError, ValueError) as exc:
         return _verdict("unknown", f"coverage not read ({type(exc).__name__})")
     gaps = [{"dataset": text(g.dataset, 80), "distinction": g.distinction, "detail": text(g.detail, 120)}
@@ -558,6 +571,32 @@ def judgment_text(judge: Any, jev: Any) -> str:
     else:
         parts.append("Jev: not recorded")
     return "; ".join(parts)
+
+
+def provider_summaries(value: Any) -> list[dict[str, Any]]:
+    """Separate provider evidence for display only. Never manufacture pooled judge/Jev statistics."""
+    if not isinstance(value, list):
+        return []
+    out = []
+    for p in value[:4]:
+        if not isinstance(p, dict):
+            continue
+        arms = _obj(p.get("arms"))
+        a, b = _obj(arms.get("A")), _obj(arms.get("B"))
+        out.append({"provider": text(p.get("provider"), 40) or "unknown",
+                    "verdict": text(p.get("verdict"), 30) or None,
+                    "baseline_pass": arm_rate(arms, "A"), "candidate_pass": arm_rate(arms, "B"),
+                    "baseline_checked": a.get("checked") if _count(a.get("checked")) else None,
+                    "candidate_checked": b.get("checked") if _count(b.get("checked")) else None,
+                    "judge": _small(p.get("judge"), JUDGE_FIELDS), "jev": _small(p.get("jev"), JEV_FIELDS)})
+    return out
+
+
+def experiment_judgments(e: Mapping[str, Any]) -> str | None:
+    providers = provider_summaries(e.get("provider_results"))
+    if providers:
+        return " | ".join(f"{p['provider']}: {judgment_text(p['judge'], p['jev'])}" for p in providers)
+    return judgment_text(e.get("judge"), e.get("jev")) if e.get("judge") or e.get("jev") else None
 
 
 def apply_blockers(*, verdict: Any, change: Mapping[str, Any], ev: Mapping[str, Any], db: Db, proposal: Mapping[str, Any],
@@ -750,6 +789,9 @@ def proposal_block(e: Mapping[str, Any], db: Db, artifacts_root: Path, suites: l
     ev = evaluation(adir, h)
     if not ev["recorded"]:           # shown from the report; without the bound record it never counts as independent
         ev.update(judge=_small(e.get("judge"), JUDGE_FIELDS), jev=_small(e.get("jev"), JEV_FIELDS))
+    providers = provider_summaries(e.get("provider_results"))
+    if providers:
+        ev["provider_results"] = providers  # display from report; does not change independent/apply blockers
     blockers = apply_blockers(verdict=e.get("verdict"), change=change, ev=ev, db=db, proposal=p, h=h,
                               missing_suites=missing)
     risk = e.get("risk") or _obj(p.get("risk")).get("level")
@@ -777,17 +819,25 @@ WHY_NOT = {
     "failed": "the experiment failed before it could be judged",
     "interrupted": "interrupted when the night was aborted; nothing was staged",
     "skipped_budget": "skipped: the budget ran out before it ran",
+    "deferred_policy": "deferred: one experiment per candidate per night; its next hypothesis remains pending",
 }
 
 
 def failed_item(e: Mapping[str, Any]) -> dict[str, Any]:
     hyp = e.get("hypothesis") or {}
     v = e.get("verdict")
+    why = WHY_NOT.get(e["status"], "")
+    decision = e.get("budget_decision")
+    if e["status"] == "skipped_budget" and isinstance(decision, dict):
+        why = (f"stopped by budget limit {decision.get('resource') or 'unknown'}: "
+               f"{text(decision.get('detail'), 200) or e.get('skip_reason') or 'no detail recorded'}")
     return {"experiment_id": e.get("experiment_id"), "candidate_key": text(e.get("candidate_key"), 120) or None,
-            "verdict": v, "status": e["status"], "why_not_staged": WHY_NOT.get(e["status"], ""),
+            "verdict": v, "status": e["status"], "why_not_staged": why,
             "reasons": [text(r, 200) for r in (e.get("verdict_reasons") or [])[:6]],
+            "skip_reason": text(e.get("skip_reason"), 120) or None,
+            "budget_decision": e.get("budget_decision") if isinstance(e.get("budget_decision"), dict) else None,
             "what": text(hyp.get("what"), 300), "artifact_hash": e.get("artifact_hash"), "cost_usd": e.get("cost_usd"),
-            "judgments": judgment_text(e.get("judge"), e.get("jev")) if e.get("judge") or e.get("jev") else None}
+            "judgments": experiment_judgments(e)}
 
 
 def arm_rate(arms: Any, arm: str) -> float | None:
@@ -859,6 +909,7 @@ def build_brief(rep: Mapping[str, Any], db: Db, *, artifacts_root: Path, report:
     suites = required_suites()
     passed = [proposal_block(e, db, artifacts_root, suites) for e in exps if e["status"] == "staged"]
     failed = [failed_item(e) for e in exps if e["status"] != "staged"]
+    policy_deferred = sum(e["status"] == "deferred_policy" for e in exps)
     d = rep["delta"]
     skipped = skip_info(rep)
     sessions = {"since": text(d.get("since"), 40) or None, **{k: d.get(k) or 0 for k in COUNTS}}
@@ -872,12 +923,18 @@ def build_brief(rep: Mapping[str, Any], db: Db, *, artifacts_root: Path, report:
         cands.append({"id": text(c.get("id"), 60) or None, "key": text(c.get("key"), 120), "source": text(c.get("source"), 40),
                       "rank": c.get("rank") if _num(c.get("rank")) else None, "selected": c.get("selected") is True,
                       "reason": text(c.get("reason"), 200), "status": row.get("status"), "seen_count": row.get("seen_count")})
+        if isinstance(c.get("triage"), dict):
+            t = c["triage"]
+            cands[-1]["triage"] = {"action": text(t.get("action"), 20), "mode": text(t.get("mode"), 20),
+                                   "reason": text(t.get("reason"), 40), "explanation": text(t.get("explanation"), 200)}
     cands.sort(key=lambda c: (not c["selected"], -(c["rank"] or 0.0)))
     experiments = [{"experiment_id": e.get("experiment_id"), "candidate_key": text(e.get("candidate_key"), 120) or None,
                     "verdict": e.get("verdict"), "status": e["status"], "cost_usd": e.get("cost_usd"),
                     "db_status": (db.experiments.get(e.get("experiment_id") or "") or {}).get("status"),
                     "baseline_pass": arm_rate(e.get("arms"), "A"), "candidate_pass": arm_rate(e.get("arms"), "B"),
-                    "judge": _small(e.get("judge"), JUDGE_FIELDS), "jev": _small(e.get("jev"), JEV_FIELDS)}
+                    "judge": _small(e.get("judge"), JUDGE_FIELDS), "jev": _small(e.get("jev"), JEV_FIELDS),
+                    **({"provider_results": provider_summaries(e["provider_results"])}
+                       if provider_summaries(e.get("provider_results")) else {})}
                    for e in exps]
     c = rep["costs"]
     mb = _obj(c.get("model_bases"))
@@ -923,7 +980,11 @@ def build_brief(rep: Mapping[str, Any], db: Db, *, artifacts_root: Path, report:
         "summary": (f"{_plural(sum(1 for x in passed if x['actions']['apply']), 'improvement')} ready to apply"
                     + (f" ({len(passed) - sum(1 for x in passed if x['actions']['apply'])} more staged but not "
                        "ready)" if any(not x["actions"]["apply"] for x in passed) else "")
-                    + f", {len(failed)} failed or inconclusive, {_plural(n_pending, 'decision')} waiting for you. "
+                    + f", {len(failed) - policy_deferred} failed or inconclusive"
+                    + (f", {policy_deferred} hypotheses deferred by policy "
+                       f"({sum(bool(e.get('experiment_id')) for e in exps)} experiments executed)"
+                       if policy_deferred else "")
+                    + f", {_plural(n_pending, 'decision')} waiting for you. "
                     f"Total cost {usd(costs['total_usd'])}."),
         "notes": notes,
         "sessions": sessions,
@@ -937,7 +998,9 @@ def build_brief(rep: Mapping[str, Any], db: Db, *, artifacts_root: Path, report:
                        "items": cands[:MAX_CANDIDATES]},
         "experiments": {"total": len(exps), "items": experiments},
         "passed": passed, "failed": failed, "costs": costs, "health": health, "pending_decisions": pending,
+        **({"connection_recovery": rep["connection_recovery"]} if "connection_recovery" in rep else {}),
         "sections": list(SECTIONS),
+        **({"manual_run": rep["manual_run"]} if "manual_run" in rep else {}),
     }
 
 
@@ -1056,8 +1119,14 @@ def _proposal_md(i: int, b: dict[str, Any]) -> list[str]:
     out.append(f"- **Artifact hash:** `{b['artifact_hash']}` ({state}; {ch['dir']}).")
     ev = b.get("evaluation") or {}
     src = "the bound sandbox-replay record" if ev.get("recorded") else "the night report (no bound record)"
-    out.append(f"- **Codex and Jev judgments:** {judgment_text(ev.get('judge'), ev.get('jev'))} (from {src}; "
-               + ("independent" if ev.get("independent") else "NOT independent") + ").")
+    if ev.get("provider_results"):
+        for p in ev["provider_results"]:
+            out.append(f"- **{p['provider']} provider judgments:** {judgment_text(p['judge'], p['jev'])} "
+                       "(night report; providers are not pooled).")
+        out.append("- Provider display does not replace a bound independent evaluation or authorize Apply.")
+    else:
+        out.append(f"- **Codex and Jev judgments:** {judgment_text(ev.get('judge'), ev.get('jev'))} (from {src}; "
+                   + ("independent" if ev.get("independent") else "NOT independent") + ").")
     out.append(f"- **Proposal:** `{b['proposal_id']}`, {b['proposal_status'] or 'status unknown'}"
                + (f", expires {_when(b['expires_at'])} UTC" if b["expires_at"] else "") + ".")
     a = b["actions"]
@@ -1077,7 +1146,9 @@ def usd4(v: Any) -> str:
 
 
 def render_markdown(b: dict[str, Any]) -> str:
-    out = [f"# RSI morning brief: night {b['night']}", "", f"{b['headline']} {b['summary']}"]
+    title = (f"# RSI manual verification: {_obj(b.get('manual_run')).get('id')}" if b.get("manual_run") else
+             f"# RSI morning brief: night {b['night']}")
+    out = [title, "", f"{b['headline']} {b['summary']}"]
     ck = b["checkpoint"]
     sk = b.get("skipped")
     not_run = "not analyzed: the night did not run" if sk else ""
@@ -1098,6 +1169,18 @@ def render_markdown(b: dict[str, Any]) -> str:
         out.append(f"- Warning: {w}")
     for w in b["health"]["warnings"]:
         out.append(f"- Warning: {w}")
+    review=b.get('telemetry_review')
+    if isinstance(review,dict):
+        out += ['', '## Deterministic daily telemetry', '',
+                f"Status: {text(review.get('status'))}. {text(review.get('detail'))}"]
+        if review.get('status')=='recorded':
+            out += [f"Stored window: {review.get('stored_spans')} spans and {review.get('stored_test_runs')} test runs. "
+                    "Captured rows are not all eligible source events. Cumulative work is not wall time.",
+                    f"Report: {text(review.get('report_ref'))}."]
+            for item in review.get('findings',[])[:5]:
+                out += ['- '+text(item.get('summary'),240),
+                        '  Evidence: '+', '.join(text(ref,140) for ref in item.get('evidence_refs',[])[:3]),
+                        '  Limit: '+text(item.get('limitation'),300)]
 
     s = b["sessions"]
     out += ["", "## Sessions analyzed", ""]
@@ -1139,6 +1222,11 @@ def render_markdown(b: dict[str, Any]) -> str:
         out += ["", *_table(["rank", "candidate", "source", "selected", "status", "reason"],
                             [[_fmt(x["rank"]), x["key"], x["source"], "yes" if x["selected"] else "no",
                               text(x["status"], 20) or "-", x["reason"] or "-"] for x in cd["items"]])]
+        for candidate in cd["items"]:
+            triage = _obj(candidate.get("triage"))
+            if triage:
+                out.append(f"\n{candidate['key']}: triage {text(triage.get('action'), 20)} "
+                           f"({text(triage.get('mode'), 20)}). {text(triage.get('explanation'), 200)}")
         if cd["total"] > len(cd["items"]):
             out.append(f"\nAnd {cd['total'] - len(cd['items'])} more (see the report).")
 
@@ -1151,7 +1239,15 @@ def render_markdown(b: dict[str, Any]) -> str:
                         usd(x["cost_usd"]) if x["cost_usd"] is not None else "-"] for x in ex])
         out.append("")
         for x in ex:
-            if x["experiment_id"] and (x["judge"] or x["jev"]):
+            if x["experiment_id"] and x.get("provider_results"):
+                for p in x["provider_results"]:
+                    rate_a = f"{100 * p['baseline_pass']:.0f}%" if _num(p["baseline_pass"]) else "unknown"
+                    rate_b = f"{100 * p['candidate_pass']:.0f}%" if _num(p["candidate_pass"]) else "unknown"
+                    out.append(f"- {x['experiment_id']}, {p['provider']}: baseline pass {rate_a} "
+                               f"({_fmt(p['baseline_checked'])} checked), candidate pass {rate_b} "
+                               f"({_fmt(p['candidate_checked'])} checked); {p['verdict'] or 'verdict unknown'}; "
+                               f"{judgment_text(p['judge'], p['jev'])}. Providers are not pooled.")
+            elif x["experiment_id"] and (x["judge"] or x["jev"]):
                 out.append(f"- {x['experiment_id']}: {judgment_text(x['judge'], x['jev'])}.")
             elif x["experiment_id"] and x["verdict"]:
                 out.append(f"- {x['experiment_id']}: judge and Jev results not in the report.")
@@ -1210,6 +1306,13 @@ def render_markdown(b: dict[str, Any]) -> str:
             out.append(f"- {k}: {v}" + (" (DEGRADED)" if k in h["degraded"] else "") + (f": {why}" if why else ""))
         if not h["services"]:
             out.append("- The report lists no services.")
+    recovery = b.get("connection_recovery") or {}
+    for check in recovery.get("checks") or []:
+        attempts = check.get("attempts")
+        out.append(f"- {text(check.get('source'), 32)} / {text(check.get('stage'), 160)} / "
+                   f"{text(check.get('step'), 80)}: {text(check.get('status'), 24)}; "
+                   + (f"{attempts} attempt(s)" if attempts is not None else "attempt count unknown")
+                   + f". {text(check.get('impact'), 200)}")
     db = h["database"]
     out.append(f"- Database rows for this brief: {db['status']}" + (f" ({db['detail']})" if db["detail"] else "") + ".")
 
@@ -1265,7 +1368,7 @@ def notification(b: Mapping[str, Any]) -> tuple[str, str]:
     ready = sum(1 for x in b["passed"] if x["actions"].get("apply"))
     sk = b.get("skipped")
     lines = [f"Night {b['status']}. Ready to apply {ready}, staged not ready {len(b['passed']) - ready}, "
-             f"failed or inconclusive {len(b['failed'])}.",
+             f"failed or inconclusive {sum(x.get('status') != 'deferred_policy' for x in b['failed'])}.",
              f"Not run: skipped by the night job ({sk['reason']}); nothing analyzed. Cost {usd(b['costs']['total_usd'])}."
              if sk and sk.get("reason") in SKIP_REASONS else
              f"Sessions {int(s['sessions'])}, candidates {int(b['candidates']['total'])}, "

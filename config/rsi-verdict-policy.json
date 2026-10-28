@@ -1,14 +1,14 @@
 {
-  "version": "rsi-verdict-policy/1",
-  "note": "Read by src/agent_memory/rsi_verdict.py (decide). Versioned repo data: the investigator never writes it. A change here is a code review, not a night-time decision.",
-  "min_pairs": 3,
+  "version": "rsi-verdict-policy/2",
+  "note": "Read by src/agent_memory/rsi_verdict.py (decide). Versioned repo data: the investigator never writes it. A change here is a code review, not a night-time decision. min_score_margin is in summed check-score units (each run scores 0..1, an arm sums its pairs), the same for WORSE and IMPROVES: 2.0 with 5 pairs means one flipped run is noise.",
+  "min_pairs": 5,
   "max_error_runs": 0,
-  "min_improve_delta": 0.01,
-  "min_worse_delta": 0.01,
+  "min_score_margin": 2.0,
   "require_judge": true,
   "judge_min_b_winrate": 0.5,
   "judge_strong_winrate": 0.75,
   "require_jev": true,
   "jev_min_confidence": 0.5,
-  "jev_harness_max": 0.7
+  "jev_harness_max": 0.7,
+  "harness_dead_inconclusive": true
 }

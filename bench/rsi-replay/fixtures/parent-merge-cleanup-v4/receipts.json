@@ -1,0 +1,115 @@
+{
+  "case": "parent-merge-cleanup",
+  "contract_version": 4,
+  "scenarios": [
+    {
+      "id": "complete",
+      "worker_verified": true,
+      "head_sha": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "gate": {
+        "sha": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "config": "cfg-a",
+        "exit_code": 0
+      },
+      "current_config": "cfg-a",
+      "published_sha": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "confirmed_sha": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "cleanup": {
+        "applicable": true,
+        "completed": true
+      },
+      "evidence_ref": "receipt:complete"
+    },
+    {
+      "id": "red",
+      "worker_verified": true,
+      "head_sha": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "gate": {
+        "sha": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "config": "cfg-a",
+        "exit_code": 1
+      },
+      "current_config": "cfg-a",
+      "published_sha": null,
+      "confirmed_sha": null,
+      "cleanup": {
+        "applicable": true,
+        "completed": false
+      },
+      "evidence_ref": "receipt:red"
+    },
+    {
+      "id": "stale-gate",
+      "worker_verified": true,
+      "head_sha": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "gate": {
+        "sha": "dddddddddddddddddddddddddddddddddddddddd",
+        "config": "cfg-a",
+        "exit_code": 0
+      },
+      "current_config": "cfg-a",
+      "published_sha": null,
+      "confirmed_sha": null,
+      "cleanup": {
+        "applicable": true,
+        "completed": false
+      },
+      "evidence_ref": "receipt:stale-gate"
+    },
+    {
+      "id": "unconfirmed",
+      "worker_verified": true,
+      "head_sha": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "gate": {
+        "sha": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "config": "cfg-a",
+        "exit_code": 0
+      },
+      "current_config": "cfg-a",
+      "published_sha": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "confirmed_sha": null,
+      "cleanup": {
+        "applicable": true,
+        "completed": false
+      },
+      "evidence_ref": "receipt:unconfirmed"
+    },
+    {
+      "id": "no-cleanup",
+      "worker_verified": true,
+      "head_sha": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "gate": {
+        "sha": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "config": "cfg-a",
+        "exit_code": 0
+      },
+      "current_config": "cfg-a",
+      "published_sha": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "confirmed_sha": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "cleanup": {
+        "applicable": false,
+        "completed": false,
+        "reason": "No completed clean merged worktrees belong to this parent."
+      },
+      "evidence_ref": "receipt:no-cleanup"
+    },
+    {
+      "id": "stale-config",
+      "worker_verified": true,
+      "head_sha": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "gate": {
+        "sha": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "config": "cfg-a",
+        "exit_code": 0
+      },
+      "current_config": "cfg-b",
+      "published_sha": null,
+      "confirmed_sha": null,
+      "cleanup": {
+        "applicable": true,
+        "completed": false
+      },
+      "evidence_ref": "receipt:stale-config"
+    }
+  ]
+}

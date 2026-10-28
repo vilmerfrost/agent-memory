@@ -18,7 +18,7 @@ IDENTITY = re.compile(r"[A-Za-z0-9_.:/@+-]{1,200}\Z")
 META_KEYS = frozenset({"head", "config", "repo", "turn_id", "request_id", "attempt", "model",
                        "clock", "duration_source", "tests", "passed", "failed", "skipped", "errors",
                        "workers", "log_hash", "log_ref", "worktree", "operation_id", "http_status", "timing_unavailable",
-                       "identity_source", "actor_scope"})
+                       "identity_source", "identity_unavailable", "actor_scope", "api_scope", "endpoint"})
 
 
 def number(value: Any) -> float | None:
@@ -142,7 +142,12 @@ def parse_record(d: Any) -> Span | None:
     if d.get("source") == "codex.otel" and end is not None and end.timestamp() == 0:
         start = end = None
         meta["clock"] = "unavailable"
-    return Span(d["span_id"], sid, d["tool"], d["category"], label(d.get("operation")), start, end,
+    category = d['category']
+    if d.get('source') == 'codex.otel' and d.get('operation') == 'codex.websocket_request':
+        category, version = 'unclassified', max(version, 4)
+        meta.update(api_scope='session_transport' if sid else 'unknown_transport',
+                    timing_unavailable='inference_duration_not_reported')
+    return Span(d["span_id"], sid, d["tool"], category, label(d.get("operation")), start, end,
                 elapsed, d["status"], d["measurement_kind"], label(d.get("source")), parent, code,
                 method_version=version, meta=meta)
 
@@ -242,6 +247,36 @@ def otlp_attributes(rows: Any) -> dict[str, Any]:
     return out
 
 
+def otlp_session(locations: list[dict[str, Any]]) -> tuple[str | None, str]:
+    """Use explicit conversation/thread identity only. Never infer an actor from
+    request time, process identity, or the collector's own session environment.
+    Scope attributes occur in native OTLP exporters as well as resource/record
+    attributes; disagreement is a visible capture gap, not last-value-wins.
+    """
+    keys = ("thread.id", "thread_id", "conversation.id", "conversation_id",
+            "codex.thread.id", "codex.thread_id", "codex.conversation_id")
+    values: dict[str, str] = {}
+    malformed = False
+    for attrs in locations:
+        for name in keys:
+            if name not in attrs:
+                continue
+            raw = identity(attrs[name])
+            if raw is None:
+                malformed = True
+                continue
+            sid = raw if raw.startswith("codex:") else "codex:" + raw
+            values[sid] = name
+    if len(values) > 1:
+        return None, "conflicting_explicit_thread_ids"
+    if malformed:
+        return None, "invalid_explicit_thread_id"
+    if not values:
+        return None, "explicit_thread_id_missing"
+    sid, field_name = next(iter(values.items()))
+    return sid, "otel_attribute:" + field_name
+
+
 def otlp_spans(payload: Any) -> list[Span]:
     """Allowlist API measurements; discard prompts, tool arguments/results and auth data."""
     found: dict[str, Span] = {}
@@ -255,12 +290,14 @@ def otlp_spans(payload: Any) -> list[Span]:
         for scope in sequence(resource.get("scopeLogs")):
             if not isinstance(scope, dict):
                 continue
+            scoped = otlp_attributes(mapping(scope.get("scope")).get("attributes"))
             for rec in sequence(scope.get("logRecords")):
                 if not isinstance(rec, dict):
                     continue
-                attrs = {**common, **otlp_attributes(rec.get("attributes"))}
+                record_attrs = otlp_attributes(rec.get("attributes"))
+                attrs = {**common, **scoped, **record_attrs}
                 name = attrs.get("event.name") or attrs.get("event") or mapping(rec.get("body")).get("stringValue")
-                if name not in {"codex.api_request", "codex.websocket_request"}:
+                if name not in {"codex.api_request", "codex.websocket_request", "codex.sse_event"}:
                     continue
                 duration = attrs.get("duration_ms")
                 if duration is None and isinstance(attrs.get("duration"), str):
@@ -287,20 +324,53 @@ def otlp_spans(payload: Any) -> list[Span]:
                         continue
                     clock, clock_key = clock_name, raw_clock
                     break
-                raw_sid = attrs.get("thread.id") or attrs.get("thread_id") or attrs.get("conversation.id") or attrs.get("conversation_id")
-                raw_sid = identity(raw_sid)
-                session = (raw_sid if raw_sid.startswith("codex:") else "codex:"+raw_sid) if raw_sid else None
+                session, identity_basis = otlp_session([common, scoped, record_attrs])
+                # Native model-catalog requests are process-wide control traffic.
+                # They carry no conversation identity and are not inference time.
+                catalog = attrs.get("endpoint") in ("/models", "models")
+                if catalog:
+                    session, identity_basis = None, "session_not_applicable"
+                api_scope = "client_control" if catalog else "session" if session else "unknown"
+                transport = name == 'codex.websocket_request'
+                if transport:
+                    api_scope = 'session_transport' if session else 'unknown_transport'
+                if clock != "provider_event_end":
+                    event_clock = attrs.get("event.timestamp")
+                    try:
+                        observed = datetime.fromisoformat(event_clock.replace("Z", "+00:00")) if isinstance(event_clock,str) else None
+                    except ValueError:
+                        observed = None
+                    if observed is not None and observed.tzinfo is not None:
+                        end, clock = observed.astimezone(UTC), "provider_event_timestamp"
+                http_status = attrs.get("http.response.status_code", attrs.get("status"))
                 meta = clean_meta({"model": attrs.get("model"), "attempt": attrs.get("attempt"),
-                                   "http_status": attrs.get("status"), "request_id": attrs.get("request.id")})
-                span_id = key(session, name, clock_key, rec.get("traceId"), rec.get("spanId"), elapsed, meta)
+                                   "http_status": http_status, "request_id": attrs.get("request.id")})
+                # Keep the method-2 anonymous key seed unchanged on redelivery.
+                # New scope/status metadata enriches evidence, not source identity.
+                legacy_meta = clean_meta({"model": attrs.get("model"), "attempt": attrs.get("attempt"),
+                                          "http_status": attrs.get("status"), "request_id": attrs.get("request.id")})
+                # A native request/trace identity permits a later exact actor
+                # assignment without creating a second measurement. Anonymous
+                # legacy events keep the previous key contract.
+                request_id = identity(attrs.get("request.id") or attrs.get("request_id"))
+                trace, native_span = identity(rec.get("traceId")), identity(rec.get("spanId"))
+                native_trace = bool(trace and native_span and trace.strip('0') and native_span.strip('0'))
+                span_id = (key("codex.otel.request/2", name, request_id, trace, native_span,
+                               attrs.get("attempt")) if request_id or native_trace
+                           else key(session, name, clock_key, rec.get("traceId"), rec.get("spanId"), elapsed, legacy_meta))
                 success = attrs.get("success")
-                http = str(attrs.get("status") or "")
+                http = str(http_status or "")
                 status = ("failed" if success is False or success == "false" or (http.isdigit() and int(http)>=400)
                           else "passed" if success is True or success == "true" or (http.isdigit() and 200<=int(http)<400)
                           else "unknown")
-                meta.update(duration_source='otel_duration_ms', clock=clock)
-                found[span_id] = Span(span_id, session, "codex", "api", name, end-timedelta(milliseconds=elapsed) if end else None,
-                                      end, elapsed, status, "provider_reported", "codex.otel", meta=meta)
+                meta.update(duration_source='otel_duration_ms', clock=clock, api_scope=api_scope)
+                if transport:
+                    meta['timing_unavailable'] = 'inference_duration_not_reported'
+                if catalog:
+                    meta['endpoint'] = 'models'
+                meta["identity_source" if session else "identity_unavailable"] = identity_basis
+                found[span_id] = Span(span_id, session, "codex", "unclassified" if catalog or transport else "api", name, end-timedelta(milliseconds=elapsed) if end else None,
+                                      end, elapsed, status, "provider_reported", "codex.otel", method_version=4 if transport else 3, meta=meta)
     return list(found.values())
 
 

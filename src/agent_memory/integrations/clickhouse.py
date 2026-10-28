@@ -77,6 +77,7 @@ Tested against a local mock only (tests/test_integrations_clickhouse.py): the SQ
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 import hashlib
 import hmac
 import json
@@ -172,6 +173,20 @@ class Client:
         self.cfg = cfg if cfg is not None else config()
         self.timeout = timeout if timeout is not None else (30.0 if self.cfg.cloud else 10.0)
         self.retries, self.sleep = retries, sleep
+        self._read_state = threading.local()
+
+    @contextmanager
+    def read_budget(self, seconds: float):
+        """One deadline for health and SELECTs; never changes sync/write retries."""
+        if not math.isfinite(seconds) or seconds < 0:
+            raise ValueError("read budget must be finite and nonnegative")
+        old = getattr(self._read_state, 'deadline', None)
+        deadline = time.monotonic() + seconds
+        self._read_state.deadline = min(old, deadline) if old is not None else deadline
+        try:
+            yield
+        finally:
+            self._read_state.deadline = old
 
     def _check(self) -> None:
         if self.cfg.problem:
@@ -185,6 +200,13 @@ class Client:
         if self.cfg.key:
             headers["X-ClickHouse-Key"] = self.cfg.key
         url = f"{self.cfg.url}/" + (f"?{urlencode(params, quote_via=quote)}" if params else "")
+        deadline = getattr(self._read_state, 'deadline', None)
+        if deadline is not None:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise TimeoutError("ClickHouse read budget exhausted")
+            return http.request("POST", url, headers=headers, body=body, timeout=min(self.timeout, left),
+                                retries=0, sleep=self.sleep, total_timeout=left)
         return http.request("POST", url, headers=headers, body=body, timeout=self.timeout, retries=self.retries,
                             sleep=self.sleep)
 
@@ -988,13 +1010,16 @@ class ClickHouseRetriever:
         self.client = client if client is not None else Client()
         self._now = now or (lambda: datetime.now(UTC))
 
+    def read_budget(self, seconds: float):
+        return self.client.read_budget(seconds)
+
     def health(self) -> Health:
         if self.client.cfg.problem:
             return Health(False, self.client.cfg.problem)
         try:
             self.client.ping()
         except http.HttpError as exc:
-            return Health(False, str(exc)[:200])
+            return Health(False, str(exc)[:200], exc.retryable)
         return Health(True)
 
     def named_queries(self) -> Mapping[str, NamedQuery]:

@@ -335,7 +335,10 @@ def record_params(r: dict[str, Any]) -> tuple[Any, ...]:
                                           if isinstance(r.get("profile"), dict) else None)
     out = r.get("outcome") if isinstance(r.get("outcome"), dict) else {}
     name = out.get("name") if out.get("name") in session_tokens.OUTCOMES else None
-    evidence = Jsonb(out["evidence"]) if name and isinstance(out.get("evidence"), dict) else None
+    raw_evidence = out.get("evidence") if isinstance(out.get("evidence"), dict) else None
+    if raw_evidence is not None and raw_evidence.get("method_version") != 2:
+        name = None  # Old queued invocation labels remain unverified; do not upgrade them.
+    evidence = Jsonb(raw_evidence) if raw_evidence is not None else None
     return (r["session_id"], r["kind"], repo, r["project_dir"], _ts(r.get("started_at")), _ts(r.get("ended_at")),
             Jsonb(meta), *t, Jsonb(models) if models is not None else None, turns,
             _ts(r.get("last_activity_at")), t[0], category, project, title,

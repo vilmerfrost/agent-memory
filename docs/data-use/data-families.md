@@ -9,11 +9,25 @@ Every table and view in `supabase/migrations` belongs to exactly one family belo
 Learning families with no automatic analysis consumer:
 
 - **Models, effort, tokens and costs** (`models_costs`)
-- **Command and tool timings** (`command_timings`)
-- **Test runs and individual test timings** (`test_timings`)
 - **Lessons and lesson-use history** (`lessons`)
-- **Reports, ledger events and checkpoints** (`reports_checkpoints`)
 - **Evaluation drafts** (`eval_drafts`)
+
+## Manual subscription connection diagnostics
+
+- Key: `connection_diagnostics`
+- Purpose: Verify one owner-requested real subscription call without automatic inference retries
+- Producers: Night Desk owner-authenticated amem-health model-start; Night Desk management/model-probe.py
+- Owner job: com.vilmerfrost.night-desk-model-probe (manual requests only)
+- Tables: `amem_private.model_connection_tests`; `amem_private.model_connection_receipts`
+- Views: none
+- Local files: none
+- External sinks: none
+- Consumers:
+  - report: Night Desk Connections (fixed status function) (`supabase/migrations/20261027200215_model_connection.sql`)
+  - operational: exclusive claims and request replay prevention (`supabase/migrations/20261027200215_model_connection.sql`)
+- Retention: Latest result per provider; request-ID replay receipts kept indefinitely. Requests expire after 3 minutes; verification after 15 minutes; cooldown is 5 minutes.
+- Exclusion: Never a learning input. Private records expose only fixed status, model, time, latency and token totals through owner-authenticated status. No prompts, replies, secrets or native session IDs.
+- Learning input: no
 
 ## Sessions, outcomes and summaries
 
@@ -71,8 +85,8 @@ Learning families with no automatic analysis consumer:
 - External sinks: none
 - Consumers:
   - operational: profile refresh (sessions.api_seconds / tool_seconds) (`src/agent_memory/timing_store.py`)
+  - analysis: amem-daily deterministic telemetry review (`src/agent_memory/telemetry_analysis.py`)
   - manual: amem timing report / coverage (`src/agent_memory/cli_timing.py`)
-  - analysis: none found (Stage E gap)
 - Retention: No pruning found: spans are kept indefinitely.
 - Exclusion: Operation names and categories only; no command text or output. Reconstructed and estimated spans (measurement_kind) never count as measured latency.
 - Learning input: yes
@@ -89,8 +103,8 @@ Learning families with no automatic analysis consumer:
 - External sinks: none
 - Consumers:
   - operational: retention prune (`src/agent_memory/timing_collector.py`)
+  - analysis: amem-daily deterministic test review (`src/agent_memory/telemetry_analysis.py`)
   - manual: amem timing tests (`src/agent_memory/test_timings.py`)
-  - analysis: none found (Stage E gap)
 - Retention: Case rows 30 days (test_timings.prune, run by the collector); run summaries kept (details_retained=false after pruning).
 - Exclusion: Measurements and node ids only, never test logs or captured output.
 - Learning input: yes
@@ -107,6 +121,7 @@ Learning families with no automatic analysis consumer:
 - External sinks: ClickHouse skill_calls
 - Consumers:
   - analysis: amem-rsi-night (amem rsi night-job) discovery (`src/agent_memory/rsi_night.py`)
+  - analysis: amem-rsi-night (amem rsi night-job) validated production observations via rsi_evidence (`src/agent_memory/production_feedback.py`)
   - analysis: amem-rsi-night (amem rsi night-job) skill_refresh prerequisite (`src/agent_memory/skill_refresh.py`)
   - export: sync clickhouse (amem daily step_sync) (`src/agent_memory/integrations/clickhouse.py`)
   - manual: amem skills scores / suggest (`src/agent_memory/skills.py`)
@@ -252,9 +267,9 @@ Learning families with no automatic analysis consumer:
 - External sinks: none
 - Consumers:
   - operational: night/brief dependency checks (`src/agent_memory/rsi_night.py`)
+  - analysis: amem-daily checkpoint freshness review (`src/agent_memory/telemetry_analysis.py`)
   - operational: sync cursors (`src/agent_memory/integrations/sync.py`)
   - report: Night Desk (external web app, owner JWT; dashboard_owner_read policy) (`supabase/migrations/20261024230827_night_desk.sql`)
-  - analysis: none found (Stage E gap)
 - Retention: Checkpoints and nights kept indefinitely; report_snapshots one row per kind and date.
 - Exclusion: Summaries only; report bodies stay in local files.
 - Learning input: yes
@@ -296,7 +311,7 @@ Learning families with no automatic analysis consumer:
 
 - Key: `evidence_links`
 - Purpose: Confirm identity, relevance and current availability
-- Producers: amem sync run (evidence links per pushed batch); evidence providers (rsi_evidence_providers); amem integrations ncm record
+- Producers: amem sync run (evidence links per pushed batch); evidence providers (rsi_evidence_providers); amem integrations ncm record; amem rsi outcome (immutable advisory production observations)
 - Owner job: amem-rsi-night (amem rsi night-job)
 - Tables: `rsi_evidence`
 - Views: none

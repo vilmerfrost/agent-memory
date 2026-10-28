@@ -16,8 +16,8 @@ cloud_digests (cloud routines) ─┴─sessions ingest──▶ sessions (tool 
             digest (redacted, capped) + instructions in force + rule catalog
                                                    │ writer: claude -p, JSON, ref = a rule id
                                                    ▼
-            deviations: rule_id, what / why / how, followed_grade, result_grade
-                                                   │ Jev: labels + grades + recurrence only
+            deviations: rule_id, what / why / how, why_category, followed_grade, result_grade
+                                                   │ Jev: labels (why_category too) + grades + recurrence only
                                                    ▼
             jev_verdict: edit_instruction | enforce | leave
                                                    │ deviations report --json
@@ -254,10 +254,11 @@ Per session:
    same run, with the parse error appended to the prompt. At most one extra writer call per
    session; a reply with at least one valid item is not retried.
 3. **Validation**: the reply must be JSON with a `deviations` list. Every item needs an offered
-   `instruction_source`, a ref, a turn (positive integer or null), `what`/`why`/`how` strings
-   and both grades as numbers in 0..1. A reply that is not JSON, has no list or has more than
-   8 items is rejected whole (session error). A malformed item (e.g. `"followed_grade": null`,
-   a missing or out-of-range grade, a bad turn, a source that was not offered) is skipped, and
+   `instruction_source`, a ref, a turn (positive integer or null), `what`/`why`/`how` strings,
+   a `why_category` (see "Why category") and both grades as numbers in 0..1. A reply that is not
+   JSON, has no list or has more than 8 items is rejected whole (session error). A malformed item
+   (e.g. `"followed_grade": null`, a missing or out-of-range grade, a missing or unknown
+   `why_category`, a bad turn, a source that was not offered) is skipped, and
    the session's valid items are kept: the scan counts it (`skipped=N` on the session line and
    in the summary) and stores `sessions.meta.scan_skipped` (the count) and
    `scan_skipped_reasons` (redacted, one line each, e.g. `deviation 0: followed_grade must be a
@@ -273,7 +274,8 @@ Per session:
    findings on the same rule and turn become one.
 5. **Jev** (`questions/deviation.toml`): one ask per deviation. The state holds only
    `instruction_source`, `instruction_rule` (the id), `rule_title` (the heading; for an
-   unmatched ref the writer's ref plus `(not in the rule list)`), `session_kind`, the two
+   unmatched ref the writer's ref plus `(not in the rule list)`), `why_category` (the label and
+   its fixed gloss, see "Why category"), `session_kind`, the two
    raw grades, `objective_result` (see "Objective result"; `unknown` while the session is
    active or has no outcome) and `recurrence` (other sessions in the window with a deviation
    on the same source + rule). Never transcript text and never what/why/how. Questions: `verdict`
@@ -352,11 +354,37 @@ adds two columns to `deviations` (RLS unchanged):
   `deviations reref` writes the new values (`objective=N` in its summary when rows moved;
   also for rows whose source file is gone).
 
+## Why category
+
+The writer's `why` is free text, and Jev never reads it. So the writer also picks one label,
+`why_category`, and Jev reads that label. Migration `20261027220000_deviation_why.sql` adds
+`deviations.why_category` (text, check constraint on the six values, null for rows scanned
+before it; RLS unchanged, no Night Desk grant). The scan's upsert writes it.
+
+| why_category | Meaning | Points Jev's verdict to |
+|---|---|---|
+| `unclear` | the instruction is unclear | edit_instruction |
+| `wrong` | the instruction is wrong or outdated | edit_instruction |
+| `conflict` | the instruction conflicts with another instruction | edit_instruction |
+| `missing_context` | the agent lacked context it needed | edit_instruction |
+| `ignored` | the agent ignored a clear instruction | enforce (leave for a harmless one-off) |
+| `tool_blocked` | a tool or hook got in the way | fix the setup: edit_instruction to fit it, or leave a one-off glitch |
+
+- The reply schema makes `why_category` required with exactly these values. An item without
+  it, or with another value, is malformed and skipped like a null grade.
+- Jev's state line is `why_category: <label> (the writer's view of why: <meaning>)`. The
+  meaning is the fixed text above, never the writer's words.
+- The `verdict` question in `questions/deviation.toml` states the mapping. Grades,
+  `objective_result` and recurrence overrule it only when they clearly disagree. The
+  `systemic` question uses it too: `ignored` points to a slip, the others to the instruction
+  or the setup.
+- The verdict options stay edit_instruction / enforce / leave.
+
 ## Privacy rules
 
 - Transcript text never reaches the database. The writer's what/why/how are its own words,
   cleaned of quotes, paths, code and secrets.
-- Jev never sees transcript text or what/why/how.
+- Jev never sees transcript text or what/why/how. It sees the `why_category` label only.
 - The writer gets the redacted digest and the instruction files, with no tools.
 - `.env*` files are never read.
 - Tests use synthetic transcripts only.

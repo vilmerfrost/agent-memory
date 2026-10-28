@@ -488,7 +488,8 @@ def _session_params(conn: psycopg.Connection, sid: str) -> dict[str, Any]:
 def _deviation_params(conn: psycopg.Connection, did: str) -> tuple[Any, ...]:
     cols = ("source_key", "session_id", "instruction_source", "instruction_ref", "turn", "what", "why", "how",
             "followed_grade", "result_grade", "jev_verdict", "jev_confidence", "jev_mode", "jev_answers",
-            "writer_model", "rule_id", "rule_title", "instruction_sha", "meta", "result_outcome", "objective_result")
+            "writer_model", "rule_id", "rule_title", "instruction_sha", "meta", "result_outcome", "objective_result",
+            "why_category")
     row = conn.execute(sql.SQL("select {} from deviations where id = %s").format(
         sql.SQL(", ").join(map(sql.Identifier, cols))), (did,)).fetchone()
     return tuple(Jsonb(v) if isinstance(v, dict | list) else v for v in row)
@@ -693,3 +694,42 @@ def test_proposed_indexes_are_not_applied(pack_db: str) -> None:
         names = {r[0] for r in conn.execute("select indexname from pg_indexes where schemaname = 'public'")}
     proposed = {ddl.split(" exists ")[1].split()[0] for ddl in P.PROPOSED_INDEXES}
     assert proposed and not proposed & names
+
+
+def test_provider_budget_context_covers_health_and_all_phase_calls():
+    from contextlib import contextmanager
+    class Bounded(Stub):
+        active=False
+        budgets=[]
+        @contextmanager
+        def read_budget(self,seconds):
+            assert seconds>0 and not self.active
+            self.budgets.append(seconds);self.active=True
+            try:yield
+            finally:self.active=False
+        def health(self):
+            assert self.active
+            return super().health()
+        def query(self,name,params):
+            assert self.active
+            return super().query(name,params)
+    lf=Bounded('lf',LF.LangfuseRetriever._QUERIES)
+    from agent_memory import rsi_evidence_providers as providers
+    gated=providers.GatedRetriever('langfuse',lf,providers.ProviderPolicy(True,('*',)))
+    runner=P._Runner({'lf':gated},timeout_s=20)
+    wrapped=runner.r['lf']
+    assert runner.call('lf',wrapped.health)[0]=='ok'
+    steps=[P._Step('lf','experiment_scores',{'experiment_id':EXP},'langfuse')]
+    result=runner.phase(steps)
+    assert result[0][1].status=='ok' and not lf.active
+    assert len(lf.budgets)==2 and 0<lf.budgets[1]<=lf.budgets[0]<=20
+
+
+def test_langfuse_budget_covers_cloud_spacing():
+    # 2026-10-26 night: a full pack's Langfuse reads (up to 11 calls, 2.1s apart on Cloud) could not fit in 20s.
+    cloud = LF.LangfuseRetriever(LF.LangfuseClient("https://cloud.langfuse.com", "pk", "sk"))
+    local = LF.LangfuseRetriever(LF.LangfuseClient("http://localhost:3000", "pk", "sk"))
+    runner = P._Runner({'lf': cloud, 'ch': None}, timeout_s=20)
+    assert runner.budget('ch') == 20
+    assert runner.budget('lf') >= 20 + (P.LF_PACK_CALLS - 1) * LF.CLOUD_MIN_INTERVAL_S
+    assert P._Runner({'lf': local}, timeout_s=1).budget('lf') == 1      # unthrottled: the caller's limit stands

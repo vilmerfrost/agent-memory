@@ -1,0 +1,54 @@
+{
+  "scenarios": [
+    {
+      "id": "team",
+      "first_read": "~/.claude/parent/team-parser/profile.md",
+      "mode": "team",
+      "target": "develop",
+      "integration": "feat/parser-batch",
+      "worker_branch": "task/parser",
+      "test": "python -m pytest tests/parser",
+      "announce_profile": false
+    },
+    {
+      "id": "personal",
+      "first_read": "~/.claude/parent/formatter/profile.md",
+      "mode": "personal",
+      "target": "main",
+      "integration": "integration",
+      "worker_branch": "worktree-formatter",
+      "test": "uv run pytest tests/formatter",
+      "announce_profile": false
+    },
+    {
+      "id": "absent",
+      "first_read": "~/.claude/parent/new-tool/profile.md",
+      "mode": "personal",
+      "target": null,
+      "integration": "integration",
+      "worker_branch": "worktree-fix",
+      "test": null,
+      "announce_profile": false
+    },
+    {
+      "id": "explicit-default",
+      "first_read": "~/.claude/parent/explicit/profile.md",
+      "mode": "personal",
+      "target": "main",
+      "integration": "integration",
+      "worker_branch": "worktree-fix",
+      "test": null,
+      "announce_profile": false
+    },
+    {
+      "id": "explicit-announcement",
+      "first_read": "~/.claude/parent/announced/profile.md",
+      "mode": "personal",
+      "target": "main",
+      "integration": "integration",
+      "worker_branch": "worktree-fix",
+      "test": "uv run pytest tests/announced",
+      "announce_profile": true
+    }
+  ]
+}

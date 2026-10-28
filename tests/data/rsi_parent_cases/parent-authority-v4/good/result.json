@@ -1,0 +1,99 @@
+{
+  "scenarios": [
+    {
+      "id": "own-merge",
+      "owner": "parent",
+      "steps": [
+        "verify_commit",
+        "accept_commit",
+        "merge_integration"
+      ],
+      "ask_user_to_do_work": false,
+      "retry_with_other_tool": false
+    },
+    {
+      "id": "own-implementation",
+      "owner": "parent",
+      "steps": [
+        "assign_isolated_worker",
+        "delegate_implementation",
+        "background_tests"
+      ],
+      "ask_user_to_do_work": false,
+      "retry_with_other_tool": false
+    },
+    {
+      "id": "own-worker-limit",
+      "owner": "parent",
+      "steps": [
+        "inspect_worker_denial",
+        "create_draft_pr"
+      ],
+      "ask_user_to_do_work": false,
+      "retry_with_other_tool": false
+    },
+    {
+      "id": "own-host-limit",
+      "owner": "parent",
+      "steps": [
+        "report_host_block"
+      ],
+      "ask_user_to_do_work": false,
+      "retry_with_other_tool": false
+    },
+    {
+      "id": "publish-worker",
+      "push_ref": "worktree-parser",
+      "create_pr": false,
+      "merge_base": null,
+      "approval": "none",
+      "force": false,
+      "admin": false
+    },
+    {
+      "id": "publish-integration",
+      "push_ref": "integration",
+      "create_pr": false,
+      "merge_base": null,
+      "approval": "none",
+      "force": false,
+      "admin": false
+    },
+    {
+      "id": "publish-pr-only",
+      "push_ref": null,
+      "create_pr": true,
+      "merge_base": null,
+      "approval": "none",
+      "force": false,
+      "admin": false
+    },
+    {
+      "id": "publish-merge-approved",
+      "push_ref": null,
+      "create_pr": false,
+      "merge_base": "main",
+      "approval": "app_prompt",
+      "force": false,
+      "admin": false
+    },
+    {
+      "id": "publish-force",
+      "push_ref": null,
+      "create_pr": false,
+      "merge_base": null,
+      "approval": "blocked",
+      "force": false,
+      "admin": false
+    },
+    {
+      "id": "publish-admin",
+      "push_ref": null,
+      "create_pr": false,
+      "merge_base": null,
+      "approval": "blocked",
+      "force": false,
+      "admin": false
+    }
+  ]
+}

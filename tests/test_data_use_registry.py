@@ -84,8 +84,10 @@ def test_every_family_is_documented_and_points_at_real_code() -> None:
             assert (REPO / c.where).exists(), (f.key, c.where)
     auth = DF.family("auth_recovery")
     assert not auth.learning_input and "rsi_totp_used" in auth.tables and "Never a learning input" in auth.exclusion
-    assert [f.key for f in DF.gaps()] == ["models_costs", "command_timings", "test_timings", "lessons",
-                                          "reports_checkpoints", "eval_drafts"]
+    assert [f.key for f in DF.gaps()] == ["models_costs", "lessons", "eval_drafts"]
+    for key in ('command_timings','test_timings','reports_checkpoints'):
+        assert any(c.kind=='analysis' and c.where=='src/agent_memory/telemetry_analysis.py'
+                   for c in DF.family(key).consumers)
 
 
 def test_the_doc_is_the_generated_registry() -> None:
@@ -101,7 +103,7 @@ def test_cli_families_json_and_text() -> None:
     assert data["problems"] == [] and data["excluded"] == {}
     assert len(data["families"]) == len(DF.FAMILIES)
     tt = next(f for f in data["families"] if f["key"] == "test_timings")
-    assert tt["stage_e_gap"] and tt["tables"] == ["test_timing_runs", "test_timing_cases"]
+    assert not tt["stage_e_gap"] and tt["tables"] == ["test_timing_runs", "test_timing_cases"]
     text = run_amem("coverage", "families", env=env)
     assert text.returncode == 0 and "test_timings" in text.stdout and "[no analysis consumer]" in text.stdout
 

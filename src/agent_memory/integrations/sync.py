@@ -227,6 +227,24 @@ def _deliver(sink: Sink, batch: Batch, usage: dict[str, Any],
 def run(sink: Sink, conn: psycopg.Connection, *, budget_s: float = 60.0, replay: bool = False,
         clock: Callable[[], float] = time.monotonic, now: datetime | None = None,
         environ: Mapping[str, str] | None = None) -> SyncReport:
+    """Serialize each sink's shared cursor and daily usage, including scoped exports."""
+    if switched_off(sink.name, environ):
+        return SyncReport(sink.name, status="off", detail="kill switch")
+    lock = f"amem:sync:{sink.name}"
+    held = conn.execute("select pg_try_advisory_lock(hashtextextended(%s, 0))", (lock,)).fetchone()[0]
+    if not held:
+        return SyncReport(sink.name, status="unavailable", detail="another sync for this sink is active")
+    try:
+        return _run(sink, conn, budget_s=budget_s, replay=replay, clock=clock, now=now, environ=environ)
+    finally:
+        conn.rollback()  # a failed SQL statement must not prevent releasing the session lock
+        conn.execute("select pg_advisory_unlock(hashtextextended(%s, 0))", (lock,))
+        conn.commit()
+
+
+def _run(sink: Sink, conn: psycopg.Connection, *, budget_s: float = 60.0, replay: bool = False,
+         clock: Callable[[], float] = time.monotonic, now: datetime | None = None,
+         environ: Mapping[str, str] | None = None) -> SyncReport:
     rep = SyncReport(sink.name)
     start = clock()
     now = now or datetime.now(UTC)

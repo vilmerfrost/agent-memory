@@ -38,7 +38,7 @@ import os
 import re
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -106,36 +106,159 @@ def session_id_for(experiment_id: str, arm: str, case: str, rep: int, profile: s
         return None
 
 
+def native_session_id(provider: Any, raw: Any) -> str | None:
+    """A trusted client's explicit actor identity, distinct from our attempt UUID.
+    Never accept a model-written id or derive one from nearby timestamps.
+    """
+    if provider not in ("claude", "codex") or not isinstance(raw, str):
+        return None
+    value = raw.removeprefix("codex:") if provider == "codex" else raw
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,160}", value):
+        return None
+    return "codex:" + value if provider == "codex" else value
+
+
 def runner_identity(experiment_id: str, run: Any, profile: str | None) -> dict[str, Any]:
     """What the runner hands the night for one agent run (an rsi_replay RunRecord)."""
     rel = Path("replays") / experiment_id / (profile or "") / "runs" / f"{run.run_id}.json"
     return {"experiment_id": experiment_id, "profile": profile or None, "arm": run.arm, "case": run.case,
-            "rep": run.rep, "run_id": run.run_id, "replay_record": rel.as_posix(), "error": bool(run.error)}
+            "rep": run.rep, "run_id": run.run_id, "replay_record": rel.as_posix(), "error": bool(run.error),
+            "native_session_id": native_session_id(getattr(run, "agent", None), getattr(run, "native_session_id", None)),
+            "agent": getattr(run, "agent", None), "model": getattr(run, "model", None),
+            "started_at": getattr(run, "started_at", None), "duration_s": getattr(run, "duration_s", None),
+            "runtime": getattr(run, 'runtime', None)}
 
 
-def record_runner(conn: psycopg.Connection, attempts: Iterable[Mapping[str, Any]]) -> int:
+def record_native_session(conn: psycopg.Connection, attempt: Attempt, a: Mapping[str, Any]) -> str | None:
+    """Ingest a real native-client session observation, not an invented transcript.
+    An absent client id never falls back to the logical attempt uuid. Sandbox
+    observations have zero transcript bytes and explicitly lack transcript and
+    acceptance evidence, so they cannot enter production grading or summaries.
+    """
+    provider = a.get("agent")
+    native = native_session_id(provider, a.get("native_session_id"))
+    if native is None:
+        return None
+    from agent_memory.execution_timing import number, timestamp
+    started = timestamp(a.get("started_at"))
+    duration = number(a.get("duration_s"))
+    ended = started + timedelta(seconds=duration) if started is not None and duration is not None else None
+    metadata = {"source": "rsi-native-session/1", "rsi_native_observation": True,
+                "env": "sandbox", "experiment_id": attempt.experiment_id,
+                "attempt_ref": attempt.key, "native_identity_source": "trusted_client_response",
+                "transcript_available": False, "acceptance": "unverified",
+                "execution_result": "failed" if a.get('error') else "completed",
+                "model_authority": "requested_configuration" if a.get('error') else "verified_client_response"}
+    conn.execute("""insert into sessions(session_id,tool,kind,project_dir,env,experiment_id,
+                    started_at,ended_at,duration_seconds,model,meta)
+                    values(%s,%s,'headless','rsi-native-session','sandbox',%s,%s,%s,%s,%s,%s)
+                    on conflict(session_id) do nothing""",
+                 (native, provider, attempt.experiment_id, started, ended, duration,
+                  a.get("model") if isinstance(a.get("model"), str) else None, Jsonb(metadata)))
+    got = conn.execute("select env,experiment_id,meta from sessions where session_id=%s", (native,)).fetchone()
+    if got and got[0] == "sandbox" and got[1] == attempt.experiment_id:
+        previous_attempt = got[2].get("attempt_ref") if isinstance(got[2], dict) else None
+        if previous_attempt in (None, attempt.key):
+            # Native API spans can arrive before the async session observation.
+            # Reuse exact-ID profiling; absent API measurements remain NULL.
+            from agent_memory import timing_store
+            runtime = a.get('runtime')
+            if provider == 'claude' and isinstance(runtime, dict) and runtime.get('api_duration_source') == 'client_result_duration_api_ms':
+                from agent_memory.execution_timing import Span, key
+                api_ms = number(runtime.get('api_duration_ms'))
+                if api_ms is not None:
+                    # A cumulative client total has no per-request wall interval.
+                    timing_store.upsert_conn(conn, [Span(key('claude.api.total/1', native, attempt.key), native,
+                        'claude', 'api', 'claude.api.total', None, None, api_ms,
+                        'failed' if a.get('error') else 'passed', 'provider_reported', 'claude.result',
+                        meta={'duration_source': 'client_result_duration_api_ms', 'api_scope': 'session'})])
+            timing_store.refresh_profiles(conn, [native])
+            return native
+    return None  # A real actor collision stays visible; never relabel a prod session.
+
+
+def record_runner(conn: psycopg.Connection, attempts: Iterable[Mapping[str, Any]], *, source: str = "runner") -> int:
     """Write the runner's attempts (source runner), idempotently. Returns the rows inserted or changed."""
+    if source not in ("runner", "repair"):
+        raise ValueError("invalid attempt evidence source")
     n = 0
     for a in attempts:
         at = Attempt(str(a["experiment_id"]), str(a["arm"]), str(a["case"]), int(a["rep"]), a.get("profile") or None)
-        ev = {"replay_record": a.get("replay_record"), **({"run_error": True} if a.get("error") else {})}
+        ev = {"replay_record": a.get("replay_record"), **({"run_error": True} if a.get("error") else {}),
+              **({"provider": a['agent']} if a.get('agent') in ('claude','codex') else {})}
+        native = native_session_id(a.get("agent"), a.get("native_session_id"))
+        sid = None
+        previous = conn.execute("select evidence,session_id from rsi_attempts where id=%s", (at.key,)).fetchone()
+        previous_ev = previous[0] if previous and isinstance(previous[0], dict) else {}
+        previous_native = native_session_id(previous_ev.get("provider"), previous_ev.get("native_session_id"))
+        if native:
+            if previous and previous_ev.get("native_session_id") not in (None, native):
+                raise refs.RefError("conflicting native identity for the same attempt")
+            if previous and previous[1] not in (None, native):
+                raise refs.RefError("existing attempt session link conflicts with native identity")
+            ev["native_session_id"] = native
+            ev["native_identity_source"] = "trusted_client_response"
+            sid = record_native_session(conn, at, a)
+            if sid is None:
+                ev["native_identity_unavailable"] = "existing_session_scope_or_attempt_conflict"
+        elif previous_native and previous_ev.get("native_identity_source") == "trusted_client_response":
+            # A late historical record has weaker evidence than the already
+            # captured client response. Preserve the exact existing identity;
+            # do not synthesize a native observation from its old logical UUID.
+            if a.get("agent") in ("claude", "codex") and a["agent"] != previous_ev.get("provider"):
+                raise refs.RefError("conflicting provider identity for the same attempt")
+            ev.update(provider=previous_ev["provider"], native_session_id=previous_native,
+                      native_identity_source="trusted_client_response")
+            target = conn.execute("select env,experiment_id,meta from sessions where session_id=%s",
+                                  (previous_native,)).fetchone()
+            if target and target[0] == "sandbox" and target[1] == at.experiment_id \
+                    and isinstance(target[2], dict) and target[2].get("attempt_ref") in (None, at.key) \
+                    and previous[1] in (None, previous_native):
+                sid = previous_native
+            else:
+                ev["native_identity_unavailable"] = "existing_session_scope_or_attempt_conflict"
+        else:
+            ev["native_identity_unavailable"] = "client_id_not_recorded"
         row = {"id": at.key, "status": "linked", "experiment_id": at.experiment_id, "profile": at.profile,
                "arm": at.arm, "case_id": at.case, "rep": at.rep, "attempt_session_id": at.session_id,
-               "run_id": a.get("run_id"), "session_id": None, "source": "runner",
+               "run_id": a.get("run_id"), "session_id": sid, "source": source,
                "evidence": {k: v for k, v in ev.items() if v is not None}, "reason": None}
         cur = conn.execute(
             f"insert into rsi_attempts ({', '.join(COLS)}) values ({', '.join(['%s'] * len(COLS))}) "
             "on conflict (id) do update set status = excluded.status, experiment_id = excluded.experiment_id, "
             "profile = excluded.profile, arm = excluded.arm, case_id = excluded.case_id, rep = excluded.rep, "
             "attempt_session_id = excluded.attempt_session_id, run_id = excluded.run_id, "
-            "session_id = coalesce(rsi_attempts.session_id, excluded.session_id), source = excluded.source, "
-            "evidence = rsi_attempts.evidence || excluded.evidence, reason = null, updated_at = now() "
-            "where (rsi_attempts.status, rsi_attempts.run_id, rsi_attempts.source, rsi_attempts.attempt_session_id) "
-            "is distinct from (excluded.status, excluded.run_id, excluded.source, excluded.attempt_session_id) "
+            "session_id = coalesce(rsi_attempts.session_id, excluded.session_id), "
+            "source = case when rsi_attempts.source='runner' then 'runner' else excluded.source end, "
+            "evidence = case when excluded.session_id is not null "
+            "and excluded.evidence->>'native_identity_source'='trusted_client_response' "
+            "then (rsi_attempts.evidence || excluded.evidence) - 'native_identity_unavailable' "
+            "else rsi_attempts.evidence || excluded.evidence end, reason = null, updated_at = now() "
+            "where (rsi_attempts.status, rsi_attempts.run_id, rsi_attempts.attempt_session_id) "
+            "is distinct from (excluded.status, excluded.run_id, excluded.attempt_session_id) "
+            "or (rsi_attempts.source<>'runner' and excluded.source='runner') "
+            "or (rsi_attempts.session_id is null and excluded.session_id is not null) "
+            "or (excluded.session_id is not null and rsi_attempts.evidence ? 'native_identity_unavailable') "
             "or not (rsi_attempts.evidence @> excluded.evidence)",
             _params(row))
         n += cur.rowcount
     return n
+
+
+def reconcile_native_sessions(conn: psycopg.Connection) -> int:
+    """Late arrival reconciliation using explicit client identity only.
+    This never creates sessions, reassigns an existing link, or matches by time.
+    """
+    cur = conn.execute("""
+        update rsi_attempts a set session_id=s.session_id,
+          evidence=a.evidence - 'native_identity_unavailable', updated_at=now()
+        from sessions s where a.status='linked' and a.session_id is null
+          and a.evidence->>'native_identity_source'='trusted_client_response'
+          and a.evidence->>'native_session_id'=s.session_id
+          and s.env='sandbox' and s.experiment_id=a.experiment_id
+          and coalesce(s.meta->>'attempt_ref',a.id)=a.id
+        """)
+    return cur.rowcount
 
 
 # --------------------------------------------------------------------------- observations

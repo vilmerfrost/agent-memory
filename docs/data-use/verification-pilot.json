@@ -1,0 +1,1488 @@
+{
+  "format": "verification-browser-observations/1",
+  "surface": "Codex IAB through cua_repl",
+  "scope": "controlled fixture, one repository; no production acceptance claims",
+  "launch_receipt": {
+    "repo_id": "agent-memory",
+    "revision": "294c472d98f9d60aa9ed398d772977a6848cc030",
+    "worktree": "/Users/vilmerfrost/worktrees/agent-memory/_integration",
+    "build_id": "106a206a6f1cb56cfe99c630afed19b30357818485bc51d31a3ec91ec25dc9c7",
+    "server_instance": "0b9de3ae-7c40-48b3-9f1f-4a9d9f63ee4e",
+    "origin": "http://127.0.0.1:53630"
+  },
+  "observed_viewport": "1280x720 CSS pixels",
+  "attempts": [
+    {
+      "attempt_id": "browser-pilot-01",
+      "scenario": "correct",
+      "actor": "/root",
+      "task": "controlled-verification-contract-pilot",
+      "observed_at": "2026-10-26T21:00:20.748Z",
+      "expected": {
+        "repo_id": "agent-memory",
+        "revision": "294c472d98f9d60aa9ed398d772977a6848cc030",
+        "worktree": "/Users/vilmerfrost/worktrees/agent-memory/_integration",
+        "build_id": "106a206a6f1cb56cfe99c630afed19b30357818485bc51d31a3ec91ec25dc9c7",
+        "server_instance": "0b9de3ae-7c40-48b3-9f1f-4a9d9f63ee4e",
+        "origin": "http://127.0.0.1:53630",
+        "route": "/",
+        "tab_id": "1"
+      },
+      "observed": {
+        "build_id": "106a206a6f1cb56cfe99c630afed19b30357818485bc51d31a3ec91ec25dc9c7",
+        "origin": "http://127.0.0.1:53630",
+        "repo_id": "agent-memory",
+        "revision": "294c472d98f9d60aa9ed398d772977a6848cc030",
+        "scope": "controlled_browser_fixture",
+        "server_instance": "0b9de3ae-7c40-48b3-9f1f-4a9d9f63ee4e",
+        "source_sha256": "36b22e38a7fb1f3ada95a628649ebad4dd594a0128e334029dd1540443debd67",
+        "worktree": "/Users/vilmerfrost/worktrees/agent-memory/_integration",
+        "route": "/",
+        "tab_id": "1"
+      },
+      "viewport": {
+        "height": 720,
+        "width": 1280
+      },
+      "interaction": "Increment button click after fresh page load",
+      "criterion": {
+        "key": "counter-increments-after-click/1",
+        "expected": 1,
+        "actual": 1
+      },
+      "evidence_ref": "cua:browser:2:tab:1:attempt:1",
+      "dom_counter": 1,
+      "elapsed_ms": 543,
+      "provenance": "trusted-launch-receipt plus owned-tab DOM observation",
+      "ax_observation": "Browser tab: 1, Title: \"Agent-Memory Verification Fixture\", URL: \"http://127.0.0.1:53630/\".\n1 AXWebArea Agent-Memory Verification Fixture, URL: 127.0.0.1:53630/\n\t2 container\n\t\t3 heading Verification Fixture, Value: 1\n\t\t\t4 text Verification Fixture\n\t\t5 text Controlled test target. No production data.\n\t\t6 button Increment, ID: increment\n\t\t7 text 1\n\nThe focused UI element is 6 button Increment, ID: increment",
+      "assessment": {
+        "format": "verification-pilot/1",
+        "result": "pass",
+        "binding_status": "verified",
+        "reason": "observed_predicate",
+        "missing": [],
+        "mismatch": [],
+        "criterion": {
+          "key": "counter-increments-after-click/1",
+          "expected": 1,
+          "actual": 1
+        },
+        "evidence_ref": "cua:browser:2:tab:1:attempt:1",
+        "acceptance_scope": "this_observed_criterion_only"
+      }
+    },
+    {
+      "attempt_id": "browser-pilot-02",
+      "scenario": "correct",
+      "actor": "/root",
+      "task": "controlled-verification-contract-pilot",
+      "observed_at": "2026-10-26T21:00:21.212Z",
+      "expected": {
+        "repo_id": "agent-memory",
+        "revision": "294c472d98f9d60aa9ed398d772977a6848cc030",
+        "worktree": "/Users/vilmerfrost/worktrees/agent-memory/_integration",
+        "build_id": "106a206a6f1cb56cfe99c630afed19b30357818485bc51d31a3ec91ec25dc9c7",
+        "server_instance": "0b9de3ae-7c40-48b3-9f1f-4a9d9f63ee4e",
+        "origin": "http://127.0.0.1:53630",
+        "route": "/",
+        "tab_id": "1"
+      },
+      "observed": {
+        "build_id": "106a206a6f1cb56cfe99c630afed19b30357818485bc51d31a3ec91ec25dc9c7",
+        "origin": "http://127.0.0.1:53630",
+        "repo_id": "agent-memory",
+        "revision": "294c472d98f9d60aa9ed398d772977a6848cc030",
+        "scope": "controlled_browser_fixture",
+        "server_instance": "0b9de3ae-7c40-48b3-9f1f-4a9d9f63ee4e",
+        "source_sha256": "36b22e38a7fb1f3ada95a628649ebad4dd594a0128e334029dd1540443debd67",
+        "worktree": "/Users/vilmerfrost/worktrees/agent-memory/_integration",
+        "route": "/",
+        "tab_id": "1"
+      },
+      "viewport": {
+        "height": 720,
+        "width": 1280
+      },
+      "interaction": "Increment button click after fresh page load",
+      "criterion": {
+        "key": "counter-increments-after-click/1",
+        "expected": 1,
+        "actual": 1
+      },
+      "evidence_ref": "cua:browser:2:tab:1:attempt:2",
+      "dom_counter": 1,
+      "elapsed_ms": 460,
+      "provenance": "trusted-launch-receipt plus owned-tab DOM observation",
+      "ax_observation": "Browser tab: 1, Title: \"Agent-Memory Verification Fixture\", URL: \"http://127.0.0.1:53630/\".\n1 AXWebArea Agent-Memory Verification Fixture, URL: 127.0.0.1:53630/\n\t2 container\n\t\t3 heading Verification Fixture, Value: 1\n\t\t\t4 text Verification Fixture\n\t\t5 text Controlled test target. No production data.\n\t\t6 button Increment, ID: increment\n\t\t7 text 1\n\nThe focused UI element is 6 button Increment, ID: increment",
+      "assessment": {
+        "format": "verification-pilot/1",
+        "result": "pass",
+        "binding_status": "verified",
+        "reason": "observed_predicate",
+        "missing": [],
+        "mismatch": [],
+        "criterion": {
+          "key": "counter-increments-after-click/1",
+          "expected": 1,
+          "actual": 1
+        },
+        "evidence_ref": "cua:browser:2:tab:1:attempt:2",
+        "acceptance_scope": "this_observed_criterion_only"
+      }
+    },
+    {
+      "attempt_id": "browser-pilot-03",
+      "scenario": "correct",
+      "actor": "/root",
+      "task": "controlled-verification-contract-pilot",
+      "observed_at": "2026-10-26T21:00:21.643Z",
+      "expected": {
+        "repo_id": "agent-memory",
+        "revision": "294c472d98f9d60aa9ed398d772977a6848cc030",
+        "worktree": "/Users/vilmerfrost/worktrees/agent-memory/_integration",
+        "build_id": "106a206a6f1cb56cfe99c630afed19b30357818485bc51d31a3ec91ec25dc9c7",
+        "server_instance": "0b9de3ae-7c40-48b3-9f1f-4a9d9f63ee4e",
+        "origin": "http://127.0.0.1:53630",
+        "route": "/",
+        "tab_id": "1"
+      },
+      "observed": {
+        "build_id": "106a206a6f1cb56cfe99c630afed19b30357818485bc51d31a3ec91ec25dc9c7",
+        "origin": "http://127.0.0.1:53630",
+        "repo_id": "agent-memory",
+        "revision": "294c472d98f9d60aa9ed398d772977a6848cc030",
+        "scope": "controlled_browser_fixture",
+        "server_instance": "0b9de3ae-7c40-48b3-9f1f-4a9d9f63ee4e",
+        "source_sha256": "36b22e38a7fb1f3ada95a628649ebad4dd594a0128e334029dd1540443debd67",
+        "worktree": "/Users/vilmerfrost/worktrees/agent-memory/_integration",
+        "route": "/",
+        "tab_id": "1"
+      },
+      "viewport": {
+        "height": 720,
+        "width": 1280
+      },
+      "interaction": "Increment button click after fresh page load",
+      "criterion": {
+        "key": "counter-increments-after-click/1",
+        "expected": 1,
+        "actual": 1
+      },
+      "evidence_ref": "cua:browser:2:tab:1:attempt:3",
+      "dom_counter": 1,
+      "elapsed_ms": 431,
+      "provenance": "trusted-launch-receipt plus owned-tab DOM observation",
+      "ax_observation": "Browser tab: 1, Title: \"Agent-Memory Verification Fixture\", URL: \"http://127.0.0.1:53630/\".\n1 AXWebArea Agent-Memory Verification Fixture, URL: 127.0.0.1:53630/\n\t2 container\n\t\t3 heading Verification Fixture, Value: 1\n\t\t\t4 text Verification Fixture\n\t\t5 text Controlled test target. No production data.\n\t\t6 button Increment, ID: increment\n\t\t7 text 1\n\nThe focused UI element is 6 button Increment, ID: increment",
+      "assessment": {
+        "format": "verification-pilot/1",
+        "result": "pass",
+        "binding_status": "verified",
+        "reason": "observed_predicate",
+        "missing": [],
+        "mismatch": [],
+        "criterion": {
+          "key": "counter-increments-after-click/1",
+          "expected": 1,
+          "actual": 1
+        },
+        "evidence_ref": "cua:browser:2:tab:1:attempt:3",
+        "acceptance_scope": "this_observed_criterion_only"
+      }
+    },
+    {
+      "attempt_id": "browser-pilot-04",
+      "scenario": "correct",
+      "actor": "/root",
+      "task": "controlled-verification-contract-pilot",
+      "observed_at": "2026-10-26T21:00:22.056Z",
+      "expected": {
+        "repo_id": "agent-memory",
+        "revision": "294c472d98f9d60aa9ed398d772977a6848cc030",
+        "worktree": "/Users/vilmerfrost/worktrees/agent-memory/_integration",
+        "build_id": "106a206a6f1cb56cfe99c630afed19b30357818485bc51d31a3ec91ec25dc9c7",
+        "server_instance": "0b9de3ae-7c40-48b3-9f1f-4a9d9f63ee4e",
+        "origin": "http://127.0.0.1:53630",
+        "route": "/",
+        "tab_id": "1"
+      },
+      "observed": {
+        "build_id": "106a206a6f1cb56cfe99c630afed19b30357818485bc51d31a3ec91ec25dc9c7",
+        "origin": "http://127.0.0.1:53630",
+        "repo_id": "agent-memory",
+        "revision": "294c472d98f9d60aa9ed398d772977a6848cc030",
+        "scope": "controlled_browser_fixture",
+        "server_instance": "0b9de3ae-7c40-48b3-9f1f-4a9d9f63ee4e",
+        "source_sha256": "36b22e38a7fb1f3ada95a628649ebad4dd594a0128e334029dd1540443debd67",
+        "worktree": "/Users/vilmerfrost/worktrees/agent-memory/_integration",
+        "route": "/",
+        "tab_id": "1"
+      },
+      "viewport": {
+        "height": 720,
+        "width": 1280
+      },
+      "interaction": "Increment button click after fresh page load",
+      "criterion": {
+        "key": "counter-increments-after-click/1",
+        "expected": 1,
+        "actual": 1
+      },
+      "evidence_ref": "cua:browser:2:tab:1:attempt:4",
+      "dom_counter": 1,
+      "elapsed_ms": 413,
+      "provenance": "trusted-launch-receipt plus owned-tab DOM observation",
+      "ax_observation": "Browser tab: 1, Title: \"Agent-Memory Verification Fixture\", URL: \"http://127.0.0.1:53630/\".\n1 AXWebArea Agent-Memory Verification Fixture, URL: 127.0.0.1:53630/\n\t2 container\n\t\t3 heading Verification Fixture, Value: 1\n\t\t\t4 text Verification Fixture\n\t\t5 text Controlled test target. No production data.\n\t\t6 button Increment, ID: increment\n\t\t7 text 1\n\nThe focused UI element is 6 button Increment, ID: increment",
+      "assessment": {
+        "format": "verification-pilot/1",
+        "result": "pass",
+        "binding_status": "verified",
+        "reason": "observed_predicate",
+        "missing": [],
+        "mismatch": [],
+        "criterion": {
+          "key": "counter-increments-after-click/1",
+          "expected": 1,
+          "actual": 1
+        },
+        "evidence_ref": "cua:browser:2:tab:1:attempt:4",
+        "acceptance_scope": "this_observed_criterion_only"
+      }
+    },
+    {
+      "attempt_id": "browser-pilot-05",
+      "scenario": "correct",
+      "actor": "/root",
+      "task": "controlled-verification-contract-pilot",
+      "observed_at": "2026-10-26T21:00:22.579Z",
+      "expected": {
+        "repo_id": "agent-memory",
+        "revision": "294c472d98f9d60aa9ed398d772977a6848cc030",
+        "worktree": "/Users/vilmerfrost/worktrees/agent-memory/_integration",
+        "build_id": "106a206a6f1cb56cfe99c630afed19b30357818485bc51d31a3ec91ec25dc9c7",
+        "server_instance": "0b9de3ae-7c40-48b3-9f1f-4a9d9f63ee4e",
+        "origin": "http://127.0.0.1:53630",
+        "route": "/",
+        "tab_id": "1"
+      },
+      "observed": {
+        "build_id": "106a206a6f1cb56cfe99c630afed19b30357818485bc51d31a3ec91ec25dc9c7",
+        "origin": "http://127.0.0.1:53630",
+        "repo_id": "agent-memory",
+        "revision": "294c472d98f9d60aa9ed398d772977a6848cc030",
+        "scope": "controlled_browser_fixture",
+        "server_instance": "0b9de3ae-7c40-48b3-9f1f-4a9d9f63ee4e",
+        "source_sha256": "36b22e38a7fb1f3ada95a628649ebad4dd594a0128e334029dd1540443debd67",
+        "worktree": "/Users/vilmerfrost/worktrees/agent-memory/_integration",
+        "route": "/",
+        "tab_id": "1"
+      },
+      "viewport": {
+        "height": 720,
+        "width": 1280
+      },
+      "interaction": "Increment button click after fresh page load",
+      "criterion": {
+        "key": "counter-increments-after-click/1",
+        "expected": 1,
+        "actual": 1
+      },
+      "evidence_ref": "cua:browser:2:tab:1:attempt:5",
+      "dom_counter": 1,
+      "elapsed_ms": 523,
+      "provenance": "trusted-launch-receipt plus owned-tab DOM observation",
+      "ax_observation": "Browser tab: 1, Title: \"Agent-Memory Verification Fixture\", URL: \"http://127.0.0.1:53630/\".\n1 AXWebArea Agent-Memory Verification Fixture, URL: 127.0.0.1:53630/\n\t2 container\n\t\t3 heading Verification Fixture, Value: 1\n\t\t\t4 text Verification Fixture\n\t\t5 text Controlled test target. No production data.\n\t\t6 button Increment, ID: increment\n\t\t7 text 1\n\nThe focused UI element is 6 button Increment, ID: increment",
+      "assessment": {
+        "format": "verification-pilot/1",
+        "result": "pass",
+        "binding_status": "verified",
+        "reason": "observed_predicate",
+        "missing": [],
+        "mismatch": [],
+        "criterion": {
+          "key": "counter-increments-after-click/1",
+          "expected": 1,
+          "actual": 1
+        },
+        "evidence_ref": "cua:browser:2:tab:1:attempt:5",
+        "acceptance_scope": "this_observed_criterion_only"
+      }
+    },
+    {
+      "attempt_id": "browser-pilot-06",
+      "scenario": "stale",
+      "actor": "/root",
+      "task": "controlled-verification-contract-pilot",
+      "observed_at": "2026-10-26T21:00:36.097Z",
+      "expected": {
+        "repo_id": "agent-memory",
+        "revision": "294c472d98f9d60aa9ed398d772977a6848cc030",
+        "worktree": "/Users/vilmerfrost/worktrees/agent-memory/_integration",
+        "build_id": "106a206a6f1cb56cfe99c630afed19b30357818485bc51d31a3ec91ec25dc9c7",
+        "server_instance": "0b9de3ae-7c40-48b3-9f1f-4a9d9f63ee4e",
+        "origin": "http://127.0.0.1:53630",
+        "route": "/stale",
+        "tab_id": "1"
+      },
+      "observed": {
+        "build_id": "intentionally-stale-fixture",
+        "origin": "http://127.0.0.1:53630",
+        "repo_id": "agent-memory",
+        "revision": "294c472d98f9d60aa9ed398d772977a6848cc030",
+        "scope": "controlled_browser_fixture",
+        "server_instance": "0b9de3ae-7c40-48b3-9f1f-4a9d9f63ee4e",
+        "source_sha256": "36b22e38a7fb1f3ada95a628649ebad4dd594a0128e334029dd1540443debd67",
+        "worktree": "/Users/vilmerfrost/worktrees/agent-memory/_integration",
+        "route": "/stale",
+        "tab_id": "1"
+      },
+      "viewport": {
+        "height": 720,
+        "width": 1280
+      },
+      "interaction": "Increment button click after fresh page load",
+      "criterion": {
+        "key": "counter-increments-after-click/1",
+        "expected": 1,
+        "actual": 1
+      },
+      "evidence_ref": "cua:browser:2:tab:1:attempt:6",
+      "dom_counter": 1,
+      "elapsed_ms": 493,
+      "provenance": "trusted-launch-receipt plus owned-tab DOM observation",
+      "ax_observation": "Browser tab: 1, Title: \"Agent-Memory Verification Fixture\", URL: \"http://127.0.0.1:53630/stale\".\n1 AXWebArea Agent-Memory Verification Fixture, URL: 127.0.0.1:53630/stale\n\t2 container\n\t\t3 heading Verification Fixture, Value: 1\n\t\t\t4 text Verification Fixture\n\t\t5 text Controlled test target. No production data.\n\t\t6 button Increment, ID: increment\n\t\t7 text 1\n\nThe focused UI element is 6 button Increment, ID: increment",
+      "assessment": {
+        "format": "verification-pilot/1",
+        "result": "fail",
+        "binding_status": "mismatch",
+        "reason": "target_mismatch",
+        "missing": [],
+        "mismatch": [
+          "build_id"
+        ],
+        "criterion": {
+          "key": "counter-increments-after-click/1",
+          "expected": 1,
+          "actual": 1
+        },
+        "evidence_ref": "cua:browser:2:tab:1:attempt:6",
+        "acceptance_scope": "this_observed_criterion_only"
+      }
+    },
+    {
+      "attempt_id": "browser-pilot-07",
+      "scenario": "stale",
+      "actor": "/root",
+      "task": "controlled-verification-contract-pilot",
+      "observed_at": "2026-10-26T21:00:36.521Z",
+      "expected": {
+        "repo_id": "agent-memory",
+        "revision": "294c472d98f9d60aa9ed398d772977a6848cc030",
+        "worktree": "/Users/vilmerfrost/worktrees/agent-memory/_integration",
+        "build_id": "106a206a6f1cb56cfe99c630afed19b30357818485bc51d31a3ec91ec25dc9c7",
+        "server_instance": "0b9de3ae-7c40-48b3-9f1f-4a9d9f63ee4e",
+        "origin": "http://127.0.0.1:53630",
+        "route": "/stale",
+        "tab_id": "1"
+      },
+      "observed": {
+        "build_id": "intentionally-stale-fixture",
+        "origin": "http://127.0.0.1:53630",
+        "repo_id": "agent-memory",
+        "revision": "294c472d98f9d60aa9ed398d772977a6848cc030",
+        "scope": "controlled_browser_fixture",
+        "server_instance": "0b9de3ae-7c40-48b3-9f1f-4a9d9f63ee4e",
+        "source_sha256": "36b22e38a7fb1f3ada95a628649ebad4dd594a0128e334029dd1540443debd67",
+        "worktree": "/Users/vilmerfrost/worktrees/agent-memory/_integration",
+        "route": "/stale",
+        "tab_id": "1"
+      },
+      "viewport": {
+        "height": 720,
+        "width": 1280
+      },
+      "interaction": "Increment button click after fresh page load",
+      "criterion": {
+        "key": "counter-increments-after-click/1",
+        "expected": 1,
+        "actual": 1
+      },
+      "evidence_ref": "cua:browser:2:tab:1:attempt:7",
+      "dom_counter": 1,
+      "elapsed_ms": 424,
+      "provenance": "trusted-launch-receipt plus owned-tab DOM observation",
+      "ax_observation": "Browser tab: 1, Title: \"Agent-Memory Verification Fixture\", URL: \"http://127.0.0.1:53630/stale\".\n1 AXWebArea Agent-Memory Verification Fixture, URL: 127.0.0.1:53630/stale\n\t2 container\n\t\t3 heading Verification Fixture, Value: 1\n\t\t\t4 text Verification Fixture\n\t\t5 text Controlled test target. No production data.\n\t\t6 button Increment, ID: increment\n\t\t7 text 1\n\nThe focused UI element is 6 button Increment, ID: increment",
+      "assessment": {
+        "format": "verification-pilot/1",
+        "result": "fail",
+        "binding_status": "mismatch",
+        "reason": "target_mismatch",
+        "missing": [],
+        "mismatch": [
+          "build_id"
+        ],
+        "criterion": {
+          "key": "counter-increments-after-click/1",
+          "expected": 1,
+          "actual": 1
+        },
+        "evidence_ref": "cua:browser:2:tab:1:attempt:7",
+        "acceptance_scope": "this_observed_criterion_only"
+      }
+    },
+    {
+      "attempt_id": "browser-pilot-08",
+      "scenario": "stale",
+      "actor": "/root",
+      "task": "controlled-verification-contract-pilot",
+      "observed_at": "2026-10-26T21:00:36.930Z",
+      "expected": {
+        "repo_id": "agent-memory",
+        "revision": "294c472d98f9d60aa9ed398d772977a6848cc030",
+        "worktree": "/Users/vilmerfrost/worktrees/agent-memory/_integration",
+        "build_id": "106a206a6f1cb56cfe99c630afed19b30357818485bc51d31a3ec91ec25dc9c7",
+        "server_instance": "0b9de3ae-7c40-48b3-9f1f-4a9d9f63ee4e",
+        "origin": "http://127.0.0.1:53630",
+        "route": "/stale",
+        "tab_id": "1"
+      },
+      "observed": {
+        "build_id": "intentionally-stale-fixture",
+        "origin": "http://127.0.0.1:53630",
+        "repo_id": "agent-memory",
+        "revision": "294c472d98f9d60aa9ed398d772977a6848cc030",
+        "scope": "controlled_browser_fixture",
+        "server_instance": "0b9de3ae-7c40-48b3-9f1f-4a9d9f63ee4e",
+        "source_sha256": "36b22e38a7fb1f3ada95a628649ebad4dd594a0128e334029dd1540443debd67",
+        "worktree": "/Users/vilmerfrost/worktrees/agent-memory/_integration",
+        "route": "/stale",
+        "tab_id": "1"
+      },
+      "viewport": {
+        "height": 720,
+        "width": 1280
+      },
+      "interaction": "Increment button click after fresh page load",
+      "criterion": {
+        "key": "counter-increments-after-click/1",
+        "expected": 1,
+        "actual": 1
+      },
+      "evidence_ref": "cua:browser:2:tab:1:attempt:8",
+      "dom_counter": 1,
+      "elapsed_ms": 409,
+      "provenance": "trusted-launch-receipt plus owned-tab DOM observation",
+      "ax_observation": "Browser tab: 1, Title: \"Agent-Memory Verification Fixture\", URL: \"http://127.0.0.1:53630/stale\".\n1 AXWebArea Agent-Memory Verification Fixture, URL: 127.0.0.1:53630/stale\n\t2 container\n\t\t3 heading Verification Fixture, Value: 1\n\t\t\t4 text Verification Fixture\n\t\t5 text Controlled test target. No production data.\n\t\t6 button Increment, ID: increment\n\t\t7 text 1\n\nThe focused UI element is 6 button Increment, ID: increment",
+      "assessment": {
+        "format": "verification-pilot/1",
+        "result": "fail",
+        "binding_status": "mismatch",
+        "reason": "target_mismatch",
+        "missing": [],
+        "mismatch": [
+          "build_id"
+        ],
+        "criterion": {
+          "key": "counter-increments-after-click/1",
+          "expected": 1,
+          "actual": 1
+        },
+        "evidence_ref": "cua:browser:2:tab:1:attempt:8",
+        "acceptance_scope": "this_observed_criterion_only"
+      }
+    },
+    {
+      "attempt_id": "browser-pilot-09",
+      "scenario": "stale",
+      "actor": "/root",
+      "task": "controlled-verification-contract-pilot",
+      "observed_at": "2026-10-26T21:00:37.391Z",
+      "expected": {
+        "repo_id": "agent-memory",
+        "revision": "294c472d98f9d60aa9ed398d772977a6848cc030",
+        "worktree": "/Users/vilmerfrost/worktrees/agent-memory/_integration",
+        "build_id": "106a206a6f1cb56cfe99c630afed19b30357818485bc51d31a3ec91ec25dc9c7",
+        "server_instance": "0b9de3ae-7c40-48b3-9f1f-4a9d9f63ee4e",
+        "origin": "http://127.0.0.1:53630",
+        "route": "/stale",
+        "tab_id": "1"
+      },
+      "observed": {
+        "build_id": "intentionally-stale-fixture",
+        "origin": "http://127.0.0.1:53630",
+        "repo_id": "agent-memory",
+        "revision": "294c472d98f9d60aa9ed398d772977a6848cc030",
+        "scope": "controlled_browser_fixture",
+        "server_instance": "0b9de3ae-7c40-48b3-9f1f-4a9d9f63ee4e",
+        "source_sha256": "36b22e38a7fb1f3ada95a628649ebad4dd594a0128e334029dd1540443debd67",
+        "worktree": "/Users/vilmerfrost/worktrees/agent-memory/_integration",
+        "route": "/stale",
+        "tab_id": "1"
+      },
+      "viewport": {
+        "height": 720,
+        "width": 1280
+      },
+      "interaction": "Increment button click after fresh page load",
+      "criterion": {
+        "key": "counter-increments-after-click/1",
+        "expected": 1,
+        "actual": 1
+      },
+      "evidence_ref": "cua:browser:2:tab:1:attempt:9",
+      "dom_counter": 1,
+      "elapsed_ms": 461,
+      "provenance": "trusted-launch-receipt plus owned-tab DOM observation",
+      "ax_observation": "Browser tab: 1, Title: \"Agent-Memory Verification Fixture\", URL: \"http://127.0.0.1:53630/stale\".\n1 AXWebArea Agent-Memory Verification Fixture, URL: 127.0.0.1:53630/stale\n\t2 container\n\t\t3 heading Verification Fixture, Value: 1\n\t\t\t4 text Verification Fixture\n\t\t5 text Controlled test target. No production data.\n\t\t6 button Increment, ID: increment\n\t\t7 text 1\n\nThe focused UI element is 6 button Increment, ID: increment",
+      "assessment": {
+        "format": "verification-pilot/1",
+        "result": "fail",
+        "binding_status": "mismatch",
+        "reason": "target_mismatch",
+        "missing": [],
+        "mismatch": [
+          "build_id"
+        ],
+        "criterion": {
+          "key": "counter-increments-after-click/1",
+          "expected": 1,
+          "actual": 1
+        },
+        "evidence_ref": "cua:browser:2:tab:1:attempt:9",
+        "acceptance_scope": "this_observed_criterion_only"
+      }
+    },
+    {
+      "attempt_id": "browser-pilot-10",
+      "scenario": "wrong_tab",
+      "actor": "/root",
+      "task": "controlled-verification-contract-pilot",
+      "observed_at": "2026-10-26T21:00:37.868Z",
+      "expected": {
+        "repo_id": "agent-memory",
+        "revision": "294c472d98f9d60aa9ed398d772977a6848cc030",
+        "worktree": "/Users/vilmerfrost/worktrees/agent-memory/_integration",
+        "build_id": "106a206a6f1cb56cfe99c630afed19b30357818485bc51d31a3ec91ec25dc9c7",
+        "server_instance": "0b9de3ae-7c40-48b3-9f1f-4a9d9f63ee4e",
+        "origin": "http://127.0.0.1:53630",
+        "route": "/",
+        "tab_id": "1"
+      },
+      "observed": {
+        "build_id": "106a206a6f1cb56cfe99c630afed19b30357818485bc51d31a3ec91ec25dc9c7",
+        "origin": "http://127.0.0.1:53630",
+        "repo_id": "agent-memory",
+        "revision": "294c472d98f9d60aa9ed398d772977a6848cc030",
+        "scope": "controlled_browser_fixture",
+        "server_instance": "0b9de3ae-7c40-48b3-9f1f-4a9d9f63ee4e",
+        "source_sha256": "36b22e38a7fb1f3ada95a628649ebad4dd594a0128e334029dd1540443debd67",
+        "worktree": "/Users/vilmerfrost/worktrees/agent-memory/_integration",
+        "route": "/",
+        "tab_id": "2"
+      },
+      "viewport": {
+        "height": 720,
+        "width": 1280
+      },
+      "interaction": "Increment button click after fresh page load",
+      "criterion": {
+        "key": "counter-increments-after-click/1",
+        "expected": 1,
+        "actual": 1
+      },
+      "evidence_ref": "cua:browser:2:tab:2:attempt:10",
+      "dom_counter": 1,
+      "elapsed_ms": 476,
+      "provenance": "trusted-launch-receipt plus owned-tab DOM observation",
+      "ax_observation": "Browser tab: 2, Title: \"Agent-Memory Verification Fixture\", URL: \"http://127.0.0.1:53630/\".\n1 AXWebArea Agent-Memory Verification Fixture, URL: 127.0.0.1:53630/\n\t2 container\n\t\t3 heading Verification Fixture, Value: 1\n\t\t\t4 text Verification Fixture\n\t\t5 text Controlled test target. No production data.\n\t\t6 button Increment, ID: increment\n\t\t7 text 1\n\nThe focused UI element is 6 button Increment, ID: increment",
+      "assessment": {
+        "format": "verification-pilot/1",
+        "result": "fail",
+        "binding_status": "mismatch",
+        "reason": "target_mismatch",
+        "missing": [],
+        "mismatch": [
+          "tab_id"
+        ],
+        "criterion": {
+          "key": "counter-increments-after-click/1",
+          "expected": 1,
+          "actual": 1
+        },
+        "evidence_ref": "cua:browser:2:tab:2:attempt:10",
+        "acceptance_scope": "this_observed_criterion_only"
+      }
+    },
+    {
+      "attempt_id": "browser-pilot-11",
+      "scenario": "wrong_tab",
+      "actor": "/root",
+      "task": "controlled-verification-contract-pilot",
+      "observed_at": "2026-10-26T21:00:42.812Z",
+      "expected": {
+        "repo_id": "agent-memory",
+        "revision": "294c472d98f9d60aa9ed398d772977a6848cc030",
+        "worktree": "/Users/vilmerfrost/worktrees/agent-memory/_integration",
+        "build_id": "106a206a6f1cb56cfe99c630afed19b30357818485bc51d31a3ec91ec25dc9c7",
+        "server_instance": "0b9de3ae-7c40-48b3-9f1f-4a9d9f63ee4e",
+        "origin": "http://127.0.0.1:53630",
+        "route": "/",
+        "tab_id": "1"
+      },
+      "observed": {
+        "build_id": "106a206a6f1cb56cfe99c630afed19b30357818485bc51d31a3ec91ec25dc9c7",
+        "origin": "http://127.0.0.1:53630",
+        "repo_id": "agent-memory",
+        "revision": "294c472d98f9d60aa9ed398d772977a6848cc030",
+        "scope": "controlled_browser_fixture",
+        "server_instance": "0b9de3ae-7c40-48b3-9f1f-4a9d9f63ee4e",
+        "source_sha256": "36b22e38a7fb1f3ada95a628649ebad4dd594a0128e334029dd1540443debd67",
+        "worktree": "/Users/vilmerfrost/worktrees/agent-memory/_integration",
+        "route": "/",
+        "tab_id": "2"
+      },
+      "viewport": {
+        "height": 720,
+        "width": 1280
+      },
+      "interaction": "Increment button click after fresh page load",
+      "criterion": {
+        "key": "counter-increments-after-click/1",
+        "expected": 1,
+        "actual": 1
+      },
+      "evidence_ref": "cua:browser:2:tab:2:attempt:11",
+      "dom_counter": 1,
+      "elapsed_ms": 434,
+      "provenance": "trusted-launch-receipt plus owned-tab DOM observation",
+      "ax_observation": "Browser tab: 2, Title: \"Agent-Memory Verification Fixture\", URL: \"http://127.0.0.1:53630/\".\n1 AXWebArea Agent-Memory Verification Fixture, URL: 127.0.0.1:53630/\n\t2 container\n\t\t3 heading Verification Fixture, Value: 1\n\t\t\t4 text Verification Fixture\n\t\t5 text Controlled test target. No production data.\n\t\t6 button Increment, ID: increment\n\t\t7 text 1\n\nThe focused UI element is 6 button Increment, ID: increment",
+      "assessment": {
+        "format": "verification-pilot/1",
+        "result": "fail",
+        "binding_status": "mismatch",
+        "reason": "target_mismatch",
+        "missing": [],
+        "mismatch": [
+          "tab_id"
+        ],
+        "criterion": {
+          "key": "counter-increments-after-click/1",
+          "expected": 1,
+          "actual": 1
+        },
+        "evidence_ref": "cua:browser:2:tab:2:attempt:11",
+        "acceptance_scope": "this_observed_criterion_only"
+      }
+    },
+    {
+      "attempt_id": "browser-pilot-12",
+      "scenario": "wrong_tab",
+      "actor": "/root",
+      "task": "controlled-verification-contract-pilot",
+      "observed_at": "2026-10-26T21:00:43.205Z",
+      "expected": {
+        "repo_id": "agent-memory",
+        "revision": "294c472d98f9d60aa9ed398d772977a6848cc030",
+        "worktree": "/Users/vilmerfrost/worktrees/agent-memory/_integration",
+        "build_id": "106a206a6f1cb56cfe99c630afed19b30357818485bc51d31a3ec91ec25dc9c7",
+        "server_instance": "0b9de3ae-7c40-48b3-9f1f-4a9d9f63ee4e",
+        "origin": "http://127.0.0.1:53630",
+        "route": "/",
+        "tab_id": "1"
+      },
+      "observed": {
+        "build_id": "106a206a6f1cb56cfe99c630afed19b30357818485bc51d31a3ec91ec25dc9c7",
+        "origin": "http://127.0.0.1:53630",
+        "repo_id": "agent-memory",
+        "revision": "294c472d98f9d60aa9ed398d772977a6848cc030",
+        "scope": "controlled_browser_fixture",
+        "server_instance": "0b9de3ae-7c40-48b3-9f1f-4a9d9f63ee4e",
+        "source_sha256": "36b22e38a7fb1f3ada95a628649ebad4dd594a0128e334029dd1540443debd67",
+        "worktree": "/Users/vilmerfrost/worktrees/agent-memory/_integration",
+        "route": "/",
+        "tab_id": "2"
+      },
+      "viewport": {
+        "height": 720,
+        "width": 1280
+      },
+      "interaction": "Increment button click after fresh page load",
+      "criterion": {
+        "key": "counter-increments-after-click/1",
+        "expected": 1,
+        "actual": 1
+      },
+      "evidence_ref": "cua:browser:2:tab:2:attempt:12",
+      "dom_counter": 1,
+      "elapsed_ms": 393,
+      "provenance": "trusted-launch-receipt plus owned-tab DOM observation",
+      "ax_observation": "Browser tab: 2, Title: \"Agent-Memory Verification Fixture\", URL: \"http://127.0.0.1:53630/\".\n1 AXWebArea Agent-Memory Verification Fixture, URL: 127.0.0.1:53630/\n\t2 container\n\t\t3 heading Verification Fixture, Value: 1\n\t\t\t4 text Verification Fixture\n\t\t5 text Controlled test target. No production data.\n\t\t6 button Increment, ID: increment\n\t\t7 text 1\n\nThe focused UI element is 6 button Increment, ID: increment",
+      "assessment": {
+        "format": "verification-pilot/1",
+        "result": "fail",
+        "binding_status": "mismatch",
+        "reason": "target_mismatch",
+        "missing": [],
+        "mismatch": [
+          "tab_id"
+        ],
+        "criterion": {
+          "key": "counter-increments-after-click/1",
+          "expected": 1,
+          "actual": 1
+        },
+        "evidence_ref": "cua:browser:2:tab:2:attempt:12",
+        "acceptance_scope": "this_observed_criterion_only"
+      }
+    },
+    {
+      "attempt_id": "browser-pilot-13",
+      "scenario": "wrong_tab",
+      "actor": "/root",
+      "task": "controlled-verification-contract-pilot",
+      "observed_at": "2026-10-26T21:00:43.594Z",
+      "expected": {
+        "repo_id": "agent-memory",
+        "revision": "294c472d98f9d60aa9ed398d772977a6848cc030",
+        "worktree": "/Users/vilmerfrost/worktrees/agent-memory/_integration",
+        "build_id": "106a206a6f1cb56cfe99c630afed19b30357818485bc51d31a3ec91ec25dc9c7",
+        "server_instance": "0b9de3ae-7c40-48b3-9f1f-4a9d9f63ee4e",
+        "origin": "http://127.0.0.1:53630",
+        "route": "/",
+        "tab_id": "1"
+      },
+      "observed": {
+        "build_id": "106a206a6f1cb56cfe99c630afed19b30357818485bc51d31a3ec91ec25dc9c7",
+        "origin": "http://127.0.0.1:53630",
+        "repo_id": "agent-memory",
+        "revision": "294c472d98f9d60aa9ed398d772977a6848cc030",
+        "scope": "controlled_browser_fixture",
+        "server_instance": "0b9de3ae-7c40-48b3-9f1f-4a9d9f63ee4e",
+        "source_sha256": "36b22e38a7fb1f3ada95a628649ebad4dd594a0128e334029dd1540443debd67",
+        "worktree": "/Users/vilmerfrost/worktrees/agent-memory/_integration",
+        "route": "/",
+        "tab_id": "2"
+      },
+      "viewport": {
+        "height": 720,
+        "width": 1280
+      },
+      "interaction": "Increment button click after fresh page load",
+      "criterion": {
+        "key": "counter-increments-after-click/1",
+        "expected": 1,
+        "actual": 1
+      },
+      "evidence_ref": "cua:browser:2:tab:2:attempt:13",
+      "dom_counter": 1,
+      "elapsed_ms": 389,
+      "provenance": "trusted-launch-receipt plus owned-tab DOM observation",
+      "ax_observation": "Browser tab: 2, Title: \"Agent-Memory Verification Fixture\", URL: \"http://127.0.0.1:53630/\".\n1 AXWebArea Agent-Memory Verification Fixture, URL: 127.0.0.1:53630/\n\t2 container\n\t\t3 heading Verification Fixture, Value: 1\n\t\t\t4 text Verification Fixture\n\t\t5 text Controlled test target. No production data.\n\t\t6 button Increment, ID: increment\n\t\t7 text 1\n\nThe focused UI element is 6 button Increment, ID: increment",
+      "assessment": {
+        "format": "verification-pilot/1",
+        "result": "fail",
+        "binding_status": "mismatch",
+        "reason": "target_mismatch",
+        "missing": [],
+        "mismatch": [
+          "tab_id"
+        ],
+        "criterion": {
+          "key": "counter-increments-after-click/1",
+          "expected": 1,
+          "actual": 1
+        },
+        "evidence_ref": "cua:browser:2:tab:2:attempt:13",
+        "acceptance_scope": "this_observed_criterion_only"
+      }
+    },
+    {
+      "attempt_id": "browser-pilot-14",
+      "scenario": "wrong_target",
+      "actor": "/root",
+      "task": "controlled-verification-contract-pilot",
+      "observed_at": "2026-10-26T21:00:44.051Z",
+      "expected": {
+        "repo_id": "agent-memory",
+        "revision": "294c472d98f9d60aa9ed398d772977a6848cc030",
+        "worktree": "/Users/vilmerfrost/worktrees/agent-memory/_integration/intentionally-wrong-target",
+        "build_id": "106a206a6f1cb56cfe99c630afed19b30357818485bc51d31a3ec91ec25dc9c7",
+        "server_instance": "0b9de3ae-7c40-48b3-9f1f-4a9d9f63ee4e",
+        "origin": "http://127.0.0.1:53630",
+        "route": "/",
+        "tab_id": "1"
+      },
+      "observed": {
+        "build_id": "106a206a6f1cb56cfe99c630afed19b30357818485bc51d31a3ec91ec25dc9c7",
+        "origin": "http://127.0.0.1:53630",
+        "repo_id": "agent-memory",
+        "revision": "294c472d98f9d60aa9ed398d772977a6848cc030",
+        "scope": "controlled_browser_fixture",
+        "server_instance": "0b9de3ae-7c40-48b3-9f1f-4a9d9f63ee4e",
+        "source_sha256": "36b22e38a7fb1f3ada95a628649ebad4dd594a0128e334029dd1540443debd67",
+        "worktree": "/Users/vilmerfrost/worktrees/agent-memory/_integration",
+        "route": "/",
+        "tab_id": "1"
+      },
+      "viewport": {
+        "height": 720,
+        "width": 1280
+      },
+      "interaction": "Increment button click after fresh page load",
+      "criterion": {
+        "key": "counter-increments-after-click/1",
+        "expected": 1,
+        "actual": 1
+      },
+      "evidence_ref": "cua:browser:2:tab:1:attempt:14",
+      "dom_counter": 1,
+      "elapsed_ms": 458,
+      "provenance": "trusted-launch-receipt plus owned-tab DOM observation",
+      "ax_observation": "Browser tab: 1, Title: \"Agent-Memory Verification Fixture\", URL: \"http://127.0.0.1:53630/\".\n1 AXWebArea Agent-Memory Verification Fixture, URL: 127.0.0.1:53630/\n\t2 container\n\t\t3 heading Verification Fixture, Value: 1\n\t\t\t4 text Verification Fixture\n\t\t5 text Controlled test target. No production data.\n\t\t6 button Increment, ID: increment\n\t\t7 text 1\n\nThe focused UI element is 6 button Increment, ID: increment",
+      "assessment": {
+        "format": "verification-pilot/1",
+        "result": "fail",
+        "binding_status": "mismatch",
+        "reason": "target_mismatch",
+        "missing": [],
+        "mismatch": [
+          "worktree"
+        ],
+        "criterion": {
+          "key": "counter-increments-after-click/1",
+          "expected": 1,
+          "actual": 1
+        },
+        "evidence_ref": "cua:browser:2:tab:1:attempt:14",
+        "acceptance_scope": "this_observed_criterion_only"
+      }
+    },
+    {
+      "attempt_id": "browser-pilot-15",
+      "scenario": "wrong_target",
+      "actor": "/root",
+      "task": "controlled-verification-contract-pilot",
+      "observed_at": "2026-10-26T21:00:44.502Z",
+      "expected": {
+        "repo_id": "agent-memory",
+        "revision": "294c472d98f9d60aa9ed398d772977a6848cc030",
+        "worktree": "/Users/vilmerfrost/worktrees/agent-memory/_integration",
+        "build_id": "106a206a6f1cb56cfe99c630afed19b30357818485bc51d31a3ec91ec25dc9c7",
+        "server_instance": "0b9de3ae-7c40-48b3-9f1f-4a9d9f63ee4e",
+        "origin": "http://127.0.0.1:53631",
+        "route": "/",
+        "tab_id": "1"
+      },
+      "observed": {
+        "build_id": "106a206a6f1cb56cfe99c630afed19b30357818485bc51d31a3ec91ec25dc9c7",
+        "origin": "http://127.0.0.1:53630",
+        "repo_id": "agent-memory",
+        "revision": "294c472d98f9d60aa9ed398d772977a6848cc030",
+        "scope": "controlled_browser_fixture",
+        "server_instance": "0b9de3ae-7c40-48b3-9f1f-4a9d9f63ee4e",
+        "source_sha256": "36b22e38a7fb1f3ada95a628649ebad4dd594a0128e334029dd1540443debd67",
+        "worktree": "/Users/vilmerfrost/worktrees/agent-memory/_integration",
+        "route": "/",
+        "tab_id": "1"
+      },
+      "viewport": {
+        "height": 720,
+        "width": 1280
+      },
+      "interaction": "Increment button click after fresh page load",
+      "criterion": {
+        "key": "counter-increments-after-click/1",
+        "expected": 1,
+        "actual": 1
+      },
+      "evidence_ref": "cua:browser:2:tab:1:attempt:15",
+      "dom_counter": 1,
+      "elapsed_ms": 450,
+      "provenance": "trusted-launch-receipt plus owned-tab DOM observation",
+      "ax_observation": "Browser tab: 1, Title: \"Agent-Memory Verification Fixture\", URL: \"http://127.0.0.1:53630/\".\n1 AXWebArea Agent-Memory Verification Fixture, URL: 127.0.0.1:53630/\n\t2 container\n\t\t3 heading Verification Fixture, Value: 1\n\t\t\t4 text Verification Fixture\n\t\t5 text Controlled test target. No production data.\n\t\t6 button Increment, ID: increment\n\t\t7 text 1\n\nThe focused UI element is 6 button Increment, ID: increment",
+      "assessment": {
+        "format": "verification-pilot/1",
+        "result": "fail",
+        "binding_status": "mismatch",
+        "reason": "target_mismatch",
+        "missing": [],
+        "mismatch": [
+          "origin"
+        ],
+        "criterion": {
+          "key": "counter-increments-after-click/1",
+          "expected": 1,
+          "actual": 1
+        },
+        "evidence_ref": "cua:browser:2:tab:1:attempt:15",
+        "acceptance_scope": "this_observed_criterion_only"
+      }
+    },
+    {
+      "attempt_id": "browser-pilot-16",
+      "scenario": "wrong_target",
+      "actor": "/root",
+      "task": "controlled-verification-contract-pilot",
+      "observed_at": "2026-10-26T21:00:48.674Z",
+      "expected": {
+        "repo_id": "agent-memory",
+        "revision": "294c472d98f9d60aa9ed398d772977a6848cc030",
+        "worktree": "/Users/vilmerfrost/worktrees/agent-memory/_integration/intentionally-wrong-target",
+        "build_id": "106a206a6f1cb56cfe99c630afed19b30357818485bc51d31a3ec91ec25dc9c7",
+        "server_instance": "0b9de3ae-7c40-48b3-9f1f-4a9d9f63ee4e",
+        "origin": "http://127.0.0.1:53630",
+        "route": "/",
+        "tab_id": "1"
+      },
+      "observed": {
+        "build_id": "106a206a6f1cb56cfe99c630afed19b30357818485bc51d31a3ec91ec25dc9c7",
+        "origin": "http://127.0.0.1:53630",
+        "repo_id": "agent-memory",
+        "revision": "294c472d98f9d60aa9ed398d772977a6848cc030",
+        "scope": "controlled_browser_fixture",
+        "server_instance": "0b9de3ae-7c40-48b3-9f1f-4a9d9f63ee4e",
+        "source_sha256": "36b22e38a7fb1f3ada95a628649ebad4dd594a0128e334029dd1540443debd67",
+        "worktree": "/Users/vilmerfrost/worktrees/agent-memory/_integration",
+        "route": "/",
+        "tab_id": "1"
+      },
+      "viewport": {
+        "height": 720,
+        "width": 1280
+      },
+      "interaction": "Increment button click after fresh page load",
+      "criterion": {
+        "key": "counter-increments-after-click/1",
+        "expected": 1,
+        "actual": 1
+      },
+      "evidence_ref": "cua:browser:2:tab:1:attempt:16",
+      "dom_counter": 1,
+      "elapsed_ms": 431,
+      "provenance": "trusted-launch-receipt plus owned-tab DOM observation",
+      "ax_observation": "Browser tab: 1, Title: \"Agent-Memory Verification Fixture\", URL: \"http://127.0.0.1:53630/\".\n1 AXWebArea Agent-Memory Verification Fixture, URL: 127.0.0.1:53630/\n\t2 container\n\t\t3 heading Verification Fixture, Value: 1\n\t\t\t4 text Verification Fixture\n\t\t5 text Controlled test target. No production data.\n\t\t6 button Increment, ID: increment\n\t\t7 text 1\n\nThe focused UI element is 6 button Increment, ID: increment",
+      "assessment": {
+        "format": "verification-pilot/1",
+        "result": "fail",
+        "binding_status": "mismatch",
+        "reason": "target_mismatch",
+        "missing": [],
+        "mismatch": [
+          "worktree"
+        ],
+        "criterion": {
+          "key": "counter-increments-after-click/1",
+          "expected": 1,
+          "actual": 1
+        },
+        "evidence_ref": "cua:browser:2:tab:1:attempt:16",
+        "acceptance_scope": "this_observed_criterion_only"
+      }
+    },
+    {
+      "attempt_id": "browser-pilot-17",
+      "scenario": "wrong_target",
+      "actor": "/root",
+      "task": "controlled-verification-contract-pilot",
+      "observed_at": "2026-10-26T21:00:49.084Z",
+      "expected": {
+        "repo_id": "agent-memory",
+        "revision": "294c472d98f9d60aa9ed398d772977a6848cc030",
+        "worktree": "/Users/vilmerfrost/worktrees/agent-memory/_integration",
+        "build_id": "106a206a6f1cb56cfe99c630afed19b30357818485bc51d31a3ec91ec25dc9c7",
+        "server_instance": "0b9de3ae-7c40-48b3-9f1f-4a9d9f63ee4e",
+        "origin": "http://127.0.0.1:53631",
+        "route": "/",
+        "tab_id": "1"
+      },
+      "observed": {
+        "build_id": "106a206a6f1cb56cfe99c630afed19b30357818485bc51d31a3ec91ec25dc9c7",
+        "origin": "http://127.0.0.1:53630",
+        "repo_id": "agent-memory",
+        "revision": "294c472d98f9d60aa9ed398d772977a6848cc030",
+        "scope": "controlled_browser_fixture",
+        "server_instance": "0b9de3ae-7c40-48b3-9f1f-4a9d9f63ee4e",
+        "source_sha256": "36b22e38a7fb1f3ada95a628649ebad4dd594a0128e334029dd1540443debd67",
+        "worktree": "/Users/vilmerfrost/worktrees/agent-memory/_integration",
+        "route": "/",
+        "tab_id": "1"
+      },
+      "viewport": {
+        "height": 720,
+        "width": 1280
+      },
+      "interaction": "Increment button click after fresh page load",
+      "criterion": {
+        "key": "counter-increments-after-click/1",
+        "expected": 1,
+        "actual": 1
+      },
+      "evidence_ref": "cua:browser:2:tab:1:attempt:17",
+      "dom_counter": 1,
+      "elapsed_ms": 410,
+      "provenance": "trusted-launch-receipt plus owned-tab DOM observation",
+      "ax_observation": "Browser tab: 1, Title: \"Agent-Memory Verification Fixture\", URL: \"http://127.0.0.1:53630/\".\n1 AXWebArea Agent-Memory Verification Fixture, URL: 127.0.0.1:53630/\n\t2 container\n\t\t3 heading Verification Fixture, Value: 1\n\t\t\t4 text Verification Fixture\n\t\t5 text Controlled test target. No production data.\n\t\t6 button Increment, ID: increment\n\t\t7 text 1\n\nThe focused UI element is 6 button Increment, ID: increment",
+      "assessment": {
+        "format": "verification-pilot/1",
+        "result": "fail",
+        "binding_status": "mismatch",
+        "reason": "target_mismatch",
+        "missing": [],
+        "mismatch": [
+          "origin"
+        ],
+        "criterion": {
+          "key": "counter-increments-after-click/1",
+          "expected": 1,
+          "actual": 1
+        },
+        "evidence_ref": "cua:browser:2:tab:1:attempt:17",
+        "acceptance_scope": "this_observed_criterion_only"
+      }
+    },
+    {
+      "attempt_id": "browser-pilot-18",
+      "scenario": "unbound",
+      "actor": "/root",
+      "task": "controlled-verification-contract-pilot",
+      "observed_at": "2026-10-26T21:00:49.671Z",
+      "expected": {
+        "repo_id": "agent-memory",
+        "revision": "294c472d98f9d60aa9ed398d772977a6848cc030",
+        "worktree": "/Users/vilmerfrost/worktrees/agent-memory/_integration",
+        "build_id": "106a206a6f1cb56cfe99c630afed19b30357818485bc51d31a3ec91ec25dc9c7",
+        "server_instance": "0b9de3ae-7c40-48b3-9f1f-4a9d9f63ee4e",
+        "origin": "http://127.0.0.1:53630",
+        "route": "/unbound",
+        "tab_id": "1"
+      },
+      "observed": {
+        "origin": "http://127.0.0.1:53630",
+        "route": "/unbound",
+        "tab_id": "1"
+      },
+      "viewport": {
+        "height": 720,
+        "width": 1280
+      },
+      "interaction": "Increment button click after fresh page load",
+      "criterion": {
+        "key": "counter-increments-after-click/1",
+        "expected": 1,
+        "actual": 1
+      },
+      "evidence_ref": "cua:browser:2:tab:1:attempt:18",
+      "dom_counter": 1,
+      "elapsed_ms": 587,
+      "provenance": "trusted-launch-receipt plus owned-tab DOM observation",
+      "ax_observation": "Browser tab: 1, Title: \"Agent-Memory Verification Fixture\", URL: \"http://127.0.0.1:53630/unbound\".\n1 AXWebArea Agent-Memory Verification Fixture, URL: 127.0.0.1:53630/unbound\n\t2 container\n\t\t3 heading Verification Fixture, Value: 1\n\t\t\t4 text Verification Fixture\n\t\t5 text Controlled test target. No production data.\n\t\t6 button Increment, ID: increment\n\t\t7 text 1\n\nThe focused UI element is 6 button Increment, ID: increment",
+      "assessment": {
+        "format": "verification-pilot/1",
+        "result": "unknown",
+        "binding_status": "incomplete",
+        "reason": "target_binding_incomplete",
+        "missing": [
+          "repo_id",
+          "revision",
+          "worktree",
+          "build_id",
+          "server_instance"
+        ],
+        "mismatch": [],
+        "criterion": {
+          "key": "counter-increments-after-click/1",
+          "expected": 1,
+          "actual": 1
+        },
+        "evidence_ref": "cua:browser:2:tab:1:attempt:18",
+        "acceptance_scope": "this_observed_criterion_only"
+      }
+    },
+    {
+      "attempt_id": "browser-pilot-19",
+      "scenario": "unbound",
+      "actor": "/root",
+      "task": "controlled-verification-contract-pilot",
+      "observed_at": "2026-10-26T21:00:50.110Z",
+      "expected": {
+        "repo_id": "agent-memory",
+        "revision": "294c472d98f9d60aa9ed398d772977a6848cc030",
+        "worktree": "/Users/vilmerfrost/worktrees/agent-memory/_integration",
+        "build_id": "106a206a6f1cb56cfe99c630afed19b30357818485bc51d31a3ec91ec25dc9c7",
+        "server_instance": "0b9de3ae-7c40-48b3-9f1f-4a9d9f63ee4e",
+        "origin": "http://127.0.0.1:53630",
+        "route": "/unbound",
+        "tab_id": "1"
+      },
+      "observed": {
+        "origin": "http://127.0.0.1:53630",
+        "route": "/unbound",
+        "tab_id": "1"
+      },
+      "viewport": {
+        "height": 720,
+        "width": 1280
+      },
+      "interaction": "Increment button click after fresh page load",
+      "criterion": {
+        "key": "counter-increments-after-click/1",
+        "expected": 1,
+        "actual": 1
+      },
+      "evidence_ref": "cua:browser:2:tab:1:attempt:19",
+      "dom_counter": 1,
+      "elapsed_ms": 439,
+      "provenance": "trusted-launch-receipt plus owned-tab DOM observation",
+      "ax_observation": "Browser tab: 1, Title: \"Agent-Memory Verification Fixture\", URL: \"http://127.0.0.1:53630/unbound\".\n1 AXWebArea Agent-Memory Verification Fixture, URL: 127.0.0.1:53630/unbound\n\t2 container\n\t\t3 heading Verification Fixture, Value: 1\n\t\t\t4 text Verification Fixture\n\t\t5 text Controlled test target. No production data.\n\t\t6 button Increment, ID: increment\n\t\t7 text 1\n\nThe focused UI element is 6 button Increment, ID: increment",
+      "assessment": {
+        "format": "verification-pilot/1",
+        "result": "unknown",
+        "binding_status": "incomplete",
+        "reason": "target_binding_incomplete",
+        "missing": [
+          "repo_id",
+          "revision",
+          "worktree",
+          "build_id",
+          "server_instance"
+        ],
+        "mismatch": [],
+        "criterion": {
+          "key": "counter-increments-after-click/1",
+          "expected": 1,
+          "actual": 1
+        },
+        "evidence_ref": "cua:browser:2:tab:1:attempt:19",
+        "acceptance_scope": "this_observed_criterion_only"
+      }
+    },
+    {
+      "attempt_id": "browser-pilot-20",
+      "scenario": "unbound",
+      "actor": "/root",
+      "task": "controlled-verification-contract-pilot",
+      "observed_at": "2026-10-26T21:00:50.532Z",
+      "expected": {
+        "repo_id": "agent-memory",
+        "revision": "294c472d98f9d60aa9ed398d772977a6848cc030",
+        "worktree": "/Users/vilmerfrost/worktrees/agent-memory/_integration",
+        "build_id": "106a206a6f1cb56cfe99c630afed19b30357818485bc51d31a3ec91ec25dc9c7",
+        "server_instance": "0b9de3ae-7c40-48b3-9f1f-4a9d9f63ee4e",
+        "origin": "http://127.0.0.1:53630",
+        "route": "/unbound",
+        "tab_id": "1"
+      },
+      "observed": {
+        "origin": "http://127.0.0.1:53630",
+        "route": "/unbound",
+        "tab_id": "1"
+      },
+      "viewport": {
+        "height": 720,
+        "width": 1280
+      },
+      "interaction": "Increment button click after fresh page load",
+      "criterion": {
+        "key": "counter-increments-after-click/1",
+        "expected": 1,
+        "actual": 1
+      },
+      "evidence_ref": "cua:browser:2:tab:1:attempt:20",
+      "dom_counter": 1,
+      "elapsed_ms": 422,
+      "provenance": "trusted-launch-receipt plus owned-tab DOM observation",
+      "ax_observation": "Browser tab: 1, Title: \"Agent-Memory Verification Fixture\", URL: \"http://127.0.0.1:53630/unbound\".\n1 AXWebArea Agent-Memory Verification Fixture, URL: 127.0.0.1:53630/unbound\n\t2 container\n\t\t3 heading Verification Fixture, Value: 1\n\t\t\t4 text Verification Fixture\n\t\t5 text Controlled test target. No production data.\n\t\t6 button Increment, ID: increment\n\t\t7 text 1\n\nThe focused UI element is 6 button Increment, ID: increment",
+      "assessment": {
+        "format": "verification-pilot/1",
+        "result": "unknown",
+        "binding_status": "incomplete",
+        "reason": "target_binding_incomplete",
+        "missing": [
+          "repo_id",
+          "revision",
+          "worktree",
+          "build_id",
+          "server_instance"
+        ],
+        "mismatch": [],
+        "criterion": {
+          "key": "counter-increments-after-click/1",
+          "expected": 1,
+          "actual": 1
+        },
+        "evidence_ref": "cua:browser:2:tab:1:attempt:20",
+        "acceptance_scope": "this_observed_criterion_only"
+      }
+    },
+    {
+      "attempt_id": "browser-pilot-21",
+      "scenario": "unbound",
+      "actor": "/root",
+      "task": "controlled-verification-contract-pilot",
+      "observed_at": "2026-10-26T21:01:00.556Z",
+      "expected": {
+        "repo_id": "agent-memory",
+        "revision": "294c472d98f9d60aa9ed398d772977a6848cc030",
+        "worktree": "/Users/vilmerfrost/worktrees/agent-memory/_integration",
+        "build_id": "106a206a6f1cb56cfe99c630afed19b30357818485bc51d31a3ec91ec25dc9c7",
+        "server_instance": "0b9de3ae-7c40-48b3-9f1f-4a9d9f63ee4e",
+        "origin": "http://127.0.0.1:53630",
+        "route": "/unbound",
+        "tab_id": "1"
+      },
+      "observed": {
+        "origin": "http://127.0.0.1:53630",
+        "route": "/unbound",
+        "tab_id": "1"
+      },
+      "viewport": {
+        "height": 720,
+        "width": 1280
+      },
+      "interaction": "Increment button click after fresh page load",
+      "criterion": {
+        "key": "counter-increments-after-click/1",
+        "expected": 1,
+        "actual": 1
+      },
+      "evidence_ref": "cua:browser:2:tab:1:attempt:21",
+      "dom_counter": 1,
+      "elapsed_ms": 481,
+      "provenance": "trusted-launch-receipt plus owned-tab DOM observation",
+      "ax_observation": "Browser tab: 1, Title: \"Agent-Memory Verification Fixture\", URL: \"http://127.0.0.1:53630/unbound\".\n1 AXWebArea Agent-Memory Verification Fixture, URL: 127.0.0.1:53630/unbound\n\t2 container\n\t\t3 heading Verification Fixture, Value: 1\n\t\t\t4 text Verification Fixture\n\t\t5 text Controlled test target. No production data.\n\t\t6 button Increment, ID: increment\n\t\t7 text 1\n\nThe focused UI element is 6 button Increment, ID: increment",
+      "assessment": {
+        "format": "verification-pilot/1",
+        "result": "unknown",
+        "binding_status": "incomplete",
+        "reason": "target_binding_incomplete",
+        "missing": [
+          "repo_id",
+          "revision",
+          "worktree",
+          "build_id",
+          "server_instance"
+        ],
+        "mismatch": [],
+        "criterion": {
+          "key": "counter-increments-after-click/1",
+          "expected": 1,
+          "actual": 1
+        },
+        "evidence_ref": "cua:browser:2:tab:1:attempt:21",
+        "acceptance_scope": "this_observed_criterion_only"
+      }
+    },
+    {
+      "attempt_id": "browser-pilot-22",
+      "scenario": "missing_criterion",
+      "actor": "/root",
+      "task": "controlled-verification-contract-pilot",
+      "observed_at": "2026-10-26T21:01:00.972Z",
+      "expected": {
+        "repo_id": "agent-memory",
+        "revision": "294c472d98f9d60aa9ed398d772977a6848cc030",
+        "worktree": "/Users/vilmerfrost/worktrees/agent-memory/_integration",
+        "build_id": "106a206a6f1cb56cfe99c630afed19b30357818485bc51d31a3ec91ec25dc9c7",
+        "server_instance": "0b9de3ae-7c40-48b3-9f1f-4a9d9f63ee4e",
+        "origin": "http://127.0.0.1:53630",
+        "route": "/",
+        "tab_id": "1"
+      },
+      "observed": {
+        "build_id": "106a206a6f1cb56cfe99c630afed19b30357818485bc51d31a3ec91ec25dc9c7",
+        "origin": "http://127.0.0.1:53630",
+        "repo_id": "agent-memory",
+        "revision": "294c472d98f9d60aa9ed398d772977a6848cc030",
+        "scope": "controlled_browser_fixture",
+        "server_instance": "0b9de3ae-7c40-48b3-9f1f-4a9d9f63ee4e",
+        "source_sha256": "36b22e38a7fb1f3ada95a628649ebad4dd594a0128e334029dd1540443debd67",
+        "worktree": "/Users/vilmerfrost/worktrees/agent-memory/_integration",
+        "route": "/",
+        "tab_id": "1"
+      },
+      "viewport": {
+        "height": 720,
+        "width": 1280
+      },
+      "interaction": "Increment button click after fresh page load",
+      "criterion": null,
+      "evidence_ref": "cua:browser:2:tab:1:attempt:22",
+      "dom_counter": 1,
+      "elapsed_ms": 416,
+      "provenance": "trusted-launch-receipt plus owned-tab DOM observation",
+      "ax_observation": "Browser tab: 1, Title: \"Agent-Memory Verification Fixture\", URL: \"http://127.0.0.1:53630/\".\n1 AXWebArea Agent-Memory Verification Fixture, URL: 127.0.0.1:53630/\n\t2 container\n\t\t3 heading Verification Fixture, Value: 1\n\t\t\t4 text Verification Fixture\n\t\t5 text Controlled test target. No production data.\n\t\t6 button Increment, ID: increment\n\t\t7 text 1\n\nThe focused UI element is 6 button Increment, ID: increment",
+      "assessment": {
+        "format": "verification-pilot/1",
+        "result": "unknown",
+        "binding_status": "verified",
+        "reason": "criterion_or_evidence_missing",
+        "missing": [],
+        "mismatch": [],
+        "criterion": null,
+        "evidence_ref": "cua:browser:2:tab:1:attempt:22",
+        "acceptance_scope": "this_observed_criterion_only"
+      }
+    },
+    {
+      "attempt_id": "browser-pilot-23",
+      "scenario": "missing_criterion",
+      "actor": "/root",
+      "task": "controlled-verification-contract-pilot",
+      "observed_at": "2026-10-26T21:01:01.388Z",
+      "expected": {
+        "repo_id": "agent-memory",
+        "revision": "294c472d98f9d60aa9ed398d772977a6848cc030",
+        "worktree": "/Users/vilmerfrost/worktrees/agent-memory/_integration",
+        "build_id": "106a206a6f1cb56cfe99c630afed19b30357818485bc51d31a3ec91ec25dc9c7",
+        "server_instance": "0b9de3ae-7c40-48b3-9f1f-4a9d9f63ee4e",
+        "origin": "http://127.0.0.1:53630",
+        "route": "/",
+        "tab_id": "1"
+      },
+      "observed": {
+        "build_id": "106a206a6f1cb56cfe99c630afed19b30357818485bc51d31a3ec91ec25dc9c7",
+        "origin": "http://127.0.0.1:53630",
+        "repo_id": "agent-memory",
+        "revision": "294c472d98f9d60aa9ed398d772977a6848cc030",
+        "scope": "controlled_browser_fixture",
+        "server_instance": "0b9de3ae-7c40-48b3-9f1f-4a9d9f63ee4e",
+        "source_sha256": "36b22e38a7fb1f3ada95a628649ebad4dd594a0128e334029dd1540443debd67",
+        "worktree": "/Users/vilmerfrost/worktrees/agent-memory/_integration",
+        "route": "/",
+        "tab_id": "1"
+      },
+      "viewport": {
+        "height": 720,
+        "width": 1280
+      },
+      "interaction": "Increment button click after fresh page load",
+      "criterion": null,
+      "evidence_ref": "cua:browser:2:tab:1:attempt:23",
+      "dom_counter": 1,
+      "elapsed_ms": 416,
+      "provenance": "trusted-launch-receipt plus owned-tab DOM observation",
+      "ax_observation": "Browser tab: 1, Title: \"Agent-Memory Verification Fixture\", URL: \"http://127.0.0.1:53630/\".\n1 AXWebArea Agent-Memory Verification Fixture, URL: 127.0.0.1:53630/\n\t2 container\n\t\t3 heading Verification Fixture, Value: 1\n\t\t\t4 text Verification Fixture\n\t\t5 text Controlled test target. No production data.\n\t\t6 button Increment, ID: increment\n\t\t7 text 1\n\nThe focused UI element is 6 button Increment, ID: increment",
+      "assessment": {
+        "format": "verification-pilot/1",
+        "result": "unknown",
+        "binding_status": "verified",
+        "reason": "criterion_or_evidence_missing",
+        "missing": [],
+        "mismatch": [],
+        "criterion": null,
+        "evidence_ref": "cua:browser:2:tab:1:attempt:23",
+        "acceptance_scope": "this_observed_criterion_only"
+      }
+    },
+    {
+      "attempt_id": "browser-pilot-24",
+      "scenario": "missing_criterion",
+      "actor": "/root",
+      "task": "controlled-verification-contract-pilot",
+      "observed_at": "2026-10-26T21:01:01.800Z",
+      "expected": {
+        "repo_id": "agent-memory",
+        "revision": "294c472d98f9d60aa9ed398d772977a6848cc030",
+        "worktree": "/Users/vilmerfrost/worktrees/agent-memory/_integration",
+        "build_id": "106a206a6f1cb56cfe99c630afed19b30357818485bc51d31a3ec91ec25dc9c7",
+        "server_instance": "0b9de3ae-7c40-48b3-9f1f-4a9d9f63ee4e",
+        "origin": "http://127.0.0.1:53630",
+        "route": "/",
+        "tab_id": "1"
+      },
+      "observed": {
+        "build_id": "106a206a6f1cb56cfe99c630afed19b30357818485bc51d31a3ec91ec25dc9c7",
+        "origin": "http://127.0.0.1:53630",
+        "repo_id": "agent-memory",
+        "revision": "294c472d98f9d60aa9ed398d772977a6848cc030",
+        "scope": "controlled_browser_fixture",
+        "server_instance": "0b9de3ae-7c40-48b3-9f1f-4a9d9f63ee4e",
+        "source_sha256": "36b22e38a7fb1f3ada95a628649ebad4dd594a0128e334029dd1540443debd67",
+        "worktree": "/Users/vilmerfrost/worktrees/agent-memory/_integration",
+        "route": "/",
+        "tab_id": "1"
+      },
+      "viewport": {
+        "height": 720,
+        "width": 1280
+      },
+      "interaction": "Increment button click after fresh page load",
+      "criterion": null,
+      "evidence_ref": "cua:browser:2:tab:1:attempt:24",
+      "dom_counter": 1,
+      "elapsed_ms": 412,
+      "provenance": "trusted-launch-receipt plus owned-tab DOM observation",
+      "ax_observation": "Browser tab: 1, Title: \"Agent-Memory Verification Fixture\", URL: \"http://127.0.0.1:53630/\".\n1 AXWebArea Agent-Memory Verification Fixture, URL: 127.0.0.1:53630/\n\t2 container\n\t\t3 heading Verification Fixture, Value: 1\n\t\t\t4 text Verification Fixture\n\t\t5 text Controlled test target. No production data.\n\t\t6 button Increment, ID: increment\n\t\t7 text 1\n\nThe focused UI element is 6 button Increment, ID: increment",
+      "assessment": {
+        "format": "verification-pilot/1",
+        "result": "unknown",
+        "binding_status": "verified",
+        "reason": "criterion_or_evidence_missing",
+        "missing": [],
+        "mismatch": [],
+        "criterion": null,
+        "evidence_ref": "cua:browser:2:tab:1:attempt:24",
+        "acceptance_scope": "this_observed_criterion_only"
+      }
+    },
+    {
+      "attempt_id": "browser-pilot-25",
+      "scenario": "missing_criterion",
+      "actor": "/root",
+      "task": "controlled-verification-contract-pilot",
+      "observed_at": "2026-10-26T21:01:02.207Z",
+      "expected": {
+        "repo_id": "agent-memory",
+        "revision": "294c472d98f9d60aa9ed398d772977a6848cc030",
+        "worktree": "/Users/vilmerfrost/worktrees/agent-memory/_integration",
+        "build_id": "106a206a6f1cb56cfe99c630afed19b30357818485bc51d31a3ec91ec25dc9c7",
+        "server_instance": "0b9de3ae-7c40-48b3-9f1f-4a9d9f63ee4e",
+        "origin": "http://127.0.0.1:53630",
+        "route": "/",
+        "tab_id": "1"
+      },
+      "observed": {
+        "build_id": "106a206a6f1cb56cfe99c630afed19b30357818485bc51d31a3ec91ec25dc9c7",
+        "origin": "http://127.0.0.1:53630",
+        "repo_id": "agent-memory",
+        "revision": "294c472d98f9d60aa9ed398d772977a6848cc030",
+        "scope": "controlled_browser_fixture",
+        "server_instance": "0b9de3ae-7c40-48b3-9f1f-4a9d9f63ee4e",
+        "source_sha256": "36b22e38a7fb1f3ada95a628649ebad4dd594a0128e334029dd1540443debd67",
+        "worktree": "/Users/vilmerfrost/worktrees/agent-memory/_integration",
+        "route": "/",
+        "tab_id": "1"
+      },
+      "viewport": {
+        "height": 720,
+        "width": 1280
+      },
+      "interaction": "Increment button click after fresh page load",
+      "criterion": null,
+      "evidence_ref": "cua:browser:2:tab:1:attempt:25",
+      "dom_counter": 1,
+      "elapsed_ms": 407,
+      "provenance": "trusted-launch-receipt plus owned-tab DOM observation",
+      "ax_observation": "Browser tab: 1, Title: \"Agent-Memory Verification Fixture\", URL: \"http://127.0.0.1:53630/\".\n1 AXWebArea Agent-Memory Verification Fixture, URL: 127.0.0.1:53630/\n\t2 container\n\t\t3 heading Verification Fixture, Value: 1\n\t\t\t4 text Verification Fixture\n\t\t5 text Controlled test target. No production data.\n\t\t6 button Increment, ID: increment\n\t\t7 text 1\n\nThe focused UI element is 6 button Increment, ID: increment",
+      "assessment": {
+        "format": "verification-pilot/1",
+        "result": "unknown",
+        "binding_status": "verified",
+        "reason": "criterion_or_evidence_missing",
+        "missing": [],
+        "mismatch": [],
+        "criterion": null,
+        "evidence_ref": "cua:browser:2:tab:1:attempt:25",
+        "acceptance_scope": "this_observed_criterion_only"
+      }
+    }
+  ],
+  "active_browser_capture_ms": 11178,
+  "total_session_elapsed_ms": 41999,
+  "assessment_elapsed_ms": 0.030959025025367737,
+  "result_counts": {
+    "pass": 5,
+    "fail": 12,
+    "unknown": 8
+  },
+  "criterion_scope": "controlled fixture predicates; no production task acceptance or statistical accuracy estimate"
+}

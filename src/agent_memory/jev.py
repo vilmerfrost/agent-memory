@@ -12,7 +12,8 @@ caller can count it and go on. A missing fixture raises its subclass `JevFixture
 Error text never holds the API key.
 
 Fixture files hold the API response body (`{"model", "usage", "answers"}`), so
-fixture and live answers are parsed by the same SDK answer models.
+fixture and live answers are parsed by the same SDK answer models. `ask` returns a
+`JevAnswers` dict that also carries the response's `model` and `usage` (input/output tokens).
 
 SDK facts (checked in the installed source, `typesafe_sdk/_schemas/models.py`):
 - choice answer: `choice`, `confidence`, `probabilities`
@@ -110,6 +111,39 @@ class JevResult:
     value: str | float
     confidence: float | None
     probabilities: dict[str, float] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class JevUsage:
+    """The response's token counts (SDK `Usage`). Jev bills per call; tokens are recorded, not priced."""
+
+    input_tokens: int = 0
+    output_tokens: int = 0
+
+
+class JevAnswers(dict):  # type: ignore[type-arg]
+    """`ask`'s result: the JevResult per question name (a plain dict for every caller), plus the response's
+    `model` (the model that answered; may differ from the requested MODEL) and `usage` (JevUsage). Both are None
+    when the response did not carry them (an old fixture). A fixture's values are its recording, not a live call."""
+
+    def __init__(self, results: dict[str, JevResult], *, model: str | None = None,
+                 usage: JevUsage | None = None) -> None:
+        super().__init__(results)
+        self.model = model
+        self.usage = usage
+
+
+def _usage(raw: Any) -> JevUsage | None:
+    """JevUsage from the SDK model or a fixture's dict; None when a count is missing or not a non-negative int."""
+    get = raw.get if isinstance(raw, dict) else (lambda k: getattr(raw, k, None))
+    vals = [get("input_tokens"), get("output_tokens")]
+    if not all(isinstance(v, int) and not isinstance(v, bool) and v >= 0 for v in vals):
+        return None
+    return JevUsage(*vals)
+
+
+def _model(raw: Any) -> str | None:
+    return raw[:80] if isinstance(raw, str) and raw else None
 
 
 def mode() -> Mode:
@@ -210,7 +244,7 @@ def _describe(exc: BaseException) -> str:
     return text
 
 
-def _ask_fixture(state: str, questions: list[Question]) -> dict[str, JevResult]:
+def _ask_fixture(state: str, questions: list[Question]) -> JevAnswers:
     key = fixture_key(state, questions)
     path = config.jev_fixtures_dir() / f"{key}.json"
     if not path.is_file():
@@ -230,11 +264,12 @@ def _ask_fixture(state: str, questions: list[Question]) -> dict[str, JevResult]:
         answers = {name: adapter.validate_json(json.dumps(raw)) for name, raw in raw_answers.items()}
     except ValueError as exc:  # pydantic ValidationError: an answer the SDK models reject
         raise JevError(f"fixture {path} has an invalid answer: {_describe(exc)}") from exc
-    return _collect(questions, answers)
+    return JevAnswers(_collect(questions, answers), model=_model(body.get("model")), usage=_usage(body.get("usage")))
 
 
-def _ask_live(state: str, questions: list[Question]) -> dict[str, JevResult]:
-    """One System One call. Every SDK, network or response error becomes a JevError."""
+def _ask_live(state: str, questions: list[Question]) -> JevAnswers:
+    """One System One call. Every SDK, network or response error becomes a JevError. The response's model and
+    token usage ride along on the result (JevAnswers.model / .usage)."""
     from typesafe_sdk import TypeSafeClient, TypeSafeError
 
     try:
@@ -242,15 +277,17 @@ def _ask_live(state: str, questions: list[Question]) -> dict[str, JevResult]:
             response = client.system_one(state=state, questions={q.name: q.to_sdk() for q in questions},
                                          model=MODEL)
         answers = dict(response.answers)
+        served, usage = _model(getattr(response, "model", None)), _usage(getattr(response, "usage", None))
     except TypeSafeError as exc:  # HTTP 4xx/5xx, rate limit, connection, timeout, invalid response
         raise JevError(f"Jev API error: {_describe(exc)}") from exc
     except (OSError, ValueError) as exc:  # network below the SDK, or a response the models reject
         raise JevError(f"Jev call failed: {_describe(exc)}") from exc
-    return _collect(questions, answers)
+    return JevAnswers(_collect(questions, answers), model=served, usage=usage)
 
 
-def ask(state: str, questions: list[Question]) -> dict[str, JevResult]:
-    """Ask Jev typed questions about `state`. Returns results keyed by question name."""
+def ask(state: str, questions: list[Question]) -> JevAnswers:
+    """Ask Jev typed questions about `state`. Returns results keyed by question name (JevAnswers, a dict that
+    also carries the response's model and token usage)."""
     _validate(state, questions)
     if mode() == "live":
         return _ask_live(state, questions)

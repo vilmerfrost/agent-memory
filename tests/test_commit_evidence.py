@@ -134,7 +134,8 @@ def test_old_saved_tracker_state_loads() -> None:
     for e in call("t1", 'git commit -m "x"', "[main abc1234] x")[1:]:   # its result: counted at the call already
         t.feed(e)
     assert t.signals["commit"] == 2 and t.end == "result"
-    assert amem_digest.SignalTracker(None).state() == {"signals": {}, "end": None, "pending": [], "commit_calls": {}}
+    assert amem_digest.SignalTracker(None).state() == {"signals": {}, "end": None, "pending": [], "commit_calls": {},
+                                                               "operation_calls": {}, "method_version": 2}
 
 
 def test_commit_waits_in_the_state_until_its_result() -> None:

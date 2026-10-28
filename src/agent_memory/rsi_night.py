@@ -54,6 +54,7 @@ from psycopg.types.json import Jsonb
 
 from agent_memory import config, edits_targets as ET, night_coverage as NC, rsi_approval as AP, rsi_artifact as RA
 from agent_memory import rsi_targets
+from agent_memory.rsi_relevance import section_rule_id
 from agent_memory.rsi_budget import Budget, BudgetConfig, BudgetConfigError, BudgetExhausted, Usage
 
 FORMAT = "rsi-night/1"
@@ -67,7 +68,7 @@ HYPOTHESES_FIXTURES = config.REPO_ROOT / "tests" / "fixtures" / "rsi-night" / "h
 STATUSES = ("ok", "partial", "aborted", "budget_exhausted", "preflight_failed")
 SKIP_REASONS = ("prerequisites", "credentials")     # report["skipped"]["reason"]: the night job did not start it
 MAX_PREREQ_WARNINGS = 10
-EXP_STATUSES = ("staged", "not_promotable", "failed", "interrupted", "skipped_budget")
+EXP_STATUSES = ("staged", "not_promotable", "failed", "interrupted", "skipped_budget", "deferred_policy")
 VERDICTS = ("IMPROVES", "NO_EFFECT", "WORSE", "INCONCLUSIVE")
 RISKS = ("low", "medium", "high")
 PROVIDERS = ("supabase", "clickhouse", "langfuse", "pastdev")
@@ -143,6 +144,7 @@ class NightConfig:
     sha256: str
     # The skill_refresh prerequisite (skill_refresh.py): `mode` report | enforce, `max_lag_h` (default 2).
     skill_refresh: tuple[str, float] = ("report", 2.0)
+    experiment_goal: tuple[int, int] = (0, 0)  # minimum and target; zero minimum keeps legacy veto behavior
 
 
 _STAGE_MODES = {"triage": ("fixture", "live"), "hypothesizer": ("fixture", "claude-cli"),
@@ -189,6 +191,11 @@ def load_config(path: Path | None = None) -> NightConfig:
     min_rank = tri.get("min_rank", 0.0)
     if isinstance(min_rank, bool) or not isinstance(min_rank, (int, float)):
         raise ConfigError(f"{p}: triage.min_rank must be a number")
+    minimum = tri.get("minimum_experiments", 0)
+    target = tri.get("target_experiments", budget.max_experiments)
+    if (any(isinstance(v, bool) or not isinstance(v, int) for v in (minimum, target))
+            or not 0 <= minimum <= target <= budget.max_experiments):
+        raise ConfigError(f"{p}: triage experiment goal must satisfy 0 <= minimum <= target <= max_experiments")
 
     def section(name: str) -> dict[str, Any]:
         v = d.get(name) or {}
@@ -204,7 +211,8 @@ def load_config(path: Path | None = None) -> NightConfig:
     result = NightConfig(budget=budget, stages=stages, candidates=cands, weights=weights, min_rank=float(min_rank),
                          hypothesizer=section("hypothesizer"), implementer=section("implementer"),
                          replay=section("replay"), staging=section("staging"), path=str(p),
-                         sha256=hashlib.sha256(raw).hexdigest(), skill_refresh=skill_refresh)
+                         sha256=hashlib.sha256(raw).hexdigest(), skill_refresh=skill_refresh,
+                         experiment_goal=(minimum, target))
     from agent_memory.rsi_subscription_config import validate_role
     roles = [("claude", result.hypothesizer, "") ] if stages["hypothesizer"] == "claude-cli" else []
     if stages["implementer"] == "writer":
@@ -261,12 +269,16 @@ class Hypothesis:
     expected: str = ""
     risk: str = "medium"
     confidence: float = 0.5
+    edit: dict[str, str] | None = None  # S5's exact declared section intervention; legacy records remain readable
 
     def as_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        out = asdict(self)
+        if self.edit is None:
+            out.pop("edit")
+        return out
 
 
-HYP_FIELDS = {"what": 200, "why": 400, "target": 300, "expected": 200, "risk": 10, "confidence": 0}
+HYP_FIELDS = {"what": 200, "why": 400, "target": 300, "expected": 200, "risk": 10, "confidence": 0, "edit": 0}
 HYP_REQUIRED = ("what", "why", "target")
 # Text that an instruction-edit hypothesis never needs: commands, code, links, secrets, approval verbs and the
 # usual prompt-injection phrasing. A false positive only drops one hypothesis; nothing runs because of it.
@@ -321,12 +333,20 @@ def parse_hypothesis(obj: Any, allowlist: Sequence[str]) -> Hypothesis:
     conf = obj.get("confidence", 0.5)
     if isinstance(conf, bool) or not isinstance(conf, (int, float)) or not math.isfinite(conf) or not 0 <= conf <= 1:
         raise HypothesisRejected("bad_confidence", "confidence must be a number in 0..1", "confidence")
-    return Hypothesis(what=what, why=why, target=target, expected=expected, risk=risk, confidence=float(conf))
+    edit = obj.get("edit")
+    if edit is not None:
+        if (not isinstance(edit, dict) or set(edit) != {"section_id", "before", "after"}
+                or not all(isinstance(v, str) and v for v in edit.values())
+                or not re.fullmatch(r"[a-z0-9][a-z0-9/_-]{0,119}", edit["section_id"])
+                or any(len(edit[k]) > 16_000 for k in ("before", "after")) or edit["before"] == edit["after"]):
+            raise HypothesisRejected("bad_edit_contract", "edit must declare one bounded exact section replacement")
+    return Hypothesis(what=what, why=why, target=target, expected=expected, risk=risk, confidence=float(conf), edit=edit)
 
 
 # Why a hypothesis was thrown out before any test, in fixed plain words (Night Desk decision 18). The report keeps
 # the code and these words only; the model's own text never reaches it.
 REJECT_REASONS = {
+    "bad_edit_contract": "the proposed edit lacked one exact bounded section replacement",
     "unparseable": "the idea writer's reply was not the required JSON shape",
     "not_an_object": "the idea was not a structured object",
     "unknown_fields": "the idea had fields the rules do not allow",
@@ -421,9 +441,31 @@ class TriageAnswers:
     risk: float            # 0..2
     testability: float     # 0..2
     mode: str              # fixture | live | heuristic
+    reason: str | None = None  # Jev's typed reason code; never infer a missing rationale from scores
+    model: str | None = None   # the model that answered (Jev's response; None for heuristic or an old fixture)
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+TRIAGE_REASONS = {
+    "worth_testing": "A replay can test a plausible improvement.",
+    "rare_evidence": "The problem has too little recurring evidence.",
+    "low_impact": "The expected benefit is low.",
+    "hard_to_test": "A short replay may not measure this problem well.",
+    "prior_no_effect": "Earlier experiments did not improve the result.",
+    "prior_worse": "An earlier experiment made the result worse.",
+    "instruction_unlikely": "Changing instruction text is unlikely to fix this problem.",
+    "risk": "Changing this instruction may harm other behavior.",
+    "out_of_scope": "The target is outside the permitted edit scope.",
+    "other": "Jev chose another concern; a more specific reason was not provided.",
+}
+
+
+def triage_explanation(a: TriageAnswers) -> str:
+    if a.mode == "heuristic":
+        return "No Jev assessment was available; deterministic ranking was used."
+    return TRIAGE_REASONS.get(a.reason, "Jev did not provide a reason.")
 
 
 def _bucket(n: Any) -> str:
@@ -444,16 +486,45 @@ def _token(v: Any, limit: int = 120) -> str:
     return _TOKEN.sub("", str(v if v is not None else "none"))[:limit] or "none"
 
 
-def triage_state(c: Mapping[str, Any], history: Sequence[str], in_scope: bool) -> str:
-    """Jev's state for one candidate: structured fields only, bucketed, so fixtures stay stable across nights."""
+def _rate(passed: Any, total: Any) -> str:
+    """A pass rate as a stable bucket: none | some (under half) | most | all; unknown without runs."""
+    p, n = _num(passed), _num(total)
+    if p is None or not n or n <= 0:
+        return "unknown"
+    r = max(0.0, min(1.0, float(p) / float(n)))
+    return "none" if r <= 0 else "all" if r >= 1 else "some" if r < 0.5 else "most"
+
+
+# At most this many covering cases in a triage state (the rest are counted), so the state stays short.
+TRIAGE_CASES_MAX = 8
+
+
+def triage_state(c: Mapping[str, Any], history: Sequence[str], in_scope: bool, test_cases: Sequence[str] = (),
+                 baselines: Mapping[str, Mapping[str, Sequence[int]]] | None = None) -> str:
+    """Jev's state for one candidate: structured fields only, bucketed, so fixtures stay stable across nights.
+
+    recurrence is `recurrence(c)` (distinct occurrences or sessions), not `seen_count` (nights that sighted it).
+    test_cases: the replay cases that use the target (Night._test_cases). baselines: per case, per replay suite
+    label, the last recorded arm-A (unchanged file) result as (passed, pairs) (Night._baselines); a case with no
+    record reads `unknown`. Pure: the night passes everything in."""
     m = c.get("metrics") or {}
     lines = ["rsi candidate for a nightly sandbox experiment",
              f"source: {_token(c.get('source'))}", f"kind: {_token(c.get('kind'))}",
              f"target: {_token(c.get('target'))}", f"target_in_scope: {'yes' if in_scope else 'no'}",
-             f"rule: {_token(c.get('rule_key'))}", f"recurrence: {_bucket(c.get('seen_count'))}",
+             f"rule: {_token(c.get('rule_key'))}", f"recurrence: {_bucket(recurrence(c))}",
              f"sessions: {_bucket(m.get('sessions'))}", f"followed_grade: {_grade(m.get('followed_grade_mean'))}",
+             f"result_grade: {_grade(m.get('result_grade_mean'))}",
              f"objective_result: {_grade(m.get('objective_result_mean'))}",
              f"prior_experiments: {', '.join(_token(v, 20) for v in history) or 'none'}"]
+    cases = sorted({_token(t, 80) for t in test_cases})
+    lines.append(f"test_cases: {len(cases)}")
+    for case in cases[:TRIAGE_CASES_MAX]:
+        seen = (baselines or {}).get(case) or {}
+        last = " ".join(f"{_token(label, 30)}={_rate(*v[:2]) if len(v) >= 2 else 'unknown'}"
+                        for label, v in sorted((k, list(x or ())) for k, x in seen.items())) or "unknown"
+        lines.append(f"- {case}: baseline_passes {last}")
+    if len(cases) > TRIAGE_CASES_MAX:
+        lines.append(f"- and {len(cases) - TRIAGE_CASES_MAX} more")
     return "\n".join(lines)
 
 
@@ -502,6 +573,15 @@ def rank(a: TriageAnswers, recurrence: int, history: Sequence[str], weights: Map
     return round(r, 4)
 
 
+def jev_usage(answers: Any) -> Usage:
+    """The budget Usage of one Jev response: its reported input/output tokens (jev.JevAnswers.usage), no USD (Jev
+    reports none: the price table books the flat per-call price). Usage() when the response carried no usage."""
+    u = getattr(answers, "usage", None)
+    if u is None:
+        return Usage()
+    return Usage(tokens_in=int(u.input_tokens), tokens_out=int(u.output_tokens))
+
+
 class JevTriage:
     """S3 through Jev with questions/rsi-triage.toml. Fixture mode never calls the API (jev._ask_fixture)."""
 
@@ -523,10 +603,11 @@ class JevTriage:
         model = jev.MODEL if live else "jev-fixture"
 
         def ask() -> tuple[dict[str, Any], Usage]:
-            if live:   # the wrapper reports no usage: the price table books its flat per-call price (an estimate,
-                return jev.ask(state, qs), Usage()    # never labelled provider-reported)
+            if live:   # the response's token counts are recorded; the price table still books Jev's flat per-call
+                got = jev.ask(state, qs)              # price (an estimate, never labelled provider-reported)
+                return got, jev_usage(got)
             jev._validate(state, qs)
-            return jev._ask_fixture(state, qs), Usage()
+            return jev._ask_fixture(state, qs), Usage()   # a fixture's recorded usage was never spent tonight
         try:
             res = budget.call(model, "triage", ask)
         except BudgetExhausted:
@@ -538,9 +619,17 @@ class JevTriage:
             self.health = "error"
             return None
         act = res["action"]
+        if act.value not in ("experiment", "wait"):
+            self.health = "error"
+            return None
+        reason = str(res["reason"].value) if "reason" in res else None
+        if reason is not None and reason not in TRIAGE_REASONS:
+            self.health = "error"
+            reason = None
         return TriageAnswers(action=str(act.value), p_experiment=float(act.probabilities.get("experiment", 0.0)),
                              impact=float(res["impact"].value), risk=float(res["risk"].value),
-                             testability=float(res["testability"].value), mode="live" if live else "fixture")
+                             testability=float(res["testability"].value), mode="live" if live else "fixture",
+                             reason=reason, model=getattr(res, "model", None))
 
 
 # =========================================================================== adapters (protocols + defaults)
@@ -603,7 +692,8 @@ class ReplayOutcome:
 
 
 JUDGE_KEYS = ("mode", "judged", "wins_a", "wins_b", "ties", "unfired_b", "errors", "b_winrate")
-JEV_KEYS = ("mode", "status", "effect", "confidence", "harness_problem", "evidence_strength", "error")
+JEV_KEYS = ("mode", "status", "effect", "confidence", "harness_problem", "evidence_strength", "error", "model",
+            "tokens_in", "tokens_out")
 
 
 def _summary(obj: Any, keys: Sequence[str]) -> dict[str, Any] | None:
@@ -777,6 +867,7 @@ class PackEvidence:
     def pack(self, candidate: Mapping[str, Any]) -> Any:
         mod = self._mod()
         kw = {"connect": self._connect} if self.db_url else {}     # no db_url: the store default, as the night
+        kw["current_instruction_sha256"] = current_target_sha(candidate)
         if self.retrievers is None:
             return mod.build_pack(candidate, **kw)
         rs = dict(self.retrievers)
@@ -791,6 +882,19 @@ class PackEvidence:
 
 def _sha16(s: str) -> str:
     return hashlib.sha256(s.encode()).hexdigest()[:16]
+
+
+def current_target_sha(candidate: Mapping[str, Any]) -> str | None:
+    target = candidate.get("target")
+    if not isinstance(target, str):
+        return None
+    try:
+        path = rsi_targets.untilde(target)
+        if path.name.startswith('.env') or not ET.is_allowed(path) or path.stat().st_size > NEW_TEXT_MAX:
+            return None
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except (OSError, ValueError):
+        return None
 
 
 class FixtureHypothesizer:
@@ -835,10 +939,16 @@ with the unchanged one, so each change must be small, concrete and testable.
 Reply with JSON only, exactly this shape and nothing else:
 {{"hypotheses": [{{"what": "<the concrete change to the instruction text, one sentence, <= 200 chars>",
   "why": "<the evidence-based reason, <= 400 chars>", "target": "<one path from the list below>",
-  "expected": "<the measurable effect, <= 200 chars>", "risk": "low|medium|high", "confidence": <0..1>}}]}}
+  "expected": "<the measurable effect, <= 200 chars>", "risk": "low|medium|high", "confidence": <0..1>,
+  "edit": {{"section_id": "<existing section id>", "before": "<exact current full section text including heading>",
+           "after": "<exact proposed full section text including unchanged heading>"}}}}]}}
 
 Rules: "target" must be exactly one of: {targets}
-Plain prose only: no commands, code, links, file paths other than the target, or secrets.
+The edit object is the authoritative intervention. Copy before exactly from the displayed section; after must
+make only the proposed change in that same section. Preserve its heading and every unrelated requirement.
+Use the candidate's rule section when one is named. Do not move the change to another section or add reporting
+requirements that are absent from the proposed intervention. Legacy ideas without an edit object cannot run.
+For what/why/expected use plain prose only: no commands, code, links, file paths other than the target, or secrets.
 
 Problem (structured, from the investigator's own database):
 {candidate}
@@ -944,6 +1054,8 @@ class ClaudeCliHypothesizer:
             argv += ["--effort", str(self.cfg["effort"])]
         cand = {k: candidate.get(k) for k in ("dedupe_key", "source", "kind", "target", "rule_key", "seen_count")}
         cand["metrics"] = {k: v for k, v in (candidate.get("metrics") or {}).items() if isinstance(v, (int, float))}
+        from agent_memory import edits_sections
+        cand["section_ids"] = {s.id: s.title for s in edits_sections.sections(target_text)}
         limit = int(self.cfg.get("max_prompt_chars") or 24_000)
         fields = dict(cap=cap, targets=", ".join(targets), candidate=json.dumps(cand, sort_keys=True, default=str),
                       target=candidate.get("target") or "(choose from the list)", evidence=evidence_text)
@@ -996,12 +1108,14 @@ class Implementation:
     kind: str | None = None
     diff: str | None = None
     section_from: str | None = None     # "rule_key" (the candidate's rule section) | "hypothesis" (the section it names)
+    contract_verified: bool = False
 
     def record(self) -> dict[str, Any]:
         return {"implementer": self.implementer, "implementer_fallback_reason": self.fallback_reason,
                 "implementation": {"section_id": self.section_id, "section_from": self.section_from,
                                    "kind": self.kind, "diff": self.diff,
-                                   "new_sha256": hashlib.sha256(self.text.encode()).hexdigest()}}
+                                   "new_sha256": hashlib.sha256(self.text.encode()).hexdigest(),
+                                   "contract_verified": self.contract_verified}}
 
 
 IMPLEMENTATION_DIFF_MAX = 12_000
@@ -1012,6 +1126,7 @@ test this change to the rule:
   what: {what}
   why: {why}
 Rewrite only this rule's section so the change is made. Do not append a new line at the end of the file.
+{edit_contract}
 
 Reply with ONLY one JSON object. No prose, no code fence. Shape:
 {{"new_section": string, "topic": string, "why": string, "summary": string, "kind": string,
@@ -1134,6 +1249,16 @@ def section_for_hypothesis(text: str, what: str) -> Any:
     return None
 
 
+def writer_rule_pin(target: str, section: str, text: str, rule_key: str | None = None,
+                    candidate_key: str | None = None) -> bool:
+    identifiers = [section_rule_id(target, section), f"rsi-night-{section}"]
+    if candidate_key:
+        identifiers.append(f"rsi-night-{_sha16(candidate_key)[:10]}")
+    if rule_key:
+        identifiers.extend((rule_key, rule_key.removeprefix("dev:")))
+    return any(ET.pinned_rule(identity, text) is not None for identity in identifiers)
+
+
 class WriterImplementer:
     """S6 by default under the subscription profile: the morning edit loop's writer (edits_writer: its strategy,
     policy, reply shape and `parse_proposal`, which splices exactly one section and refuses ids, code blocks,
@@ -1141,9 +1266,9 @@ class WriterImplementer:
     candidate without one (skill scores, routine failures, findings), the section its hypothesis names. The call
     is the hypothesizer's: `claude -p` with no tools, hooks off, model pinned to claude-opus-5-5, through the
     subscription runner when the profile says so, counted in the night budget. The evidence reaches it only inside
-    its untrusted-data envelope. Pinned files and rules get no writer call. On a pin, no matching section, a writer
-    or proposal error, or a budget stop, this experiment falls back to `stub_change` and records why; a staging
-    refusal of the writer's text (improve's content guard) falls back in Night._experiment."""
+    its untrusted-data envelope. Pinned files and rules get no writer call. The legacy diagnostic return
+    retains fallback reasons; Night never stages or replays that fallback. Live writer-mode hypotheses require
+    an exact declared section replacement, and only byte-matching writer output can reach replay."""
 
     wants_context = True
 
@@ -1198,12 +1323,26 @@ class WriterImplementer:
         # The candidate's own rule section (a deviation's rule key names it); else the section the hypothesis names
         # (skill scores, routine failures and findings carry no section id: the 2026-10-25 night fell back 3 of 3).
         sec, picked_by = _section_for(old_text, ctx.get("rule_key")), "rule_key"
+        if hyp.edit is not None:
+            declared = next((x for x in edits_sections.sections(old_text) if x.id == hyp.edit["section_id"]), None)
+            if declared is None or (sec is not None and sec.id != declared.id):
+                return fallback("declared edit names another rule section: no writer call")
+            sec, picked_by = declared, "declared_edit"
+            if edits_sections.section_text(old_text, sec.id).strip("\r\n") != hyp.edit["before"].strip("\r\n"):
+                return fallback("declared edit baseline is stale: no writer call")
         if sec is None:
             sec, picked_by = section_for_hypothesis(old_text, hyp.what), "hypothesis"
         if sec is None:
             return fallback("no section matches the candidate or the hypothesis: no writer call")
+        if hyp.edit is not None:
+            for other in edits_sections.sections(old_text):
+                heading = other.title.rsplit(" > ", 1)[-1]
+                if other.id != sec.id and re.search(
+                        r"\b(?:under|in|within|below|to)\s+(?:the\s+)?[\"']?" + re.escape(heading) + r"(?=[\s\"'.,:]|$)",
+                        hyp.what, re.I):
+                    return fallback("hypothesis placement conflicts with the declared section: no writer call")
         section_text = edits_sections.section_text(old_text, sec.id)
-        if ET.pinned_rule(f"rsi-night-{sec.id}", section_text) is not None:
+        if writer_rule_pin(hyp.target, sec.id, section_text, ctx.get("rule_key"), ctx.get("dedupe_key")):
             return fallback("the rule is pinned: no writer call")
         if ET.pinned_sections(path, section_text):
             return fallback("the rule's section was edited by hand recently (section pin): no writer call")
@@ -1211,12 +1350,25 @@ class WriterImplementer:
         heading_note = (f"({sec.heading.strip()!r}, unchanged)" if sec.heading
                         else "(this section has no heading of its own: keep it that way)")
         evidence = str(ctx.get("evidence_text") or "") or "(no evidence pack tonight)"
+        contract_note = ("Exact declared replacement (do not add, omit, paraphrase or relocate any part):\n"
+                         + json.dumps(hyp.edit, ensure_ascii=True) if hyp.edit else
+                         "Legacy writer diagnostic: the original intent has no exact edit contract.")
         prompt = WRITER_NIGHT_PROMPT.format(
-            what=hyp.what, why=hyp.why, heading_note=heading_note, added_max=edits_writer.ADDED_MAX,
+            edit_contract=contract_note, what=hyp.what, why=hyp.why, heading_note=heading_note, added_max=edits_writer.ADDED_MAX,
             why_max=edits_writer.WHY_MAX, summary_max=edits_writer.SUMMARY_MAX,
             kind_reason_max=edits_writer.KIND_REASON_MAX, strategy=edits_writer.STRATEGY, policy=edits_writer.POLICY,
             target=hyp.target, rule_id=sec.id, rule_title=sec.title, section=section_text, prev=prev or "(none)",
             next=nxt or "(none)", evidence=evidence)
+        cand = {"examples": [{"what": evidence}], "session_ids": [], "deviation_ids": []}
+        expected_prop = None
+        if hyp.edit is not None:
+            expected_reply = json.dumps({"new_section": hyp.edit["after"], "topic": "declared section edit",
+                "why": "the exact intervention declared before writing", "summary": "apply the declared replacement",
+                "kind": "prose", "kind_reason": "one declared section replacement"})
+            try:
+                expected_prop = edits_writer.parse_proposal(expected_reply, file_text=old_text, rule_id=sec.id, cand=cand)
+            except (edits_writer.ProposalError, edits_sections.SectionError):
+                return fallback("declared edit violates the existing content policy: no writer call")
         self.calls += 1
         try:
             reply = budget.call(self.model, "implement", lambda: self._run(prompt, budget),
@@ -1235,10 +1387,12 @@ class WriterImplementer:
             return fallback(f"writer proposal refused: {_one_line(exc, 200)}")
         except edits_sections.SectionError as exc:
             return fallback(f"writer proposal refused: {_one_line(exc, 200)}")
+        if expected_prop is not None and prop.new_text != expected_prop.new_text:
+            return fallback("writer drift: output differs from the declared edit")
         diff = "\n".join(difflib.unified_diff(old_text.splitlines(), prop.new_text.splitlines(), "a" + hyp.target[1:],
                                               "b" + hyp.target[1:], lineterm="", n=1))
         return Implementation(prop.new_text, "writer", None, sec.id, prop.kind, diff[:IMPLEMENTATION_DIFF_MAX],
-                              picked_by)
+                              picked_by, hyp.edit is not None)
 
 
 def sandbox_module() -> Any:
@@ -1502,6 +1656,12 @@ class Adapters:
     sandbox: SandboxOps
     targets: Callable[[], list[str]] = instruction_targets
     baseline: Callable[[str], tuple[str, Path]] = create_baseline
+    exporter: Callable[..., Mapping[str, Any]] | None = None
+
+
+def export_replay(conn: psycopg.Connection, experiment_id: str, *, budget_s: float) -> Mapping[str, Any]:
+    from agent_memory.integrations.langfuse import export_experiment
+    return export_experiment(conn, experiment_id, budget_s=budget_s, root=RA.sandbox_dir())
 
 
 def default_adapters(cfg: NightConfig, db_url: str | None = None) -> Adapters:
@@ -1517,7 +1677,8 @@ def default_adapters(cfg: NightConfig, db_url: str | None = None) -> Adapters:
         impl = StubImplementer()
     return Adapters(evidence=PackEvidence(db_url), triage=JevTriage(st["triage"]), hypothesizer=hyp, implementer=impl,
                     stager=ImproveStager(), replayer=SandboxReplayer(st, cfg.replay), proposer=ApprovalProposer(),
-                    sandbox=SandboxOps())
+                    sandbox=SandboxOps(), exporter=export_replay if cfg.replay.get("provider_profiles") or
+                    st.get("replay_agent") in ("claude", "codex") else None)
 
 
 # =========================================================================== candidates (S2)
@@ -1599,7 +1760,13 @@ class Night:
     def __init__(self, cfg: NightConfig, adapters: Adapters, *, night: str, db_url: str | None = None,
                  dry_run: bool = False, clock: Callable[[], float] = time.monotonic,
                  install_signals: bool = True, prerequisite_warnings: Sequence[str] = (),
-                 routines_log: Path | None = None) -> None:
+                 routines_log: Path | None = None, manual_run_id: str | None = None) -> None:
+        if manual_run_id is not None and not re.fullmatch(r"manual-[a-z0-9-]{8,48}", manual_run_id):
+            raise ConfigError("manual_run_id must be manual- followed by 8..48 lowercase letters, digits or hyphens")
+        self.manual_run_id = manual_run_id
+        self.run_key = manual_run_id or night
+        self.output = (RA.sandbox_dir() / "manual-runs" / manual_run_id / "nights" / night / "report.json"
+                       if manual_run_id else report_path(night))
         self.cfg, self.ad, self.night, self.db_url, self.dry_run = cfg, adapters, night, db_url, dry_run
         self.routines_log = routines_log           # the skill_refresh prerequisite's fallback source
         self.skill_refresh: Any = None             # skill_refresh.Check, set in S1 before any sighting
@@ -1612,6 +1779,7 @@ class Night:
         self.owns_night = False        # the night's checkpoint row and report belong to this run
         self.marked_running = False
         self.failed = False            # an experiment or stage failed: the checkpoint is not advanced
+        self.execution_ready = True    # missing sandbox blocks paid stages, not deterministic collection
         self.degraded = False          # a provider was down or an experiment failed: partial, but S1-S8 finished
         self.health_reasons: dict[str, list[str]] = {}   # provider -> why it was not ok (redacted, one line each)
         self.health_where: dict[str, str] = {}            # provider -> the stage that first reported it not ok
@@ -1625,7 +1793,22 @@ class Night:
             "checkpoint": {"before": None, "after": None, "advanced": False},
             "delta": {"since": None, "sessions": 0, "deviations": 0, "eval_failures": 0, "routine_failures": 0},
             "patterns": [], "candidates": [], "experiments": [], "costs": {}, "health": {},
-            "pending_decisions": [], "notes": []}
+            "pending_decisions": [], "notes": [],
+            "connection_recovery": {"format": "rsi-connection-recovery/1",
+                "policy": {"max_attempts": 3, "retry_delay_s": 0.25,
+                           "scope": "read-only evidence; shared provider deadline"},
+                "checks": [], "dependencies": [
+                    {"capability": "database, run lock and budget", "required_for": "durable safe execution",
+                     "failure_scope": "whole run"},
+                    {"capability": "sandbox and configured evaluation providers", "required_for": "valid paired replay",
+                     "failure_scope": "dependent replay; required provider comparisons are never dropped"},
+                    {"capability": "clickhouse, langfuse and pastdev reads", "required_for": "supporting evidence",
+                     "failure_scope": "affected evidence queries; independent work continues"},
+                    {"capability": "verified candidate evidence", "required_for": "hypothesis generation",
+                     "failure_scope": "candidate only"}]}}
+        if manual_run_id:
+            self.report["manual_run"] = {"id": manual_run_id, "kind": "verification", "scheduled_checkpoint_unchanged": True}
+            self.notes.append("Manual verification run; scheduled report/checkpoint and promotion gates unchanged")
         if prerequisite_warnings:      # failed prerequisite steps the night does not read (rsi_schedule's gate)
             self.report["prerequisite_warnings"] = _prereq_warnings(prerequisite_warnings)
         self.allowlist: list[str] = []
@@ -1633,12 +1816,13 @@ class Night:
         self.since: str | None = None
         self.next_checkpoint: str | None = None
         self.selected_ids: list[str] = []
+        self.standby_ids: list[str] = []
         self._pool_rows: dict[str, dict[str, Any]] = {}
         self._evidence: dict[str, dict[str, list[dict[str, Any]]]] = {}   # candidate key -> its pack's details
         self._evidence_text: dict[str, str] = {}      # candidate key -> its rendered (enveloped) evidence pack
         self._advance = False
         # data-use R4: what S1 and S4 read, used and skipped, written once in _finish (night_coverage.py)
-        self.cov = NC.Ledger(night, f"{FORMAT} config {cfg.sha256[:12]}")
+        self.cov = NC.Ledger(self.run_key, f"{FORMAT} config {cfg.sha256[:12]}")
 
     def _cov(self) -> NC.Ledger:
         """The coverage ledger (a night built without __init__, as some tests do, gets an unwritten one)."""
@@ -1708,6 +1892,26 @@ class Night:
                     if not hasattr(self, "health_where"):
                         self.health_where = {}
                     self.health_where.setdefault(k, _one_line(where, 120))
+        for step in steps or []:
+            if not isinstance(step, Mapping):
+                continue
+            source = _RETRIEVER.get(str(step.get("step", "")).split(".", 1)[0])
+            if source is None:
+                continue
+            state = step.get("recovery_status")
+            if state not in {"healthy", "recovered", "failed", "excluded", "not_required"}:
+                state = "healthy" if step.get("status") == "ok" else (
+                    "excluded" if str(step.get("detail", "")).startswith("policy-excluded:") else "failed")
+            checks = getattr(self, "report", {}).get("connection_recovery", {}).get("checks")
+            if checks is not None and len(checks) < 200:
+                checks.append({"source": source, "stage": _one_line(where, 160),
+                    "step": _one_line(step.get("step", "unknown"), 80), "status": state,
+                    "attempts": step.get("attempts"), "checked_at": step.get("checked_at") or _now_iso(),
+                    "elapsed_ms": step.get("elapsed_ms"),
+                    "reason": step.get("recovery_reason") or (
+                        "read succeeded" if state == "healthy" else "see recorded health reason"),
+                    "impact": "supporting evidence unavailable; independent work continues" if state == "failed" else (
+                        "query excluded; coverage gap retained" if state == "excluded" else "read completed")})
         # Why a provider was not ok: the failing steps' own detail (the 2026-10-23 night logged only "error").
         for st in steps or []:
             if not isinstance(st, Mapping) or st.get("status") in (None, "ok"):
@@ -1774,22 +1978,33 @@ class Night:
             self.health_reasons["supabase"] = [f"preflight: database unavailable ({type(exc).__name__})"]
             raise PreflightFailed(f"database unavailable ({type(exc).__name__})") from None
         row = self.conn.execute("select status from rsi_checkpoints where job = %s and run_key = %s",
-                                (JOB, self.night)).fetchone()
+                                (JOB, self.run_key)).fetchone()
         if row and row[0] == "done":
             raise PreflightFailed(f"night {self.night} is already done")
         self.owns_night = not self.dry_run
         self.health["sandbox"] = self.ad.replayer.preflight()
-        if self.health["sandbox"] != "ok" and not self.dry_run:      # a dry run never reaches the sandbox
-            raise PreflightFailed("sandbox unavailable (docker or the worker image)")
+        if self.health["sandbox"] != "ok" and not self.dry_run:
+            self.execution_ready = False
+            self.degraded = True
+            reason = "sandbox unavailable (docker or the worker image); paid stages deferred; collection continues"
+            self.notes.append(reason)
+            self.health_reasons["sandbox"] = [reason]
+            self.report["connection_recovery"]["checks"].append({
+                "source": "sandbox", "stage": "S0 preflight", "step": "sandbox.preflight", "status": "failed",
+                "attempts": 1, "checked_at": _now_iso(), "elapsed_ms": None,
+                "reason": "sandbox unavailable; no automatic service restart configured",
+                "impact": "paid triage and experiments deferred; deterministic evidence collection continues"})
         self.allowlist = list(self.ad.targets())
         self.pinned = [t for t in self.allowlist if _refused_by_improve(t)]
         if self.pinned:                # improve refuses these: a candidate on one only burns triage and model money
             self.allowlist = [t for t in self.allowlist if t not in self.pinned]
         self.budget.check()
         if not self.dry_run:
-            self._reconcile_orphans()
-            AP.checkpoint(self.conn, JOB, self.night, "running",
-                          meta={"started_at": self.report["started_at"], "config_sha256": self.cfg.sha256})
+            if not self.manual_run_id:
+                self._reconcile_orphans()
+            AP.checkpoint(self.conn, JOB, self.run_key, "running",
+                          meta={"started_at": self.report["started_at"], "config_sha256": self.cfg.sha256,
+                                **({"manual_run_id": self.manual_run_id} if self.manual_run_id else {})})
             self.marked_running = True
 
     # -- S1-S3 ----------------------------------------------------------------------------------------
@@ -1797,8 +2012,8 @@ class Night:
         assert self.conn is not None
         row = self.conn.execute(
             "select meta->>'next_checkpoint' from rsi_checkpoints where job = %s and status = 'done' and run_key <> %s "
-            "and meta ? 'next_checkpoint' order by finished_at desc nulls last, run_key desc limit 1",
-            (JOB, self.night)).fetchone()
+            "and meta ? 'next_checkpoint' and not (meta ? 'manual_run_id') order by finished_at desc nulls last, run_key desc limit 1",
+            (JOB, self.run_key)).fetchone()
         return row[0] if row else None
 
     def _check_skill_refresh(self, night_window_end: datetime) -> None:
@@ -2094,6 +2309,8 @@ class Night:
         the last sighted: sources are sighted in a fixed order, so `last_seen_at` favoured whichever came last."""
         assert self.conn is not None
         if not self.dry_run:
+            self._reconsider_production()
+        if not self.dry_run:
             for s in sightings:
                 self._sight(s)
         limit = int(self.cfg.candidates["max_considered"])
@@ -2155,21 +2372,114 @@ class Night:
         uncovered = [c for c in pool if not self._test_cases(c.get("target"))]
         return covered[:limit] + uncovered[:limit]
 
-    def _test_cases(self, target: str | None) -> list[str]:
+    def _reconsider_production(self) -> None:
+        """A bounded advisory reopening policy. Keep total attempts/history;
+        only a materially new verified generation gets a named per-generation
+        allowance. No edit, proposal, promotion or Undo authorization here.
+        """
+        from agent_memory import production_feedback as PF
+        assert self.conn is not None
+        with self.conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("select * from rsi_candidates where status in ('tested','rejected') "
+                        "and target=any(%s) order by last_considered_at desc nulls last,id limit 20",
+                        (list(self.allowlist),))
+            candidates = [dict(r) for r in cur.fetchall()]
+        for candidate in candidates:
+            if not self._test_cases(candidate.get('target')):
+                continue
+            sha = current_target_sha(candidate)
+            bound = {**candidate, "rule_key": (candidate.get('meta') or {}).get('last_tested_rule_key') or candidate.get('rule_key')}
+            for finding in PF.for_candidate(self.conn, bound, sha):
+                decision = PF.reconsider(bound, finding, sha)
+                if decision.allowed:
+                    self._update_candidate(candidate['id'], status='new', reason='advisory feedback: '+decision.reason,
+                        meta={"production_feedback_reopened_generation": decision.generation,
+                              "generation_attempts": 0, "attempt_limit_scope": "verified_feedback_generation"})
+                    self.notes.append(f"candidate {candidate['dedupe_key']}: advisory reconsideration {decision.reason}; "
+                                      f"evidence {finding['ref']}"[:300])
+                    break
+
+    def _test_cases(self, target: str | None, rule_key: str | None = None,
+                    section_id: str | None = None) -> list[str]:
         """Replay cases (the night's `replay.cases`, default all of bench/rsi-replay) that declare `target`. Path
         only: the artifact's kind is checked again by the replay. A bench that does not load covers nothing."""
         cov = getattr(self, "_case_coverage", None)
         if cov is None:
             cov = {}
+            self._case_digests: dict[str, str] = {}
+            self._case_sections: dict[tuple[str, str], list[str]] = {}
             try:
                 from agent_memory import rsi_replay
                 for case in rsi_replay.load_cases(self.cfg.replay.get("cases")):
+                    self._case_digests[case.id] = case.digest()
                     for t in case.targets:
                         cov.setdefault(t["path"], []).append(case.id)
+                        self._case_sections[(t["path"], case.id)] = list(t.get("sections", []))
             except Exception as exc:  # noqa: BLE001 - fail closed: no experiment without a case
                 self.notes.append(f"test cases unavailable: {type(exc).__name__}: {str(exc)[:150]}")
             self._case_coverage = cov
-        return sorted(cov.get(target or "", []))
+        if section_id is None and rule_key and target in self.allowlist:
+            with contextlib.suppress(OSError, ValueError):
+                sec = _section_for(rsi_targets.untilde(target).read_text(), rule_key)
+                section_id = sec.id if sec else None
+        ids = sorted(cov.get(target or "", []))
+        if section_id is not None:
+            return [cid for cid in ids if section_id in self._case_sections.get((target, cid), [])]
+        return ids
+
+    def _writer_block(self, c: Mapping[str, Any]) -> str | None:
+        if not isinstance(getattr(self.ad, "implementer", None), WriterImplementer) or c.get("target") not in self.allowlist:
+            return None
+        try:
+            path = rsi_targets.untilde(c["target"])
+            if ET.pinned_file(path) is not None:
+                return "target file is pinned"
+            sec = _section_for(path.read_text(), (c.get("meta") or {}).get("last_tested_rule_key") or c.get("rule_key"))
+            if sec is not None:
+                from agent_memory.edits_sections import section_text
+                text = section_text(path.read_text(), sec.id)
+                if writer_rule_pin(c["target"], sec.id, text, c.get("rule_key"), c.get("dedupe_key")) or ET.pinned_sections(path, text):
+                    return "instruction section is pinned"
+        except (OSError, ValueError, RuntimeError):
+            return "writer target readiness unavailable"
+        return None
+
+    def _baselines(self, cases: Sequence[str]) -> dict[str, dict[str, tuple[int, int]]]:
+        """Per case, per replay suite label, the last recorded arm-A result (passed, pairs): the newest
+        rsi_eval_results record of a sandbox-replay suite with that case, read from its `results.cases`. A record of
+        an older version of the case (another `case_digests` entry) does not count. Label: the suite's provider
+        profile (sandbox-replay-<profile>), `default` for the plain suite. A case without a record is absent
+        (triage_state says unknown); a failed read is a note and no history."""
+        if not cases or self.conn is None:
+            return {}
+        cache: dict[str, dict[str, tuple[int, int]]] = getattr(self, "_baseline_cache", {})
+        self._baseline_cache = cache
+        todo = sorted(set(cases) - set(cache))
+        if todo:
+            for case in todo:
+                cache[case] = {}
+            try:
+                rows = self.conn.execute(
+                    "select r.suite, x->>'case', (x->>'a_pass')::numeric, (x->>'pairs')::numeric, "
+                    "r.record->'results'->'case_digests'->>(x->>'case') "
+                    "from rsi_eval_results r cross join lateral jsonb_array_elements(case when "
+                    "jsonb_typeof(r.record->'results'->'cases') = 'array' then r.record->'results'->'cases' "
+                    "else '[]'::jsonb end) x "
+                    "where r.suite like 'sandbox-replay%%' and x->>'case' = any(%s) "
+                    "and jsonb_typeof(x->'a_pass') = 'number' and jsonb_typeof(x->'pairs') = 'number' "
+                    "order by r.created_at desc, r.id desc", (todo,)).fetchall()
+            except psycopg.Error as exc:
+                self.notes.append(f"triage: baseline history unavailable ({type(exc).__name__})")
+                rows = []
+            digests = getattr(self, "_case_digests", {})
+            for suite, case, a_pass, pairs, digest in rows:
+                label = str(suite).removeprefix("sandbox-replay").lstrip("-") or "default"
+                if pairs is None or pairs <= 0 or label in cache[case]:
+                    continue
+                if digest and digests.get(case) and digest != digests[case]:
+                    continue                          # recorded against an older version of the case
+                cache[case][label] = (int(a_pass), int(pairs))
+        return {c: dict(cache[c]) for c in cases if cache.get(c)}
 
     def _history(self, key: str) -> list[str]:
         assert self.conn is not None
@@ -2184,21 +2494,25 @@ class Night:
             self._poll()
             hist = self._history(c["dedupe_key"])
             in_scope = self._in_scope(c.get("target"))
-            tests = self._test_cases(c.get("target"))
+            section_key = (c.get("meta") or {}).get("last_tested_rule_key") or c.get("rule_key")
+            tests = self._test_cases(c.get("target"), section_key) if isinstance(self.ad.implementer, WriterImplementer) else self._test_cases(c.get("target"))
+            writer_block = self._writer_block(c)
             ans = None
             # No replay case uses the file: no paid triage call, the deterministic heuristic ranks it for the report.
-            if tests and (not self.dry_run or self.cfg.stages["triage"] == "fixture"):
-                ans = self.ad.triage.assess(c, state=triage_state(c, hist, in_scope), budget=self.budget)
+            if tests and not writer_block and self.execution_ready and (not self.dry_run or self.cfg.stages["triage"] == "fixture"):
+                state = triage_state(c, hist, in_scope, tests, self._baselines(tests))
+                ans = self.ad.triage.assess(c, state=state, budget=self.budget)
             if ans is None:
                 ans = heuristic_answers(c, hist, in_scope)
             r = rank(ans, recurrence(c), hist, self.cfg.weights)
-            eligible = ans.action == "experiment" and in_scope and bool(tests) and r >= self.cfg.min_rank
-            why = ("eligible" if eligible else "no in-scope target" if not in_scope else NO_TEST_CASE if not tests
+            explore = self.cfg.experiment_goal[0] > 0
+            eligible = in_scope and bool(tests) and not writer_block and (explore or (ans.action == "experiment" and r >= self.cfg.min_rank))
+            why = (writer_block if writer_block else "eligible" if eligible else "no in-scope target" if not in_scope else NO_TEST_CASE if not tests
                    else "triage: wait" if ans.action != "experiment" else "rank below the minimum")
             results.append((c, ans, r, eligible, why, hist))
         self.health["jev"] = getattr(self.ad.triage, "health", self.health["jev"])
-        order = sorted(results, key=lambda x: (not x[3], -x[2], x[0]["dedupe_key"]))
-        slots = self.budget.experiments_left()
+        order = sorted(results, key=lambda x: (not x[3], x[1].action != "experiment", -x[2], x[0]["dedupe_key"]))
+        slots = min(self.budget.experiments_left(), self.cfg.experiment_goal[1])
         for c, ans, r, eligible, why, hist in order:
             selected = eligible and slots > 0
             if selected:
@@ -2207,35 +2521,87 @@ class Night:
             else:
                 reason = f"deferred: {why}" if not eligible else f"deferred: rank {r:.3f} below tonight's experiment slots"
             c["rank"], c["jev"] = r, {**ans.as_dict(), "history": hist}
+            if selected and ans.action == "wait":
+                reason += "; scheduled exploration despite wait: " + triage_explanation(ans)
             if selected:
                 self.selected_ids.append(str(c.get("id") or c["dedupe_key"]))
+            elif eligible:
+                self.standby_ids.append(str(c.get("id") or c["dedupe_key"]))
             if not self.dry_run:
                 self.conn.execute(
                     "update rsi_candidates set status = %s, rank = %s, jev = %s, decided_reason = %s, "
                     "last_considered_at = now() where id = %s",
                     ("selected" if selected else "deferred", r, Jsonb(c["jev"]), reason[:300], c["id"]))
+                from agent_memory import production_feedback as PF
+                sha = current_target_sha(c)
+                bound = {**c, 'rule_key': (c.get('meta') or {}).get('last_tested_rule_key') or c.get('rule_key')}
+                observations = PF.for_candidate(self.conn, bound, sha)
+                reopened = (c.get('meta') or {}).get('production_feedback_reopened_generation')
+                valid = next((x for x in observations if x['status']=='ok' and x['metrics'].get('generation')==reopened), None)
+                valid = valid or next((x for x in observations if x['status']=='ok'), None)
+                if valid:
+                    metrics = valid['metrics']
+                    extra = {'production_feedback_generation': metrics['generation'],
+                             'production_feedback_sessions_after': metrics['measurements']['sessions_after']}
+                    self._update_candidate(c['id'], meta=extra)
+                    c['meta'] = {**(c.get('meta') or {}), **extra}
             tests = self._test_cases(c.get("target"))
             self.report["candidates"].append({"id": str(c.get("id")) if c.get("id") else None, "key": c["dedupe_key"],
                                               "source": c["source"], "rank": r, "selected": selected, "reason": reason,
                                               # additive (Night Desk): the file, the cases that use it, or why not
                                               "target": c.get("target"), "test_cases": tests,
+                                              "triage": {**ans.as_dict(), "explanation": triage_explanation(ans)},
                                               "skip_reason": None if tests else NO_TEST_CASE})
         self._pool_rows = {str(c.get("id") or c["dedupe_key"]): c for c, *_ in results}
 
     # -- S4-S8 -----------------------------------------------------------------------------------------
     def _experiments(self) -> None:
-        for cid in list(self.selected_ids):
+        if not self.execution_ready:
+            for cid in self.selected_ids:
+                c = self._pool_rows[cid]
+                reason = "deferred: sandbox unavailable; no paid experiment attempted"
+                self._update_candidate(c.get("id"), status="deferred", reason=reason)
+                for entry in self.report["candidates"]:
+                    if entry["key"] == c["dedupe_key"]:
+                        entry.update(selected=False, reason=reason, skip_reason="sandbox unavailable")
+            return
+        target = self.cfg.experiment_goal[1]
+        standby = self.standby_ids if self.cfg.experiment_goal[0] > 0 else []
+        for cid in [*self.selected_ids, *standby]:
+            if self.budget.experiments_left() <= self.cfg.budget.max_experiments - target:
+                break
             self._poll()
+            if cid not in self.selected_ids:
+                # A prior candidate yielded no usable hypothesis: fill its unused slot, within the same caps.
+                c = self._pool_rows[cid]
+                reason = "selected: backfill unused daily experiment slot"
+                if c["jev"]["action"] == "wait":
+                    reason += "; scheduled exploration despite wait: " + triage_explanation(
+                        TriageAnswers(**{k: c["jev"][k] for k in TriageAnswers.__dataclass_fields__ if k in c["jev"]}))
+                self._update_candidate(c.get("id"), status="selected", reason=reason)
+                self.selected_ids.append(cid)
+                for entry in self.report["candidates"]:
+                    if entry["key"] == c["dedupe_key"]:
+                        entry.update(selected=True, reason=reason)
             self._investigate(self._pool_rows[cid])
 
     def _investigate(self, c: dict[str, Any]) -> None:
         assert self.conn is not None
+        blocker = self._writer_block(c)
+        if blocker:
+            self._update_candidate(c.get("id"), status="deferred", reason=blocker)
+            for entry in self.report["candidates"]:
+                if entry["key"] == c["dedupe_key"]:
+                    entry.update(selected=False, reason=blocker, skip_reason=blocker)
+            return
         cand = {k: c.get(k) for k in ("id", "dedupe_key", "source", "kind", "target", "rule_key", "evidence_refs",
                                       "metrics", "seen_count")}
+        cand['rule_key'] = (c.get('meta') or {}).get('last_tested_rule_key') or cand.get('rule_key')
         cand["id"] = str(c["id"]) if c.get("id") else None
         # S4: a bounded evidence pack (untrusted data; it only reaches the model inside its envelope)
         refs = list(c.get("evidence_refs") or [])[:20]
         evidence_text = ""
+        pack = None
         self._evidence[str(c["dedupe_key"])] = evidence_detail([])
         try:
             with self._interruptible():
@@ -2256,12 +2622,33 @@ class Night:
             self.degraded = True
             self.notes.append(f"evidence pack for {c['dedupe_key']}: {type(exc).__name__}")
             self._cov().pack_failed(f"evidence pack for {c['dedupe_key']}: {type(exc).__name__}")
+        # A missing optional source is not a whole-night stop. But without any
+        # re-readable authoritative support this candidate must wait before S5.
+        if pack is None or any(self.health.get(k) in UNHEALTHY for k in PROVIDERS[1:]):
+            from agent_memory.rsi_evidence_pack import existing
+            local_refs = [r for r in refs if isinstance(r, str) and r.startswith("amem:")]
+            verified = existing(self.conn, local_refs) if local_refs else set()
+            pack_ok = any(_dget(f, "status") == "ok" and _dget(f, "authority")
+                          for f in (_dget(pack, "findings") or []))
+            if not verified and not pack_ok:
+                reason = "deferred: required candidate evidence unavailable; independent candidates continue"
+                self._update_candidate(c.get("id"), status="deferred", reason=reason)
+                for entry in self.report["candidates"]:
+                    if entry["key"] == c["dedupe_key"]:
+                        entry.update(selected=False, reason=reason, skip_reason="required evidence unavailable")
+                self.degraded = True
+                return
         refs = list(dict.fromkeys(refs))[:20]
         self._evidence_text[str(c["dedupe_key"])] = evidence_text     # S6's writer sees it only in its envelope
         # S5: typed hypotheses (pending ones from an earlier night first: no new model call)
         meta = dict(c.get("meta") or {})
         cap = self.budget.hypothesis_cap()
         pending = [h for h in meta.get("pending_hypotheses") or [] if isinstance(h, dict)]
+        if isinstance(self.ad.implementer, WriterImplementer):
+            unbound = [h for h in pending if not isinstance(h.get("edit"), dict)]
+            if unbound:
+                self._update_candidate(c.get("id"), meta={"unbound_pending_hypotheses": unbound})
+            pending = [h for h in pending if isinstance(h.get("edit"), dict)]
         if pending:
             reply = json.dumps({"hypotheses": pending[:cap]})
         else:
@@ -2288,6 +2675,10 @@ class Night:
             hyps, rejected = parse_hypotheses(reply, allowlist=self.allowlist, cap=cap)
         except HypothesisParseError as exc:
             hyps, rejected = [], [{"index": None, "reason": str(exc), "code": "unparseable", "field": None}]
+        if isinstance(self.ad.implementer, WriterImplementer):
+            rejected.extend({"index": i, "field": "edit", "code": "bad_edit_contract", "reason": "missing exact edit contract"}
+                            for i, h in enumerate(hyps) if h.edit is None)
+            hyps = [h for h in hyps if h.edit is not None]
         if rejected:
             self.notes.append(f"{len(rejected)} hypothesis(es) rejected for {c['dedupe_key']}")
         for ce in self.report["candidates"]:       # additive (Night Desk decision 18): why each idea was thrown out
@@ -2297,34 +2688,79 @@ class Night:
         if not hyps:
             # Counted as an attempt: a candidate that never yields a usable hypothesis retires (it returns as
             # `new` when it is seen again) instead of costing a model call every night.
-            attempts = int(meta.get("attempts") or 0) + 1
+            generation = meta.get('attempt_limit_scope') == 'verified_feedback_generation'
+            attempts = int(meta.get('generation_attempts' if generation else 'attempts') or 0) + 1
             final = attempts >= int(self.cfg.candidates["max_attempts"])
             self._update_candidate(c["id"], status="retired" if final else "deferred",
                                    reason="no valid hypothesis" + (" (retired until seen again)" if final else ""),
-                                   meta={"pending_hypotheses": [], "attempts": attempts})
+                                   meta={"pending_hypotheses": [], "attempts": int(meta.get('attempts') or 0)+1,
+                                         **({'generation_attempts':attempts} if generation else {})})
             return
+        attempted = False
         for i, h in enumerate(hyps):
             later = hyps[i + 1:]
             # One experiment per candidate per night. Triage gave each selected candidate one of tonight's slots, so
             # a candidate's second hypothesis never takes another candidate's slot; it stays pending (stored by
             # _experiment) and runs on a later night without a new model call.
-            if i > 0 or self.budget.experiments_left() <= 0:
-                self.report["experiments"].append(self._entry(None, c, h, refs, status="skipped_budget"))
+            if i > 0 and attempted:
+                self.report["experiments"].append(self._skipped_entry(
+                    c, h, refs, policy="one_experiment_per_candidate"))
+                continue
+            if isinstance(self.ad.implementer, WriterImplementer):
+                reason = None
+                if h.edit is None:
+                    reason = "missing exact edit contract"
+                elif not self._test_cases(h.target, section_id=h.edit["section_id"]):
+                    reason = "no replay case covers the declared instruction section"
+                elif ET.pinned_sections(rsi_targets.untilde(h.target), h.edit["before"]) or writer_rule_pin(
+                        h.target, h.edit['section_id'], h.edit["before"], c.get("rule_key"), c.get("dedupe_key")):
+                    reason = "declared instruction section is pinned"
+                if reason:
+                    self.report["experiments"].append(self._skipped_entry(c, h, refs, policy=reason))
+                    self._update_candidate(c.get("id"), status="deferred", reason=reason)
+                    for candidate_entry in self.report["candidates"]:
+                        if candidate_entry["key"] == c["dedupe_key"]:
+                            candidate_entry.update(selected=False, reason="deferred: " + reason, skip_reason=reason)
+                    continue
+            if isinstance(self.ad.implementer, WriterImplementer) and h.edit:
+                self._update_candidate(c.get("id"), status="selected", reason="selected: exact intervention validated")
+                for candidate_entry in self.report["candidates"]:
+                    if candidate_entry["key"] == c["dedupe_key"]:
+                        candidate_entry.update(selected=True, skip_reason=None,
+                            test_cases=self._test_cases(h.target, section_id=h.edit["section_id"]))
+                        if candidate_entry.get("reason", "").startswith("deferred:"):
+                            candidate_entry["reason"] = "selected: a later exact intervention has declared coverage"
+            if self.budget.experiments_left() <= 0:
+                self.report["experiments"].append(self._skipped_entry(c, h, refs, resource="experiments"))
                 continue
             try:
                 self.budget.take_experiment()
-            except BudgetExhausted:
+                attempted = True
+            except BudgetExhausted as exc:
                 for x in hyps[i:]:
-                    self.report["experiments"].append(self._entry(None, c, x, refs, status="skipped_budget"))
-                self._update_candidate(c["id"], status="deferred", reason="budget",
+                    self.report["experiments"].append(self._skipped_entry(c, x, refs, resource=exc.kind,
+                                                                          detail=str(exc)))
+                self._update_candidate(c["id"], status="deferred", reason=f"budget:{exc.kind}",
                                        meta={"pending_hypotheses": [x.as_dict() for x in hyps[i:]]})
                 raise
             try:
                 self._experiment(c, h, refs, later)
-            except BudgetExhausted:
+            except BudgetExhausted as exc:
                 for x in later:
-                    self.report["experiments"].append(self._entry(None, c, x, refs, status="skipped_budget"))
+                    self.report["experiments"].append(self._skipped_entry(c, x, refs, resource=exc.kind,
+                                                                          detail=str(exc)))
                 raise
+
+    def _skipped_entry(self, c: Mapping[str, Any], h: Hypothesis, refs: list[str], *,
+                       policy: str | None = None, resource: str | None = None, detail: str = "") -> dict[str, Any]:
+        """A deferred hypothesis is not an executed experiment or proof that the USD budget ran out."""
+        entry = self._entry(None, c, h, refs, status="deferred_policy" if policy else "skipped_budget")
+        reason = policy or f"budget:{resource or 'unknown'}"
+        entry.update(skip_reason=reason, budget_decision={**self.budget.snapshot(resource=resource),
+                                                        "decision": "deferred" if policy else "refused",
+                                                        "policy": policy, "detail": detail[:300]})
+        entry["verdict_reasons"] = [reason]
+        return entry
 
     def _update_candidate(self, cid: Any, *, status: str | None = None, reason: str | None = None,
                           meta: dict[str, Any] | None = None) -> None:
@@ -2336,7 +2772,7 @@ class Night:
 
     def _exp_id(self, key: str) -> str:
         assert self.conn is not None
-        base = f"exp-{self.night.replace('-', '')}-{_sha16(key)[:8]}"
+        base = f"exp-{self.night.replace('-', '')}-{_sha16(key + (self.manual_run_id or ''))[:8]}"
         taken = {r[0] for r in self.conn.execute("select id from rsi_experiments where id = %s or id like %s",
                                                   (base, base + "-r%")).fetchall()}
         if base not in taken:
@@ -2349,7 +2785,7 @@ class Night:
     def _entry(self, exp_id: str | None, c: Mapping[str, Any], h: Hypothesis, refs: list[str], *,
                status: str) -> dict[str, Any]:
         detail = self._evidence.get(str(c["dedupe_key"])) or evidence_detail([])
-        return {"experiment_id": exp_id, "candidate_key": c["dedupe_key"], "hypothesis": {"what": h.what, "why": h.why},
+        return {"experiment_id": exp_id, "candidate_key": c["dedupe_key"], "hypothesis": {"what": h.what, "why": h.why, **({"edit": h.edit} if h.edit else {})},
                 "target": h.target, "artifact_hash": None, "baseline_id": None, "verdict": None, "verdict_reasons": [],
                 "arms": {"A": {}, "B": {}}, "risk": h.risk, "confidence": h.confidence, "cost_usd": 0.0,
                 "status": status, "proposal_id": None, "evidence_refs": refs[:20], "judge": None, "jev": None,
@@ -2383,6 +2819,43 @@ class Night:
             self.notes.append(f"experiment {exp_id}: attempt identities not recorded ({type(exc).__name__}); "
                               "amem coverage repair-links rebuilds them"[:300])
 
+    def _export_current_replay(self, exp_id: str, entry: dict[str, Any]) -> None:
+        exporter = getattr(self.ad, "exporter", None)
+        if exporter is None:
+            return
+        try:
+            with self._interruptible():
+                result = dict(exporter(self.conn, exp_id, budget_s=min(90.0, self.budget.remaining_s())))
+            if result.get("experiment_id") != exp_id:
+                raise ValueError("export identity mismatch")
+        except (NightAborted, BudgetExhausted):
+            raise
+        except Exception as exc:
+            result = {"status": "failed", "experiment_id": exp_id, "rows": 0,
+                      "detail": f"current replay export: {type(exc).__name__}"}
+        entry["langfuse_export"] = result
+        self.conn.execute("update rsi_experiments set meta=meta || %s where id=%s",
+                          (Jsonb({"langfuse_export": result}), exp_id))
+        if result.get("status") not in ("ok", "off"):
+            self.degraded = True
+            self.health["langfuse"] = "unavailable"
+            reason = _one_line(f"current replay export {exp_id}: {result.get('status')}: {result.get('detail', '')}", 200)
+            self.health_reasons.setdefault("langfuse", []).append(reason)
+            self.notes.append(reason)
+
+    def _record_evaluations(self, exp_id: str, adir: Path, intended: bool) -> bool:
+        from agent_memory import replay_evidence
+        assert self.conn is not None
+        try:
+            with self.conn.transaction():
+                result = replay_evidence.register_evaluations(self.conn, adir, exp_id)
+                self.conn.execute("update rsi_experiments set meta=meta || %s where id=%s",
+                                  (Jsonb({'replay_ingestion': result, 'intended_intervention': intended}), exp_id))
+            return True
+        except (OSError, ValueError, psycopg.Error, RA.ArtifactError) as exc:
+            self.notes.append(f"experiment {exp_id}: replay evaluation evidence not ingested ({type(exc).__name__})"[:300])
+            return False
+
     def _experiment(self, c: dict[str, Any], h: Hypothesis, refs: list[str], later: list[Hypothesis]) -> None:
         assert self.conn is not None
         exp_id = self._exp_id(c["dedupe_key"])
@@ -2390,11 +2863,14 @@ class Night:
         self.report["experiments"].append(entry)
         mark = self.budget.mark()
         base_meta = {"candidate_key": c["dedupe_key"], "candidate_id": str(c["id"]), "source": "rsi-night",
-                     "evidence_refs": refs[:20], "config_sha256": self.cfg.sha256}
+                     "evidence_refs": refs[:20], "config_sha256": self.cfg.sha256,
+                     **({"manual_run_id": self.manual_run_id} if self.manual_run_id else {})}
         self.conn.execute("insert into rsi_experiments (id, night, kind, hypothesis, status, meta) "
                           "values (%s, %s, 'edit_instruction', %s, 'running', %s)",
-                          (exp_id, self.night, Jsonb(h.as_dict()), Jsonb(base_meta)))
-        attempts = int((c.get("meta") or {}).get("attempts") or 0) + 1
+                          (exp_id, self.run_key, Jsonb(h.as_dict()), Jsonb(base_meta)))
+        previous_total = int((c.get("meta") or {}).get("attempts") or 0)
+        generation = (c.get("meta") or {}).get('attempt_limit_scope') == 'verified_feedback_generation'
+        attempts = int((c.get("meta") or {}).get('generation_attempts' if generation else 'attempts') or 0) + 1
         pending = [x.as_dict() for x in later]
         row: dict[str, Any] = {"status": "failed", "verdict": None, "meta": {}}
         cand_status, cand_reason = "deferred", "experiment failed"
@@ -2420,20 +2896,19 @@ class Night:
             # then stops the night (fail closed) right after this experiment's fallback.
             self._record_implementation(exp_id, entry, impl)
             self._poll()
+            if isinstance(self.ad.implementer, WriterImplementer) and (
+                    impl.implementer == "stub-fallback" or not impl.contract_verified):
+                raise ExperimentFailed("writer intervention deferred: " + (impl.fallback_reason or "unverified edit contract"))
 
             def stage(text: str) -> StageResult:
                 return self.ad.stager.stage(experiment_id=exp_id, baseline_dir=Path(bdir), key=h.target, new_text=text,
-                                            rule_id=f"rsi-night-{_sha16(c['dedupe_key'])[:10]}",
+                                            rule_id=(section_rule_id(h.target, impl.section_id) if impl.section_id and h.edit else
+                                                     f"rsi-night-{_sha16(c['dedupe_key'])[:10]}"),
                                             timeout=max(1.0, min(float(self.cfg.staging.get("timeout_s") or 600),
                                                                  self.budget.remaining_s())))
             st = stage(new)
             if (st.status != "staged" or not st.artifact_hash) and impl.implementer == "writer":
-                # improve's own checks (its content guard: pasted ids, paths, code, failure output) refused the
-                # writer's text: this experiment tests the stub's change instead.
-                impl = Implementation(stub_change(old, h), "stub-fallback",
-                                      f"improve stage refused the writer's change: {_one_line(st.reason, 200)}")
-                new = impl.text
-                st = stage(new)
+                raise ExperimentFailed(f"writer intervention refused by staging: {_one_line(st.reason, 200)}")
             self._record_implementation(exp_id, entry, impl)
             if st.status != "staged" or not st.artifact_hash:
                 raise ExperimentFailed(f"improve stage refused: {st.reason}")
@@ -2444,9 +2919,27 @@ class Night:
             with self._interruptible():
                 rr = self.ad.replayer.replay(artifact_hash=st.artifact_hash, experiment_id=exp_id, baseline_id=bid,
                                              budget=self.budget)
+            entry["replay_runs"] = rr.runs
             self._record_attempts(exp_id, rr)
             verdict = rr.verdict if rr.verdict in VERDICTS else "INCONCLUSIVE"
-            entry.update(verdict=verdict, verdict_reasons=rr.reasons[:20],
+            reasons = list(rr.reasons)
+            intended = impl.contract_verified if isinstance(self.ad.implementer, WriterImplementer) else impl.implementer != "stub-fallback"
+            # A fallback tests other bytes than the hypothesizer asked the writer to produce. It can inform
+            # diagnostics, but an improving fallback is not evidence for that intended intervention.
+            replay_verdict = verdict
+            if not intended:
+                verdict = "INCONCLUSIVE"
+                reasons = ["fallback_intervention:not_the_intended_writer_change", *reasons]
+            entry["implementation"].update(intended_intervention=intended, replay_verdict=replay_verdict)
+            if self._record_evaluations(exp_id, Path(st.artifact_dir or RA.artifacts_dir()/st.artifact_hash), intended):
+                self._export_current_replay(exp_id, entry)
+            tested = {'last_tested_instruction_sha256': hashlib.sha256(old.encode()).hexdigest()}
+            if impl.section_id:
+                tested['last_tested_rule_key'] = (str(c.get('rule_key') or c.get('dedupe_key'))+':'+impl.section_id
+                    if c.get('source')=='skill_scores' else str(c.get('rule_key') or '').removeprefix('dev:'))
+            self._update_candidate(c['id'], meta=tested)
+            c['meta'] = {**(c.get('meta') or {}), **tested}
+            entry.update(verdict=verdict, verdict_reasons=reasons[:20],
                          arms={"A": dict(rr.arms.get("A") or {}), "B": dict(rr.arms.get("B") or {})},
                          judge=_summary(getattr(rr, "judge", None), JUDGE_KEYS),
                          jev=_summary(getattr(rr, "jev", None), JEV_KEYS))
@@ -2454,16 +2947,21 @@ class Night:
             views = report_provider_results(rr.provider_results)
             entry.update(test_setup=rr.setup, relevance=rr.relevance, judge_pairs=pairs, provider_results=views)
             row = {"status": "evaluated", "verdict": verdict,
-                   "meta": {"verdict_reasons": rr.reasons[:20], "arms": entry["arms"], "eval_path": rr.eval_path,
+                   "meta": {"verdict_reasons": reasons[:20], "arms": entry["arms"], "eval_path": rr.eval_path,
                             "replay_runs": rr.runs, "budget_stop": rr.budget_stop, "judge": entry["judge"],
                             "jev": entry["jev"], "test_setup": rr.setup, "relevance": rr.relevance,
-                            "judge_pairs": pairs, "provider_results": views}}
+                            "judge_pairs": pairs, "provider_results": views,
+                            "intended_intervention": intended, "replay_verdict": replay_verdict}}
             if rr.budget_stop:
                 entry["status"] = "skipped_budget"
                 cand_status, cand_reason = "deferred", f"replay stopped by the budget ({rr.budget_stop})"
                 raise BudgetExhausted(str(rr.budget_stop), "replay")
             # S8: only IMPROVES with the exact artifact becomes a staged proposal
-            if verdict == "IMPROVES":
+            if verdict == "IMPROVES" and self.manual_run_id:
+                entry["status"] = "not_promotable"
+                cand_status, cand_reason = "tested", "manual verification only; no proposal created"
+                pending = []
+            elif verdict == "IMPROVES":
                 pid = self.ad.proposer.propose(self.conn, adir=Path(st.artifact_dir or RA.artifacts_dir() / st.artifact_hash),
                                                artifact_hash=st.artifact_hash, candidate=c, hyp=h, replay=rr, refs=refs)
                 entry.update(status="staged", proposal_id=pid)
@@ -2485,6 +2983,9 @@ class Night:
             raise
         except BudgetExhausted as exc:
             entry["status"] = "skipped_budget"
+            entry.update(skip_reason=f"budget:{exc.kind}",
+                         budget_decision={**self.budget.snapshot(resource=exc.kind),
+                                          "decision": "stopped", "detail": str(exc)[:300]})
             if row["status"] != "evaluated":
                 row = {**row, "status": "aborted"}
             row["meta"] = {**row["meta"], "reason": f"budget: {exc.kind}"}
@@ -2514,10 +3015,12 @@ class Night:
             counted = attempts - 1 if stopped else attempts
             if stopped:
                 pending = [h.as_dict()] + pending
+            total = previous_total + (0 if stopped else 1)
+            generation_fields = {'generation_attempts': counted} if generation else {}
             self._update_candidate(c["id"], status=cand_status, reason=cand_reason,
-                                   meta={"attempts": counted, "history": hist, "pending_hypotheses": pending,
+                                   meta={"attempts": total, **generation_fields, "history": hist, "pending_hypotheses": pending,
                                          "last_experiment": exp_id})
-            c["meta"] = {**(c.get("meta") or {}), "attempts": counted, "history": hist}
+            c["meta"] = {**(c.get("meta") or {}), "attempts": total, **generation_fields, "history": hist}
 
     # -- unwinding, S9, the report ----------------------------------------------------------------------
     def _reap_tonight(self) -> None:
@@ -2553,9 +3056,14 @@ class Night:
         try:
             self.conn.execute("update rsi_experiments set status = 'aborted', finished_at = now(), "
                               "meta = meta || %s where night = %s and status in ('planned', 'running')",
-                              (Jsonb({"reason": why}), self.night))
-            self.conn.execute("update rsi_candidates set status = 'deferred', decided_reason = %s "
-                              "where status = 'selected'", (f"night stopped: {why}",))
+                              (Jsonb({"reason": why}), self.run_key))
+            if self.manual_run_id:
+                self.conn.execute("update rsi_candidates set status='deferred', decided_reason=%s "
+                                  "where status='selected' and id=any(%s::uuid[])",
+                                  (f"manual verification stopped: {why}", self.selected_ids))
+            else:
+                self.conn.execute("update rsi_candidates set status = 'deferred', decided_reason = %s "
+                                  "where status = 'selected'", (f"night stopped: {why}",))
         except psycopg.Error as exc:
             self.notes.append(f"unwind failed: {type(exc).__name__}")
 
@@ -2586,7 +3094,9 @@ class Night:
             self.degraded = True       # no writer change was tested tonight: partial, and the routines.log line says why
         if self.failed:
             return "partial"
-        degraded = self.degraded or any(_SEVERITY.get(self.health.get(k, "ok"), 0) >= 2 for k in PROVIDERS)
+        minimum, _ = self.cfg.experiment_goal
+        missed_minimum = minimum > sum(bool(e.get("replay_runs")) for e in self.report["experiments"])
+        degraded = self.degraded or missed_minimum or any(_SEVERITY.get(self.health.get(k, "ok"), 0) >= 2 for k in PROVIDERS)
         self._advance = True
         return "partial" if degraded else "ok"
 
@@ -2607,6 +3117,7 @@ class Night:
 
     def _finish(self, status: str) -> None:
         advance = self._advance and status in ("ok", "partial") and not self.failed and not self.dry_run
+        scheduled_advance = advance and not self.manual_run_id
         r = self.report
         r["status"] = status
         r["finished_at"] = _now_iso()
@@ -2628,6 +3139,28 @@ class Night:
         self._record_coverage(status)
         ws = self._writer_summary()
         notes = list(self.notes)
+        minimum, target = self.cfg.experiment_goal
+        if minimum and not self.dry_run:
+            attempted = sum(bool(e.get("experiment_id")) for e in r["experiments"])
+            replayed = sum(bool(e.get("replay_runs")) for e in r["experiments"])
+            shortfall = []
+            if replayed < target:
+                if status in ("preflight_failed", "budget_exhausted", "aborted"):
+                    shortfall.append(status)
+                if attempted > replayed:
+                    shortfall.append("an experiment did not produce any replay runs")
+                if not self.selected_ids:
+                    shortfall.append("no permitted candidate with applicable replay cases")
+                elif len(self.selected_ids) < target:
+                    shortfall.append("fewer permitted candidates than the daily target")
+                if any(c.get("hypotheses_accepted") == 0 for c in r["candidates"]):
+                    shortfall.append("a candidate produced no valid hypothesis")
+                shortfall = shortfall or ["candidate preparation did not fill the remaining slots"]
+            r["experiment_goal"] = {"minimum": minimum, "target": target, "attempted": attempted,
+                                    "replayed": replayed, "minimum_met": replayed >= minimum,
+                                    "target_met": replayed >= target, "shortfall_reasons": shortfall}
+            notes.insert(0, f"Daily experiments: {replayed} with replay runs; minimum {minimum}, target {target}. "
+                         + ("; ".join(shortfall) if shortfall else "Daily target met."))
         if ws is not None:
             r["writer"] = ws
             if ws["all_fell_back"]:
@@ -2635,7 +3168,7 @@ class Night:
                 notes.insert(0, _one_line(f"{WRITER_NEVER_RAN}: {ws['fell_back']}/{ws['experiments']} experiments fell "
                                           f"back to the stub ({top})", 300))
         r["notes"] = notes[:1] + notes[1:][-29:] if ws and ws["all_fell_back"] else notes[-30:]
-        if advance:
+        if scheduled_advance:
             r["checkpoint"]["after"] = self.next_checkpoint
             r["checkpoint"]["advanced"] = True
         if self.conn is not None:
@@ -2645,10 +3178,11 @@ class Night:
                                 "order by created_at, id")
                     r["pending_decisions"] = [str(x[0]) for x in cur.fetchall()]
                 if self.marked_running:
-                    meta = {"status": status, "report": str(report_path(self.night)), "costs": r["costs"]["total_usd"]}
+                    meta = {"status": status, "report": str(self.output), "costs": r["costs"]["total_usd"],
+                            **({"manual_run_id": self.manual_run_id} if self.manual_run_id else {})}
                     if advance:
                         meta.update(next_checkpoint=self.next_checkpoint, since=r["delta"]["since"])
-                    AP.checkpoint(self.conn, JOB, self.night, "done" if advance else "failed", meta=meta)
+                    AP.checkpoint(self.conn, JOB, self.run_key, "done" if advance else "failed", meta=meta)
             except psycopg.Error as exc:
                 r["notes"].append(f"finish: database error {type(exc).__name__}")
                 if advance:
@@ -2656,7 +3190,7 @@ class Night:
                     r["checkpoint"]["after"] = r["checkpoint"]["before"]
         if self.owns_night:
             try:
-                _write_json(report_path(self.night), r)
+                _write_json(self.output, r)
             except OSError as exc:
                 r["notes"].append(f"report not written: {type(exc).__name__}")
         if self.lock is not None:
@@ -2675,7 +3209,8 @@ def _prereq_warnings(warnings: Sequence[str]) -> list[str]:
 def run_night(*, night: str | None = None, config_path: Path | None = None, dry_run: bool = False,
               db_url: str | None = None, adapters: Adapters | None = None,
               clock: Callable[[], float] = time.monotonic, install_signals: bool = True,
-              prerequisite_warnings: Sequence[str] = (), routines_log: Path | None = None) -> dict[str, Any]:
+              prerequisite_warnings: Sequence[str] = (), routines_log: Path | None = None,
+              manual_run_id: str | None = None) -> dict[str, Any]:
     """One night. Returns the report (rsi-night/1); writes it to $RSI_SANDBOX_DIR/nights/<night>/report.json
     unless dry_run (then nothing is written: no lock, no rows, no report file). `prerequisite_warnings` (the night
     job's gate: failed prerequisite steps the night does not read) go into the report as they are. `routines_log`:
@@ -2696,13 +3231,66 @@ def run_night(*, night: str | None = None, config_path: Path | None = None, dry_
         return rep
     return Night(cfg, adapters or default_adapters(cfg, db_url), night=night, db_url=db_url, dry_run=dry_run,
                  clock=clock, install_signals=install_signals, prerequisite_warnings=prerequisite_warnings,
-                 routines_log=routines_log).run()
+                 routines_log=routines_log, manual_run_id=manual_run_id).run()
 
 
 # =========================================================================== the contract check
 
 _EXP_ID = re.compile(r"[a-z0-9][a-z0-9-]{2,60}")
 _UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+
+
+def experiment_goal_problems(goal: Any, experiments: Any = None) -> list[str]:
+    """Validate optional daily counts without treating skipped/preparation attempts as replay evidence."""
+    counts = ("minimum", "target", "attempted", "replayed")
+    if not isinstance(goal, dict) or any(
+            isinstance(goal.get(k), bool) or not isinstance(goal.get(k), int) or goal[k] < 0 for k in counts):
+        return ["experiment_goal counts must be nonnegative integers"]
+    errors = []
+    if not 1 <= goal["minimum"] <= goal["target"] <= 3 or not goal["replayed"] <= goal["attempted"] <= 3:
+        errors.append("experiment_goal counts are inconsistent with the daily limits")
+    for key, threshold in (("minimum_met", "minimum"), ("target_met", "target")):
+        if not isinstance(goal.get(key), bool) or goal[key] != (goal["replayed"] >= goal[threshold]):
+            errors.append(f"experiment_goal.{key} does not match the replay count")
+    reasons = goal.get("shortfall_reasons")
+    if (not isinstance(reasons, list) or not all(isinstance(x, str) and x.strip() for x in reasons)
+            or bool(reasons) != (goal["replayed"] < goal["target"])):
+        errors.append("experiment_goal shortfall reasons do not match the daily result")
+    if isinstance(experiments, list) and all(isinstance(e, dict) for e in experiments):
+        attempted = sum(bool(e.get("experiment_id")) for e in experiments)
+        replayed = sum(type(e.get("replay_runs")) is int and e["replay_runs"] > 0 for e in experiments)
+        if (goal["attempted"], goal["replayed"]) != (attempted, replayed):
+            errors.append("experiment_goal counts do not match the experiment evidence")
+    return errors
+
+
+def connection_recovery_problems(value: Any) -> list[str]:
+    """Optional additive execution evidence, never current service health."""
+    if not isinstance(value, dict) or value.get("format") != "rsi-connection-recovery/1":
+        return ["connection_recovery: unsupported format"]
+    checks = value.get("checks")
+    if not isinstance(checks, list) or len(checks) > 200:
+        return ["connection_recovery.checks: expected at most 200 checks"]
+    problems = []
+    for row in checks:
+        if not isinstance(row, dict):
+            problems.append("connection_recovery: check is not an object")
+            continue
+        attempts, elapsed = row.get("attempts"), row.get("elapsed_ms")
+        if row.get("source") not in HEALTH_KEYS or row.get("status") not in {
+                "healthy", "recovered", "failed", "excluded", "not_required"}:
+            problems.append("connection_recovery: invalid source or status")
+        if attempts is not None and (type(attempts) is not int or not 1 <= attempts <= 3):
+            problems.append("connection_recovery: invalid attempt count")
+        if row.get("status") == "recovered" and (type(attempts) is not int or attempts < 2):
+            problems.append("connection_recovery: recovery requires a successful retry")
+        if elapsed is not None and (type(elapsed) not in (int, float) or not math.isfinite(elapsed) or elapsed < 0):
+            problems.append("connection_recovery: invalid duration")
+        if not isinstance(row.get("checked_at"), str) or _parse_ts(row["checked_at"]) is None:
+            problems.append("connection_recovery: invalid check time")
+        if not all(isinstance(row.get(k), str) for k in ("stage", "step", "reason", "impact")):
+            problems.append("connection_recovery: missing check description")
+    return problems
 
 
 def validate_report(obj: Any) -> list[str]:
@@ -2732,7 +3320,7 @@ def validate_report(obj: Any) -> list[str]:
                "blocked",                                      # optional: ideas no experiment can use (2026-10-25)
                "writer",                                       # optional: the section writer's tally (2026-10-26)
                "prerequisites",                                # optional: the night's own prerequisite checks (R2)
-               "coverage"}                                     # optional: coverage rows written (R4, night_coverage)
+               "coverage", "experiment_goal", "connection_recovery", "manual_run"}                  # optional: coverage ledger and daily cadence
     errs += [f"unknown key {k}" for k in sorted(set(obj) - allowed)]
     if obj.get("format") != FORMAT:
         errs.append("format is not rsi-night/1")
@@ -2744,6 +3332,16 @@ def validate_report(obj: Any) -> list[str]:
             errs.append(f"{k} is not an ISO timestamp")
     if obj.get("status") not in STATUSES:
         errs.append(f"status {obj.get('status')!r} not in {STATUSES}")
+    manual = obj.get("manual_run")
+    if manual is not None and not (isinstance(manual, dict)
+            and re.fullmatch(r"manual-[a-z0-9-]{8,48}", str(manual.get("id", "")))
+            and manual.get("kind") == "verification" and manual.get("scheduled_checkpoint_unchanged") is True):
+        errs.append("manual_run: invalid verification identity")
+        return errs
+    if "connection_recovery" in obj:
+        errs += connection_recovery_problems(obj["connection_recovery"])
+    if "experiment_goal" in obj:
+        errs += experiment_goal_problems(obj["experiment_goal"], obj.get("experiments"))
     cp = need(obj, "checkpoint", dict, "report")
     if isinstance(cp, dict):
         need(cp, "before", str, "checkpoint", True)
@@ -2774,6 +3372,12 @@ def validate_report(obj: Any) -> list[str]:
         need(c, "rank", (int, float), w, True)
         need(c, "selected", bool, w)
         need(c, "reason", str, w)
+        if isinstance(c, dict) and "triage" in c:
+            triage = c["triage"]
+            if (not isinstance(triage, dict) or triage.get("action") not in ("experiment", "wait")
+                    or not isinstance(triage.get("explanation"), str)
+                    or triage.get("reason") not in (None, *TRIAGE_REASONS)):
+                errs.append(f"{w}.triage has an invalid action, reason or explanation")
         if isinstance(c, dict) and "hypotheses_rejected" in c:     # optional (2026-10-25): why ideas were dropped
             hr = c["hypotheses_rejected"]
             if not (isinstance(hr, list) and all(isinstance(x, dict) and x.get("code") in REJECT_REASONS
@@ -2899,8 +3503,8 @@ def validate_report(obj: Any) -> list[str]:
             errs += SR.report_problems(pr["skill_refresh"])
     if "coverage" in obj:
         errs += NC.report_problems(obj["coverage"])
-        if isinstance(obj["coverage"], dict) and obj["coverage"].get("run_key") != obj.get("night"):
-            errs.append("coverage.run_key must be the night")
+        if isinstance(obj["coverage"], dict) and obj["coverage"].get("run_key") != (obj.get("manual_run") or {}).get("id", obj.get("night")):
+            errs.append("coverage.run_key must match the execution identity" if manual else "coverage.run_key must be the night")
     return errs
 
 
@@ -2953,7 +3557,24 @@ def cli(args: argparse.Namespace) -> int:
     guard = _read_guard if args.dry_run else _write_guard
     if (code := guard("rsi night")) is not None:
         return code
-    rep = run_night(night=args.night, config_path=args.config, dry_run=args.dry_run)
+    manual_id = getattr(args, "manual_run_id", None)
+    warnings = []
+    if manual_id:
+        # Manual runs require fresh, successful inputs, not a future night's calendar slot.
+        from dataclasses import replace
+        from agent_memory import rsi_schedule as schedule
+        cfg = load_config(args.config)
+        current = datetime.now().astimezone()
+        prereqs = [replace(p, same_night=False, max_age_h=p.max_age_h or 25)
+                   for p in schedule.prerequisites(schedule.schedule_section(cfg.path))]
+        gate = schedule.evaluate_prerequisites(schedule.routines_log_path(), args.night or AP.night_key(), current, prereqs)
+        problems = [*gate.reasons, *schedule.credential_problems(cfg)]
+        if problems:
+            print("Manual verification preflight failed: " + "; ".join(_one_line(x, 200) for x in problems), file=sys.stderr)
+            return 2
+        warnings = [*gate.warnings, "Manual verification uses fresh latest prerequisites; not scheduled-night acceptance"]
+    rep = run_night(night=args.night, config_path=args.config, dry_run=args.dry_run,
+                    manual_run_id=manual_id, prerequisite_warnings=warnings)
     if args.json:
         print(json.dumps(rep, sort_keys=True, default=str))
     else:
@@ -2961,7 +3582,10 @@ def cli(args: argparse.Namespace) -> int:
         print(f"rsi night {rep['night']}: {rep['status']}"
               f"{' (dry run, nothing written)' if args.dry_run else ''}; delta sessions={rep['delta']['sessions']} "
               f"deviations={rep['delta']['deviations']}; candidates={len(rep['candidates'])} "
-              f"selected={sum(c['selected'] for c in rep['candidates'])}; experiments={len(rep['experiments'])} "
+              f"selected={sum(c['selected'] for c in rep['candidates'])}; "
+              f"experiments={sum(bool(e.get('experiment_id')) for e in rep['experiments'])} "
+              f"hypothesis_entries={len(rep['experiments'])} "
+              f"policy_deferred={sum(e['status'] == 'deferred_policy' for e in rep['experiments'])} "
               f"staged={len(staged)}; checkpoint {'advanced' if rep['checkpoint']['advanced'] else 'not advanced'}; "
               f"cost ${rep['costs'].get('total_usd', 0):.2f}" + (f"; {rep['notes'][-1]}" if rep.get("notes") else ""))
     return EXIT.get(rep["status"], 1)
@@ -2971,6 +3595,8 @@ def register(sub: argparse._SubParsersAction) -> None:
     p = sub.add_parser("night", help="the nightly RSI investigator (S0-S9); stages proposals, never approves")
     p.add_argument("--night", default=None, help="the night key YYYY-MM-DD (default: the current night)")
     p.add_argument("--config", type=Path, default=None, help="config file (default: config/rsi-night.json)")
+    p.add_argument("--manual-run-id", default=None,
+                   help="separate manual- identity for an approved verification run; preserves scheduled checkpoints/report")
     p.add_argument("--dry-run", action="store_true", help="read and rank only; write nothing")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cli)

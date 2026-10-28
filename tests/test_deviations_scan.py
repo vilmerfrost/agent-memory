@@ -98,6 +98,9 @@ def test_writer_prompt_holds_instructions_and_digest_but_no_env(setup_home: Home
     assert "Merge to integration only." in prompt and "Every brief has a DoD." in prompt
     assert "TOOL Agent: worker worker-api" in prompt
     assert "do-not-read-me" not in prompt
+    assert '"why_category": string' in prompt  # the reply shape and the six labels with their meaning
+    for name, text in deviations.WHY_CATEGORIES.items():
+        assert f"  {name}: {text}\n" in prompt
 
 
 def test_jev_state_never_holds_transcript_or_writer_text(setup_home: Home, db: str, writer: Writer,  # noqa: F811
@@ -111,8 +114,11 @@ def test_jev_state_never_holds_transcript_or_writer_text(setup_home: Home, db: s
                      "pytest"):
             assert text not in state, (text, state)
         assert set(ln.split(":", 1)[0] for ln in state.splitlines()[1:]) == {
-            "instruction_source", "instruction_rule", "rule_title", "session_kind", "followed_grade",
-            "result_grade", "objective_result", "recurrence"}
+            "instruction_source", "instruction_rule", "rule_title", "why_category", "session_kind",
+            "followed_grade", "result_grade", "objective_result", "recurrence"}
+        # The writer's label and its fixed gloss, never its free-text why.
+        assert "why_category: conflict (the writer's view of why: the instruction conflicts with another " \
+               "instruction)" in state
 
 
 def test_recurrence_counts_other_sessions(setup_home: Home, db: str, writer: Writer,  # noqa: F811
@@ -388,6 +394,42 @@ def test_jev_fixture_mode_end_to_end(setup_home: Home, db: str, writer: Writer, 
     (row,) = _q(db, "select jev_verdict, jev_confidence, jev_mode, jev_answers -> 'systemic' ->> 'value' "
                     "from deviations")
     assert row == ("enforce", pytest.approx(0.91), "fixture", "0.3")
+
+
+def test_upsert_stores_the_why_category_and_a_rescan_updates_it(setup_home: Home, db: str, writer: Writer,  # noqa: F811
+                                                                 fake_jev: FakeJev) -> None:  # noqa: F811
+    ids = _ingest(setup_home, db)
+    writer(default=envelope({"deviations": [finding(why_category="ignored"),
+                                            finding("skill:dispatch", "Brief", 2, why_category="unclear")]}))
+    deviations.scan(session_id=ids["parent"], now=NOW)
+    sql = "select instruction_source, why_category from deviations where session_id = %s order by 1"
+    assert _q(db, sql, ids["parent"]) == [("claude-md:global", "ignored"), ("skill:dispatch", "unclear")]
+    # Jev saw each label.
+    assert any("why_category: ignored (the writer's view of why: the agent ignored a clear instruction)" in s
+               for s in fake_jev.states)
+    writer(default=envelope({"deviations": [finding(why_category="tool_blocked")]}))
+    deviations.scan(session_id=ids["parent"], now=NOW)  # explicit re-scan: same source_key, new label
+    assert _q(db, sql, ids["parent"])[0] == ("claude-md:global", "tool_blocked")
+
+
+def test_why_category_migration_applies_and_checks_values(db: str) -> None:
+    migration = (deviations.config.MIGRATIONS_DIR / "20261027220000_deviation_why.sql").read_text()
+    with psycopg.connect(db) as conn:
+        conn.execute("lock table public.deviations in access exclusive mode")  # see the RLS test above
+        conn.execute(migration)  # re-runnable on top of the applied schema
+        assert conn.execute("select data_type, is_nullable from information_schema.columns where "
+                            "table_name = 'deviations' and column_name = 'why_category'").fetchone() == ("text", "YES")
+        conn.execute("insert into sessions (session_id, kind, project_dir) values ('why-x', 'chat', 'p')")
+        insert = ("insert into deviations (source_key, session_id, instruction_source, instruction_ref, what, why, "
+                  "how, followed_grade, result_grade, why_category) values (%s, 'why-x', 's', 'r', 'w', 'y', 'h', "
+                  "0.5, 0.5, %s)")
+        conn.execute(insert, ("why-old", None))  # a row scanned before the column: null is fine
+        for i, value in enumerate(deviations.WHY_CATEGORIES):
+            conn.execute(insert, (f"why-{i}", value))
+        with pytest.raises(psycopg.errors.CheckViolation):
+            conn.execute(insert, ("why-bad", "lazy"))
+        conn.rollback()
+    assert _q(db, "select relrowsecurity from pg_class where relname = 'deviations'") == [(True,)]
 
 
 def test_dry_run_calls_and_writes_nothing(setup_home: Home, db: str, writer: Writer,  # noqa: F811

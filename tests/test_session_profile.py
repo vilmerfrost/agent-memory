@@ -203,11 +203,12 @@ def test_outcome_precedence_and_evidence_has_no_command_text() -> None:
               assistant(text("Status: DONE"), minute=3)]
     got, evidence = outcome_of(events, MUCH_LATER)
     assert got == "shipped"  # the most advanced state wins
-    assert evidence == {"commit": 1, "edit": 1, "pr_merge": 1, "push": 1, "report_done": 1, "end": "reply"}
+    assert evidence == {"commit": 1, "edit": 1, "pr_merge": 1, "push": 1, "report_done": 1, "end": "reply",
+                        "method_version": 2, "acceptance": "unverified"}
     dumped = json.dumps(evidence)
     for leak in (secret, "feature-branch", "/secret", "msg", "gh pr"):
         assert leak not in dumped
-    assert set(evidence) - {"end"} <= {"edit", "commit", "push", "push_main", "pr_create", "pr_merge",
+    assert set(evidence) - {"end", "method_version", "acceptance"} <= {"edit", "commit", "push", "push_main", "pr_create", "pr_merge",
                                        "merge_main", "deploy", "report_done", "report_partial", "report_blocked"}
 
 
@@ -233,7 +234,7 @@ def test_codex_outcome_signals() -> None:
 
 def test_digest_carries_outcome_signals() -> None:
     events = [bash("1", "git push origin main"), ok("1"), assistant(text("done"), minute=2)]
-    assert amem_digest.outcome_signals(events) == {"signals": {"push_main": 1}, "end": "reply"}
+    assert amem_digest.outcome_signals(events) == {"signals": {"push_main": 1}, "end": "reply", "method_version": 2}
 
 
 # --------------------------------------------------------------------------- project and category

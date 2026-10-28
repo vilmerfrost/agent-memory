@@ -167,6 +167,44 @@ def night_report(**over: Any) -> dict[str, Any]:
     return rep
 
 
+def test_separate_provider_judge_and_jev_results_are_visible_without_pooling(sandbox: Path) -> None:
+    # Real night 2026-10-26 shape: aggregate judge/jev are NULL intentionally, both provider records exist.
+    providers = [{"provider": "claude", "verdict": "NO_EFFECT", "arms": {
+        "A": {"check_pass_rate": 1.0, "checked": 3}, "B": {"check_pass_rate": 1.0, "checked": 3}},
+        "judge": {**LIVE_RESULTS["judge"], "wins_b": 2, "wins_a": 1},
+        "jev": {**LIVE_RESULTS["jev"], "confidence": .25}},
+        {"provider": "codex", "verdict": "INCONCLUSIVE", "arms": {
+            "A": {"check_pass_rate": 0.0, "checked": 3}, "B": {"check_pass_rate": 0.0, "checked": 3}},
+         "judge": {**LIVE_RESULTS["judge"], "wins_b": 2, "wins_a": 0, "ties": 1, "b_winrate": .8333},
+         "jev": {**LIVE_RESULTS["jev"], "confidence": .71}}]
+    e = experiment("exp-20261026-63a57bf4", "not_promotable", "INCONCLUSIVE", arms={}, judge=None, jev=None,
+                   provider_results=providers)
+    rep = night_report(experiments=[e], status="partial")
+    b = BR.build_brief(rep, BR.Db("unavailable", "test fixture"), artifacts_root=sandbox / "artifacts")
+    md = BR.render_markdown(b)
+    assert "claude: baseline pass 100% (3 checked), candidate pass 100% (3 checked); NO_EFFECT" in md
+    assert "codex: baseline pass 0% (3 checked), candidate pass 0% (3 checked); INCONCLUSIVE" in md
+    assert "Jev live: improves (0.25)" in md and "Jev live: improves (0.71)" in md
+    assert "judge codex: candidate won 2/3" in md and "Providers are not pooled." in md
+    assert "judge and Jev results not in the report" not in md
+    item = b["experiments"]["items"][0]
+    assert item["judge"] is None and item["jev"] is None
+    assert [p["provider"] for p in item["provider_results"]] == ["claude", "codex"]
+    assert "claude: judge codex" in b["failed"][0]["judgments"]
+    assert "codex: judge codex" in b["failed"][0]["judgments"]
+    assert b["passed"] == []  # Displaying provider evidence grants no proposal/Apply authority.
+
+
+def test_provider_with_missing_judgment_is_reported_missing_only_for_that_provider(sandbox: Path) -> None:
+    e = experiment("exp-20261026-63a57bf4", "not_promotable", "INCONCLUSIVE", arms={}, judge=None, jev=None,
+                   provider_results=[{"provider": "claude", "verdict": "NO_EFFECT", "judge": LIVE_RESULTS["judge"],
+                                      "jev": None}, {"provider": "codex", "verdict": "INCONCLUSIVE", "judge": None,
+                                                     "jev": LIVE_RESULTS["jev"]}])
+    result = BR.failed_item(e)["judgments"]
+    assert "claude: judge codex: candidate won 2/3" in result
+    assert "Jev: not recorded | codex: judge: not recorded; Jev live:" in result
+
+
 def write_report(root: Path, rep: Any, night: str = NIGHT) -> Path:
     p = root / "nights" / night / "report.json"
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -736,3 +774,39 @@ def test_watch_list_shows_first_step_misses_and_possible_guard_bypasses(rdb: str
     assert "  - first step skipped: Watch Me · agent:worker rules:" in md
     assert "It opened the PR itself" not in md
     sections_once(md)
+
+
+def test_recorded_recovery_reaches_brief_and_markdown(sandbox: Path) -> None:
+    check = dict(source='clickhouse', stage='S1 delta', step='ch.rule_gap', status='recovered', attempts=2,
+                 checked_at='2026-10-28T00:30:00Z', elapsed_ms=450,
+                 reason='temporary read failure; recheck succeeded', impact='read completed')
+    recovery = {'format': 'rsi-connection-recovery/1', 'checks': [check]}
+    rep = night_report()
+    rep['connection_recovery'] = recovery
+    write_report(sandbox, rep)
+    brief = BR.make_brief(root=sandbox, db_url=CLOSED_DB)
+    assert brief['connection_recovery'] == recovery
+    markdown = BR.render_markdown(brief)
+    assert 'clickhouse / S1 delta / ch.rule_gap: recovered; 2 attempt(s)' in markdown
+    assert 'read completed' in markdown
+
+
+def test_manual_brief_reads_separate_coverage_identity(sandbox: Path, rdb: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    from agent_memory import coverage as CV
+    manual_id = 'manual-20261028-reader-test'
+    rep = night_report()
+    rep['manual_run'] = {'id': manual_id, 'kind': 'verification', 'scheduled_checkpoint_unchanged': True}
+    rep['coverage'] = {'job': 'amem-rsi-night', 'run_key': manual_id, 'enabled': True,
+        'analysis_version': 'test', 'consumption': {}, 'snapshots': {}, 'datasets': {}, 'required': [], 'failed': 0}
+    assert BR.validate_report(rep) == []
+    write_report(sandbox, rep)
+    seen = []
+    original = CV.verdict
+    def observe(conn, **kw):
+        seen.append(kw['run_key'])
+        return original(conn, **kw)
+    monkeypatch.setattr(CV, 'verdict', observe)
+    brief = BR.make_brief(root=sandbox, db_url=rdb)
+    assert seen == [manual_id]
+    assert brief['manual_run']['id'] == manual_id
+    assert BR.render_markdown(brief).startswith('# RSI manual verification: '+manual_id)

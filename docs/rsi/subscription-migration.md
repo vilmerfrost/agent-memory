@@ -80,7 +80,7 @@ Crafted compliant and non-compliant outputs live in `tests/data/rsi_skill_cases/
 also break each rule alone and check that the hidden check fails.
 
 **Which cases run.** With `replay.cases: null`, an experiment replays only the cases that
-declare its changed file. Only those cases count towards the verdict's `min_pairs` (3), so
+declare its changed file. Only those cases count towards the verdict's `min_pairs` (5, policy/2), so
 one skill case runs 3 repetitions. That fits each provider's share of the night: 3 pairs for
 Claude and 3 for Codex on a shared skill (6 of 6). A `CLAUDE.md` change still runs the three
 generic cases once. An explicit case list is replayed as given.
@@ -119,37 +119,63 @@ approval, after the skill cases went live). Each limit has a scope:
   experiment per candidate. The second hypothesis waits, pending, for a later night and
   needs no new model call. So 3 experiments means 3 different candidates. With fewer
   covered candidates, the night runs fewer experiments.
-- **Per experiment (per replay):** at most 6 provider-specific A/B pairs (`max_ab_pairs`).
+- **Per experiment (per replay):** at most 10 provider-specific A/B pairs (`max_ab_pairs`):
+  exactly 5 A + 5 B per provider (Vilmer, 2026-10-28).
 - **Per night:** model calls, sandbox runs, wall clock, API dollars and the token stop.
 
-One shared-skill experiment at its worst case: 1 Opus hypothesis, 1 Opus section writer, 3 pairs per provider
-(12 agent runs: 6 Opus, 6 Sol), 6 Sol judgments and 2 Jev calls. Each agent run reserves
-8 tool containers and 1 check container, so one experiment takes 108 sandbox runs.
+**How the 5 pairs are spread.** `rsi_replay.plan_pairs` aims for exactly one provider's share
+(`max_ab_pairs` / providers = 5) over the target's eligible cases. It keeps a covering case for
+every changed file, then fills in id order, at most 5 cases. The replay runs repetition-major and
+stops at 5 pairs: 1 case runs 5 times, 2 cases run 3 + 2, 3 cases 2 + 2 + 1, 5 or more cases
+the first 5 once. It never plans more than the cap. If the cap were below the verdict's
+`min_pairs`, the cap wins and the verdict reports too few pairs.
+
+**The judge sees the rule under test.** For an artifact whose file carries a section rule id
+(an exact declared edit the writer reproduced), the replay recovers the section from the
+artifact's own verified bytes and shows the judge its heading and new text as "The rule under
+test", without saying which attempt had it. The judge picks the attempt that follows that rule
+better while staying correct (the check result stays strong evidence). Length counts neither way.
+Legacy artifacts get the old prompt without the rule and without the "short explanation"
+preference. Judge prompt version 2 is recorded in replay.json, the eval record and each judge row.
+
+One shared-skill experiment at its worst case: 1 Opus hypothesis, 1 Opus section writer, 5 pairs per provider
+(20 agent runs: 10 Opus, 10 Sol), 10 Sol judgments and 2 Jev calls. Each agent run reserves
+8 tool containers and 1 check container, so one experiment takes at most 180 sandbox runs.
+After each agent run the replay gives back the tool reservations it did not use
+(`Budget.release_sandbox_runs`, numbered by the bridge's tool evidence). An unknown use (an
+error, a crash) keeps every reservation. The report's `costs.sandbox_releases` and each
+run's `runtime.tool_containers` show reserved, used and released.
 
 | Limit (per night) | Need for 3 experiments | Cap |
 |---|---|---|
-| Opus calls | 3 × 8 = 24 | 26 |
-| Sol calls | 3 × 12 = 36 | 40 |
+| Opus calls | 3 × 12 = 36 | 40 |
+| Sol calls | 3 × 20 = 60 | 64 |
 | Jev calls | 5 triage + 3 × 2 = 11 | 12 |
-| Sandbox runs | 3 × 108 = 324 | 360 |
+| Sandbox runs (worst case, every tool slot used) | 3 × 180 = 540 | 540 (code maximum 600) |
 | Observed subscription tokens | 3 × 2,000,000 | 6,000,000 |
-| Wall clock | 600 + 3 × 5,760 = 17,880 s | 17,940 s (4 h 59 min) |
+| Wall clock (every stage at its timeout) | 600 + 3 × 8,960 = 27,480 s | 17,940 s (code maximum 18,000 s) |
 | API dollars (Jev only) | 11 × $0.01 = $0.11 | $1.00 |
 
-**Why 17,940 s** (60 s slack over the 17,880 s need) (was 17,100 s before the section writer, 17,280 s with its first 90 s timeout). The bound counts every model stage at its
-own timeout: hypothesizer 300 s, section writer 300 s, `improve stage` 300 s, each agent run at its
-case's `timeout_s` (240 s for the skill cases),
-each judge call at `rsi_replay.JUDGE_TIMEOUT_S` (300 s). Steps that wait on no model get an
-allowance: 10 s per check run (a check took under 1 s on night 2026-10-24) and 30 s per Jev call
-(the SDK's 10 s per HTTP operation). Per provider: 6 × (240 + 10) + 3 × 300 + 30 = 2,430 s.
-One experiment: 300 + 300 + 300 + 2 × 2,430 = 5,760 s. The night adds 600 s once for the delta, triage
-and evidence packs (all of it took 37 s on 2026-10-24). The night starts at 01:30, so its own
-stop comes at 06:28 and the watchdog's hard exit (+10 + 2 min) at 06:40, 50 min before the
-07:30 brief at the latest 45 min ahead (tested; Vilmer raised the writer to the morning loop's 300 s on 2026-10-26, so the margin went from 60 to 50 min; the brief job waits up to 90 min anyway). The code ceiling is 5 h (`HARD_MAX_WALL_CLOCK_S`); a night at that ceiling still ends
-by 06:42.
+**The wall clock does not fit the worst case.** The bound counts every model stage at its own
+timeout: hypothesizer 300 s, section writer 300 s, `improve stage` 300 s, each agent run at its
+case's `timeout_s` (240 s for the skill cases), each judge call at `rsi_replay.JUDGE_TIMEOUT_S`
+(300 s), 10 s per check run and 30 s per Jev call. Per provider: 10 × (240 + 10) + 5 × 300 + 30
+= 4,030 s. One experiment: 900 + 2 × 4,030 = 8,960 s. At every timeout only 1 of 3 experiments
+finishes inside 17,940 s, and 3 would need 27,480 s, over the 5 h code ceiling
+(`HARD_MAX_WALL_CLOCK_S`). The runtime enforcement is unchanged: the night stops cleanly at the
+wall clock and records later experiments as not run; nothing is cut silently. Observed on
+2026-10-27 at 3 pairs: 1,350 s for the whole night, so a 5-pair night is expected near 2,300 s.
+`amem rsi night-job --plan` prints the worst-case line. Proposals, if a worst-case fit is
+wanted: lower the skill cases' `timeout_s` from 240 s towards their observed durations, or lower `JUDGE_TIMEOUT_S`; raising the ceiling past 5 h would push the watchdog's
+hard exit into the 07:30 brief. Not done here.
+
+**Why the sandbox maximum went from 400 to 600.** 400 was 324 (3 pairs) plus a margin. The
+5-pair worst case is 540. With releases the cap binds on containers that actually ran, plus at
+most one in-flight run's 8 reservations.
 
 **Why 6,000,000 tokens.** The 2,000,000 stop was approved for one experiment; three get three
-times that. The qualification replays used about 163,000 tokens for both providers together.
+times that. The qualification replays used about 163,000 tokens for both providers together; the
+2026-10-27 night used about 1.42M at 3 pairs, so about 2.4M is expected at 5 pairs.
 
 `amem rsi night-job --plan --config config/rsi-night.subscription.json` prints this check as
 "Room for 3 experiment(s)". It lists every per-night limit with its need and cap and says

@@ -96,6 +96,8 @@ class DailyResult:
     edits: Any = None  # edits.Report; None: the edits step was off or failed early
     rsi_push: list[str] | None = None  # one result per pushed proposal; None: not stage mode, or failed early
     synced: list[Any] | None = None  # sync.SyncReport per sink run today; None: no sink due, configured and on
+    replay_observations: dict[str, Any] | None = None
+    telemetry: dict[str, Any] | None = None
     coverage: list[Any] = field(default_factory=list)  # coverage records of the steps that ran (step_coverage)
     coverage_notes: list[str] = field(default_factory=list)  # coverage problems: stderr + one log-line field
     failures: list[str] = field(default_factory=list)
@@ -698,6 +700,45 @@ def step_coverage(result: DailyResult) -> None:
         _err(note)
 
 
+def step_observations(result: DailyResult, *, now: datetime, reports_dir: Path) -> None:
+    """One existing daily owner: recover immutable replay evidence and analyze
+    current measurements deterministically. No model, promotion or new routine.
+    Capture failures become explicit coverage gaps, never an invented all clear.
+    """
+    if config.backend() != "postgres":
+        return
+    from agent_memory import coverage as CV, replay_evidence, telemetry_analysis as TA
+    from datetime import timedelta
+    try:
+        recovered = replay_evidence.run(limit=100)
+        result.replay_observations = recovered.as_dict()
+        if recovered.missing_artifacts or recovered.unresolved_native:
+            result.warn(f"replay evidence: artifacts_missing={recovered.missing_artifacts} "
+                        f"native_sessions_unresolved={recovered.unresolved_native}; historical gaps are not guessed")
+        for failure in recovered.failures[:5]:
+            result.coverage_notes.append("replay evidence: " + failure)
+    except Exception as exc:
+        result.coverage_notes.append(f"replay evidence: analysis_failed ({type(exc).__name__})")
+    try:
+        report = TA.run(now=now, days=7, limit=5)
+        report['replay_evidence'] = result.replay_observations
+        path = TA.save(report, reports_dir)
+        result.telemetry = {"format": TA.FORMAT, "findings": len(report['findings']),
+                            "stored_spans": report['span_coverage']['stored'],
+                            "stored_test_runs": report['test_coverage']['stored'], "report_path": str(path)}
+        if CV.writes_enabled():
+            result.coverage.extend(TA.records(report, run_key=run_key(now)))
+    except Exception as exc:
+        result.coverage_notes.append(f"telemetry analysis: analysis_failed ({type(exc).__name__})")
+        for dataset in (("command_timings:execution_spans", "test_timings:test_timing_runs",'reports_checkpoints:rsi_checkpoints')
+                        if CV.writes_enabled() else ()):
+            result.coverage += [CV.Snapshot(dataset, now-timedelta(days=7), now,
+                                           "stored rows in explicit analysis window; query failed", None),
+                               CV.Consumption(NAME, run_key(now), dataset, TA.FORMAT,
+                                              now-timedelta(days=7), now, status="analysis_failed",
+                                              detail=f"query/report unavailable: {type(exc).__name__}")]
+
+
 def log_lines(ts: str, result: DailyResult, secs: int) -> list[str]:
     head = (f"{ts} {NAME} {result.verdict} scored={result.scored} escalations={result.escalations} "
             f"new={result.new} push={result.push} tasks={result.tasks} ")
@@ -723,6 +764,8 @@ def log_lines(ts: str, result: DailyResult, secs: int) -> list[str]:
                  f"sync_rows={sum(r.rows for r in result.synced)} ")
     if result.coverage_notes:  # a coverage problem is a note, never a failure; absent when there is none
         head += f"coverage_problems={len(result.coverage_notes)} "
+    if result.telemetry is not None and result.telemetry['findings']:
+        head += f"telemetry_findings={result.telemetry['findings']} "
     head += f"{secs}s"
     return [head, *(f"{ts} {NAME}-fail {reason}" for reason in result.failures),
             *(f"{ts} {NAME}-warn {reason}" for reason in result.warnings)]
@@ -762,7 +805,8 @@ def run_daily(
         step_deviations(result, state_file=state_path(state), now=now)
         step_edits(result, push=push, notify=notify)
         step_rsi_push(result, push=push, notify=notify)
-        step_sync(result, state_file=state_path(state), now=now)  # last: it feeds nothing the steps above read
+        step_observations(result, now=now, reports_dir=log_file.parent / "reports")
+        step_sync(result, state_file=state_path(state), now=now)  # after replay observations, so exports include them
         step_coverage(result)
         secs = int(time.monotonic() - start)
         result.lines = log_lines(now.strftime(TS_FORMAT), result, secs)

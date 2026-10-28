@@ -1,17 +1,43 @@
 {
   "id": "anatomy-plan",
   "title": "Size and plan an anatomy figure before any geometry",
-  "tags": ["skill", "anatomy", "planning"],
-  "targets": [{"path": "~/.agents/skills/anatomy/SKILL.md", "kind": "skill", "behavior": "Apply workflow steps 1-4: size the request, choose a real object, and write a grouped 40-80 part list with one lit subject part before any geometry."}],
+  "tags": [
+    "skill",
+    "anatomy",
+    "planning"
+  ],
+  "targets": [
+    {
+      "path": "~/.agents/skills/anatomy/SKILL.md",
+      "kind": "skill",
+      "behavior": "Apply workflow steps 1-4: size the request, choose a real object, and write a grouped 40-80 part list with one lit subject part before any geometry.",
+      "sections": [
+        "workflow"
+      ]
+    }
+  ],
   "fixture": "anatomy-plan",
-  "hidden_check": "anatomy-plan",
+  "hidden_check": "anatomy-plan-v2",
   "prompt": "Use the anatomy skill (~/.agents/skills/anatomy/SKILL.md) for the figure requested in request.md. This workspace has no network and no external services. Do not render, generate audio, search the web or call any API; there is also no browser and no Node. Do only the planning that comes before any geometry, then stop. Write plan.json with these keys: size (\"Figure\", \"Hero\" or \"Epic\"), estimate_minutes ([low, high]), object (the physical object you will draw), motion (one sentence: what moves and what that motion means), lit_part (the name of the one lit part), parts (a list of {\"name\", \"group\"}) and numbers (the numbers the readout will show, as strings). Write no code or SVG. Do not change request.md.",
   "check": "python3 \"$HIDDEN_CHECK_DIR\"/check.py && cmp -s request.md \"$FIXTURE_DIR\"/request.md",
   "timeout_s": 240,
   "stub": [
-    {"op": "skill", "name": "anatomy"},
-    {"op": "read", "path": "request.md"},
-    {"op": "write", "path": "plan.json", "text": "{\n  \"size\": \"Figure\",\n  \"estimate_minutes\": [45, 75],\n  \"object\": \"A pin-tumbler lock on a bench stand with a key carrying four cuts\",\n  \"motion\": \"The key slides in; when all four pins line up at the shear line the plug turns and the restore lever drops, which means a cache hit skips the rebuild.\",\n  \"lit_part\": \"plug\",\n  \"numbers\": [\"82% hit rate\", \"1.2 s restore\", \"94 s rebuild\", \"4 inputs per key\"],\n  \"parts\": [\n    {\"name\": \"base plate\", \"group\": \"base\"},\n    {\"name\": \"front left foot\", \"group\": \"base\"},\n    {\"name\": \"front right foot\", \"group\": \"base\"},\n    {\"name\": \"back left foot\", \"group\": \"base\"},\n    {\"name\": \"back right foot\", \"group\": \"base\"},\n    {\"name\": \"base groove\", \"group\": \"base\"},\n    {\"name\": \"corner screw front left\", \"group\": \"base\"},\n    {\"name\": \"corner screw front right\", \"group\": \"base\"},\n    {\"name\": \"corner screw back left\", \"group\": \"base\"},\n    {\"name\": \"corner screw back right\", \"group\": \"base\"},\n    {\"name\": \"label plate\", \"group\": \"base\"},\n    {\"name\": \"ruler strip\", \"group\": \"base\"},\n    {\"name\": \"left post\", \"group\": \"structure\"},\n    {\"name\": \"right post\", \"group\": \"structure\"},\n    {\"name\": \"cylinder housing\", \"group\": \"structure\"},\n    {\"name\": \"housing face plate\", \"group\": \"structure\"},\n    {\"name\": \"key guide rail\", \"group\": \"structure\"},\n    {\"name\": \"rail end stop\", \"group\": \"structure\"},\n    {\"name\": \"store drawer frame\", \"group\": \"structure\"},\n    {\"name\": \"drawer rail\", \"group\": \"structure\"},\n    {\"name\": \"pin chamber 1\", \"group\": \"mechanism\"},\n    {\"name\": \"pin chamber 2\", \"group\": \"mechanism\"},\n    {\"name\": \"pin chamber 3\", \"group\": \"mechanism\"},\n    {\"name\": \"pin chamber 4\", \"group\": \"mechanism\"},\n    {\"name\": \"driver pin 1\", \"group\": \"mechanism\"},\n    {\"name\": \"driver pin 2\", \"group\": \"mechanism\"},\n    {\"name\": \"driver pin 3\", \"group\": \"mechanism\"},\n    {\"name\": \"driver pin 4\", \"group\": \"mechanism\"},\n    {\"name\": \"key pin 1\", \"group\": \"mechanism\"},\n    {\"name\": \"key pin 2\", \"group\": \"mechanism\"},\n    {\"name\": \"key pin 3\", \"group\": \"mechanism\"},\n    {\"name\": \"key pin 4\", \"group\": \"mechanism\"},\n    {\"name\": \"pin spring 1\", \"group\": \"mechanism\"},\n    {\"name\": \"pin spring 2\", \"group\": \"mechanism\"},\n    {\"name\": \"pin spring 3\", \"group\": \"mechanism\"},\n    {\"name\": \"pin spring 4\", \"group\": \"mechanism\"},\n    {\"name\": \"cam\", \"group\": \"mechanism\"},\n    {\"name\": \"restore lever\", \"group\": \"mechanism\"},\n    {\"name\": \"key\", \"group\": \"controls\"},\n    {\"name\": \"key bow knurl\", \"group\": \"controls\"},\n    {\"name\": \"input selector knob\", \"group\": \"controls\"},\n    {\"name\": \"drawer pull\", \"group\": \"controls\"},\n    {\"name\": \"plug\", \"group\": \"subject\"},\n    {\"name\": \"shear line ring\", \"group\": \"subject\"},\n    {\"name\": \"readout window\", \"group\": \"subject\"}\n  ]\n}\n"},
-    {"op": "final", "text": "Planned a Figure: a pin-tumbler lock, 45 parts."}
+    {
+      "op": "skill",
+      "name": "anatomy"
+    },
+    {
+      "op": "read",
+      "path": "request.md"
+    },
+    {
+      "op": "write",
+      "path": "plan.json",
+      "text": "{\n  \"size\": \"Figure\",\n  \"estimate_minutes\": [45, 75],\n  \"object\": \"A pin-tumbler lock on a bench stand with a key carrying four cuts\",\n  \"motion\": \"The key slides in; when all four pins line up at the shear line the plug turns and the restore lever drops, which means a cache hit skips the rebuild.\",\n  \"lit_part\": \"plug\",\n  \"numbers\": [\"82% hit rate\", \"1.2 s restore\", \"94 s rebuild\", \"4 inputs per key\"],\n  \"parts\": [\n    {\"name\": \"base plate\", \"group\": \"base\"},\n    {\"name\": \"front left foot\", \"group\": \"base\"},\n    {\"name\": \"front right foot\", \"group\": \"base\"},\n    {\"name\": \"back left foot\", \"group\": \"base\"},\n    {\"name\": \"back right foot\", \"group\": \"base\"},\n    {\"name\": \"base groove\", \"group\": \"base\"},\n    {\"name\": \"corner screw front left\", \"group\": \"base\"},\n    {\"name\": \"corner screw front right\", \"group\": \"base\"},\n    {\"name\": \"corner screw back left\", \"group\": \"base\"},\n    {\"name\": \"corner screw back right\", \"group\": \"base\"},\n    {\"name\": \"label plate\", \"group\": \"base\"},\n    {\"name\": \"ruler strip\", \"group\": \"base\"},\n    {\"name\": \"left post\", \"group\": \"structure\"},\n    {\"name\": \"right post\", \"group\": \"structure\"},\n    {\"name\": \"cylinder housing\", \"group\": \"structure\"},\n    {\"name\": \"housing face plate\", \"group\": \"structure\"},\n    {\"name\": \"key guide rail\", \"group\": \"structure\"},\n    {\"name\": \"rail end stop\", \"group\": \"structure\"},\n    {\"name\": \"store drawer frame\", \"group\": \"structure\"},\n    {\"name\": \"drawer rail\", \"group\": \"structure\"},\n    {\"name\": \"pin chamber 1\", \"group\": \"mechanism\"},\n    {\"name\": \"pin chamber 2\", \"group\": \"mechanism\"},\n    {\"name\": \"pin chamber 3\", \"group\": \"mechanism\"},\n    {\"name\": \"pin chamber 4\", \"group\": \"mechanism\"},\n    {\"name\": \"driver pin 1\", \"group\": \"mechanism\"},\n    {\"name\": \"driver pin 2\", \"group\": \"mechanism\"},\n    {\"name\": \"driver pin 3\", \"group\": \"mechanism\"},\n    {\"name\": \"driver pin 4\", \"group\": \"mechanism\"},\n    {\"name\": \"key pin 1\", \"group\": \"mechanism\"},\n    {\"name\": \"key pin 2\", \"group\": \"mechanism\"},\n    {\"name\": \"key pin 3\", \"group\": \"mechanism\"},\n    {\"name\": \"key pin 4\", \"group\": \"mechanism\"},\n    {\"name\": \"pin spring 1\", \"group\": \"mechanism\"},\n    {\"name\": \"pin spring 2\", \"group\": \"mechanism\"},\n    {\"name\": \"pin spring 3\", \"group\": \"mechanism\"},\n    {\"name\": \"pin spring 4\", \"group\": \"mechanism\"},\n    {\"name\": \"cam\", \"group\": \"mechanism\"},\n    {\"name\": \"restore lever\", \"group\": \"mechanism\"},\n    {\"name\": \"key\", \"group\": \"controls\"},\n    {\"name\": \"key bow knurl\", \"group\": \"controls\"},\n    {\"name\": \"input selector knob\", \"group\": \"controls\"},\n    {\"name\": \"drawer pull\", \"group\": \"controls\"},\n    {\"name\": \"plug\", \"group\": \"subject\"},\n    {\"name\": \"shear line ring\", \"group\": \"subject\"},\n    {\"name\": \"readout window\", \"group\": \"subject\"}\n  ]\n}\n"
+    },
+    {
+      "op": "final",
+      "text": "Planned a Figure: a pin-tumbler lock, 45 parts."
+    }
   ]
 }
