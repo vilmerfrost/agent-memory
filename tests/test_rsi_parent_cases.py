@@ -239,6 +239,11 @@ def test_provider_router_runs_all_target_cases_within_existing_limits(path, tmp_
     assert sum(len(cases) * n for _, cases, n in calls) == cfg.budget.max_ab_pairs
 
 
+# Stub-size policy: this deterministic stub replay runs 3 pairs (max_pairs=3), below the shipped policy/2
+# minimum of 5; the shipped score margin (2.0) is kept.
+STUB_POLICY = V.VerdictPolicy(require_jev=False, min_pairs=3)
+
+
 @pytest.mark.parametrize("path", [PARENT, WORKER])
 def test_stub_replay_reads_exact_parent_or_worker_bytes_in_both_arms(path, tmp_path, monkeypatch):
     bench = tmp_path / "bench"
@@ -254,7 +259,7 @@ def test_stub_replay_reads_exact_parent_or_worker_bytes_in_both_arms(path, tmp_p
     cases, reps = R.auto_cases(artifact, R.load_cases(), root=root, reps=1, max_pairs=3)
     sb = HostSandbox(root)
     result = R.run_replay(artifact, cases, R.ReplayConfig(reps=reps, jev="none"), root=root,
-                          experiment_id=EXP, sandbox=sb, policy=V.VerdictPolicy(require_jev=False))
+                          experiment_id=EXP, sandbox=sb, policy=STUB_POLICY)
     assert len(result.runs) == 6
     assert all(run.check_passed and run.error is None for run in result.runs), \
         [(r.error, r.check_log) for r in result.runs]
