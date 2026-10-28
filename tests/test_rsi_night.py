@@ -380,7 +380,8 @@ def test_candidate_under_a_symlink_of_an_allowlisted_file_is_in_scope(env: Simpl
     worker = [c for c in rep["candidates"] if c["key"] == "dev:agent:worker:rules"]
     assert len(worker) == 1 and worker[0]["target"] == "~/agent-config/agents/worker.md"
     assert worker[0]["selected"] and worker[0]["reason"].startswith("selected: rank ")
-    assert worker[0]["test_cases"] == ["worker-final-report"] and worker[0]["skip_reason"] is None
+    assert worker[0]["test_cases"] == ["worker-final-report", "worker-helper-lifecycle", "worker-server-launch"]
+    assert worker[0]["skip_reason"] is None
     assert "candidates:" not in " ".join(rep["notes"])
     assert candidate(env.url, "dev:agent:worker:rules")["target"] == "~/.claude/agents/worker.md"   # dry: unchanged
     run(env, config_path=write_config(env.tmp, candidates={"max_considered": 1}))
