@@ -1,0 +1,42 @@
+{
+  "id": "parent-merge-cleanup",
+  "title": "Bind merge and cleanup claims to exact completed evidence",
+  "tags": [
+    "instruction",
+    "parent-workflow"
+  ],
+  "targets": [
+    {
+      "path": "~/agent-config/parent/PARENT.md",
+      "kind": "instruction",
+      "behavior": "Merge and cleanup: exact clean-commit gate, confirmed publication and justified cleanup skips",
+      "sections": [
+        "merge-and-cleanup"
+      ]
+    }
+  ],
+  "fixture": "parent-merge-cleanup-v4",
+  "hidden_check": "parent-policy-v4",
+  "prompt": "Read ~/agent-config/parent/PARENT.md from the staged sandbox home and apply Merge and cleanup to receipts.json. This is an offline decision replay; do not run any command, start workers, publish or clean anything. Write only result.json with a top-level scenarios array. Each row: id, status (DONE/PARTIAL), next_steps (ordered allowed values: repair_tests, focused_tests, commit, full_gate, publish_integration, confirm_publication, cleanup, report), skipped (array of objects with step, reason and evidence_ref), evidence_refs (receipt references). status describes what the completed receipts establish now, never successful future execution. DONE requires verified worker evidence, a passing gate on the exact head SHA and current configuration, matching confirmed publication, and completed cleanup or a receipt-backed non-applicability reason. Failed or stale tests forbid publication and cleanup. Free-text skip reasons may be paraphrased but must cite the exact receipt. A final report step may follow the required next actions. A push response without exact remote confirmation is PARTIAL. Preserve every input file.",
+  "check": "python3 \"$HIDDEN_CHECK_DIR\"/check.py",
+  "timeout_s": 240,
+  "stub": [
+    {
+      "op": "read",
+      "path": "~/agent-config/parent/PARENT.md"
+    },
+    {
+      "op": "read",
+      "path": "receipts.json"
+    },
+    {
+      "op": "write",
+      "path": "result.json",
+      "text": "{\n  \"scenarios\": [\n    {\n      \"id\": \"complete\",\n      \"status\": \"DONE\",\n      \"next_steps\": [\n        \"report\"\n      ],\n      \"skipped\": [],\n      \"evidence_refs\": [\n        \"receipt:complete\"\n      ]\n    },\n    {\n      \"id\": \"red\",\n      \"status\": \"PARTIAL\",\n      \"next_steps\": [\n        \"repair_tests\",\n        \"focused_tests\",\n        \"commit\",\n        \"full_gate\"\n      ],\n      \"skipped\": [],\n      \"evidence_refs\": [\n        \"receipt:red\"\n      ]\n    },\n    {\n      \"id\": \"stale-gate\",\n      \"status\": \"PARTIAL\",\n      \"next_steps\": [\n        \"full_gate\"\n      ],\n      \"skipped\": [],\n      \"evidence_refs\": [\n        \"receipt:stale-gate\"\n      ]\n    },\n    {\n      \"id\": \"unconfirmed\",\n      \"status\": \"PARTIAL\",\n      \"next_steps\": [\n        \"confirm_publication\"\n      ],\n      \"skipped\": [],\n      \"evidence_refs\": [\n        \"receipt:unconfirmed\"\n      ]\n    },\n    {\n      \"id\": \"no-cleanup\",\n      \"status\": \"DONE\",\n      \"next_steps\": [\n        \"report\"\n      ],\n      \"skipped\": [\n        {\n          \"step\": \"cleanup\",\n          \"reason\": \"No completed clean merged worktrees belong to this parent.\",\n          \"evidence_ref\": \"receipt:no-cleanup\"\n        }\n      ],\n      \"evidence_refs\": [\n        \"receipt:no-cleanup\"\n      ]\n    },\n    {\n      \"id\": \"stale-config\",\n      \"status\": \"PARTIAL\",\n      \"next_steps\": [\n        \"full_gate\"\n      ],\n      \"skipped\": [],\n      \"evidence_refs\": [\n        \"receipt:stale-config\"\n      ]\n    }\n  ]\n}\n"
+    },
+    {
+      "op": "final",
+      "text": "Wrote result.json from completed receipts."
+    }
+  ]
+}
