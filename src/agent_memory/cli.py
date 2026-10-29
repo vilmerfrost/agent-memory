@@ -209,6 +209,7 @@ def build_parser() -> argparse.ArgumentParser:
     cli_synth.register(sub)
     from agent_memory import cli_timing
     cli_timing.register(sub)
+    __import__("agent_memory.cli_dispatch", fromlist=["register"]).register(sub)
     __import__("agent_memory.cli_coverage", fromlist=["register"]).register(sub)
 
     # Handled in main() before parsing: every argument goes to amem_digest as is.

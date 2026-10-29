@@ -12,6 +12,23 @@ Learning families with no automatic analysis consumer:
 - **Lessons and lesson-use history** (`lessons`)
 - **Evaluation drafts** (`eval_drafts`)
 
+## Morning audio overviews and report corrections
+
+- Key: `morning_audio`
+- Purpose: Explain the morning results and evidence-backed next steps without executing repairs
+- Producers: Night Desk owner audio request; morning_overview_worker (independent Mac worker)
+- Owner job: com.vilmerfrost.night-desk-audio
+- Tables: `amem_private.morning_overviews`; `report_annotations`
+- Views: none
+- Local files: ~/.claude/parent/night-desk/audio-results/*
+- External sinks: private Supabase morning-audio bucket; ElevenLabs final redacted speech text
+- Consumers:
+  - report: Night Desk (external web app, owner JWT; dashboard_owner_read policy) (`supabase/migrations/20261029082003_morning_audio_overviews.sql`)
+  - operational: exclusive audio generation and upload recovery (`src/agent_memory/morning_overview_worker.py`)
+- Retention: Accepted overview revisions and correction history retained; no source reports deleted.
+- Exclusion: Never a learning input. Derived narration cannot become new evidence or approval. Claims stay private; only owner-bound status and short-lived media access leave the broker.
+- Learning input: no
+
 ## Manual subscription connection diagnostics
 
 - Key: `connection_diagnostics`
@@ -107,6 +124,23 @@ Learning families with no automatic analysis consumer:
   - manual: amem timing tests (`src/agent_memory/test_timings.py`)
 - Retention: Case rows 30 days (test_timings.prune, run by the collector); run summaries kept (details_retained=false after pruning).
 - Exclusion: Measurements and node ids only, never test logs or captured output.
+- Learning input: yes
+
+## Parent dispatch runs, plan-limit usage and estimates
+
+- Key: `dispatch_runs`
+- Purpose: Give each parent dispatch a data-based time and usage estimate (dispatch to brief)
+- Producers: amem dispatch start / end (spool records with Vitals plan-limit snapshots); amem dispatch refresh (worker token totals as tokens records); timing collector flush_dispatch / amem dispatch ingest (upload)
+- Owner job: timing collector (amem timing collect, local service); refresh per dispatch
+- Tables: `dispatch_runs`; `usage_snapshots`; `dispatch_estimates`
+- Views: `dispatch_run_actuals`
+- Local files: ~/.claude/parent/<repo>/dispatch-events.jsonl (spool); ~/.claude/parent/<repo>/dispatch-open/<session>.json (open run); ~/.claude/parent/dispatch-estimates.json (lookup); dispatch cursor file next to the spools
+- External sinks: none
+- Consumers:
+  - analysis: amem dispatch refresh -> estimates lookup (run after each dispatch) (`src/agent_memory/dispatch_estimates.py`)
+  - manual: amem dispatch report (`src/agent_memory/cli_dispatch.py`)
+- Retention: No pruning: runs, snapshots and estimates are kept indefinitely.
+- Exclusion: Plan-limit percent and counts only. Accounts are a 16-character SHA-256 prefix, never the email. A usage delta counts only when clean (no other session of the tool working, no limit reset).
 - Learning input: yes
 
 ## Skill calls and scores

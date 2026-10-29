@@ -81,6 +81,21 @@ NO_RAW = "No transcript text, secrets or raw private content: only redacted, cap
 
 FAMILIES: tuple[Family, ...] = (
     Family(
+        key="morning_audio",
+        title="Morning audio overviews and report corrections",
+        purpose="Explain the morning results and evidence-backed next steps without executing repairs",
+        producers=("Night Desk owner audio request", "morning_overview_worker (independent Mac worker)"),
+        owner_job="com.vilmerfrost.night-desk-audio",
+        tables=("amem_private.morning_overviews", "report_annotations"),
+        local=("~/.claude/parent/night-desk/audio-results/*",),
+        external=("private Supabase morning-audio bucket", "ElevenLabs final redacted speech text"),
+        consumers=(_c(NIGHT_DESK, "supabase/migrations/20261029082003_morning_audio_overviews.sql", "report"),
+                   _c("exclusive audio generation and upload recovery", "src/agent_memory/morning_overview_worker.py", "operational")),
+        retention="Accepted overview revisions and correction history retained; no source reports deleted.",
+        exclusion="Never a learning input. Derived narration cannot become new evidence or approval. Claims stay private; only owner-bound status and short-lived media access leave the broker.",
+        learning_input=False,
+    ),
+    Family(
         key="connection_diagnostics",
         title="Manual subscription connection diagnostics",
         purpose="Verify one owner-requested real subscription call without automatic inference retries",
@@ -179,6 +194,27 @@ FAMILIES: tuple[Family, ...] = (
         retention="Case rows 30 days (test_timings.prune, run by the collector); run summaries kept "
                   "(details_retained=false after pruning).",
         exclusion="Measurements and node ids only, never test logs or captured output.",
+    ),
+    Family(
+        key="dispatch_runs",
+        title="Parent dispatch runs, plan-limit usage and estimates",
+        purpose="Give each parent dispatch a data-based time and usage estimate (dispatch to brief)",
+        producers=("amem dispatch start / end (spool records with Vitals plan-limit snapshots)",
+                   "amem dispatch refresh (worker token totals as tokens records)",
+                   "timing collector flush_dispatch / amem dispatch ingest (upload)"),
+        owner_job="timing collector (amem timing collect, local service); refresh per dispatch",
+        tables=("dispatch_runs", "usage_snapshots", "dispatch_estimates"),
+        views=("dispatch_run_actuals",),
+        local=("~/.claude/parent/<repo>/dispatch-events.jsonl (spool)",
+               "~/.claude/parent/<repo>/dispatch-open/<session>.json (open run)",
+               "~/.claude/parent/dispatch-estimates.json (lookup)", "dispatch cursor file next to the spools"),
+        consumers=(_c("amem dispatch refresh -> estimates lookup (run after each dispatch)",
+                      "src/agent_memory/dispatch_estimates.py", "analysis"),
+                   _c("amem dispatch report", "src/agent_memory/cli_dispatch.py", "manual")),
+        retention="No pruning: runs, snapshots and estimates are kept indefinitely.",
+        exclusion="Plan-limit percent and counts only. Accounts are a 16-character SHA-256 prefix, never the "
+                  "email. A usage delta counts only when clean (no other session of the tool working, no "
+                  "limit reset).",
     ),
     Family(
         key="skills",
