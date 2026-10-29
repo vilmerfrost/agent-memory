@@ -94,9 +94,11 @@ def test_blocked_ideas_are_split_by_reason_with_every_file_listed(env: SimpleNam
     # every allowlisted file improve refuses tonight, whether or not an idea names it
     assert b["refused_files"] == [{"target": t, "reason": "hand_edited"} for t in sorted(
         [f"~/.agents/skills/{s}/SKILL.md" for s in skills] + ["~/agent-config/agents/worker.md"])]
-    # the without-note counts the blocked ideas; the refused note counts the suggest-only ones and is not cut at 200
+    # the without-note counts the blocked ideas; the suggest-only note counts the hand-edited ones and is not cut at
+    # 200 characters (no file here is pinned on purpose, so there is no "not considered" refused note)
     without = next(n for n in rep["notes"] if "without an in-scope target" in n)
-    refused = next(n for n in rep["notes"] if "on a target improve refuses" in n)
+    assert not any("on a target improve refuses" in n for n in rep["notes"])
+    refused = next(n for n in rep["notes"] if "kept as suggest-only" in n)
     assert int(without.split()[1]) == b["total"] and int(refused.split()[1]) == 3
     assert len(refused) > 300 and all(f["target"] in refused for f in b["refused_files"]) and refused.endswith(
         "never a proposal")

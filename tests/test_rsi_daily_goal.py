@@ -58,15 +58,13 @@ def test_one_or_two_testable_candidates_meet_the_minimum_without_inventing_a_thi
     assert "fewer permitted candidates than the daily target" in rep["experiment_goal"]["shortfall_reasons"]
 
 
-@pytest.mark.parametrize("blocked", ["empty", "out_of_scope", "uncovered"])
+@pytest.mark.parametrize("blocked", ["empty", "pinned", "uncovered"])
 def test_minimum_never_overrides_scope_pins_or_missing_cases(env, blocked):
-    # A file pin no longer blocks (2026-10-29: a pinned file is suggest-only and its ideas are ranked like any other,
-    # tests/test_rsi_night_suggest.py); a target the night cannot reach at all still does.
-    if blocked == "out_of_scope":
-        import psycopg
-        with psycopg.connect(env.url) as conn:
-            conn.execute("insert into rsi_candidates(dedupe_key,source,kind,target) values "
-                         "('repo','deviations','edit_instruction','~/Projects/demo/AGENTS.md')")
+    if blocked == "pinned":
+        # an owner pin (a hand-edit auto-pin would be suggest-only since 2026-10-29: tests/test_rsi_night_suggest.py)
+        seed_four(env.url)
+        (env.home / "agent-config/improve/pins.json").write_text(json.dumps(
+            {"files": {"~/.claude/CLAUDE.md": {"reason": "Vilmer: owner pin"}}, "rules": {}}))
     elif blocked == "uncovered":
         import psycopg
         p = env.home / ".agents/skills/uncovered/SKILL.md"

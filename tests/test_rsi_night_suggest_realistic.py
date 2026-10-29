@@ -3,8 +3,8 @@
 A temp HOME gets copies of the live instruction files and improve config (~/.claude/CLAUDE.md, ~/.codex/AGENTS.md,
 ~/agent-config/parent/DELEGATION.md, agents/worker.md, improve/pins.json and criteria.json), read once, never
 written. Deviations use the live rule ids (`global-claude-code-context/shell-habits`, the delegation policy's h2s),
-a pinned skill gets a skill_scores-shaped candidate (no rule key) and worker.md (not pinned live) is the editable
-contrast. Skipped where the live files are missing. Run with -s to print the triage table."""
+an owner-pinned skill gets a skill_scores-shaped candidate (no rule key; excluded before triage, as the owner pin
+says) and worker.md (not pinned live) is the editable contrast. Skipped where the live files are missing. Run with -s to print the triage table."""
 
 from __future__ import annotations
 
@@ -105,10 +105,14 @@ def test_dry_run_triage_on_live_shapes(env: SimpleNamespace) -> None:
     assert deleg["target"] == codex["target"] == "~/agent-config/parent/DELEGATION.md"
     assert deleg["suggest_only"] == codex["suggest_only"] == "outside_allowed"
     assert worker["target"] == "~/agent-config/agents/worker.md" and worker["suggest_only"] is None
-    assert by_key["skill:anatomy"]["suggest_only"] == "pinned"
-    # nothing here is dropped for its lock: every candidate is ranked, and a reason other than the lock decides
+    # the owner-pinned skill (live reason "the night and improve never touch this skill") stays out of the pool
+    assert "skill:anatomy" not in by_key
+    assert any("on a target improve refuses (pinned on purpose:" in n and "anatomy" in n and "not considered" in n
+               for n in rep["notes"]), rep["notes"]
+    # the hand-edited CLAUDE.md rule is the top eligible candidate: ranked like any other, nothing ahead of it locked
+    eligible = [c for c in rep["candidates"] if c["skip_reason"] is None]
+    assert eligible[0]["key"] == shell["key"] and shell["selected"]
     assert all(c["rank"] is not None for c in rep["candidates"])
-    assert not any("not considered" in n and "improve refuses" in n for n in rep["notes"])
 
 
 def test_a_live_shape_win_is_a_suggestion_in_the_brief(env: SimpleNamespace) -> None:

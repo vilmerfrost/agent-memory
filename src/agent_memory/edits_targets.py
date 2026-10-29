@@ -9,6 +9,7 @@
 | `routine:<name>` | ~/.claude/scheduled-tasks/<name>/SKILL.md | edit |
 | `agents-md:global` | ~/.codex/AGENTS.md | edit |
 | `claude-md:<repo>`, `agents-md:<repo>` | a file inside a repo | suggest (never edited) |
+| a `desktop-delegation-policy-v1-1/*` rule of `claude-md:global` / `agents-md:global` | ~/agent-config/parent/DELEGATION.md (the source of both copies) | suggest |
 
 An "edit" target outside improve's allowed targets (`allowed_targets` in
 ~/agent-config/improve/criteria.json, read only) becomes a suggestion too. A fenced path
@@ -325,9 +326,17 @@ def _file(path: Path) -> Target:
     return Target(EDIT, path.resolve())
 
 
-def resolve(source: str, target_paths: list[str] | None = None) -> Target:
+def resolve(source: str, target_paths: list[str] | None = None, rule_id: str | None = None) -> Target:
     """Map an instruction source to its target. `target_paths` (from the candidates file)
-    only names the file of a repo source in the suggestion."""
+    only names the file of a repo source in the suggestion. `rule_id`: a delegation-policy rule of a
+    generated copy (delegation_rule_id) targets its source parent/DELEGATION.md, as a suggestion (the
+    source is outside improve's allowed targets; the night routes it the same way)."""
+    if rule_id and delegation_rule_id(f"{source}:{rule_id}") is not None:
+        src = delegation_source()
+        if src.is_file():
+            t = Target(SUGGEST, src.resolve(), "delegation policy: CLAUDE.md and AGENTS.md hold a generated copy of "
+                                              "parent/DELEGATION.md; edit the source by hand")
+            return t if not is_allowed(src) else Target(EDIT, src.resolve())
     kind, _, name = source.partition(":")
     if source.startswith(("claude-md:", "agents-md:")) and name != "global":
         hint = Path(os.path.expanduser(target_paths[0])) if target_paths else None

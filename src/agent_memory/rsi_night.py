@@ -848,6 +848,12 @@ def _refused_by_improve(target: str) -> bool:
         return False
 
 
+# The locks whose files stay night targets as suggest-only (a win is a hand edit): an auto-pin after Vilmer's hand edit
+# and a file outside improve's allowed targets. `pinned` (an owner pin, a generated copy) and `grades_loop` (a judge
+# or eval prompt) stay excluded before triage: those files are locked on purpose.
+SUGGEST_LOCKS = ("hand_edited", "outside_allowed")
+
+
 def lock_kind(target: str) -> str:
     """Why `target` is suggest-only, as a BLOCK_REASONS code (hand_edited | grades_loop | pinned | outside_allowed).
     Only the code reaches the report, never the pin's reason text."""
@@ -1928,7 +1934,8 @@ class Night:
         self.degraded = False          # a provider was down or an experiment failed: partial, but S1-S8 finished
         self.health_reasons: dict[str, list[str]] = {}   # provider -> why it was not ok (redacted, one line each)
         self.health_where: dict[str, str] = {}            # provider -> the stage that first reported it not ok
-        self.pinned: list[str] = []    # allowlisted targets improve refuses (pins.json / allowed_targets): suggest-only
+        self.pinned: list[str] = []    # allowlisted targets improve refuses (pins.json / allowed_targets)
+        self.suggest: list[str] = []   # ... of them, the suggest-only ones (SUGGEST_LOCKS); the rest are never selected
         self.notes: list[str] = []
         self.health: dict[str, str] = {k: "skipped" for k in PROVIDERS}
         self.health["jev"] = "fixture" if cfg.stages["triage"] == "fixture" else "live"
@@ -2156,9 +2163,13 @@ class Night:
             except Exception as exc:
                 raise PreflightFailed(f"client compatibility: {type(exc).__name__}: {exc}") from None
         self.allowlist = list(self.ad.targets())
-        # improve refuses these files: they stay in the allowlist and their ideas are ranked like any other, but a
-        # winning experiment on one becomes a suggested hand edit, never a staged proposal (suggest-only)
+        # improve refuses these files. A hand-edit auto-pin or a file outside allowed_targets (SUGGEST_LOCKS) stays in
+        # the allowlist: its ideas are ranked like any other, and a win becomes a suggested hand edit, never a staged
+        # proposal. An owner pin or a judge / eval prompt leaves the allowlist: Vilmer locked it on purpose.
         self.pinned = [t for t in self.allowlist if _refused_by_improve(t)]
+        self.suggest = [t for t in self.pinned if lock_kind(t) in SUGGEST_LOCKS]
+        if len(self.suggest) < len(self.pinned):     # a candidate on one only burns triage and model money
+            self.allowlist = [t for t in self.allowlist if t not in self.pinned or t in self.suggest]
         self.budget.check()
         if not self.dry_run:
             if not self.manual_run_id:
@@ -2258,9 +2269,10 @@ class Night:
         return real if real in self.allowlist else None
 
     def _suggest_only(self, target: str | None) -> str | None:
-        """The lock code (lock_kind) when `target` is in scope but improve refuses it (self.pinned): tested like any
-        other target, a win is recorded as a suggested hand edit. None for an editable or out-of-scope target."""
-        locked = getattr(self, "pinned", None) or []     # a night built without __init__ (tests) has none
+        """The lock code (lock_kind) when `target` is in scope but improve refuses it (self.suggest, SUGGEST_LOCKS):
+        tested like any other target, a win is recorded as a suggested hand edit. None for an editable or
+        out-of-scope target."""
+        locked = getattr(self, "suggest", None) or []    # a night built without __init__ (tests) has none
         if not locked:
             return None
         scoped = self._scoped(target)
@@ -2545,19 +2557,27 @@ class Night:
             cur.execute("select target, count(*) as n from rsi_candidates where status in ('new', 'deferred') "
                         "and not coalesce(target = any(%s), false) group by target", (scope,))
             blocked_rows = cur.fetchall()
-            pinned = 0
-            if self.pinned:
+            excluded = [t for t in self.pinned if t not in self.suggest]
+
+            def open_on(targets: list[str]) -> int:
+                if not targets:
+                    return 0
                 cur.execute("select count(*) as n from rsi_candidates where status in ('new', 'deferred') "
-                            "and target = any(%s)", (list(self.pinned),))
-                pinned = int(cur.fetchone()["n"])
+                            "and target = any(%s)", (list(targets),))
+                return int(cur.fetchone()["n"])
+            pinned, suggested = open_on(excluded), open_on(list(self.suggest))
         if messengers:
             self.notes.append(_one_line(f"candidates: {', '.join(messengers)} not considered: a messenger routine only "
                                         "reports other routines' failures", 300))
-        if out_of_scope:
-            self.notes.append(f"candidates: {out_of_scope} without an in-scope target, not considered")
-        if pinned:      # the full list (report.blocked.refused_files has it per file); bounded only as a backstop
-            self.notes.append(f"candidates: {pinned} on a target improve refuses (pinned or out of scope: "
-                              f"{_one_line(', '.join(sorted(self.pinned)), 2000)}), considered suggest-only: ranked "
+        if out_of_scope - pinned:
+            self.notes.append(f"candidates: {out_of_scope - pinned} without an in-scope target, not considered")
+        # the full lists (report.blocked.refused_files has them per file); bounded only as a backstop
+        if pinned:      # an owner pin, a generated copy, a judge or eval prompt: locked on purpose
+            self.notes.append(f"candidates: {pinned} on a target improve refuses (pinned on purpose: "
+                              f"{_one_line(', '.join(sorted(excluded)), 2000)}), not considered")
+        if suggested:   # a hand-edit auto-pin or a file outside allowed_targets
+            self.notes.append(f"candidates: {suggested} on a locked file kept as suggest-only (hand-edited or outside "
+                              f"improve's allowed targets: {_one_line(', '.join(sorted(self.suggest)), 2000)}): ranked "
                               "like any other; a winning change becomes a suggested hand edit, never a proposal")
         if rerouted:
             self.notes.append(f"candidates: {len(rerouted)} delegation-policy idea(s) target the source "

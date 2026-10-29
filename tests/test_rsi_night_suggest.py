@@ -87,12 +87,12 @@ def test_a_pinned_target_ranks_exactly_like_the_unpinned_one_and_can_be_selected
     assert [(e["candidate_key"], e["status"], e["suggest_only"]) for e in pinned["experiments"] if e["experiment_id"]] == \
         [(KEY_A, "not_promotable", "hand_edited")]       # NO_EFFECT: tested, nothing suggested
     assert not any("not considered" in n and "improve refuses" in n for n in pinned["notes"])
-    assert any("on a target improve refuses" in n and "considered suggest-only" in n for n in pinned["notes"])
+    assert any("kept as suggest-only" in n and "CLAUDE.md" in n for n in pinned["notes"])
 
 
 def test_a_locked_target_without_a_replay_case_is_still_skipped_no_test_case(env: SimpleNamespace) -> None:
-    # ~/.agents/skills/demo/SKILL.md: allowlisted, pinned, and no replay case declares it
-    pin(env, {"~/.agents/skills/demo/SKILL.md": "Vilmer 2026-10-27: owner pin, the night and improve never touch this skill"})
+    # ~/.agents/skills/demo/SKILL.md: allowlisted, auto-pinned after a hand edit, and no replay case declares it
+    pin(env, {"~/.agents/skills/demo/SKILL.md": "auto-pin: edited by hand after imp-20261020-2"})
     with psycopg.connect(env.url) as conn:
         AP.upsert_candidate(conn, dedupe_key="dev:skill:demo:demo", source="deviations", kind="edit_instruction",
                             target="~/.agents/skills/demo/SKILL.md", rule_key="skill:demo:demo",
@@ -100,8 +100,40 @@ def test_a_locked_target_without_a_replay_case_is_still_skipped_no_test_case(env
     rep = run(env)
     c = next(c for c in rep["candidates"] if c["key"] == "dev:skill:demo:demo")
     assert c["selected"] is False and c["skip_reason"] == N.NO_TEST_CASE and c["test_cases"] == []
-    assert c["suggest_only"] == "pinned" and "deferred: no test case" in c["reason"]
+    assert c["suggest_only"] == "hand_edited" and "deferred: no test case" in c["reason"]
     assert rep["experiments"] == []
+
+
+def test_owner_pins_and_judge_prompts_stay_excluded_before_triage(env: SimpleNamespace) -> None:
+    """Only a hand-edit auto-pin and a file outside allowed_targets are suggest-only. A file pinned on purpose (an
+    owner pin, a generated copy) and a judge / eval prompt (the measuring stick) leave the pool as before."""
+    judge = env.home / ".claude" / "scheduled-tasks" / "evals-parent" / "SKILL.md"
+    judge.parent.mkdir(parents=True)
+    judge.write_text("# Evals parent\n\n## Grade\n\n- Grade the run.\n")
+    pin(env, {"~/.agents/skills/demo/SKILL.md": "Vilmer 2026-10-27: owner pin, the night and improve never touch this skill",
+              "~/.claude/scheduled-tasks/evals-parent/SKILL.md":
+                  "judge prompt: the measuring stick is never changed by the loop (Vilmer, 2026-10-13)",
+              **CLAUDE_PIN})
+    seed_ab(env)                                       # KEY_A / KEY_B on the hand-edited CLAUDE.md: still considered
+    with psycopg.connect(env.url) as conn:
+        for key, target in (("dev:skill:demo:demo", "~/.agents/skills/demo/SKILL.md"),
+                            ("routine:evals-parent", "~/.claude/scheduled-tasks/evals-parent/SKILL.md")):
+            AP.upsert_candidate(conn, dedupe_key=key, source="deviations", kind="edit_instruction", target=target,
+                                rule_key=key.removeprefix("dev:"), evidence_refs=[f"amem:deviation/{key}-1",
+                                f"amem:deviation/{key}-2", f"amem:deviation/{key}-3"], metrics={"sessions": 9})
+    rep = run(env, replayer=FakeReplayer("NO_EFFECT"))
+    assert {c["key"] for c in rep["candidates"]} == {KEY_A, KEY_B}
+    assert {c["suggest_only"] for c in rep["candidates"]} == {"hand_edited"}
+    b = rep["blocked"]
+    assert b["groups"]["pinned"] == 1 and b["groups"]["grades_loop"] == 1 and b["groups"]["hand_edited"] == 0
+    assert {(t["target"], t["reason"]) for t in b["refused_files"]} == {
+        ("~/.agents/skills/demo/SKILL.md", "pinned"), ("~/.claude/scheduled-tasks/evals-parent/SKILL.md", "grades_loop"),
+        ("~/.claude/CLAUDE.md", "hand_edited")}
+    excluded = next(n for n in rep["notes"] if "on a target improve refuses" in n)
+    assert excluded.startswith("candidates: 2 ") and excluded.endswith("), not considered")
+    assert "demo/SKILL.md" in excluded and "evals-parent" in excluded and "CLAUDE.md" not in excluded
+    assert not any("without an in-scope target" in n for n in rep["notes"])
+    assert all(e["target"] == "~/.claude/CLAUDE.md" for e in rep["experiments"])
 
 
 # --------------------------------------------------------------------------- a win becomes a suggestion
@@ -264,6 +296,23 @@ def test_rsi_targets_lists_delegation_md(env: SimpleNamespace, capsys: pytest.Ca
     assert "~/agent-config/parent/DELEGATION.md" in N.instruction_targets()
     assert N._refused_by_improve("~/agent-config/parent/DELEGATION.md")          # not in allowed_targets
     assert ET.lock_action(T.untilde("~/agent-config/parent/DELEGATION.md")).action == ET.SUGGEST
+
+
+def test_morning_edits_resolve_sends_delegation_rules_to_delegation_md(env: SimpleNamespace) -> None:
+    """The edits step (edits.plan_candidate -> edits_targets.resolve) agrees with the night: a delegation rule of a
+    generated copy is a suggestion on the source DELEGATION.md (outside improve's allowed targets)."""
+    src = write_delegation(env).resolve()
+    rule = "desktop-delegation-policy-v1-1/approval-without-handing-work-back"
+    for source in ("claude-md:global", "agents-md:global"):
+        t = ET.resolve(source, None, rule)
+        assert (t.action, t.path) == (ET.SUGGEST, src) and "generated copy" in t.reason
+    # other rules keep their file; without a rule id (older callers) nothing changes
+    assert ET.resolve("claude-md:global", None, "global-claude-code-context/shell-habits").path == \
+        (env.home / ".claude" / "CLAUDE.md").resolve()
+    assert ET.resolve("claude-md:global").path == (env.home / ".claude" / "CLAUDE.md").resolve()
+    assert ET.resolve("claude-md:demo", ["~/Projects/demo/CLAUDE.md"], rule).reason.startswith("repo file")
+    src.unlink()                  # no source file: the copy stays the target, as before
+    assert ET.resolve("claude-md:global", None, rule).path == (env.home / ".claude" / "CLAUDE.md").resolve()
 
 
 def test_open_and_new_delegation_candidates_target_delegation_md(env: SimpleNamespace) -> None:

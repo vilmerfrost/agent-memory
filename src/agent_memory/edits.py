@@ -448,7 +448,7 @@ def plan_candidate(conn: psycopg.Connection, cand: dict[str, Any], *, min_confid
     rule_id = cand.get("rule_id")
     if not rule_id or rule_id == rule_catalog.UNMATCHED:
         return _Plan(cand, "skip", "no rule id (run `amem deviations reref`)")
-    t = edits_targets.resolve(cand["instruction_source"], cand.get("target_paths"))
+    t = edits_targets.resolve(cand["instruction_source"], cand.get("target_paths"), rule_id)
     if t.action == edits_targets.SKIP:
         return _Plan(cand, "skip", t.reason)
     # improve refuses pinned files and rules; skip them here, before any writer call or row.
