@@ -107,8 +107,32 @@ A usage delta counts for the usage estimate only when it is clean:
    the parent itself. Codex rows have no status: a Codex process counts when it
    uses at least 2% CPU (minus the Codex parent itself).
 2. The limit did not reset during the run (`resets_at` moved by at most 5 minutes).
+3. Its token share is 100% or unknown (see below).
 
 Time estimates use every finished run, clean or not.
+
+## Token share (runs that shared their window)
+
+Most runs overlap other sessions, so clean runs are rare. Refresh measures each finished
+run's token share of its own window, from real local records only:
+
+- Claude: transcript messages under `~/.claude/projects` with a timestamp inside
+  `[dispatched_at, briefed_at]`. Fresh tokens = input + output + cache creation, the
+  latest line of a message wins. The run's part is its parent session file and that
+  session's `subagents/` files.
+- Codex: `token_count` events of rollouts inside the window. The run's part is the parent
+  thread and its child threads (`parent_thread_id`).
+
+Share = run's fresh tokens / all fresh tokens of that tool in the window. A run with a
+share below 100% is not clean, even when Vitals saw no other session working: Vitals
+status misses short bursts. Its delta counts as `delta x share` ("split by token share").
+No own tokens in the window gives no share and no number. A share is measured once and
+kept in the lookup file (`shares`), because transcripts get pruned. Limit: use outside
+this Mac (claude.ai chat, Codex cloud, other devices) is not in local records, so a share
+can overstate the run's part.
+
+`refresh` also counts dispatch rounds since the first recorded run that have no
+`dispatch start` (`missed` in the lookup file, a `Missed:` line in the refresh output).
 
 ## How refresh estimates
 
@@ -123,6 +147,8 @@ Time estimates use every finished run, clean or not.
 - Usage, per limit and bucket, first match wins:
   1. Clean runs: with at least 5 clean runs in the bucket, their median and 80th
      percentile delta (the line says `(5 clean runs)`).
+  1b. Measured runs: with at least 3 clean or token-share runs in the bucket
+     (the line says `(4 runs, 3 split by token share)`).
   2. Seed (Codex only): `median worker tokens per round / fresh tokens per 1%` from
      the usage seed below (the line says `(seed: Codex rollouts, 138 intervals x 7 rounds)`).
   3. Token ratio: `median worker tokens x learned percent per million tokens` from
