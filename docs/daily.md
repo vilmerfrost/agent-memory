@@ -221,3 +221,12 @@ AMEM_DB_URL=postgresql://postgres:postgres@127.0.0.1:<port>/postgres \
 ```
 
 Tests: `tests/test_daily_*.py` (ntfy, osascript and `gh` are stand-ins; no network).
+
+### Sync after a recovered scan
+
+The normal sync still runs at most once per local day. If that daily scan fails
+(including expired authentication), it records that the exported inputs were incomplete.
+Repeated failed attempts do not resync. The first successful recovery that day performs
+one more bounded incremental sync, then clears the marker. This includes the recovered
+session reviews in ClickHouse before the recovered night reads them. Existing sink
+kill switches, privacy filters, row/request caps and per-sink time budgets still apply.
