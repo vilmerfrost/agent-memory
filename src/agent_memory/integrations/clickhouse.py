@@ -51,7 +51,16 @@ jev verdicts, skill_calls.session_id on a late match), and a row can commit afte
 So every incremental run also re-sends the rows at or behind the watermark whose `changed` is inside a
 lookback window (AMEM_CLICKHOUSE_LOOKBACK_DAYS, default 7, 0 = off). ReplacingMergeTree keeps the newest
 version, so a re-send is harmless. Silent updates older than the window heal with `--replay` (a backfill).
-The append-only tables (rsi_decisions, rsi_eval_results) have no lookback.
+The append-only tables (rsi_decisions, rsi_eval_results) cycle their full historical range in bounded pages,
+since a transaction may commit arbitrarily late. Each phase has a durable cursor; capped runs continue
+instead of repeating the same prefix. Phase scheduling rotates after every committed batch.
+
+Source deletion is represented by an insert-only `_amem_deleted` marker. A bounded ID reconciliation
+checks exported IDs against the authoritative source and inserts tombstones only after a successful
+source lookup. Recreated source rows heal from the same pass, even with old timestamps. Named queries
+and verification filter tombstones after FINAL. Existing Cloud tables require the owner-only upgrade
+from docs/integrations/clickhouse-deletion-upgrade.sql before activating this reader/writer; the writer's
+SELECT/INSERT grant is unchanged. No upgrade is applied automatically in Cloud.
 
 Reads. Only the named queries in QUERIES: fixed SQL with ClickHouse query parameters (`{name:Type}` in the
 SQL, values as `param_<name>` URL parameters, each checked first by the core NamedQuery regex). `limit` is
@@ -99,7 +108,7 @@ from psycopg.rows import dict_row
 from agent_memory import config as amem_config
 from agent_memory.integrations import egress, http, refs
 from agent_memory.integrations.evidence import EvidenceRef, Health, NamedQuery
-from agent_memory.integrations.sync import Batch
+from agent_memory.integrations.sync import Batch, limits
 
 DEFAULT_DB = "amem"
 DEDUP_WINDOW = 1000        # inserts remembered per table for insert_deduplication_token
@@ -257,7 +266,8 @@ class Table:
     day: str                    # the column verify counts per day
     changed: str                # SQL: when the row last changed (the cursor)
     cols: tuple[Col, ...]       # the allowlist; nothing else is selected
-    lookback: bool = True       # False for append-only tables
+    lookback: bool = True       # recovery visits older rows in bounded pages
+    full_recovery: bool = False # append-only commit order is not timestamp order; cycle the full history
     source: str = ""            # the Supabase table when it differs from `name` (Mission 004B: research_runs)
     where: str = ""             # a fixed SQL filter on the source rows
     owner: str = ""             # SQL: the row's ownership class (egress.class_sql), selected as `_own` (F8)
@@ -269,7 +279,7 @@ class Table:
 
     @property
     def allowlist(self) -> tuple[str, ...]:
-        return tuple(c.name for c in self.cols)
+        return (*[c.name for c in self.cols], "_amem_deleted")
 
 
 def _cols(spec: str, **exprs: str) -> tuple[Col, ...]:
@@ -401,7 +411,7 @@ TABLES: tuple[Table, ...] = (
                 "ts:created_at,expires_at,decided_at,promoted_at,reverted_at")),
     Table("rsi_decisions", "id", "decided_at", "decided_at",
           _cols("id:id,proposal_id label:action id:artifact_hash label:source,verified ts:decided_at,expires_at"),
-          lookback=False),
+          lookback=True, full_recovery=True),
     # Mission 004B: NCM research runs (public benchmark metrics) from their rsi_evidence rows. ch:research_runs/<id>
     # maps to amem:evidence/<id>. Only the contract's metric names, cost, hardware and pins; never the summary.
     Table("research_runs", "id", "observed_at", "observed_at",
@@ -416,7 +426,7 @@ TABLES: tuple[Table, ...] = (
     Table("rsi_eval_results", "id", "created_at", "created_at",
           _cols("id:id,artifact_hash,experiment_id,baseline_id label:suite,suite_version,model,effort,verdict "
                 "id:record_sha ts:created_at"),
-          lookback=False),
+          lookback=True, full_recovery=True),
 )
 TABLE_NAMES = frozenset(t.name for t in TABLES)
 _TABLE = {t.name: t for t in TABLES}
@@ -453,9 +463,17 @@ def schema_sql(db: str = DEFAULT_DB, *, cloud: bool = False) -> list[str]:
     settings = "" if cloud else f"\nSETTINGS non_replicated_deduplication_window = {DEDUP_WINDOW}"
     for t in TABLES:
         cols = ",\n    ".join(f"{c.name} {_ch_type(t, c)}" for c in t.cols)
-        out.append(f"CREATE TABLE IF NOT EXISTS {db}.{t.name} (\n    {cols},\n    version UInt64\n)\n"
+        out.append(f"CREATE TABLE IF NOT EXISTS {db}.{t.name} (\n    {cols},\n    _amem_deleted UInt8 DEFAULT 0,\n    version UInt64\n)\n"
                    f"ENGINE = ReplacingMergeTree(version)\nORDER BY id{settings}")
     return out
+
+
+def schema_upgrade_sql(db: str = DEFAULT_DB) -> list[str]:
+    """Owner-only, idempotent upgrade for existing tables. Never run by the Cloud writer."""
+    if not DB_RE.fullmatch(db):
+        raise ValueError(f"bad database name: {db!r}")
+    return [f"ALTER TABLE {db}.{t.name} ADD COLUMN IF NOT EXISTS _amem_deleted UInt8 DEFAULT 0"
+            for t in TABLES]
 
 
 PASSWORD_RULE = "12+ characters with an uppercase letter, a lowercase letter, a digit and a special character"
@@ -545,6 +563,8 @@ def check_grants(client: Client) -> list[dict[str, Any]]:
 
 def ensure_schema(client: Client) -> int:
     stmts = schema_sql(client.cfg.db, cloud=client.cfg.cloud)
+    if not client.cfg.cloud:
+        stmts += schema_upgrade_sql(client.cfg.db)
     for s in stmts:
         client.command(s)
     return len(stmts)
@@ -623,6 +643,7 @@ def map_row(t: Table, raw: Mapping[str, Any], version: int, deny: egress.Deny = 
     if t.rule_of and cls != egress.OWN and repo_scoped(str(raw.get(t.rule_of[0]) or "")):
         out[t.rule_of[1]] = None
     out["version"] = version
+    out["_amem_deleted"] = 0
     return out
 
 
@@ -677,7 +698,9 @@ class ClickHouseSink:
                  now: Callable[[], datetime] | None = None, tables: Sequence[Table] = TABLES, auto_schema: bool = True,
                  since: datetime | None = None, owners: Sequence[str] | None = None):
         self.client = client if client is not None else Client()
-        self.batch_size = batch_size
+        if batch_size < 1:
+            raise ValueError("batch_size must be positive")
+        self.batch_size = min(batch_size, max(1, limits("clickhouse")[0]))
         self.lookback_days = self.client.cfg.lookback_days if lookback_days is None else lookback_days
         self._now = now or (lambda: datetime.now(UTC))
         self.tables = tuple(tables)
@@ -702,19 +725,34 @@ class ClickHouseSink:
     @property
     def replay_scope(self) -> frozenset[str] | None:
         """The cursors a --replay starts over (sync.run): only these tables when narrowed with --tables."""
-        return None if set(self.tables) == set(TABLES) else frozenset(t.name for t in self.tables)
+        return None if set(self.tables) == set(TABLES) else frozenset(
+            phase for t in self.tables for phase in (t.name, t.name + ':lookback', t.name + ':reconcile'))
 
     def health(self) -> Health:
         if self.client.cfg.problem:
             return Health(False, self.client.cfg.problem)
         try:
             self.client.ping()
-            if self.auto_schema and not self._schema_ready:
-                ensure_schema(self.client)          # IF NOT EXISTS: cheap and idempotent
+            if not self._schema_ready:
+                if self.auto_schema:
+                    ensure_schema(self.client)
+                for table in self.tables:
+                    try:
+                        self.client.select(f"SELECT _amem_deleted FROM {table.name} LIMIT 0 FORMAT JSONEachRow", {})
+                    except http.HttpError as exc:
+                        if 'UNKNOWN_IDENTIFIER' in str(exc) or 'Unknown expression' in str(exc):
+                            return Health(False, 'ClickHouse projection schema needs owner upgrade: add _amem_deleted; no data sent')
+                        raise
                 self._schema_ready = True
         except http.HttpError as exc:
             return Health(False, str(exc)[:200])
         return Health(True)
+
+    def checkpoint(self, batch: Batch, watermarks: dict[str, str]) -> None:
+        """Persist scheduling progress atomically with this batch's cursor (sync owns the commit)."""
+        order = self._phase_order
+        if batch.table in order:
+            watermarks["ch:schedule"] = order[(order.index(batch.table) + 1) % len(order)]
 
     def batches(self, conn: psycopg.Connection, watermarks: Mapping[str, str], *, replay: bool) -> Iterator[Batch]:
         version = next_version()
@@ -726,19 +764,117 @@ class ClickHouseSink:
         since = None if replay or self.lookback_days <= 0 else self._now() - timedelta(days=self.lookback_days)
         if since is not None and self.since is not None:
             since = max(since, self.since)
+        phases = {}
         for t in self.tables:
             mark = None if replay else parse_mark(watermarks.get(t.name))
-            last = mark
-            for rows in self._pages(conn, t, after=mark, since=self.since):
-                last = (rows[-1]["_changed"], rows[-1]["_key"])
-                yield self._batch(t, rows, version, last)
+            phases[t.name] = self._forward(conn, t, version, mark)
             if since is not None and t.lookback and mark is not None:
-                # rows sent by an earlier run that may have changed without a timestamp (see module doc)
-                for rows in self._pages(conn, t, since=since, upto=mark):
-                    yield self._batch(t, rows, version, last or mark)
+                phases[t.name + ":lookback"] = self._lookback(conn, t, version, mark,
+                    (self.since or datetime.min.replace(tzinfo=UTC)) if t.full_recovery else since,
+                    watermarks.get(t.name + ":lookback"))
+            if self._schema_ready:
+                phases[t.name + ":reconcile"] = self._reconcile(conn, t, version,
+                    None if replay else watermarks.get(t.name + ":reconcile"))
+        self._phase_order = list(phases)
+        start = watermarks.get("ch:schedule")
+        if start in self._phase_order:
+            i = self._phase_order.index(start)
+            self._phase_order = self._phase_order[i:] + self._phase_order[:i]
+        active = dict(phases)
+        while active:
+            for phase in self._phase_order:
+                if phase not in active:
+                    continue
+                try:
+                    yield next(active[phase])
+                except StopIteration:
+                    del active[phase]
+
+    def _forward(self, conn: psycopg.Connection, t: Table, version: int, mark: Mark | None) -> Iterator[Batch]:
+        for rows in self._pages(conn, t, after=mark, since=self.since):
+            last = (rows[-1]["_changed"], rows[-1]["_key"])
+            yield self._batch(t, rows, version, last)
+
+    @staticmethod
+    def _progress(text: str | None) -> dict[str, Any]:
+        try:
+            value = json.loads(text or '{}')
+            return value if isinstance(value, dict) else {}
+        except (TypeError, ValueError):
+            return {}
+
+    def _lookback(self, conn: psycopg.Connection, t: Table, version: int, mark: Mark,
+                  since: datetime, progress: str | None) -> Iterator[Batch]:
+        state = self._progress(progress)
+        after = None
+        if state and state.get('done') is False:
+            try:
+                since = max(since, datetime.fromisoformat(state['since']))
+                mark = parse_mark(state['upto']) or mark
+                after = parse_mark(state.get('after'))
+            except (KeyError, TypeError, ValueError):
+                state = {}
+        pages = self._pages(conn, t, after=after, since=since, upto=mark)
+        rows = next(pages, None)
+        emitted = False
+        while rows is not None:
+            following = next(pages, None)
+            last = (rows[-1]['_changed'], rows[-1]['_key'])
+            batch = self._batch(t, rows, version, last)
+            batch.table = t.name + ':lookback'
+            batch.watermark = json.dumps({'since': since.isoformat(), 'upto': format_mark(mark),
+                                         'after': format_mark(last), 'done': following is None}, sort_keys=True)
+            emitted = True
+            yield batch
+            rows = following
+        if not emitted and state and not state.get('done') and after is not None:
+            # A source deletion can remove the rest of an interrupted cycle.
+            yield Batch(t.name + ':lookback', [], json.dumps({**state, 'done': True}, sort_keys=True))
+
+    def _reconcile(self, conn: psycopg.Connection, t: Table, version: int,
+                   progress: str | None) -> Iterator[Batch]:
+        """Bounded ID pages; tombstone only after a successful authoritative source lookup.
+
+        Deleted rows from before this feature are covered too. Read errors propagate:
+        an unavailable source is never evidence that rows were deleted.
+        """
+        state = self._progress(progress)
+        after = state.get('after', '') if state.get('done') is False else ''
+        if not isinstance(after, str):
+            after = ''
+        while True:
+            rows = self.client.select(f"SELECT id, _amem_deleted FROM {t.name} FINAL "
+                "WHERE id > {after:String} ORDER BY id LIMIT {limit:UInt32} FORMAT JSONEachRow",
+                {'after': after, 'limit': str(self.batch_size)})
+            if not all(isinstance(r, dict) and r.get('_amem_deleted') in (0, 1) for r in rows):
+                raise ValueError('invalid ClickHouse reconciliation marker')
+            ids = [r['id'] for r in rows]
+            if len(ids) > self.batch_size or not all(isinstance(i, str) and _is_id(i) for i in ids) or ids != sorted(set(ids)):
+                raise ValueError('invalid ClickHouse reconciliation IDs')
+            if not ids:
+                if state and state.get('done') is False:
+                    yield Batch(t.name + ':reconcile', [], json.dumps({'after': after, 'done': True}))
+                return
+            where = sql.SQL(" and ({})").format(sql.SQL(t.where)) if t.where else sql.SQL('')
+            existing = {r[0] for r in conn.execute(sql.SQL("select {}::text from {} where {}::text = any(%s){}").format(
+                sql.Identifier(t.key), sql.Identifier(t.src), sql.Identifier(t.key), where), (ids,)).fetchall()}
+            missing = {r['id'] for r in rows if not r.get('_amem_deleted', 0)} - existing
+            restore = [r['id'] for r in rows if r.get('_amem_deleted', 0) and r['id'] in existing]
+            stamp = self._now().astimezone(UTC).strftime('%Y-%m-%d %H:%M:%S.%f')
+            tombstones = [{'id': i, t.day: stamp, 'version': next_version(), '_amem_deleted': 1} for i in ids if i in missing]
+            restored = []
+            if restore:
+                for source_rows in self._pages(conn, t, ids=restore):
+                    restored.extend(self._batch(t, source_rows, next_version(),
+                        (source_rows[-1]['_changed'], source_rows[-1]['_key'])).rows)
+            after = ids[-1]
+            done = len(ids) < self.batch_size
+            yield Batch(t.name + ':reconcile', tombstones + restored, json.dumps({'after': after, 'done': done}, sort_keys=True))
+            if done:
+                return
 
     def _pages(self, conn: psycopg.Connection, t: Table, *, after: Mark | None = None, since: datetime | None = None,
-               upto: Mark | None = None) -> Iterator[list[dict[str, Any]]]:
+               upto: Mark | None = None, ids: Sequence[str] | None = None) -> Iterator[list[dict[str, Any]]]:
         changed = sql.SQL(t.changed)
         key = sql.SQL('{}::text collate "C"').format(sql.Identifier(t.key))
 
@@ -753,6 +889,9 @@ class ClickHouseSink:
         while True:
             conds: list[sql.Composable] = [sql.SQL(t.where)] if t.where else []
             args: list[Any] = []
+            if ids is not None:
+                conds.append(sql.SQL("{} = any(%s)").format(key))
+                args.append(list(ids))
             if after is not None:
                 conds.append(sql.SQL("({}, {}) > (%s, %s)").format(changed, key))
                 args += [after[0], after[1]]
@@ -796,11 +935,12 @@ class ClickHouseSink:
         would be inserted, without `version` (the extraction time, new on every run), its sha256 over the canonical
         JSON of that payload, its ownership class (None for a table without one) and its size on the wire."""
         out = []
+        table = batch.table.split(":", 1)[0]
         for row in batch.rows:
             payload = {k: v for k, v in row.items() if k != "version"}
             canon = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-            out.append({"ref": f"ch:{batch.table}/{row['id']}", "table": batch.table,
-                        "class": self.row_classes.get((batch.table, str(row["id"]))), "payload": payload,
+            out.append({"ref": f"ch:{table}/{row['id']}", "table": table,
+                        "class": self.row_classes.get((table, str(row["id"]))), "payload": payload,
                         "sha256": hashlib.sha256(canon.encode("utf-8")).hexdigest(), "bytes": len(body_of([row]))})
         return out
 
@@ -826,7 +966,8 @@ class ClickHouseSink:
         if not batch.rows:
             return
         body = body_of(batch.rows)
-        self.client.insert(batch.table, body, batch.key or token_of(batch.table, body))
+        table = batch.table.split(":", 1)[0]
+        self.client.insert(table, body, batch.key or token_of(table, body))
 
 
 # ---------------------------------------------------------------- the retriever: four named queries
@@ -838,6 +979,13 @@ _WEEKS_P = r"[1-9][0-9]?"
 _N_P = r"[1-9][0-9]{0,2}"
 GAP_FOLLOWED_MAX = 0.5      # rule_gap flag: followed this badly ...
 GAP_OBJECTIVE_MIN = 0.8     # ... yet the objective outcome was this good
+
+def _active_sql(statement: str) -> str:
+    for table in TABLE_NAMES:
+        statement = re.sub(r"\b" + re.escape(table) + r" FINAL\b",
+                           f"(SELECT * FROM {table} FINAL WHERE _amem_deleted = 0)", statement)
+    return statement
+
 
 RULE_WEEKLY_RATE_SQL = """\
 SELECT d.week_start AS week_start, d.rule_key AS rule_key, d.n_deviations AS n_deviations,
@@ -947,6 +1095,14 @@ LIMIT 1000
 FORMAT JSONEachRow"""
 
 
+RULE_WEEKLY_RATE_SQL = _active_sql(RULE_WEEKLY_RATE_SQL)
+TOKENS_BY_OUTCOME_SQL = _active_sql(TOKENS_BY_OUTCOME_SQL)
+SKILL_OUTCOMES_SQL = _active_sql(SKILL_OUTCOMES_SQL)
+RESEARCH_RUNS_SQL = _active_sql(RESEARCH_RUNS_SQL)
+ROUTINE_STREAKS_SQL = _active_sql(ROUTINE_STREAKS_SQL)
+RULE_GAP_SQL = _active_sql(RULE_GAP_SQL)
+
+
 def _part(v: Any) -> str:
     return _NOT_REF.sub("_", str(v)).replace("/", "_") if v not in (None, "") else "unknown"
 
@@ -1007,6 +1163,7 @@ QUERIES: dict[str, Query] = {
         ("rule_key", "n_deviations", "n_sessions", "followed_avg", "result_avg", "objective_avg", "objective_n", "gap"),
         ("deviation", "sample_ids")),
 }
+
 _NUM = re.compile(r"-?[0-9]+(\.[0-9]+)?([eE][-+]?[0-9]+)?")
 
 
@@ -1088,7 +1245,7 @@ class ClickHouseRetriever:
 # ---------------------------------------------------------------- verify: per-day parity
 
 VERIFY_SQL = {t.name: (f"SELECT toString(toDate({t.day})) AS d, count() AS n FROM {t.name} FINAL "
-                       f"WHERE toDate({t.day}) >= {{since:Date}} GROUP BY d ORDER BY d FORMAT JSONEachRow")
+                       f"WHERE _amem_deleted = 0 AND toDate({t.day}) >= {{since:Date}} GROUP BY d ORDER BY d FORMAT JSONEachRow")
               for t in TABLES}
 
 
