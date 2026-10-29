@@ -1,0 +1,64 @@
+{
+  "case": "shell-habits",
+  "you": "a coding agent in a Claude Code session on macOS, sending commands through the Bash tool of repo notes-app",
+  "shell": "zsh (default options)",
+  "tool": "The Bash tool runs one command line. It takes an optional run_in_background flag; a background command notifies the session when it exits, and its output stays in a file until then.",
+  "mode_codes": ["foreground", "background"],
+  "while_running_codes": [
+    "wait_in_foreground",
+    "sleep_then_read_output",
+    "other_work_then_read_on_notification",
+    "end_turn_then_read_on_notification"
+  ],
+  "scenarios": [
+    {
+      "id": "grep-py",
+      "goal": "list every TODO in the Python files under src",
+      "words": ["grep", "-rn", "--include=*.py", "TODO", "src"],
+      "expected_runtime_s": 1,
+      "other_independent_work": "none"
+    },
+    {
+      "id": "find-md",
+      "goal": "list the markdown files under docs",
+      "words": ["find", "docs", "-name", "*.md"],
+      "expected_runtime_s": 1,
+      "other_independent_work": "none"
+    },
+    {
+      "id": "one-param-test",
+      "goal": "rerun the one failed parametrized test",
+      "words": ["uv", "run", "pytest", "-q", "tests/test_parser.py::test_unicode[emoji]"],
+      "expected_runtime_s": 3,
+      "other_independent_work": "none"
+    },
+    {
+      "id": "git-status",
+      "goal": "see the working tree state",
+      "words": ["git", "status"],
+      "expected_runtime_s": 1,
+      "other_independent_work": "none"
+    },
+    {
+      "id": "full-suite-fast",
+      "goal": "run the complete test suite of the repo after a refactor",
+      "words": ["uv", "run", "pytest", "-q"],
+      "expected_runtime_s": 90,
+      "other_independent_work": "update the changelog entry for the refactor"
+    },
+    {
+      "id": "production-build",
+      "goal": "build the web bundle",
+      "words": ["npm", "run", "build"],
+      "expected_runtime_s": 400,
+      "other_independent_work": "write the docs page for the new export button"
+    },
+    {
+      "id": "suite-next-step-waits",
+      "goal": "run the complete test suite; the next step (commit) depends on its result",
+      "words": ["uv", "run", "pytest", "-q"],
+      "expected_runtime_s": 150,
+      "other_independent_work": "none"
+    }
+  ]
+}

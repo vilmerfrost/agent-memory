@@ -54,7 +54,11 @@ REPORT_FORMAT = "rsi-night/1"
 BRIEF_FORMAT = "rsi-brief/1"
 NIGHT_STATUSES = ("ok", "partial", "aborted", "budget_exhausted", "preflight_failed")
 SKIP_REASONS = ("prerequisites", "credentials")                       # rsi_night.SKIP_REASONS
-EXPERIMENT_STATUSES = ("staged", "not_promotable", "failed", "interrupted", "skipped_budget", "deferred_policy")
+EXPERIMENT_STATUSES = ("staged", "not_promotable", "failed", "interrupted", "skipped_budget", "deferred_policy",
+                       "suggested")                 # suggested: a tested edit for a locked file, applied by hand only
+SUGGESTED_HEADING = "Suggested edits for locked files"   # shown only when the night has one (not in SECTIONS)
+LOCK_WORDS = {"hand_edited": "pinned after a hand edit", "grades_loop": "pinned as a judge or eval prompt",
+              "pinned": "pinned", "outside_allowed": "outside improve's allowed targets"}   # rsi_night.lock_kind
 VERDICTS = ("IMPROVES", "NO_EFFECT", "WORSE", "INCONCLUSIVE")        # rsi_verdict.VERDICTS (plan 2.1)
 RISKS = ("low", "medium", "high")
 HEALTHY = ("ok", "fixture", "live")
@@ -277,6 +281,13 @@ def validate_report(rep: Any) -> list[str]:
             p.append(f"{where}.proposal_id: not a proposal uuid")
         if st == "staged" and (e.get("verdict") != "IMPROVES" or not h or not pid or not eid):
             p.append(f"{where}: staged needs verdict IMPROVES, an experiment_id, an artifact_hash and a proposal_id")
+        if st == "suggested":
+            s = e.get("suggestion")
+            if e.get("verdict") != "IMPROVES" or not h or not eid or pid is not None:
+                p.append(f"{where}: suggested needs verdict IMPROVES, an experiment_id, an artifact_hash and no proposal")
+            if not (isinstance(s, dict) and s.get("suggest_only") is True and s.get("applied_by") == "hand"
+                    and s.get("artifact_hash") == h and s.get("lock") in LOCK_WORDS):
+                p.append(f"{where}.suggestion: not a suggest-only record for this artifact")
         if e.get("risk") is not None and e["risk"] not in RISKS:
             p.append(f"{where}.risk {e['risk']!r} is not one of {', '.join(RISKS)}")
         c = e.get("confidence")
@@ -815,6 +826,34 @@ def proposal_block(e: Mapping[str, Any], db: Db, artifacts_root: Path, suites: l
     }
 
 
+def suggestion_block(e: Mapping[str, Any], artifacts_root: Path) -> dict[str, Any]:
+    """One suggested edit for a locked file (report status `suggested`): what, why, the diff summary of the tested
+    bytes, evidence, baseline vs candidate and the hash. It has no proposal and no actions: the file is pinned or
+    outside improve's allowed targets, so it is applied by hand or not at all. Never an Apply command."""
+    s = _obj(e.get("suggestion"))
+    hyp = _obj(e.get("hypothesis"))
+    h = e["artifact_hash"]
+    change = artifact_change(artifacts_root / h, None)
+    ds = _obj(s.get("diff_summary"))
+    lock = s.get("lock") if s.get("lock") in LOCK_WORDS else "pinned"
+    return {
+        "experiment_id": e["experiment_id"], "candidate_key": text(e.get("candidate_key"), 120) or None,
+        "title": text(hyp.get("what") or e["experiment_id"], 120), "what": text(hyp.get("what"), 600),
+        "why": text(hyp.get("why"), 800), "target": text(e.get("target"), 200) or None,
+        "lock": lock, "lock_words": LOCK_WORDS[lock], "applied_by": "hand", "section_id": text(s.get("section_id"), 120) or None,
+        "change": change,
+        "diff_summary": {"added": ds.get("added") if _count(ds.get("added")) else None,
+                         "removed": ds.get("removed") if _count(ds.get("removed")) else None},
+        "evidence_refs": _refs(e.get("evidence_refs"), s.get("evidence_refs")),
+        "baseline_vs_candidate": {"verdict": e.get("verdict"),
+                                  "verdict_reasons": [text(r, 200) for r in (e.get("verdict_reasons") or [])[:6]],
+                                  "metrics": compare_arms(e.get("arms"))},
+        "risk": e.get("risk") if e.get("risk") in RISKS else None,
+        "confidence": e.get("confidence") if _num(e.get("confidence")) else None,
+        "artifact_hash": h, "cost_usd": e.get("cost_usd"),
+    }
+
+
 WHY_NOT = {
     "not_promotable": "only IMPROVES can be staged",
     "failed": "the experiment failed before it could be judged",
@@ -954,7 +993,8 @@ def build_brief(rep: Mapping[str, Any], db: Db, *, artifacts_root: Path, report:
     exps = rep["experiments"]
     suites = required_suites()
     passed = [proposal_block(e, db, artifacts_root, suites) for e in exps if e["status"] == "staged"]
-    failed = [failed_item(e) for e in exps if e["status"] != "staged"]
+    suggested = [suggestion_block(e, artifacts_root) for e in exps if e["status"] == "suggested"]
+    failed = [failed_item(e) for e in exps if e["status"] not in ("staged", "suggested")]
     policy_deferred = sum(e["status"] == "deferred_policy" for e in exps)
     d = rep["delta"]
     skipped = skip_info(rep)
@@ -1029,6 +1069,8 @@ def build_brief(rep: Mapping[str, Any], db: Db, *, artifacts_root: Path, report:
         "summary": (f"{_plural(sum(1 for x in passed if x['actions']['apply']), 'improvement')} ready to apply"
                     + (f" ({len(passed) - sum(1 for x in passed if x['actions']['apply'])} more staged but not "
                        "ready)" if any(not x["actions"]["apply"] for x in passed) else "")
+                    + (f", {_plural(len(suggested), 'suggested edit')} for a locked file to apply by hand"
+                       if suggested else "")
                     + f", {len(failed) - policy_deferred} failed or inconclusive"
                     + (f", {policy_deferred} hypotheses deferred by policy "
                        f"({sum(bool(e.get('experiment_id')) for e in exps)} experiments executed)"
@@ -1047,6 +1089,7 @@ def build_brief(rep: Mapping[str, Any], db: Db, *, artifacts_root: Path, report:
                        "items": cands[:MAX_CANDIDATES]},
         "experiments": {"total": len(exps), "items": experiments},
         "passed": passed, "failed": failed, "costs": costs, "health": health, "pending_decisions": pending,
+        **({"suggested": suggested} if suggested else {}),     # additive: only on a night with a suggestion
         **({"connection_recovery": rep["connection_recovery"]} if "connection_recovery" in rep else {}),
         "sections": list(SECTIONS),
         **({"manual_run": rep["manual_run"]} if "manual_run" in rep else {}),
@@ -1183,6 +1226,38 @@ def _proposal_md(i: int, b: dict[str, Any]) -> list[str]:
     return out
 
 
+def _suggestion_md(i: int, b: dict[str, Any]) -> list[str]:
+    """A suggested edit: tested like a proposal, but the file is locked, so the loop never applies it. No Apply,
+    Reject or decide command: Vilmer copies the change by hand if he wants it."""
+    out = [f"### {i}. {b['title']}", "",
+           f"- **Suggested edit for a locked file: apply by hand.** {b['target'] or 'The file'} is {b['lock_words']}, "
+           "so the loop never applies this change and no Apply command exists for it."]
+    ch, ds = b["change"], b["diff_summary"]
+    out.append(f"- **What would change:** {_sentence(b['what']) or '(no description)'}"
+               + (f" Section: {b['section_id']}." if b["section_id"] else ""))
+    if ch["verified"]:
+        for f in ch["files"]:
+            out.append(f"  - Diff summary: {f['path']}: +{f['added']} -{f['removed']} lines.")
+            if f["excerpt"]:
+                out += ["", "    ```diff", *(f"    {ln}" for ln in f["excerpt"]), "    ```", ""]
+    else:
+        out.append(f"  - Diff summary: +{_fmt(ds['added'])} -{_fmt(ds['removed'])} lines (from the night report; the "
+                   f"tested artifact does not verify here: {ch['error'] or 'unknown'}).")
+    out.append(f"- **Why:** {b['why'] or '(no rationale recorded)'}")
+    refs = ", ".join(f"`{r}`" for r in b["evidence_refs"]) or "none recorded"
+    out.append(f"- **Supporting evidence:** {refs}")
+    bvc = b["baseline_vs_candidate"]
+    reasons = "; ".join(bvc["verdict_reasons"])
+    out.append(f"- **Baseline vs candidate:** verdict {bvc['verdict']}" + (f" ({reasons})" if reasons else "") + ".")
+    if bvc["metrics"]:
+        out += ["", *("  " + ln for ln in _table(["metric", "baseline (A)", "candidate (B)", "change"],
+                                                  [[m["name"], _fmt(m["baseline"]), _fmt(m["candidate"]), _signed(m["delta"])]
+                                                   for m in bvc["metrics"]])), ""]
+    out.append(f"- **Tested artifact:** `{b['artifact_hash']}` (experiment {b['experiment_id']}; the exact bytes the "
+               "sandbox replay tested).")
+    return out
+
+
 def _apply_md(a: Mapping[str, Any], blockers: list[str], indent: str = "", bold: bool = True) -> str:
     label = "**Apply:**" if bold else "Apply:"
     if a.get("apply"):
@@ -1314,6 +1389,11 @@ def render_markdown(b: dict[str, Any]) -> str:
         out += ([""] if i > 1 else []) + _proposal_md(i, blk)
     if not b["passed"]:
         out.append("- None this night.")
+
+    if b.get("suggested"):
+        out += ["", f"## {SUGGESTED_HEADING}", ""]
+        for i, blk in enumerate(b["suggested"], 1):
+            out += ([""] if i > 1 else []) + _suggestion_md(i, blk)
 
     out += ["", "## Failed or inconclusive experiments", ""]
     for f in b["failed"]:

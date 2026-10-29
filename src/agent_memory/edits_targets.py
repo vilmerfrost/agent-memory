@@ -9,6 +9,7 @@
 | `routine:<name>` | ~/.claude/scheduled-tasks/<name>/SKILL.md | edit |
 | `agents-md:global` | ~/.codex/AGENTS.md | edit |
 | `claude-md:<repo>`, `agents-md:<repo>` | a file inside a repo | suggest (never edited) |
+| a `desktop-delegation-policy-v1-1/*` rule of `claude-md:global` / `agents-md:global` | ~/agent-config/parent/DELEGATION.md (the source of both copies) | suggest |
 
 An "edit" target outside improve's allowed targets (`allowed_targets` in
 ~/agent-config/improve/criteria.json, read only) becomes a suggestion too. A fenced path
@@ -261,6 +262,53 @@ class Target:
     reason: str = ""
 
 
+def lock_action(path: Path) -> Target:
+    """EDIT when improve would accept a change to `path`; SUGGEST when it would refuse the file (a pins.json file pin,
+    or outside allowed_targets with the fence nuance), with the reason. The night tests ideas on a SUGGEST file like
+    any other, but a winning change becomes a suggested hand edit, never a staged proposal (docs/rsi/hand-edits.md).
+    Section and rule pins are not file locks: they block a rule on any file alike."""
+    pin = pinned_file(path)
+    if pin is not None:
+        return Target(SUGGEST, path, f"file pinned ({pin})")
+    if not is_allowed(path):
+        return Target(SUGGEST, path, "outside improve's allowed targets")
+    return Target(EDIT, path)
+
+
+# Generated copies of ~/agent-config/parent/DELEGATION.md (pins.json: "generated copy of parent/DELEGATION.md;
+# config-check requires it to match the source"). A rule under this heading in either copy is a rule of the source.
+DELEGATION_SECTION = "desktop-delegation-policy-v1-1"
+DELEGATION_COPIES = ("claude-md:global", "agents-md:global")
+
+
+def delegation_source() -> Path:
+    """The source file of the delegation policy: <agent-config>/parent/DELEGATION.md."""
+    return agent_config_dir() / "parent" / "DELEGATION.md"
+
+
+def delegation_rule_id(rule_key: Any) -> str | None:
+    """The section id in DELEGATION.md for a rule key (`<source>:<rule id>`, optionally `dev:`-prefixed or with a
+    `<namespace>--` rule id, as rsi_candidates stores it) of the delegation policy in a generated copy
+    (DELEGATION_COPIES), else None. The copies nest the policy under its H1 (`desktop-delegation-policy-v1-1/<h2>`);
+    the source has that H1 as its only top heading, so its ids are the bare `<h2>` slugs and its intro is `intro`."""
+    if not isinstance(rule_key, str):
+        return None
+    src, sep, rule = rule_key.removeprefix("dev:").rpartition(":")
+    if not sep or src not in DELEGATION_COPIES:
+        return None
+    rule = rule.split("--", 1)[-1]
+    if rule == DELEGATION_SECTION:
+        return "intro"
+    if rule.startswith(DELEGATION_SECTION + "/") and rule[len(DELEGATION_SECTION) + 1:]:
+        return rule[len(DELEGATION_SECTION) + 1:]
+    return None
+
+
+def is_delegation_rule(rule_key: Any) -> bool:
+    """True for a rule key of the delegation policy section in a generated copy (delegation_rule_id)."""
+    return delegation_rule_id(rule_key) is not None
+
+
 def _skill(name: str) -> Target:
     agents_skills = (agents_home() / "skills").resolve()
     for cand in (claude_home() / "skills" / name / "SKILL.md", agents_home() / "skills" / name / "SKILL.md"):
@@ -278,9 +326,17 @@ def _file(path: Path) -> Target:
     return Target(EDIT, path.resolve())
 
 
-def resolve(source: str, target_paths: list[str] | None = None) -> Target:
+def resolve(source: str, target_paths: list[str] | None = None, rule_id: str | None = None) -> Target:
     """Map an instruction source to its target. `target_paths` (from the candidates file)
-    only names the file of a repo source in the suggestion."""
+    only names the file of a repo source in the suggestion. `rule_id`: a delegation-policy rule of a
+    generated copy (delegation_rule_id) targets its source parent/DELEGATION.md, as a suggestion (the
+    source is outside improve's allowed targets; the night routes it the same way)."""
+    if rule_id and delegation_rule_id(f"{source}:{rule_id}") is not None:
+        src = delegation_source()
+        if src.is_file():
+            t = Target(SUGGEST, src.resolve(), "delegation policy: CLAUDE.md and AGENTS.md hold a generated copy of "
+                                              "parent/DELEGATION.md; edit the source by hand")
+            return t if not is_allowed(src) else Target(EDIT, src.resolve())
     kind, _, name = source.partition(":")
     if source.startswith(("claude-md:", "agents-md:")) and name != "global":
         hint = Path(os.path.expanduser(target_paths[0])) if target_paths else None

@@ -96,8 +96,10 @@ def _expand_criteria(ac: Path) -> list[Path]:
 def discover(*, include_schedules: bool = True) -> list[Path]:
     """Every production file the RSI loop may ever target (see docs/rsi/writers.md), as given paths."""
     h, ac = home(), agent_config_dir()
-    paths = [h / ".claude" / "CLAUDE.md", h / ".codex" / "AGENTS.md", ac / "parent" / "PARENT.md", ac / "lessons.md",
-             ac / "settings.json"]
+    # parent/DELEGATION.md: the source of the delegation policy that CLAUDE.md and AGENTS.md carry as generated copies.
+    # Outside improve's allowed_targets, so the night only ever suggests edits to it (docs/rsi/hand-edits.md).
+    paths = [h / ".claude" / "CLAUDE.md", h / ".codex" / "AGENTS.md", ac / "parent" / "PARENT.md",
+             ac / "parent" / "DELEGATION.md", ac / "lessons.md", ac / "settings.json"]
     paths += [Path(p) for p in sorted(glob.glob(str(h / ".claude" / "scheduled-tasks" / "*" / "SKILL.md")))]
     paths += [Path(p) for p in sorted(glob.glob(str(ac / "agents" / "*.md")))]
     paths += [Path(p) for p in sorted(glob.glob(str(h / ".agents" / "skills" / "*" / "SKILL.md")))]

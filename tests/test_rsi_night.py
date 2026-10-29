@@ -721,7 +721,8 @@ def test_jev_fixture_triage_ranks_with_the_typed_answers(env: SimpleNamespace) -
         c = {"source": "deviations", "kind": "edit_instruction", "target": "~/.claude/CLAUDE.md",
              "rule_key": f"claude-md:global:{rid}", "seen_count": 1,
              "metrics": {"sessions": n, "followed_grade_mean": grade, "result_grade_mean": 0.5}}
-        state = N.triage_state(c, [], True, ["docs-typo", "fix-add", "report-todos"], {})
+        state = N.triage_state(c, [], True, ["docs-typo", "fix-add", "report-todos", "shell-habits", "summary-report"],
+                               {})
         k = jev.fixture_key(state, qset.jev_questions())
         assert (config.JEV_FIXTURES_DIR / f"{k}.json").is_file(), (key, k)
         fx = json.loads((config.JEV_FIXTURES_DIR / f"{k}.json").read_text())
@@ -910,9 +911,11 @@ def test_docker_unavailable_defers_paid_work_with_the_real_sandbox_check(env: Si
 def test_candidate_on_a_pinned_target_is_dropped_before_triage(env: SimpleNamespace) -> None:
     # Night 2026-10-23 picked a candidate on agents/worker.md, which improve/pins.json pins: Jev triage and the
     # Sonnet hypothesis were paid for, then "improve stage refused: file pinned". Pinned targets leave the pool.
+    # Since 2026-10-29 this holds for an owner pin (and a judge prompt); a hand-edit auto-pin is suggest-only
+    # (tests/test_rsi_night_suggest.py).
     seed_ab(env)                                            # both rules target ~/.claude/CLAUDE.md
     (env.home / "agent-config" / "improve" / "pins.json").write_text(json.dumps(
-        {"files": {"~/.claude/CLAUDE.md": {"reason": "auto-pin: edited by hand"}}, "rules": {}}))
+        {"files": {"~/.claude/CLAUDE.md": {"reason": "Vilmer: owner pin"}}, "rules": {}}))
     rep = run(env)
     assert rep["candidates"] == [] and rep["experiments"] == []
     assert any("on a target improve refuses" in n and "CLAUDE.md" in n for n in rep["notes"]), rep["notes"]
@@ -943,15 +946,17 @@ def test_provider_error_records_its_reason() -> None:
                                     "langfuse": ["lf.traces: unavailable (not configured)"]}
 
 
-def test_target_outside_improves_allowed_targets_is_dropped(env: SimpleNamespace) -> None:
+def test_target_outside_improves_allowed_targets_is_suggest_only(env: SimpleNamespace) -> None:
     # The verify rerun of night 2026-10-23 picked parent/skills/dispatch/SKILL.md: allowlisted for the night, but not
-    # in improve's criteria.json allowed_targets, so improve refused it after the paid triage and hypothesis.
+    # in improve's criteria.json allowed_targets, so improve refused it. Since 2026-10-29 such a target is suggest-only.
     seed_ab(env)
     crit = env.home / "agent-config" / "improve" / "criteria.json"
     crit.write_text(json.dumps({"allowed_targets": [t for t in LIVE_ALLOWED if t != "~/.claude/CLAUDE.md"]}))
     rep = run(env)
-    assert rep["candidates"] == [] and rep["experiments"] == []
-    assert any("on a target improve refuses" in n and "CLAUDE.md" in n for n in rep["notes"]), rep["notes"]
+    assert {c["suggest_only"] for c in rep["candidates"]} == {"outside_allowed"}
+    assert [e["status"] for e in rep["experiments"] if e["experiment_id"]] == ["suggested"]
+    assert rows(env.url, "select count(*) from rsi_proposals") == [(0,)]
+    assert any("kept as suggest-only" in n and "CLAUDE.md" in n for n in rep["notes"]), rep["notes"]
 
 
 def test_manual_verification_keeps_scheduled_report_checkpoint_and_coverage(env: SimpleNamespace) -> None:

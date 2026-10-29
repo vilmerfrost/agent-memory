@@ -1,0 +1,62 @@
+{
+  "id": "summary-report",
+  "title": "Write the final message for finished work in the expected shape and size",
+  "tags": [
+    "instruction",
+    "claude-md"
+  ],
+  "targets": [
+    {
+      "path": "~/.claude/CLAUDE.md",
+      "kind": "instruction",
+      "behavior": "Explaining Completed Work: order, length budget, diagram, verification and closing line of a final message",
+      "sections": [
+        "global-claude-code-context/explaining-completed-work"
+      ]
+    }
+  ],
+  "fixture": "summary-report",
+  "hidden_check": "rule-decisions",
+  "prompt": "Read ~/.claude/CLAUDE.md from the staged sandbox home first. You are the agent described in scenarios.json. For each finished task, write the final message you would send by the rules in that file to reports/<id>.md, and describe that message in result.json in this shape: {\"scenarios\": [{\"id\": <scenario id>, \"work_type\": <one of work_type_codes>, \"sections\": [<section_codes in the order they appear in your message>], \"integrations\": [<names your message lists as used>], \"not_tested\": [<check codes your message reports as not run>]}]}. One row per scenario. This is an offline decision replay: run nothing, use no network, and do not edit any input file.",
+  "check": "python3 \"$HIDDEN_CHECK_DIR\"/check.py",
+  "timeout_s": 180,
+  "stub": [
+    {
+      "op": "read",
+      "path": "~/.claude/CLAUDE.md"
+    },
+    {
+      "op": "read",
+      "path": "scenarios.json"
+    },
+    {
+      "op": "write",
+      "path": "result.json",
+      "text": "{\"scenarios\": [{\"id\": \"typo-fix\", \"work_type\": \"trivial\", \"sections\": [\"result\"], \"integrations\": [], \"not_tested\": []}, {\"id\": \"retry-setting\", \"work_type\": \"normal\", \"sections\": [\"result\", \"important_changes\", \"verification\", \"next_action\", \"integrations_used\"], \"integrations\": [], \"not_tested\": []}, {\"id\": \"login-redirect\", \"work_type\": \"normal\", \"sections\": [\"result\", \"important_changes\", \"diagram\", \"verification\", \"next_action\", \"integrations_used\"], \"integrations\": [\"Supabase MCP\", \"systematic-debugging skill\"], \"not_tested\": [\"browser_check\"]}, {\"id\": \"queue-migration\", \"work_type\": \"complex\", \"sections\": [\"result\", \"important_changes\", \"diagram\", \"verification\", \"next_action\", \"integrations_used\"], \"integrations\": [\"Vitals MCP\", \"Railway plugin\"], \"not_tested\": [\"hosted_migration\"]}]}\n"
+    },
+    {
+      "op": "write",
+      "path": "reports/typo-fix.md",
+      "text": "Fixed the spelling of \"receive\" in README.md. Nothing else changed.\n"
+    },
+    {
+      "op": "write",
+      "path": "reports/retry-setting.md",
+      "text": "## Result\n\nThe HTTP client now retries a failed request 4 times instead of 2.\n\n## Important changes\n\n- `config.py` sets the new default retry count.\n- A new unit test checks that the client uses 4 retries.\n\n## Verification\n\nAll 212 unit tests pass. Nothing else was tested.\n\n## Next action\n\nNone. You can review the diff when you have time.\n\n## Skills, Plugins or MCPs used\n\nNone\n"
+    },
+    {
+      "op": "write",
+      "path": "reports/login-redirect.md",
+      "text": "## Result\n\nAfter login, users now return to the page they came from.\n\n## Important changes\n\n- The middleware saves the original URL before it sends the user to login.\n- The auth callback reads that URL and redirects there.\n- The login route passes the URL through.\n\n## Diagram\n\n```mermaid\nflowchart LR\n  B[Browser] --> M[Middleware saves return URL] --> L[Login route] --> C[Auth callback reads URL] --> P[Original page]\n```\n\n## Verification\n\nThe 48 integration tests pass. The page was not opened in a browser, so this is not verified in the app.\n\n## Next action\n\nOpen the login page in the browser and check one redirect.\n\n## Skills, Plugins or MCPs used\n\n- Supabase MCP\n- systematic-debugging\n"
+    },
+    {
+      "op": "write",
+      "path": "reports/queue-migration.md",
+      "text": "## Result\n\nThe nightly import now runs through the job queue instead of cron. Each tenant gets its own job, and failed jobs retry.\n\n## Important changes\n\n- **Scheduler:** enqueues one job per tenant each night.\n- **Worker:** consumes the jobs and retries a failed job.\n- **API:** shows the status of each job.\n- **Database:** a new migration adds the jobs table.\n\n## Diagram\n\n```mermaid\nflowchart LR\n  S[Scheduler] --> Q[Queue] --> W[Worker] --> D[(Database)]\n  A[API] --> D\n```\n\n## Verification\n\n- The full test suite passes.\n- The smoke run passes.\n- Not tested: the migration was not applied to the hosted database.\n\n## Next action\n\nDecide when to apply the migration to the hosted database. The new import cannot run there before that.\n\n## Skills, Plugins or MCPs used\n\n- Vitals MCP\n- Railway plugin\n"
+    },
+    {
+      "op": "final",
+      "text": "Wrote one final message per task and result.json."
+    }
+  ]
+}

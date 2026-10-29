@@ -266,7 +266,7 @@ def test_subscription_night_budget_fits_three_experiments_at_five_pairs_per_prov
         assert checks[limit]["fits"], limit
     assert checks["calls claude-opus-5-5"]["need"] == 2 + 3 * (1 + 1 + 10)  # readiness plus experiment calls
     assert checks["calls gpt-6.1-sol"]["need"] == 2 + 3 * (10 + 10)
-    assert checks["calls jev-1.14.0"]["need"] == 5 + 3 * 2
+    assert checks["calls jev-1.14.0"]["need"] == 10 + 3 * 2  # 10 triage calls (Vilmer 2026-10-29) plus replay
     assert checks["sandbox runs"]["need"] == 542
     assert checks["sandbox runs"]["cap"] == 540 and not checks["sandbox runs"]["fits"]
     # The worst-case wall clock is reported honestly, not hidden: over the hard maximum, so not every

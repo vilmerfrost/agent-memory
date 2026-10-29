@@ -508,7 +508,7 @@ def test_subscription_plan_has_room_for_three_experiments() -> None:
                                          "replay": 2 * (10 * (240 + S.CHECK_RUN_S) + 5 * 300 + S.JEV_CALL_S)}
     assert one["wall_clock_s"] == 8960
     assert room_needs(plan) == {
-        "calls claude-opus-5-5": (38, 40), "calls gpt-6.1-sol": (62, 64), "calls jev-1.14.0": (5 + 6, 12),
+        "calls claude-opus-5-5": (38, 40), "calls gpt-6.1-sol": (62, 64), "calls jev-1.14.0": (10 + 6, 40),
         "A/B pairs per experiment": (10, 10), "sandbox runs": (542, 540), "wall clock": (600 + 3 * 8960, 17940),
         "subscription tokens": (6_000_000, 6_000_000)}
     assert plan["max_experiments"] == 3 and plan["within_cap"]
@@ -525,7 +525,7 @@ def test_subscription_plan_has_room_for_three_experiments() -> None:
 def test_room_flags_caps_sized_for_one_experiment(tmp_path: Path) -> None:
     d = json.loads(SUBSCRIPTION.read_text())
     d["budget"].update(max_sandbox_runs=180, wall_clock_s=2700, max_subscription_tokens=2_000_000,
-                       model_calls={"jev-1.14.0": 7, "claude-opus-5-5": 12, "gpt-6.1-sol": 20})
+                       model_calls={"jev-1.14.0": 12, "claude-opus-5-5": 12, "gpt-6.1-sol": 20})
     p = tmp_path / "old.json"
     p.write_text(json.dumps(d))
     plan = S.paid_plan(N.load_config(p))
