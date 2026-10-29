@@ -339,12 +339,12 @@ class EgressGate:
                     raise Unavailable(f"withheld repo names unreadable ({type(exc).__name__})") from None
             return self._deny
 
-    def check_params(self, params: Mapping[str, str]) -> None:
+    def check_params(self, params: Mapping[str, str], *, verified_fields: frozenset[str] = frozenset()) -> None:
         env = egress.env_terms(self._environ)
-        for v in params.values():
+        for key, v in params.items():
             if _DIGITS.fullmatch(v):
                 continue
-            if env.match(v) or egress.email_like(v) or self._withheld().match(v):
+            if env.match(v) or egress.email_like(v) or egress.internal_match(self._withheld(), v, verified=key in verified_fields):
                 raise Unavailable("policy-excluded: a query parameter names a withheld term (egress deny list)")
 
     def repo_own(self, repo: str) -> bool:
@@ -367,7 +367,7 @@ class EgressGate:
     def check_rule(self, rule: str | None) -> None:
         if not rule:
             return
-        self.check_params({"rule": rule})
+        self.check_params({"rule": rule}, verified_fields=frozenset({"rule"}) if egress.catalog_rule(rule) else frozenset())
         repo = _rule_repo(rule)
         if repo is None:
             return
@@ -415,7 +415,14 @@ class GatedRetriever:
         if not self.policy.allows(name):
             raise Unavailable(f"query {name} is not approved for investigator reads")
         if self.gate is not None:
-            self.gate.check_params(params)
+            verified = set()
+            if name in ("rule_gap", "rule_weekly_rate") and egress.catalog_rule(params.get("rule", "")):
+                verified.add("rule")
+            if self.service == "pastdev" and name == "recall" and egress.catalog_rule(self.subject_rule or ""):
+                from agent_memory.rsi_evidence_pack import _recall_query
+                if params.get("query") == _recall_query(self.subject_rule):
+                    verified.add("query")
+            self.gate.check_params(params, verified_fields=frozenset(verified))
             if "rule" in params:
                 self.gate.check_rule(params["rule"])
             if self.service == "pastdev":           # recall words come from the candidate's rule
