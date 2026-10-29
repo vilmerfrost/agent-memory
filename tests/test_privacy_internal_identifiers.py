@@ -171,3 +171,14 @@ def test_clickhouse_sink_passes_derived_and_explicit_sets_separately(monkeypatch
     assert list(sink.batches(None,{},replay=False))[0].rows[0]['rule_id']=='final-report'
     monkeypatch.setattr(egress,'env_terms',lambda *a,**k:egress.Deny(('repo',)))
     assert list(sink.batches(None,{},replay=False))[0].rows[0]['rule_id'] is None
+
+
+def test_new_local_refusal_reason_is_explained_without_hiding_other_failures():
+    from agent_memory.rsi_brief import service_labels
+    report={'health':{'langfuse':'ok'}, 'health_reasons':{'langfuse':[
+        'current replay export exp-example: 8 records withheld locally; 12 upload receipts confirmed; readback not verified']},
+        'experiments':[{'langfuse_export':{'experiment_id':'exp-example','status':'partial',
+            'issue_kind':'local_refusal','refused':8,'failed':0,'uncertain':0}}]}
+    assert service_labels(report)['langfuse'].startswith('traces withheld locally (8)')
+    report['health_reasons']['langfuse'].append('lf.health: HTTP 401')
+    assert 'langfuse' not in service_labels(report)

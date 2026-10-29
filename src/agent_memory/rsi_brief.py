@@ -932,9 +932,11 @@ def service_labels(rep: Mapping[str, Any]) -> dict[str, str]:
              and all(e.get("status") == "partial" and all(type(e.get(k)) is int for k in ("refused", "failed", "uncertain")) and e["refused"] > 0
                             and e.get("failed") == 0 and e.get("uncertain") == 0 for e in partial))
     raw_reasons = (rep.get("health_reasons") or {}).get("langfuse", [])
-    reason_ids = {e.get("experiment_id") for e in partial if isinstance(e.get("experiment_id"), str)}
+    reason_ids = {e["experiment_id"]: e.get("refused") for e in partial if isinstance(e.get("experiment_id"), str)}
     reasons_explained = (isinstance(raw_reasons, list) and all(isinstance(reason, str) and
-        any(reason.startswith(f"current replay export {experiment}: partial:") for experiment in reason_ids)
+        any(reason.startswith(f"current replay export {experiment}: partial:") or
+            reason.startswith(f"current replay export {experiment}: {count} records withheld locally;")
+            for experiment, count in reason_ids.items())
         for reason in raw_reasons))
     status_explained = reasons_explained and ((rep.get("health") or {}).get("langfuse") == "ok" or bool(raw_reasons))
     if local and status_explained and not any(c.get("source") == "langfuse" and c.get("status") == "failed" for c in checks):
