@@ -207,13 +207,13 @@ def clean_text(text: Any) -> str | None:
     return _redact.redact(text)[:RESULT_MAX]
 
 
-def sensitive(text: str) -> bool:
+def sensitive(text: str, *, internal_identity: bool = False) -> bool:
     """True for a name-shaped value that must still not leave: a credential the redactor knows, an email, a
     long token-like run, anything path-shaped (`~`, `..`, two or more `/`, or `<root>/...`), or (Mission 004C)
     a term on the egress deny list: AMEM_EGRESS_DENY and the team repos the sink read this run."""
     if _redact.redact(text) != text or _EMAIL_RE.search(text) or _TOKENISH_RE.search(text):
         return True
-    if egress.current().match(text):
+    if egress.env_terms().match(text) or egress.internal_match(egress._team, text, verified=internal_identity):
         return True
     if "~" in text or ".." in text or text.count("/") > 1:
         return True
@@ -389,8 +389,9 @@ def check(run: SandboxRun) -> None:
         run.run_key  # noqa: B018 - validates arm, case and rep
     except refs.RefError as exc:
         raise Refused(str(exc)) from None
+    bound = egress.catalog_run(run.experiment_id, run.case, run.arm, run.rep, run.run_id)
     for label, value in (("experiment id", run.experiment_id), ("case", run.case), ("run id", run.run_id)):
-        if sensitive(value):                                  # part of the run's identity: refuse, never echo it
+        if sensitive(value, internal_identity=bound and label in ("case", "run id")):
             raise Refused(f"{label} looks sensitive")
     for label, value in (("exit_code", run.exit_code), ("num_turns", run.num_turns)):
         if value is not None and (not isinstance(value, int) or isinstance(value, bool)):
@@ -1077,11 +1078,20 @@ class LangfuseSink:
     name = SINK
 
     def __init__(self, client: LangfuseClient, root: Path | str | None = None, *, datasets: bool = False,
-                 since: datetime | None = None, experiment_id: str | None = None):
+                 since: datetime | None = None, experiment_id: str | None = None,
+                 retry_run_ids: frozenset[str] | None = None):
         if experiment_id is not None and not refs.EXPERIMENT_RE.fullmatch(experiment_id):
             raise ValueError("invalid scoped experiment id")
         self.experiment_id = experiment_id
+        if retry_run_ids is not None and (not experiment_id or not retry_run_ids or len(retry_run_ids) > 100
+                or any(not isinstance(x, str) or not _PART_RE.fullmatch(x) or not x.startswith(experiment_id + "-") for x in retry_run_ids)):
+            raise ValueError("retry requires bounded exact run ids from one experiment")
+        self.retry_run_ids = retry_run_ids
+        self.confirmed_skipped = 0
         self.table = f"{TABLE}:{experiment_id}" if experiment_id else TABLE
+        if retry_run_ids is not None:
+            self.table += ":retry:" + hashlib.sha256("\n".join(sorted(retry_run_ids)).encode()).hexdigest()[:16]
+            self.replay_scope = {self.table}  # leave daily and other experiment cursors untouched
         self.client = client
         self.root = Path(root).expanduser() if root else Path.home() / "sandbox"
         self.datasets = datasets
@@ -1110,6 +1120,8 @@ class LangfuseSink:
         for p in experiments.glob(pattern):
             if p.name.endswith(".rsi.json"):
                 continue
+            if self.retry_run_ids is not None and p.stem not in self.retry_run_ids:
+                continue
             side = p.with_name(f"{p.stem}.rsi.json")
             if self.experiment_id and (p.is_symlink() or side.is_symlink() or
                                       not p.resolve().is_relative_to(experiments.resolve())):
@@ -1123,6 +1135,8 @@ class LangfuseSink:
                         continue  # checkers/golden probes are not native model observations
             mtime = max(p.stat().st_mtime_ns, side.stat().st_mtime_ns if side.exists() else 0)
             out.append((f"{mtime:020d}|{p.parent.parent.name}/{p.stem}", p))
+        if self.retry_run_ids is not None and {p.stem for _, p in out} != self.retry_run_ids:
+            raise Refused("one or more requested run logs are missing or not agent observations")
         return sorted(out)
 
     def _guard_session(self, conn: psycopg.Connection, run: SandboxRun) -> None:
@@ -1168,6 +1182,11 @@ class LangfuseSink:
                                    "and run_key=%s", (run.trace_id,)).fetchone()
             if receipt:
                 self._receipt_phase[run.trace_id] = receipt[0]
+            if self.retry_run_ids is not None and (run.trace_id in self._exported or (receipt and receipt[0] == "confirmed")):
+                self.confirmed_skipped += 1
+                self._runs.pop(run.trace_id, None)
+                yield Batch(self.table, [], wm)
+                continue
             yield Batch(self.table, [{"trace_id": run.trace_id, **run.metrics()}], wm, [evidence_for(run)], key=run.trace_id)
 
     def push(self, batch: Batch) -> None:
@@ -1214,7 +1233,8 @@ class LangfuseSink:
 
 def export_experiment(conn: psycopg.Connection, experiment_id: str, *, budget_s: float,
                       root: Path | str | None = None, client: LangfuseClient | None = None,
-                      environ: Mapping[str, str] | None = None) -> dict[str, Any]:
+                      environ: Mapping[str, str] | None = None,
+                      retry_run_ids: frozenset[str] | None = None) -> dict[str, Any]:
     """Export only one completed replay through the existing sync owner.
 
     Shares normal sink kill switches, limits, sanitization and exact trace
@@ -1234,10 +1254,10 @@ def export_experiment(conn: psycopg.Connection, experiment_id: str, *, budget_s:
     if not conn.autocommit and conn.info.transaction_status != psycopg.pq.TransactionStatus.IDLE:
         raise ValueError("export requires an idle or autocommit connection; finish caller transaction explicitly")
     client = client or LangfuseClient.from_env(environ)
-    sink = LangfuseSink(client, root, experiment_id=experiment_id)
+    sink = LangfuseSink(client, root, experiment_id=experiment_id, retry_run_ids=retry_run_ids)
     try:
         with client.export_budget(budget_s):
-            rep = sync.run(sink, conn, budget_s=budget_s, environ=environ)
+            rep = sync.run(sink, conn, budget_s=budget_s, environ=environ, replay=retry_run_ids is not None)
     except Exception as exc:
         return {"status": "failed", "experiment_id": experiment_id, "rows": 0,
                 "detail": f"export: {type(exc).__name__}"}
@@ -1246,7 +1266,15 @@ def export_experiment(conn: psycopg.Connection, experiment_id: str, *, budget_s:
     conn.commit()
     pending = phases.get("pending", 0) + phases.get("observed", 0)
     status = "partial" if (pending or sink.refused) and rep.status == "ok" else rep.status
+    issue_kind = ("upload_failure" if rep.failed or rep.status not in ("ok", "off") else
+                  "upload_uncertain" if pending else "local_refusal" if sink.refused else None)
     return {"status": status, "experiment_id": experiment_id, "rows": rep.rows, "batches": rep.batches,
+            "issue_kind": issue_kind, "local_refusals": [{"run": _redact.redact(run)[:200],
+                "reason": reason if reason in {"case looks sensitive", "run id looks sensitive", "experiment id looks sensitive",
+                                               "scoped log names another experiment", "bad run id"}
+                else "invalid or unreadable run metadata"} for run, reason in sink.refused],
+            "retry_selected": len(retry_run_ids) if retry_run_ids is not None else None,
+            "already_confirmed_skipped": sink.confirmed_skipped,
             "failed": rep.failed, "refused": len(sink.refused), "uncertain": int(pending),
             "skipped_non_agent": len(sink.skipped), "delivered_rows": rep.rows,
             "confirmed_trace_uploads": int(phases.get("confirmed", 0)),

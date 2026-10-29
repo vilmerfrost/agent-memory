@@ -913,6 +913,25 @@ def skill_refresh_warning(rep: Mapping[str, Any]) -> list[str]:
     return [text(w, 300)] if w else []
 
 
+def service_labels(rep: Mapping[str, Any]) -> dict[str, str]:
+    """Explain data exclusions without changing a historical run's raw health."""
+    checks = (rep.get("connection_recovery") or {}).get("checks") or []
+    labels = {}
+    for source in ("clickhouse", "langfuse", "pastdev"):
+        own = [c for c in checks if c.get("source") == source]
+        excluded = sum(c.get("status") == "excluded" for c in own)
+        failed = any(c.get("status") == "failed" for c in own)
+        if excluded and not failed:
+            labels[source] = f"queries withheld by privacy policy ({excluded})"
+    exports = [e.get("langfuse_export") for e in rep.get("experiments", []) if isinstance(e.get("langfuse_export"), dict)]
+    partial = [e for e in exports if e.get("status") not in ("ok", "off")]
+    local = (partial and all(e.get("status") == "partial" and all(type(e.get(k)) is int for k in ("refused", "failed", "uncertain")) and e["refused"] > 0
+                            and e.get("failed") == 0 and e.get("uncertain") == 0 for e in partial))
+    if local and not any(c.get("source") == "langfuse" and c.get("status") == "failed" for c in checks):
+        labels["langfuse"] = f"traces withheld locally ({sum(e['refused'] for e in partial)}); upload readback not verified"
+    return labels
+
+
 def build_brief(rep: Mapping[str, Any], db: Db, *, artifacts_root: Path, report: dict[str, str] | None = None,
                 warnings: list[str] | None = None, now: datetime | None = None,
                 verdict: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -974,7 +993,8 @@ def build_brief(rep: Mapping[str, Any], db: Db, *, artifacts_root: Path, report:
     writer_warning = ([f"{WRITER_NEVER_RAN}: {writer['fell_back']}/{writer['experiments']} experiments fell back to the "
                        f"stub change ({writer['top_reason'] or 'no reason recorded'}). No writer change was tested."]
                       if writer and writer["all_fell_back"] else [])
-    health = {"services": services,
+    labels = service_labels(rep)
+    health = {"services": services, **({"service_labels": labels} if labels else {}),
               "degraded": sorted(k for k, v in services.items() if v not in HEALTHY + NEUTRAL),
               "database": {"status": db.status, "detail": db.detail},
               "warnings": writer_warning + list(warnings or []),
@@ -1326,7 +1346,8 @@ def render_markdown(b: dict[str, Any]) -> str:
     else:
         for k, v in h["services"].items():
             why = "; ".join(h.get("reasons", {}).get(k) or [])
-            out.append(f"- {k}: {v}" + (" (DEGRADED)" if k in h["degraded"] else "") + (f": {why}" if why else ""))
+            label = h.get("service_labels", {}).get(k, v)
+            out.append(f"- {k}: {label}" + (" (DEGRADED)" if k in h["degraded"] else "") + (f": {why}" if why else ""))
         if not h["services"]:
             out.append("- The report lists no services.")
     recovery = b.get("connection_recovery") or {}

@@ -1950,6 +1950,8 @@ class Night:
         for st in steps or []:
             if not isinstance(st, Mapping) or st.get("status") in (None, "ok"):
                 continue
+            if str(st.get("detail", "")).startswith("policy-excluded:"):
+                continue  # retained in coverage/recovery checks, not a connection failure
             prov = _RETRIEVER.get(str(st.get("step") or "").split(".", 1)[0])
             if prov is None:
                 continue
@@ -2878,8 +2880,12 @@ class Night:
                           (Jsonb({"langfuse_export": result}), exp_id))
         if result.get("status") not in ("ok", "off"):
             self.degraded = True
-            self.health["langfuse"] = "unavailable"
-            reason = _one_line(f"current replay export {exp_id}: {result.get('status')}: {result.get('detail', '')}", 200)
+            if result.get("issue_kind") == "local_refusal":
+                reason = (f"current replay export {exp_id}: {result.get('refused', 0)} records withheld locally; "
+                          f"{result.get('confirmed_trace_uploads', 0)} upload receipts confirmed; readback not verified")
+            else:
+                self.health["langfuse"] = "unavailable"
+                reason = _one_line(f"current replay export {exp_id}: {result.get('issue_kind') or result.get('status')}: {result.get('detail', '')}", 200)
             self.health_reasons.setdefault("langfuse", []).append(reason)
             self.notes.append(reason)
 
