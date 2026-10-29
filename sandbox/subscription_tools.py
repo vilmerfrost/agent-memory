@@ -128,6 +128,12 @@ def bounded_process(argv, *, env, cwd, timeout_s, input_bytes=None, max_output=M
             os.killpg(proc.pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
+        except PermissionError:
+            # Darwin may reject signalling an already-exited group. Preserve the
+            # original limit error only after confirming our child has exited.
+            # A denial for a running child still fails closed.
+            if proc.poll() is None:
+                raise
         proc.wait()
         for stream in (proc.stdin, proc.stdout, proc.stderr):
             if stream and not stream.closed:
