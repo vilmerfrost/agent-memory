@@ -25,7 +25,7 @@ def test_shared_profile_reserves_both_provider_workloads():
     # 3 experiments x (1 hypothesis + 1 section writer + 10 Opus runs + 10 Sol runs + 10 Sol judgments); the room
     # check covers every call cap
     assert sum(r['count'] for r in plan['calls'] if r['billing_source']=='subscription')==4+3*32
-    assert plan['worst_case_usd']==.11                       # Jev only: 5 triage + 3 x 2 replay calls
+    assert plan['worst_case_usd']==.16                       # Jev only: 10 triage + 3 x 2 replay calls
     assert plan['room']['per_experiment']['sandbox_runs']==180
     assert cfg.budget.max_sandbox_runs>=3*180
     assert all(c['fits'] for c in plan['room']['checks'] if c['limit'] not in ('wall clock','sandbox runs'))
