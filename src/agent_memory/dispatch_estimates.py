@@ -36,7 +36,8 @@ MAX_LINE = 32768
 VITALS_TIMEOUT = 0.5
 SAME_WINDOW_S = 300          # Vitals rounds rolling reset times; a real reset moves hours
 MIN_BUCKET_RUNS = 3          # time: fewer runs in a worker bucket -> use the tool's pooled runs
-MIN_CLEAN_USAGE = 5          # usage: fewer clean runs in a bucket -> seed, then token ratio
+MIN_CLEAN_USAGE = 5          # usage: fewer clean runs in a bucket -> measured runs, seed, token ratio
+MIN_MEASURED_USAGE = 3       # usage: clean + token-share-attributed runs needed for a measured estimate
 MIN_SEED_INTERVALS = 3       # Codex seed: fewer >=3-point intervals -> no tokens-per-1% number
 MIN_SEED_ROUNDS = 3          # round tokens: fewer rounds in a bucket -> the tool's pooled rounds
 DEFAULT_MINUTES = 30         # only when no run has ever been recorded
@@ -377,9 +378,14 @@ def estimate(lookup: dict | None, tool: str, workers: int) -> dict[str, Any]:
         ratio = info.get("pct_per_mtoken")
         tok = (tokens.get(b) or tokens.get("all") or {}).get("median_fresh")
         per_pct = ((rates.get(key) or {}).get("fresh_per_pct") or {}).get("median")
+        measured = (info.get("measured") or {}).get(b) or {}
         if clean.get("n", 0) >= MIN_CLEAN_USAGE and clean.get("median") is not None:
             result["usage"][key] = {"pct": clean["median"], "slow_pct": clean.get("p80"),
                                     "method": "clean_runs", "basis": clean["n"]}
+        elif measured.get("n", 0) >= MIN_MEASURED_USAGE and measured.get("median") is not None:
+            result["usage"][key] = {"pct": measured["median"], "slow_pct": measured.get("p80"),
+                                    "method": "measured_runs", "basis": measured["n"],
+                                    "attributed": (info.get("attributed") or {}).get(b, 0)}
         elif per_pct and typical:
             # Seed: real tokens per round / real tokens per 1% (both with their source records).
             result["usage"][key] = {"pct": _round(typical["median_fresh"] / per_pct, 1),
@@ -429,7 +435,9 @@ def expect_line(est: dict[str, Any], tool: str, current: dict[str, float] | None
     if usage:
         tail = (" from tokens" if usage["method"] == "token_ratio" else
                 f" (seed: {usage.get('source') or 'history'}, {usage['basis']} intervals x {usage['rounds']} rounds)"
-                if usage["method"] == "seed" else f" ({usage['basis']} clean runs)")
+                if usage["method"] == "seed" else
+                f" ({usage['basis']} runs, {usage['attributed']} split by token share)"
+                if usage["method"] == "measured_runs" else f" ({usage['basis']} clean runs)")
         head += f", ~{_pct(usage['pct'])} of {label}{tail}{now_text}"
     elif typical:
         head += (f", {label} use: no % history yet, ~{_tokens(typical['median_fresh'])} fresh tokens typical"
@@ -733,17 +741,35 @@ def build_lookup(runs: dict[str, dict], rounds: list[dict], *, test_ms: dict[str
         if isinstance(tf, (int, float)) and tf > 0:
             tokens.setdefault(r["tool"], {}).setdefault(bucket(r["n_workers"]), []).append(float(tf))
             tokens[r["tool"]].setdefault("all", []).append(float(tf))
+        share = (r.get("share") or {}).get("share")
         for key, d in r["deltas"].items():
-            if not d["clean"]:
+            own_tool = key.startswith(f"{r['tool']}:")
+            if own_tool and share is not None and share < 1:
+                # Transcripts show other sessions' tokens in the window, even when Vitals saw none
+                # working: the run's part is its token share of the window (real local tokens).
+                if not d["same_window"]:
+                    continue
+                d = r["deltas"][key] = {**d, "clean": False, "why": f"token share {share:.0%}"}
+                value = d["delta"] * share
+            elif d["clean"]:
+                value = d["delta"]
+            elif d["same_window"] and own_tool and share is not None and d["why"].endswith("working"):
+                value = d["delta"] * share          # share == 1: only the run spent tokens
+            else:
                 continue
-            entry = usage.setdefault(key, {"buckets": {}, "_ratios": []})
-            entry["buckets"].setdefault(bucket(r["n_workers"]), []).append(d["delta"])
-            entry["buckets"].setdefault("all", []).append(d["delta"])
-            if isinstance(tf, (int, float)) and tf > 0:
+            entry = usage.setdefault(key, {"buckets": {}, "_measured": {}, "_ratios": [], "attributed": {}})
+            for b in (bucket(r["n_workers"]), "all"):
+                entry["_measured"].setdefault(b, []).append(value)
+                if d["clean"]:
+                    entry["buckets"].setdefault(b, []).append(value)
+                else:
+                    entry["attributed"][b] = entry["attributed"].get(b, 0) + 1
+            if d["clean"] and isinstance(tf, (int, float)) and tf > 0:
                 entry["_ratios"].append(d["delta"] / (tf / 1e6))
     for key, entry in usage.items():
         ratios = entry.pop("_ratios")
         entry["buckets"] = {b: _stats(v) for b, v in entry["buckets"].items()}
+        entry["measured"] = {b: _stats(v) for b, v in entry.pop("_measured").items()}
         entry["pct_per_mtoken"] = _round(quantile(ratios, .5), 4)
         entry["n_ratio"] = len(ratios)
     token_table = {tool: {b: {"n": len(v), "median_fresh": _round(quantile(v, .5), 0)} for b, v in by.items()}
@@ -792,13 +818,56 @@ def refresh(parent: Path | None = None, *, repo: str | None = None,
                                     "sessions_counted": workers, "scope": "workers"}))
         for run, record in added:
             append_records(repo_dir(run["repo"], parent) / SPOOL, [record])
+    shares = attach_shares(runs, previous, notes, codex_home=codex_home)
     rounds = task_rounds(parent)
     lookup = build_lookup(runs, rounds, test_ms=test_ms)
+    lookup["shares"] = shares
+    lookup["missed"] = missed_rounds(runs, rounds)
     lookup["seed"] = seed_block(previous, rounds, db, notes, codex_home=codex_home, codex=codex,
                                 made_at=lookup["made_at"])
     write_json(parent / LOOKUP, lookup)
     lookup["notes"] = notes
     return lookup
+
+
+def attach_shares(runs: dict[str, dict], previous: dict, notes: list[str], *,
+                  codex_home: Path | None) -> dict[str, dict]:
+    """Token share of each finished run in its own window (1.0 = only the run spent tokens).
+
+    Measured for every run, not only runs where Vitals saw other sessions working: Vitals
+    status misses short bursts. A share is measured once and kept: transcripts get pruned later.
+    """
+    from agent_memory import dispatch_share as S, dispatch_seed, sessions_ingest
+
+    cache = previous.get("shares") if isinstance(previous.get("shares"), dict) else {}
+    out: dict[str, dict] = {}
+    projects, home = sessions_ingest.projects_dir(), dispatch_seed.codex_home(codex_home)
+    for run in runs.values():
+        if run.get("minutes") is None or run.get("status") == "abandoned":
+            continue
+        found = cache.get(run["run_id"])
+        if not isinstance(found, dict) or found.get("method_version") != S.SHARE_METHOD:
+            try:
+                found = S.run_share(run, projects=projects, codex_home=home)
+            except Exception as exc:        # a broken transcript must not stop refresh
+                notes.append(f"token share skipped for {run['run_id'][:8]}: {type(exc).__name__}")
+                continue
+        if found is not None:
+            out[run["run_id"]] = found
+            run["share"] = found
+    return out
+
+
+def missed_rounds(runs: dict[str, dict], rounds: list[dict]) -> dict[str, Any]:
+    """Dispatch rounds since the first recorded run that have no dispatch run (no tool Expect line)."""
+    starts = [parse_ts(r.get("dispatched_at")) for r in runs.values()]
+    starts = [s for s in starts if s is not None]
+    if not starts:
+        return {"since": None, "rounds": 0, "sessions": []}
+    since = min(starts)
+    missed = [rd for rd in rounds if rd["started"] >= since and not _covered(rd, runs.values())]
+    return {"since": iso(since), "rounds": len(missed),
+            "sessions": sorted({(rd["session"] or "?")[:8] for rd in missed})}
 
 
 def seed_block(previous: dict, rounds: list[dict], db: Any, notes: list[str], *, codex_home: Path | None,
@@ -835,10 +904,16 @@ def refresh_line(lookup: dict) -> str:
         if table:
             parts.append(tool + " " + ", ".join(f"{b}:n={v['n']} med={round(v['median'])}m p80={round(v['p80'])}m"
                                                 for b, v in table.items() if b != "all"))
-    usage = ", ".join(f"{k} clean n={v['buckets'].get('all', {}).get('n', 0)}" for k, v in lookup["usage"].items())
+    usage = ", ".join(f"{k} clean n={v['buckets'].get('all', {}).get('n', 0)}"
+                      f" + {(v.get('attributed') or {}).get('all', 0)} split by token share"
+                      for k, v in lookup["usage"].items())
     line = (f"Refreshed: {lookup['runs']} measured runs, {lookup['backfill_rounds']} backfill rounds, "
             f"{lookup['clean_usage_runs']} clean usage runs. " + "; ".join(parts) + (". " if parts else "")
-            + (f"Usage: {usage}" if usage else "Usage: no clean runs yet"))
+            + (f"Usage: {usage}" if usage else "Usage: no measured runs yet"))
+    missed = lookup.get("missed") or {}
+    if missed.get("rounds"):
+        line += (f"\nMissed: {missed['rounds']} dispatch round(s) since {missed['since'][:10]} had no"
+                 f" `dispatch start` (sessions {', '.join(missed['sessions'])})")
     return line + "\n" + seed_line(lookup.get("seed") or {})
 
 
@@ -869,12 +944,14 @@ def seed_line(seed: dict) -> str:
 def report(parent: Path | None = None, limit: int = 20) -> list[dict]:
     runs = [r for r in collect_runs(parent).values() if r.get("minutes") is not None]
     runs.sort(key=lambda r: r.get("dispatched_at") or "", reverse=True)
+    shares = (load_lookup(parent) or {}).get("shares") or {}
     out = []
     for r in runs[:limit]:
         est = r.get("estimate") or {}
         deltas = usage_deltas(r)
         key = PRIMARY_LIMIT.get(r.get("tool") or "claude", "claude:session")
         actual_use = deltas.get(key)
+        share = (shares.get(r["run_id"]) or {}).get("share")
         est_use = (est.get("est_usage") or {}).get(key)
         out.append({"run_id": r["run_id"], "repo": r.get("repo"), "tool": r.get("tool"),
                     "workers": r.get("n_workers"), "dispatched_at": r.get("dispatched_at"),
@@ -882,7 +959,8 @@ def report(parent: Path | None = None, limit: int = 20) -> list[dict]:
                     "time_ratio": _round(r["minutes"] / est["est_minutes"], 2) if est.get("est_minutes") else None,
                     "limit": key, "est_pct": est_use,
                     "actual_pct": _round(actual_use["delta"], 1) if actual_use else None,
-                    "clean": actual_use["clean"] if actual_use else None})
+                    "clean": (actual_use["clean"] and share in (None, 1)) if actual_use else None,
+                    "token_share": share})
     return out
 
 
