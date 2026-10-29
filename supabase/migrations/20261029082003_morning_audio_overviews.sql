@@ -131,6 +131,12 @@ end $$;
 revoke all on function public.amem_audio_playback(uuid) from public;
 
 do $$ declare r text; begin
+ -- Supabase may grant new public functions directly to API roles by default.
+ -- Revoking PUBLIC alone does not remove those explicit default grants.
+ foreach r in array array['anon','authenticated','service_role'] loop
+ if exists(select 1 from pg_roles where rolname=r) then
+ execute format('revoke all on function public.amem_audio_enqueue(date,boolean),public.amem_audio_request(date),public.amem_audio_claim(),public.amem_audio_save(uuid,uuid,text,jsonb),public.amem_audio_upload_context(uuid,uuid),public.amem_audio_status(date),public.amem_audio_playback(uuid) from %I',r);
+ end if; end loop;
  grant execute on function public.amem_audio_enqueue(date,boolean), public.amem_audio_claim(),public.amem_audio_save(uuid,uuid,text,jsonb) to amem_app;
  grant select on public.report_annotations to amem_app;
  create policy audio_annotations_app on public.report_annotations for select to amem_app using(true);
@@ -144,7 +150,8 @@ do $$ declare r text; begin
  grant execute on function public.amem_audio_upload_context(uuid,uuid) to service_role; end if;
  if exists(select 1 from pg_roles where rolname='authenticated') then
  grant select on public.report_annotations to authenticated;
- create policy audio_annotations_owner on public.report_annotations for select to authenticated using((select auth.uid())=(select public.amem_owner_uid())); end if;
+ if to_regprocedure('auth.uid()') is not null then
+ create policy audio_annotations_owner on public.report_annotations for select to authenticated using((select auth.uid())=(select public.amem_owner_uid())); end if; end if;
  if to_regclass('storage.buckets') is not null then
  insert into storage.buckets(id,name,public,file_size_limit,allowed_mime_types)
  values('morning-audio','morning-audio',false,20000000,array['audio/mpeg']) on conflict(id) do nothing;

@@ -12,6 +12,23 @@ Learning families with no automatic analysis consumer:
 - **Lessons and lesson-use history** (`lessons`)
 - **Evaluation drafts** (`eval_drafts`)
 
+## Morning audio overviews and report corrections
+
+- Key: `morning_audio`
+- Purpose: Explain the morning results and evidence-backed next steps without executing repairs
+- Producers: Night Desk owner audio request; morning_overview_worker (independent Mac worker)
+- Owner job: com.vilmerfrost.night-desk-audio
+- Tables: `amem_private.morning_overviews`; `report_annotations`
+- Views: none
+- Local files: ~/.claude/parent/night-desk/audio-results/*
+- External sinks: private Supabase morning-audio bucket; ElevenLabs final redacted speech text
+- Consumers:
+  - report: Night Desk (external web app, owner JWT; dashboard_owner_read policy) (`supabase/migrations/20261029082003_morning_audio_overviews.sql`)
+  - operational: exclusive audio generation and upload recovery (`src/agent_memory/morning_overview_worker.py`)
+- Retention: Accepted overview revisions and correction history retained; no source reports deleted.
+- Exclusion: Never a learning input. Derived narration cannot become new evidence or approval. Claims stay private; only owner-bound status and short-lived media access leave the broker.
+- Learning input: no
+
 ## Manual subscription connection diagnostics
 
 - Key: `connection_diagnostics`

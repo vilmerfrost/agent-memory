@@ -168,3 +168,44 @@ def test_ambiguous_speech_outcome_never_automatically_repeats(tmp_path, monkeypa
     w.work(None, job, tmp_path, now=NOW, make_outline=lambda d: ({'fact_ids':[f['id'] for f in d['facts']]}, {}), make_speech=speech)
     w.resume_uploads(None, tmp_path)
     assert calls == ['speech'] and states[-1] == 'outcome_unknown'
+
+
+def test_api_default_grants_do_not_expose_worker_functions(pg_url):
+    from conftest import base_env, run_amem
+    name='morning_audio_privileges'
+    roles=('anon','authenticated','service_role')
+    created=[]
+    with psycopg.connect(pg_url,autocommit=True) as c:
+        c.execute(f'create database {name}')
+        for role in roles:
+            if not c.execute('select 1 from pg_roles where rolname=%s',(role,)).fetchone():
+                c.execute(f'create role {role} nologin'); created.append(role)
+    url=pg_url.rsplit('/',1)[0]+'/'+name
+    try:
+        with psycopg.connect(url,autocommit=True) as c:
+            for kind in ('tables','functions','sequences'):
+                c.execute(f'alter default privileges in schema public grant all on {kind} to anon,authenticated,service_role')
+        result=run_amem('db','migrate',env=base_env(AMEM_DB_URL=url))
+        assert result.returncode==0,result.stderr
+        with psycopg.connect(url) as c:
+            matrix={
+                'amem_audio_enqueue(date,boolean)':{'amem_app'},
+                'amem_audio_claim()':{'amem_app'},
+                'amem_audio_save(uuid,uuid,text,jsonb)':{'amem_app'},
+                'amem_audio_upload_context(uuid,uuid)':{'service_role'},
+                'amem_audio_request(date)':{'authenticated','service_role'},
+                'amem_audio_status(date)':{'authenticated','service_role'},
+                'amem_audio_playback(uuid)':{'authenticated','service_role'},
+            }
+            for fn, allowed in matrix.items():
+                for role in (*roles,'amem_app','rsi_reader','rsi_writer'):
+                    assert c.execute("select has_function_privilege(%s,%s,'execute')",(role,'public.'+fn)).fetchone()[0]==(role in allowed),(role,fn)
+            for role in roles:
+                assert not c.execute("select has_table_privilege(%s,'amem_private.morning_overviews','select')",(role,)).fetchone()[0]
+                for operation in ('insert','update','delete'):
+                    assert not c.execute('select has_table_privilege(%s,%s,%s)',(role,'public.report_annotations',operation)).fetchone()[0]
+    finally:
+        with psycopg.connect(pg_url,autocommit=True) as c:
+            c.execute(f'drop database {name} with (force)')
+            for role in created:
+                c.execute(f'drop role {role}')
