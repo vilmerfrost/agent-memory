@@ -1,3 +1,9 @@
+# Future work
+
+When Vilmer asks what remains, what to improve, or what to work on next, read
+`roadmap.md`. It records deferred ideas and their scope; it does not authorize
+implementation or release.
+
 # Testing and visible progress
 
 - Read `~/.claude/parent/agent-memory/profile.md` when using the local parent workflow. It owns the integration test command.

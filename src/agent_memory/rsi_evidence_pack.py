@@ -23,7 +23,8 @@ The pack (build_pack). For one candidate (an rsi_candidates row: dedupe_key, rul
     then     one read-only Supabase connection re-reads every amem: subject of an external finding and the
              candidate's own evidence refs (blueprint C1: external evidence counts only when its subjects resolve),
              and reads the rule keys and targets of each recalled past.dev record (subject_scopes): a recalled
-             record counts only when it is about the candidate's rule or its target.
+             record counts only when it is about the candidate's rule or its target. Relevant memories then read
+             their current explanation from bounded Supabase records under the export's privacy checks.
 
 Each Finding carries: source (supabase | clickhouse | langfuse | pastdev | jev | experiments), ref (the record in
 its own system: amem:, ch:, lf:, past:, ncm:; `query:<step>` / `health:<retriever>` / `dropped:pack` for the
@@ -215,12 +216,22 @@ def _scalar(v: Any) -> Any:
 
 
 def _measure(metrics: Mapping[str, Any]) -> dict[str, Any]:
-    """Numbers, booleans and short strings (lists of them, at most 10); nested objects are dropped."""
+    """Scalar measurements plus two explicit score histograms; arbitrary nested objects are dropped."""
     out: dict[str, Any] = {}
     for k, v in metrics.items():
         if not isinstance(k, str) or not _MKEY.fullmatch(k):
             continue
-        if isinstance(v, list | tuple):
+        if k in ('judge_winner', 'eval_verdict') and isinstance(v, Mapping):
+            # These two provider-defined histograms are useful evidence. Do not admit arbitrary objects or keys.
+            from agent_memory.integrations.langfuse import VERDICTS
+            labels = (*'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'tie') if k == 'judge_winner' else VERDICTS
+            for label in labels:
+                count = v.get(label)
+                if isinstance(count, int) and not isinstance(count, bool) and 0 <= count <= 1_000_000_000:
+                    out[f'{k}_{label.replace("-", "_")}'] = count
+                    if len(out) >= 30:
+                        break
+        elif isinstance(v, list | tuple):
             vals = [x for x in (_scalar(i) for i in v[:10]) if x is not _SKIP and x is not None]
             out[k] = vals
         else:
@@ -709,6 +720,12 @@ _SCOPE_SQL = {
     "edit": ("uuid", """
         select id::text, array[instruction_source || ':' || rule_id], array[target_path]
           from edits where id = any(%(ids)s::uuid[])"""),
+    "run": ("uuid", """
+        select r.id::text, array['lessons:' || l.slug, r.meta ->> 'rule_key', r.meta ->> 'rule'],
+               array[r.meta ->> 'target']
+          from lesson_candidates lc join runs r on r.id=lc.run_id left join lessons l on l.id=lc.lesson_id
+         where lc.run_id=any(%(ids)s::uuid[]) and lc.decision in ('accept','reject')
+           and (lc.decision='reject' or l.id is not null)"""),
 }
 _HOME = re.compile(r"^/(?:Users|home)/[^/]+/")
 
@@ -727,7 +744,7 @@ def _norm_target(v: Any) -> str | None:
 
 
 def subject_scopes(conn: psycopg.Connection, amem_refs: Sequence[str]) -> dict[str, tuple[set[str], set[str]]]:
-    """For each amem: ref of an experiment, proposal, decision or edit: (rule keys, targets) it is about,
+    """For each experiment, proposal, decision, edit or actual lesson decision: its rule keys and targets,
     normalized (lowercase, no `dev:` prefix, home directory as `~/`). Other kinds and missing rows: absent."""
     by_entity: dict[str, list[str]] = defaultdict(list)
     for s in dict.fromkeys(amem_refs):
@@ -748,6 +765,36 @@ def subject_scopes(conn: psycopg.Connection, amem_refs: Sequence[str]) -> dict[s
             rs.update(x for x in map(_norm_rule, rules or []) if x)
             ts.update(x for x in map(_norm_target, targets or []) if x)
     return out
+
+
+def recalled_memories(conn: psycopg.Connection, amem_refs: Sequence[str], *,
+                      environ: Mapping[str, str] | None = None) -> dict[str, Mapping[str, str]]:
+    """Bounded authoritative memory fields under the same ownership/sanitization rules as their export.
+
+    Provider prose is never used. Missing/removed lesson decisions, private/team records and sanitizer
+    refusals have no narrative and cannot acquire support merely because a generic run still exists.
+    """
+    from agent_memory.integrations import egress, pastdev
+    deny = egress.load(conn, environ)
+    records = pastdev.build_records(conn, egress.owner_accounts(environ), only=list(dict.fromkeys(amem_refs))[:20])
+    out = {}
+    for record in records:
+        content, _ = pastdev.sanitize_record(record.fields, deny)
+        if content is not None:
+            out[record.ref] = pastdev._fields(content)
+    return out
+
+
+def _memory_summary(fields: Mapping[str, str], cap: int) -> str | None:
+    # Reasons/results explain the lesson; long hypotheses must not displace them completely.
+    if cap <= 0:
+        return None
+    keys = ('reason', 'result', 'decision', 'hypothesis')
+    present = [(k, fields[k]) for k in keys if fields.get(k)]
+    if not present:
+        return None
+    each = max(1, (cap - sum(len(k)+3 for k, _ in present)) // len(present))
+    return _free('; '.join(f'{key}: {_one_line(value, each)}' for key, value in present), cap)
 
 
 def _about(c: _Cand, subjects: Sequence[str], scopes: Mapping[str, tuple[set[str], set[str]]]) -> bool:
@@ -817,7 +864,8 @@ def _raws(done: Sequence[tuple[_Step, QueryResult]], per: int) -> list[_Raw]:
 
 
 def _finding(raw: _Raw, found: set[str] | None, lim: PackLimits, c: _Cand | None = None,
-             scopes: Mapping[str, tuple[set[str], set[str]]] | None = None) -> Finding:
+             scopes: Mapping[str, tuple[set[str], set[str]]] | None = None,
+             memories: Mapping[str, Mapping[str, str]] | None = None) -> Finding:
     ev = raw.ev
     subjects = [s for s in ev.subject_refs if s.startswith("amem:")]
     if ev.source == "sb":
@@ -843,9 +891,20 @@ def _finding(raw: _Raw, found: set[str] | None, lim: PackLimits, c: _Cand | None
         status, authority, detail = "unlinked", None, "production observation needs current-version and coverage validation"
     if ev.metrics.get("intended_intervention") is False:
         status, authority, detail = "unlinked", None, "fallback tested other bytes; artifact evidence only"
+    summary = _free(ev.summary, lim.text_max)
+    if raw.source == 'pastdev':
+        summary = None  # Even stand-in/provider text cannot bypass the authoritative read.
+        if len(subjects) != 1 or ev.ref != refs.past(subjects[0]):
+            status, authority, detail = 'unlinked', None, 'memory reference does not bind one authoritative subject'
+        if status == 'ok' and memories is not None:
+            fields = memories.get(authority or '')
+            if fields is None:
+                status, authority, detail = 'unlinked', None, 'authoritative memory missing or withheld by privacy checks'
+            else:
+                summary = _memory_summary(fields, lim.text_max)
     m = _measure(ev.metrics)
     return Finding(raw.source, ev.ref, ev.observed_at, m, _n(ev.metrics), status, ev.kind, authority, raw.step.name,
-                   _free(ev.summary, lim.text_max), detail)
+                   summary, detail)
 
 
 def _size(f: Finding) -> int:
@@ -937,19 +996,23 @@ def build_pack(candidate: Mapping[str, Any], *, retrievers: Mapping[str, Retriev
     recalled = [s for raw in raws if raw.source == "pastdev" for s in raw.ev.subject_refs if s.startswith("amem:")]
     found: set[str] | None = None
     scopes: dict[str, tuple[set[str], set[str]]] = {}
+    memories: dict[str, Mapping[str, str]] = {}
     production_refs: set[str] = set()
     sb_read = "skipped"
     if ro is not None and wanted:
-        def reread() -> tuple[set[str], dict[str, tuple[set[str], set[str]]], set[str]]:
+        def reread() -> tuple[set[str], dict[str, tuple[set[str], set[str]]], set[str], dict[str, Mapping[str, str]]]:
             with ro() as conn:
                 ids = [refs.parse(r).id for r in c.evidence_refs if refs.is_ref(r)
                        and refs.parse(r).kind == "evidence" and _UUID.fullmatch(refs.parse(r).id)]
                 prs = {refs.amem("evidence", str(row[0])) for row in conn.execute(
                     "select id from rsi_evidence where id=any(%s::uuid[]) and kind='production-outcome'",
                     (ids,)).fetchall()} if ids else set()
-                return existing(conn, wanted), (subject_scopes(conn, recalled) if recalled else {}), prs
+                scopes = subject_scopes(conn, recalled) if recalled else {}
+                relevant = [ref for ref in dict.fromkeys(recalled) if _about(c, [ref], scopes)]
+                memories = recalled_memories(conn, relevant, environ=environ) if relevant else {}
+                return existing(conn, wanted), scopes, prs, memories
         state, val = runner.call("sb", reread)
-        found, scopes, production_refs = val if state == "ok" else (None, {}, set())
+        found, scopes, production_refs, memories = val if state == "ok" else (None, {}, set(), {})
         sb_read = "ok" if state == "ok" else ("error" if state == "timeout" else "unavailable")
     elif ro is None and wanted:
         sb_read = "unavailable"
@@ -958,7 +1021,7 @@ def build_pack(candidate: Mapping[str, Any], *, retrievers: Mapping[str, Retriev
     # unique); a live provider answer wins over the same link read back from Supabase
     by_key: dict[tuple[str, str, str], Finding] = {}
     for raw in raws:
-        f = _finding(raw, found, limits, c, scopes)
+        f = _finding(raw, found, limits, c, scopes, memories)
         if f.ref in production_refs:
             f = replace(f, status="unlinked", authority=None,
                         detail="production observation requires current-version and coverage validation")

@@ -386,18 +386,46 @@ def _team(*metas: Any) -> bool:
     return any(isinstance(m, Mapping) and m.get("team") is True for m in metas)
 
 
-def build_records(conn: psycopg.Connection, owners: Sequence[str] | None = None) -> list[Record]:
+def build_records(conn: psycopg.Connection, owners: Sequence[str] | None = None, *,
+                  only: Sequence[str] | None = None) -> list[Record]:
     """Every decision record, in table order (TABLES) and time order. Reads only; refuses nothing (sanitize does).
-    `owners`: the owner accounts for the ownership rule (default: egress.owner_accounts())."""
+    `owners`: the owner accounts for the ownership rule (default: egress.owner_accounts()).
+    `only`: at most20 authoritative refs for evidence hydration; source queries use indexed ID predicates.
+    None retains the ordinary full exporter. Selected decisions read only their bounded parent proposals."""
     accounts = egress.owner_accounts() if owners is None else owners
+    selected = None if only is None else set(only)
+    if selected is not None and len(selected) > 20:
+        raise ValueError('selected memory lookup is limited to20 refs')
+    ids: dict[str, list[str]] = {}
+    if selected is not None:
+        for ref in sorted(selected):
+            if _ours(ref):
+                r = refs.parse(ref)
+                ids.setdefault(r.kind, []).append(r.id)
+        # A decision inherits ownership and hypothesis from its own proposal, not every proposal.
+        if ids.get('decision'):
+            parents = conn.execute('select proposal_id::text from rsi_decisions where id=any(%s::uuid[])',
+                                   (ids['decision'],)).fetchall()
+            ids['proposal'] = sorted(set(ids.get('proposal', [])) | {p[0] for p in parents})
 
     def q(text: str) -> str:
         return egress.bind_owners(text, accounts)
 
+    def rows(cur, text: str, entity: str, key: str, *, has_where: bool = False):
+        if selected is None:
+            return cur.execute(q(text)).fetchall()
+        wanted = ids.get(entity, [])
+        if not wanted:
+            return []
+        before, order = text.rsplit('order by', 1)
+        typ = 'text' if entity == 'experiment' else 'uuid'
+        statement = before + (' and ' if has_where else ' where ') + f'{key}=any(%s::{typ}[]) order by' + order
+        return cur.execute(q(statement), (wanted,)).fetchall()
+
     out: list[Record] = []
     proposals: dict[str, dict[str, Any]] = {}
     with conn.cursor(row_factory=dict_row) as cur:
-        for p in cur.execute(q(_PROPOSALS_SQL)).fetchall():
+        for p in rows(cur, _PROPOSALS_SQL, 'proposal', 'p.id'):
             rat = p["rationale"] if isinstance(p["rationale"], Mapping) else {}
             f = {"kind": "proposal", "ref": refs.amem("proposal", p["id"]),
                  "rule": _rule(p["instruction_source"], p["rule_id"]) or _rule(p["c_source"], p["rule_key"]),
@@ -406,7 +434,7 @@ def build_records(conn: psycopg.Connection, owners: Sequence[str] | None = None)
                  "night": p["night"] or _night(p["created_at"]), "team": bool(p["team"]), "private": bool(p["private"])}
             proposals[p["id"]] = f
             out.append(Record("rsi_proposals", f["ref"], p["created_at"], f))
-        for d in cur.execute(_DECISIONS_SQL).fetchall():
+        for d in rows(cur, _DECISIONS_SQL, 'decision', 'd.id'):
             base = proposals.get(d["proposal_id"]) or {"team": True}       # no proposal row: never send
             f = {"kind": "rejection" if d["action"] == "reject" else "decision", "ref": refs.amem("decision", d["id"]),
                  "rule": base.get("rule"), "hypothesis": base.get("hypothesis"), "change_kind": base.get("change_kind"),
@@ -414,7 +442,7 @@ def build_records(conn: psycopg.Connection, owners: Sequence[str] | None = None)
                  "night": _night(d["decided_at"]), "team": base.get("team") is True,
                  "private": base.get("private") is True}
             out.append(Record("rsi_decisions", f["ref"], d["decided_at"], f))
-        for x in cur.execute(_EXPERIMENTS_SQL).fetchall():
+        for x in rows(cur, _EXPERIMENTS_SQL, 'experiment', 'id'):
             hyp = x["hypothesis"] if isinstance(x["hypothesis"], Mapping) else {}
             meta = x["meta"] if isinstance(x["meta"], Mapping) else {}
             f = {"kind": "experiment", "ref": refs.amem("experiment", x["id"]),
@@ -422,19 +450,19 @@ def build_records(conn: psycopg.Connection, owners: Sequence[str] | None = None)
                  "change_kind": x["kind"], "result": _result(x["status"], x["verdict"]),
                  "night": x["night"] or _night(x["created_at"]), "team": _team(meta, hyp)}
             out.append(Record("rsi_experiments", f["ref"], x["created_at"], f))
-        for e in cur.execute(q(_EDITS_SQL)).fetchall():
+        for e in rows(cur, _EDITS_SQL, 'edit', 'e.id'):
             meta = e["meta"] if isinstance(e["meta"], Mapping) else {}
             f = {"kind": "edit", "ref": refs.amem("edit", e["id"]), "rule": _rule(e["instruction_source"], e["rule_id"]),
                  "hypothesis": e["summary"] or e["rule_title"], "change_kind": meta.get("kind") or e["verdict"],
                  "result": e["status"], "reason": e["why"], "night": _night(e["created_at"]), "team": bool(e["team"]),
                  "private": bool(e["private"])}
             out.append(Record("edits", f["ref"], e["created_at"], f))
-        for lc in cur.execute(q(_LESSONS_SQL)).fetchall():
+        for lc in rows(cur, _LESSONS_SQL, 'run', 'lc.run_id', has_where=True):
             f = {"kind": "lesson", "ref": refs.amem("run", lc["id"]), "rule": _rule("lessons", lc["slug"]),
                  "hypothesis": lc["title"], "decision": lc["decision"], "reason": lc["reason"],
                  "night": _night(lc["considered_at"]), "team": bool(lc["team"]), "private": bool(lc["private"])}
             out.append(Record("lesson_candidates", f["ref"], lc["considered_at"], f))
-    return out
+    return out if selected is None else [record for record in out if record.ref in selected]
 
 
 def corpus(conn: psycopg.Connection, environ: Mapping[str, str] | None = None) -> list[tuple[str, str]]:
