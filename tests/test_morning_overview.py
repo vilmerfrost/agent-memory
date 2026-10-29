@@ -209,3 +209,39 @@ def test_api_default_grants_do_not_expose_worker_functions(pg_url):
             c.execute(f'drop database {name} with (force)')
             for role in created:
                 c.execute(f'drop role {role}')
+
+
+def test_outline_resolves_macos_symlinked_temporary_paths(tmp_path, monkeypatch):
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+    from agent_memory import rsi_subscription as subscription, rsi_subscription_config as profiles
+    real=tmp_path/'real';real.mkdir()
+    alias=tmp_path/'alias';alias.symlink_to(real,target_is_directory=True)
+    (tmp_path/'config').mkdir()
+    (tmp_path/'config/rsi-night.subscription.json').write_text(json.dumps({'replay':{'provider_profiles':{'claude':{'model':'claude-opus-5-5','effort':'high','auth':{}}}}}))
+    monkeypatch.setattr(w.config,'REPO_ROOT',tmp_path)
+    monkeypatch.setattr(w.tempfile,'TemporaryDirectory',lambda **_:nullcontext(str(alias)))
+    monkeypatch.setattr(profiles,'auth_for',lambda *_,**__:None)
+    data=snap()
+    def run(provider,prompt,**kwargs):
+        assert kwargs['workspace']==kwargs['workspace'].resolve()
+        assert kwargs['arm_home']==kwargs['arm_home'].resolve()
+        assert kwargs['tools_allowed'] is False
+        return SimpleNamespace(text=json.dumps({'fact_ids':[f['id'] for f in data['facts']]}),usage={'input_tokens':1,'output_tokens':1},tool_calls=[])
+    monkeypatch.setattr(subscription,'run',run)
+    result,usage=w.outline(data)
+    assert m.render(data,result) and usage['output_tokens']==1
+
+
+def test_unchanged_snapshot_retains_audio_without_model_or_speech_calls(tmp_path,monkeypatch):
+    data=snap()
+    old=tmp_path/str(uuid.uuid4());old.mkdir()
+    w.save_receipt(old/'receipt.json',{'stage':'ready','job':{'id':old.name},'data':{'snapshot':data,'as_of':data['as_of']}})
+    monkeypatch.setattr(w,'collect',lambda *_:data)
+    states=[]
+    monkeypatch.setattr(w,'update',lambda conn,job,state,payload:states.append((state,payload)))
+    def forbidden(*_):
+        pytest.fail('Unchanged content must not call an LLM or speech provider')
+    job={'id':str(uuid.uuid4()),'claim_id':str(uuid.uuid4()),'night':data['night']}
+    w.work(None,job,tmp_path,now=NOW,make_outline=forbidden,make_speech=forbidden)
+    assert states==[('failed',{'error':'no_new_results','as_of':data['as_of'],'existing_overview_id':old.name})]
