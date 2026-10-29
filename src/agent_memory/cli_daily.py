@@ -4,10 +4,34 @@ from __future__ import annotations
 
 import argparse
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from agent_memory import daily
+
+
+def cmd_recover(args: argparse.Namespace) -> int:
+    from agent_memory import daily_recovery
+    try:
+        status = daily_recovery.recover(state=daily.state_path(args.state),
+                                        routines_log=daily.routines_log_path(args.routines_log),
+                                        push=not args.no_push)
+    except (OSError, ValueError) as exc:
+        print(f"amem: auth recovery failed: {type(exc).__name__}", file=sys.stderr)
+        return 1
+    failed = status in ("daily_failed", "expired", "night_pending", "brief_pending")
+    line = f"{datetime.now().astimezone().strftime(daily.TS_FORMAT)} amem-auth-recovery {'FAIL' if failed else 'PASS'} status={status}"
+    log = daily.routines_log_path(args.routines_log)
+    try:
+        log.parent.mkdir(parents=True, exist_ok=True)
+        with log.open("a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+    except OSError:
+        print("amem: auth recovery cannot append routine status", file=sys.stderr)
+        return 1
+    print(line)
+    return 1 if failed else 0
 
 
 def cmd_daily(args: argparse.Namespace) -> int:
@@ -22,6 +46,11 @@ def cmd_daily(args: argparse.Namespace) -> int:
 
 
 def register(sub: Any) -> None:
+    recovery = sub.add_parser("daily-recover", help="resume auth-blocked daily and night jobs, bounded until noon")
+    recovery.add_argument("--no-push", action="store_true")
+    recovery.add_argument("--state", type=Path)
+    recovery.add_argument("--routines-log", type=Path)
+    recovery.set_defaults(func=cmd_recover)
     p = sub.add_parser(
         "daily", help="daily job (00:40): ingest git-ref, score every routine, count new escalations (the 07:30 "
                       "brief pushes them), scan deviations, log one line"

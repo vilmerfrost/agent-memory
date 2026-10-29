@@ -12,7 +12,7 @@ Run with `-s` to see each night's rows and the brief's verdict line (the R4 evid
 from __future__ import annotations
 
 from collections.abc import Iterator
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -29,6 +29,9 @@ from synth_support import fresh_db
 from test_coverage_night import CovEvidence, Stub
 
 ANCHOR = datetime.now(UTC).date()
+# Keep these simulated nights after the seed story. Fixed October keys collide
+# with seed experiments as its real-time anchor advances (e.g. 29 October).
+NIGHTS = tuple((ANCHOR + timedelta(days=i)).isoformat() for i in range(4))
 DS = synth.build(ANCHOR)
 R1 = synth.rule_key(synth.R1)
 
@@ -90,7 +93,7 @@ def test_four_nights_on_the_synthetic_story(story: SimpleNamespace) -> None:
         return rep
 
     # 1: the story's first night
-    r1 = night("2026-10-23", CovEvidence(story.url, s1=healthy()))
+    r1 = night(NIGHTS[0], CovEvidence(story.url, s1=healthy()))
     b1, md1 = show(story.url, r1, story.sandbox)
     assert r1["delta"]["deviations"] > 0 and r1["patterns"]
     assert b1["verdict"]["conclusion"] == "findings" and "No problem found" not in md1
@@ -101,7 +104,7 @@ def test_four_nights_on_the_synthetic_story(story: SimpleNamespace) -> None:
 
         def health(self) -> E.Health:
             return E.Health(False, "switched off (AMEM_LANGFUSE=off)")
-    r2 = night("2026-10-24", CovEvidence(story.url, s1={"ch": Stub("ch", healthy=False), "lf": Off("lf"),
+    r2 = night(NIGHTS[1], CovEvidence(story.url, s1={"ch": Stub("ch", healthy=False), "lf": Off("lf"),
                                                         "pd": Stub("pd")}))
     b2, md2 = show(story.url, r2, story.sandbox)
     assert b2["verdict"]["conclusion"] == "incomplete" and "**Verdict: Analysis incomplete.**" in md2
@@ -113,24 +116,24 @@ def test_four_nights_on_the_synthetic_story(story: SimpleNamespace) -> None:
         key = conn.execute("select dedupe_key from rsi_candidates order by dedupe_key limit 1").fetchone()[0]
         conn.execute("update rsi_candidates set status = 'tested' where dedupe_key = %s", (key,))
         conn.execute("insert into rsi_experiments (id, night, kind, status, verdict, meta, finished_at) values "
-                     "('exp-20261024-quiet1', '2026-10-24', 'edit_instruction', 'evaluated', 'NO_EFFECT', %s, now())",
-                     (Jsonb({"candidate_key": key}),))
+                     "('exp-20261024-quiet1', %s, 'edit_instruction', 'evaluated', 'NO_EFFECT', %s, now())",
+                     (NIGHTS[1], Jsonb({"candidate_key": key})))
         conn.execute("insert into rsi_evidence (system, kind, subject_refs, metrics, external_ref) values "
                      "('clickhouse', 'metric', %s, %s, %s)",
                      (["amem:experiment/exp-20261024-quiet1"], Jsonb({"n_sessions": 2}), f"ch:q.rule_gap/{R1}@quiet"))
-    r3 = night("2026-10-25", CovEvidence(story.url, s1={"ch": Stub("ch"), "lf": Stub("lf"), "pd": Stub("pd")}))
+    r3 = night(NIGHTS[2], CovEvidence(story.url, s1={"ch": Stub("ch"), "lf": Stub("lf"), "pd": Stub("pd")}))
     b3, md3 = show(story.url, r3, story.sandbox)
     assert b3["verdict"]["conclusion"] == "all_clear" and "**Verdict: No problem found.**" in md3
 
     # 4: a burst of deviations past the page limit: the window was not fully collected
     seed_rule(story.url, RULE_A, "burst-a")
     seed_rule(story.url, RULE_B, "burst-b")
-    r4 = night("2026-10-26", CovEvidence(story.url, s1={"ch": Stub("ch"), "lf": Stub("lf"), "pd": Stub("pd")},
+    r4 = night(NIGHTS[3], CovEvidence(story.url, s1={"ch": Stub("ch"), "lf": Stub("lf"), "pd": Stub("pd")},
                                          limits=EP.DeltaLimits(settle_s=0, per_kind=3)))
     b4, md4 = show(story.url, r4, story.sandbox)
     with psycopg.connect(story.url) as conn:
         st = conn.execute("select s.status, s.eligible, s.collected from coverage_snapshots s join routine_consumption c "
-                          "using (dataset, window_start, window_end) where c.run_key = '2026-10-26' and dataset = %s",
-                          (NC.DEVIATIONS,)).fetchone()
+                          "using (dataset, window_start, window_end) where c.run_key = %s and dataset = %s",
+                          (NIGHTS[3], NC.DEVIATIONS)).fetchone()
     assert st[0] == "not_collected" and st[1] == 5 and st[2] < 5
     assert "No problem found" not in md4

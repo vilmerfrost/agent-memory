@@ -103,6 +103,7 @@ class DailyResult:
     failures: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)  # logged as <name>-warn lines; the verdict stays PASS
     lines: list[str] = field(default_factory=list)  # what was appended to the routines log
+    auth_failed: bool = False
 
     @property
     def verdict(self) -> str:
@@ -513,6 +514,10 @@ def step_deviations(result: DailyResult, *, state_file: Path, now: datetime) -> 
     _cover(result, COV.deviations_records, **cover, ingest=ingested, before=before, after=after, report=report,
            evidence=_cover_read(result, COV.deviation_refs, report) or [])
     _err(report.summary())
+    if report.auth_failed:
+        result.auth_failed = True
+        result.fail(f"deviations: Claude authentication failed; stopped scan; {report.pending} sessions pending")
+        return  # Keep the last successful scan timestamp unchanged for recovery.
     for o in report.outcomes:  # a counted warning (deviation_skipped=N), not a failure: see docs/daily.md
         for reason in o.skipped_reasons:
             _err(f"deviations: invalid item skipped: session {o.session_id}: {reason}")
@@ -771,7 +776,7 @@ def log_lines(ts: str, result: DailyResult, secs: int) -> list[str]:
             *(f"{ts} {NAME}-warn {reason}" for reason in result.warnings)]
 
 
-def run_daily(
+def _run_daily(
     *,
     push: bool = True,
     routines_log: Path | None = None,
@@ -803,11 +808,25 @@ def run_daily(
         step_distill(result)
         step_escalations(result, push=push, state_file=state_path(state), now=now)
         step_deviations(result, state_file=state_path(state), now=now)
-        step_edits(result, push=push, notify=notify)
+        from agent_memory import claude_auth, daily_recovery
+        result.auth_failed = result.auth_failed or claude_auth.failed()
+        if result.auth_failed:
+            try:
+                daily_recovery.record(result, state=state_path(state), now=now, push=push, notify=notify)
+            except (OSError, ValueError) as exc:
+                result.fail(f"auth-recovery: cannot persist recovery state: {type(exc).__name__}")
+        if not result.auth_failed:
+            step_edits(result, push=push, notify=notify)
         step_rsi_push(result, push=push, notify=notify)
         step_observations(result, now=now, reports_dir=log_file.parent / "reports")
         step_sync(result, state_file=state_path(state), now=now)  # after replay observations, so exports include them
         step_coverage(result)
+        result.auth_failed = result.auth_failed or claude_auth.failed()
+        try:
+            # Catch auth failures from optional steps as well, without duplicate alerts.
+            daily_recovery.record(result, state=state_path(state), now=now, push=push, notify=notify)
+        except (OSError, ValueError) as exc:
+            result.fail(f"auth-recovery: cannot persist recovery state: {type(exc).__name__}")
         secs = int(time.monotonic() - start)
         result.lines = log_lines(now.strftime(TS_FORMAT), result, secs)
         log_file.parent.mkdir(parents=True, exist_ok=True)
@@ -816,3 +835,23 @@ def run_daily(
     finally:
         RL.clear_running(log_file, NAME)
     return result
+
+
+def run_daily(*, push: bool = True, routines_log: Path | None = None, state: Path | None = None,
+              now: datetime | None = None, notify: Mapping[str, str] | None = None,
+              parent_dir: Path | None = None) -> DailyResult:
+    from agent_memory import claude_auth, daily_recovery
+    now = now or datetime.now().astimezone()
+    if now.tzinfo is None:
+        now = now.astimezone()
+    log_file = routines_log_path(routines_log)
+    with daily_recovery.job_lock(log_file.with_name("amem-daily.lock")) as acquired:
+        if not acquired:
+            result = DailyResult()
+            result.fail("overlap: another daily scan is running")
+            return result
+        with claude_auth.batch() as auth:
+            result = _run_daily(push=push, routines_log=log_file, state=state, now=now,
+                                notify=notify, parent_dir=parent_dir)
+            result.auth_failed = result.auth_failed or auth.failed
+        return result
