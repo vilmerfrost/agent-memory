@@ -928,7 +928,14 @@ class LangfuseClient:
 
     def create_scores(self, items: Sequence[Mapping[str, Any]]) -> None:
         """202: all accepted. 207: counts and errors; never retried (the accepted ones already landed)."""
-        data = self._json(self._call("POST", SCORES_WRITE_PATH, body=list(items))) or {}
+        try:
+            data = self._json(self._call("POST", SCORES_WRITE_PATH, body=list(items))) or {}
+        except http.HttpError as exc:
+            if exc.status in sync.RECORD_ERRORS:
+                # Preserve the span receipt and remember this exact score
+                # payload's permanent refusal, just like a rejected207 body.
+                raise Rejected(f'score request rejected (HTTP {exc.status})') from None
+            raise  # auth, rate limits and temporary transport failures retain backoff
         rejected = int(data.get("rejected") or 0) if isinstance(data, dict) else 0
         if rejected:
             msgs = "; ".join(str(e.get("message"))[:80] for e in (data.get("errors") or [])[:3] if isinstance(e, dict))

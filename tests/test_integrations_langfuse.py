@@ -931,6 +931,41 @@ def test_a_rejected_score_dead_letters_the_run_and_the_rest_lands(app: str, tmp_
         assert len(svc.requests_to('POST', L.SCORES_WRITE_PATH)) == before
 
 
+@pytest.mark.parametrize('status', [400, 409, 413, 415, 422])
+def test_http_score_content_refusal_is_not_resent_while_unchanged(app, tmp_path, status):
+    pa, pb = _tree(tmp_path); pb.unlink()
+    run = L.load_run_log(pa)
+    with MockService() as svc, psycopg.connect(app) as conn:
+        lf = FakeLangfuse(svc)
+        svc.route('POST', L.SCORES_WRITE_PATH, lf._guard(lambda _: (status, {'message': 'content refused'})))
+        first = sync.run(L.LangfuseSink(client_for(svc), tmp_path), conn, environ={})
+        assert first.status == 'partial' and first.outstanding_dead_letters == 1
+        receipt = conn.execute("select meta from rsi_checkpoints where job='langfuse-export' and run_key=%s",
+                               (run.trace_id,)).fetchone()[0]
+        assert receipt['phase'] == 'confirmed'  # only score content was refused
+        assert receipt['scores_state'] == 'rejected' and receipt['scores_complete'] is False
+        posts = len(svc.requests_to('POST', L.SCORES_WRITE_PATH))
+        again = sync.run(L.LangfuseSink(client_for(svc), tmp_path), conn, environ={})
+        assert again.status == 'partial' and again.rows == 0
+        assert len(svc.requests_to('POST', L.SCORES_WRITE_PATH)) == posts == 1
+        assert len(lf.observations) == 3
+
+
+@pytest.mark.parametrize('status', [401, 403, 429, 503])
+def test_http_score_access_or_temporary_failure_is_not_a_content_rejection(app, tmp_path, status):
+    pa, pb = _tree(tmp_path); pb.unlink()
+    run = L.load_run_log(pa)
+    with MockService() as svc, psycopg.connect(app) as conn:
+        lf = FakeLangfuse(svc)
+        svc.route('POST', L.SCORES_WRITE_PATH, lf._guard(lambda _: (status, {'message': 'temporarily refused'})))
+        first = sync.run(L.LangfuseSink(client_for(svc), tmp_path), conn, environ={})
+        assert first.failed == 1 and first.persistent_failures and first.outstanding_dead_letters == 0
+        receipt = conn.execute("select meta from rsi_checkpoints where job='langfuse-export' and run_key=%s",
+                               (run.trace_id,)).fetchone()[0]
+        assert receipt['phase'] == 'confirmed' and receipt.get('scores_state') != 'rejected'
+        assert len(lf.observations) == 3
+
+
 def test_scoped_export_preserves_daily_cursor_and_shared_receipts(app, tmp_path):
     pa, pb = _tree(tmp_path)
     with MockService() as svc, psycopg.connect(app) as conn:
