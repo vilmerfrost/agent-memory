@@ -425,3 +425,45 @@ def test_early_config_rejection_is_proven_unstarted(setup):
               _process=lambda *a, **k:(0,'codex-cli 0.165.0',''), _rpc_factory=lambda *a, **k:rpc)
     assert error.value.inference_started is False
     assert not any(m=='turn/start' for m,p in rpc.requests)
+
+
+def test_bounded_transport_keeps_output_error_when_exited_group_cannot_be_signalled(tmp_path, monkeypatch):
+    bridge = S._bridge()
+    processes = []
+    popen = bridge.subprocess.Popen
+    def start(*args, **kwargs):
+        proc = popen(*args, **kwargs)
+        processes.append(proc)
+        return proc
+    def expired_group(*args):
+        processes[-1].wait(timeout=2)
+        raise PermissionError(1, "Operation not permitted")
+    monkeypatch.setattr(bridge.subprocess, "Popen", start)
+    monkeypatch.setattr(bridge.os, "killpg", expired_group)
+    with pytest.raises(bridge.ToolError, match="process_output_limit"):
+        bridge.bounded_process([sys.executable, "-I", "-c", "print('x' * 10000)"],
+                               env={}, cwd=str(tmp_path), timeout_s=2, max_output=100)
+    assert processes[0].returncode == 0
+
+
+def test_bounded_transport_still_refuses_cleanup_denial_for_a_running_process(tmp_path, monkeypatch):
+    bridge = S._bridge()
+    processes = []
+    popen = bridge.subprocess.Popen
+    def start(*args, **kwargs):
+        proc = popen(*args, **kwargs)
+        processes.append(proc)
+        return proc
+    def denied_group(*args):
+        assert processes[-1].poll() is None
+        raise PermissionError(1, "Operation not permitted")
+    monkeypatch.setattr(bridge.subprocess, "Popen", start)
+    monkeypatch.setattr(bridge.os, "killpg", denied_group)
+    try:
+        with pytest.raises(PermissionError):
+            bridge.bounded_process([sys.executable, "-I", "-c", "import time; time.sleep(10)"],
+                                   env={}, cwd=str(tmp_path), timeout_s=0.05)
+    finally:
+        for proc in processes:
+            proc.kill()
+            proc.wait(timeout=2)

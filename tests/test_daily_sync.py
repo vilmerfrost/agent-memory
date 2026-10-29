@@ -132,3 +132,29 @@ def test_run_daily_runs_sync_last(monkeypatch: pytest.MonkeyPatch, tmp_path: Pat
         monkeypatch.setattr(daily, name, lambda *a, _n=name, **k: order.append(_n))
     daily.run_daily(routines_log=tmp_path / "routines.log", state=tmp_path / "s.json", now=NOW, notify={})
     assert order[-1] == "step_sync" and order.index("step_deviations") < order.index("step_sync")
+
+
+@pytest.mark.parametrize("auth_failed", [False, True])
+def test_recovered_daily_exports_new_records_once(sinks: Sinks, tmp_path: Path, auth_failed: bool) -> None:
+    state = tmp_path / "state.json"
+    failed = daily.DailyResult(auth_failed=auth_failed)
+    if not auth_failed:
+        failed.fail("deviations: session scan failed")
+    daily.step_sync(failed, state_file=state, now=NOW)
+    assert len(sinks.runs) == 3
+    assert json.loads(state.read_text())[daily.SYNC_RECOVERY_KEY] == NOW.date().isoformat()
+    daily.step_sync(failed, state_file=state, now=NOW + timedelta(minutes=15))
+    assert len(sinks.runs) == 3  # failed recovery attempts cannot keep the providers awake
+    recovered = daily.DailyResult()
+    daily.step_sync(recovered, state_file=state, now=NOW + timedelta(hours=9))
+    assert len(sinks.runs) == 6 and len(recovered.synced) == 3
+    assert daily.SYNC_RECOVERY_KEY not in json.loads(state.read_text())
+    daily.step_sync(daily.DailyResult(), state_file=state, now=NOW + timedelta(hours=10))
+    assert len(sinks.runs) == 6
+
+
+def test_yesterdays_failed_scan_does_not_bypass_todays_sync_limit(sinks: Sinks, tmp_path: Path) -> None:
+    state = tmp_path / "state.json"
+    state.write_text(json.dumps({daily.SYNC_KEY: NOW.date().isoformat(), daily.SYNC_RECOVERY_KEY: "2026-10-23"}))
+    daily.step_sync(daily.DailyResult(), state_file=state, now=NOW)
+    assert sinks.runs == []

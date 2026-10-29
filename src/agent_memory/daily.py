@@ -622,6 +622,7 @@ def step_escalations(result: DailyResult, *, push: bool = True, state_file: Path
 
 
 SYNC_KEY = "sync_last_day"
+SYNC_RECOVERY_KEY = "sync_incomplete_day"
 SYNC_BUDGET_S = 120.0  # per sink and day; sync.run stops between batches, and its client-side daily limits apply
 SYNC_STOP = ("failed", "unavailable")  # a sink that is configured and switched on but did not sync: a warning
 
@@ -644,16 +645,22 @@ def sync_configured(name: str, environ: Mapping[str, str] | None = None) -> bool
 def step_sync(result: DailyResult, *, state_file: Path, now: datetime) -> None:
     """Daily: `amem sync run --sink <sink>` (incremental, SYNC_BUDGET_S each) for every sink that is configured and
     switched on (docs/daily.md; docs/integrations/cloud-activation.md: daily, so ClickHouse can idle), at most once
-    per local day (the state file's sync_last_day). A sink without its settings or with its switch off is a skip.
+    per local day (the state file's sync_last_day), plus one completion after a failed daily scan
+    recovers. Repeated failed scans do not repeat exports. A sink without its settings or with its switch off is a skip.
     Never a failure: a sink that fails, is unreachable or hits the provider's cap is a warning, so the night's
     prerequisite check never sees a `sync` step fail (rsi_schedule: ingest, tasks and deviations block)."""
     from agent_memory import cli_integrations
     from agent_memory.integrations import sync
 
     day = now.date().isoformat()
-    if _state_dict(state_file).get(SYNC_KEY) == day:
+    prior = _state_dict(state_file)
+    recovering = (prior.get(SYNC_RECOVERY_KEY) == day
+                  and not result.failures and not result.auth_failed)
+    if prior.get(SYNC_KEY) == day and not recovering:
         _err(f"sync: not due (ran on {day})")
         return
+    if recovering:
+        _err("sync: completing exports after the daily scan recovered")
     todo = []
     for name in sync.SINKS:
         if sync.switched_off(name):
@@ -690,6 +697,10 @@ def step_sync(result: DailyResult, *, state_file: Path, now: datetime) -> None:
     result.synced = reports
     data = _state_dict(state_file)
     data[SYNC_KEY] = day
+    if result.failures or result.auth_failed:
+        data[SYNC_RECOVERY_KEY] = day
+    else:
+        data.pop(SYNC_RECOVERY_KEY, None)
     data.setdefault("pushed_run_ids", [])
     try:
         _write_state(state_file, data)
