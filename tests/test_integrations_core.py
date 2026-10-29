@@ -186,7 +186,8 @@ def test_sync_advances_the_cursor_and_records_links(app: str) -> None:
         assert rep3.batches == 4 and s.seen_marks[-1] == {}
         assert conn.execute("select count(*) from rsi_evidence where system = 'clickhouse'").fetchone()[0] == 4
         (st,) = sync.status(conn)
-        assert st["sink"] == "clickhouse" and st["status"] == "done" and st["tables"] == ["runs", "sessions"]
+        assert st["sink"] == "clickhouse" and st["status"] == "ok" and st["tables"] == ["runs", "sessions"]
+        assert st['dead_letters'] == 0 and not st['dead'] and not st['failing']
 
 
 def test_sync_down_or_off_moves_nothing(app: str) -> None:

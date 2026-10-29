@@ -358,7 +358,16 @@ def sync_records(*, run_key: str, now: datetime, sink: str, report: Any = None, 
     start = _ts(getattr(report, "last_ok_at", None)) or now - SYNC_DEFAULT_WINDOW
     start = min(start, now)
     out = []
-    for table, c in sorted((getattr(report, "tables", None) or {}).items()):
+    tables: dict[str, dict[str, int]] = {}
+    recovery = set()
+    for name, counts in (getattr(report, 'tables', None) or {}).items():
+        table = name.split(':', 1)[0] if sink == 'clickhouse' else name
+        if table != name:
+            recovery.add(table)
+        combined = tables.setdefault(table, {})
+        for key, value in counts.items():
+            combined[key] = combined.get(key, 0)+int(value)
+    for table, c in sorted(tables.items()):
         ds = sink_dataset(table, sink)
         if ds is None:
             continue
@@ -366,6 +375,8 @@ def sync_records(*, run_key: str, now: datetime, sink: str, report: Any = None, 
         backoff, stopped = int(c.get("backoff", 0)), int(c.get("stopped", 0))
         considered = delivered + dead + failed
         notes = [f"delivery acknowledged by {sink}; not read back"]
+        if table in recovery:
+            notes.append('includes bounded recovery and source reconciliation attempts')
         if stopped:
             notes.append(f"{stopped} row(s) left for the next run ({report.status}: {report.detail or 'stopped'})")
         if backoff:
@@ -376,7 +387,8 @@ def sync_records(*, run_key: str, now: datetime, sink: str, report: Any = None, 
             notes.append(f"{dead} row(s) refused (dead letters)")
         out.append(CV.Snapshot(
             dataset=ds, window_start=start, window_end=now,
-            denominator=f"{table} rows newer than the {sink} cursor, read by this sync",
+            denominator=(f"{table} delivery attempts, including recovery and reconciliation" if table in recovery else
+                         f"{table} rows newer than the {sink} cursor, read by this sync"),
             eligible=seen, collected=delivered, pending=backoff + stopped + failed, rejected=dead,
             unmeasured_fields=("readback",), last_collected_at=now, detail=_detail("; ".join(notes))))
         status = None

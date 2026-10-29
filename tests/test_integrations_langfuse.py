@@ -767,7 +767,7 @@ def test_sink_records_trace_evidence_and_is_idempotent(app: str, tmp_path: Path)
                               (f"lf:trace/{b.trace_id}",)).fetchone()
         assert mb2["eval_verdict"] == "worse"
         (st,) = [s for s in sync.status(conn) if s["sink"] == "langfuse"]
-        assert st["status"] == "done" and st["tables"] == ["sandbox_runs"]
+        assert st["status"] == "ok" and st["tables"] == ["sandbox_runs"]
 
 
 def test_sink_refuses_a_run_whose_session_supabase_marks_prod(app: str, pg_url: str, tmp_path: Path) -> None:
@@ -919,11 +919,51 @@ def test_a_rejected_score_dead_letters_the_run_and_the_rest_lands(app: str, tmp_
             return real(req)
         svc.route("POST", L.SCORES_WRITE_PATH, lf._guard(picky))
         rep = sync.run(L.LangfuseSink(client_for(svc), tmp_path), conn, environ={})
-        assert (rep.status, rep.dead_letters, rep.failed) == ("ok", 1, 0)
+        assert (rep.status, rep.dead_letters, rep.failed) == ("partial", 1, 0)
+        assert rep.outstanding_dead_letters == 1
         meta = sync.load(conn, "langfuse")
         (dl,) = meta["dead_letters"]
         assert dl["table"] == "sandbox_runs" and "scores rejected 1 of 2" in dl["error"]
         assert conn.execute("select count(*) from rsi_evidence where system = 'langfuse'").fetchone()[0] == 1
+        before = len(svc.requests_to('POST', L.SCORES_WRITE_PATH))
+        again = sync.run(L.LangfuseSink(client_for(svc), tmp_path), conn, environ={})
+        assert again.status == 'partial' and again.rows == 0
+        assert len(svc.requests_to('POST', L.SCORES_WRITE_PATH)) == before
+
+
+@pytest.mark.parametrize('status', [400, 409, 413, 415, 422])
+def test_http_score_content_refusal_is_not_resent_while_unchanged(app, tmp_path, status):
+    pa, pb = _tree(tmp_path); pb.unlink()
+    run = L.load_run_log(pa)
+    with MockService() as svc, psycopg.connect(app) as conn:
+        lf = FakeLangfuse(svc)
+        svc.route('POST', L.SCORES_WRITE_PATH, lf._guard(lambda _: (status, {'message': 'content refused'})))
+        first = sync.run(L.LangfuseSink(client_for(svc), tmp_path), conn, environ={})
+        assert first.status == 'partial' and first.outstanding_dead_letters == 1
+        receipt = conn.execute("select meta from rsi_checkpoints where job='langfuse-export' and run_key=%s",
+                               (run.trace_id,)).fetchone()[0]
+        assert receipt['phase'] == 'confirmed'  # only score content was refused
+        assert receipt['scores_state'] == 'rejected' and receipt['scores_complete'] is False
+        posts = len(svc.requests_to('POST', L.SCORES_WRITE_PATH))
+        again = sync.run(L.LangfuseSink(client_for(svc), tmp_path), conn, environ={})
+        assert again.status == 'partial' and again.rows == 0
+        assert len(svc.requests_to('POST', L.SCORES_WRITE_PATH)) == posts == 1
+        assert len(lf.observations) == 3
+
+
+@pytest.mark.parametrize('status', [401, 403, 429, 503])
+def test_http_score_access_or_temporary_failure_is_not_a_content_rejection(app, tmp_path, status):
+    pa, pb = _tree(tmp_path); pb.unlink()
+    run = L.load_run_log(pa)
+    with MockService() as svc, psycopg.connect(app) as conn:
+        lf = FakeLangfuse(svc)
+        svc.route('POST', L.SCORES_WRITE_PATH, lf._guard(lambda _: (status, {'message': 'temporarily refused'})))
+        first = sync.run(L.LangfuseSink(client_for(svc), tmp_path), conn, environ={})
+        assert first.failed == 1 and first.persistent_failures and first.outstanding_dead_letters == 0
+        receipt = conn.execute("select meta from rsi_checkpoints where job='langfuse-export' and run_key=%s",
+                               (run.trace_id,)).fetchone()[0]
+        assert receipt['phase'] == 'confirmed' and receipt.get('scores_state') != 'rejected'
+        assert len(lf.observations) == 3
 
 
 def test_scoped_export_preserves_daily_cursor_and_shared_receipts(app, tmp_path):
@@ -966,6 +1006,8 @@ def test_exact_retry_recovers_refused_only_and_never_resends_confirmed(app, tmp_
             old.setattr(egress,'catalog_run',lambda *a:False)
             first=L.export_experiment(conn,exp,root=tmp_path,client=client_for(svc),budget_s=30,environ={})
         assert (first['status'],first['rows'],first['refused'],first['issue_kind'])==('partial',1,2,'local_refusal')
+        assert first['local_refusal_counts'] == {'case looks sensitive': 2}
+        assert first['detail'] == '2 records withheld locally before upload: case looks sensitive (2)'
         original=sync.load(conn,'langfuse')['watermarks']['sandbox_runs:'+exp]
         conn.rollback()
         already=L.load_run_log(paths[0]).trace_id
@@ -1040,7 +1082,8 @@ def test_unknown_span_response_is_not_automatically_reexported(app, tmp_path, mo
         assert len(lf.observations) == before and len(calls) == 1
         # Daily scope uses the same receipt, not only the scoped watermark.
         daily = sync.run(L.LangfuseSink(client, tmp_path), conn, environ={})
-        assert daily.failed == 1 and len(lf.observations) == before
+        assert daily.status == 'partial' and daily.persistent_failures
+        assert daily.failed == 0 and len(lf.observations) == before  # same run's backoff is shared across scopes
 
 
 def test_confirmed_span_receipt_survives_a_later_score_failure(app, tmp_path, monkeypatch):
@@ -1054,17 +1097,122 @@ def test_confirmed_span_receipt_survives_a_later_score_failure(app, tmp_path, mo
             return (503, {'message': 'temporary score failure'}) if len(attempts) == 1 else real(req)
         svc.route('POST', L.SCORES_WRITE_PATH, lf._guard(once))
         first = L.export_experiment(conn, EXP, root=tmp_path, client=client_for(svc), budget_s=30, environ={})
-        assert first['failed'] == 1
+        assert first['failed'] == 1 and first['rows'] == 1
         count = len(lf.observations)
-        assert count == 3
+        assert count == 10  # a failed score upload no longer blocks the other healthy run
+        assert len(svc.requests_to('POST', L.OTLP_PATH)) == 2
+        blocked = L.export_experiment(conn, EXP, root=tmp_path, client=client_for(svc), budget_s=30, environ={})
+        assert blocked['status'] == 'partial' and blocked['issue_kind'] == 'export_blocked'
+        assert blocked['rows'] == blocked['failed'] == 0
+        assert blocked['persistent_failures'] and blocked['skipped_scopes']
+        assert len(lf.observations) == count and len(attempts) == 2
         conn.execute("update rsi_checkpoints set meta=meta || '{\"failures\":{}}'::jsonb where job='sync:langfuse'")
         conn.commit()
         second_client = client_for(svc)
         monkeypatch.setattr(second_client, 'trace_exists', lambda *a, **k: False)
         again = L.export_experiment(conn, EXP, root=tmp_path, client=second_client, budget_s=30, environ={})
-        assert again['status'] == 'ok' and again['rows'] == 2
-        assert len(lf.observations) == count + 7
+        assert again['status'] == 'ok' and again['rows'] == 1
+        assert len(lf.observations) == count
         assert len(svc.requests_to('POST', L.OTLP_PATH)) == 2
+
+
+def test_exact_retry_repairs_failed_scores_without_resending_confirmed_spans(app, tmp_path):
+    pa = write_run(tmp_path, run_id=EXP+'-claude-a-split-A-r0', stdout=json.dumps(claude_result()),
+                   sidecar={'case': 'claude.a-split', 'check_passed': True})
+    run = L.load_run_log(pa)
+    with MockService() as svc, psycopg.connect(app) as conn:
+        lf = FakeLangfuse(svc)
+        real = lf._create_scores
+        svc.route('POST', L.SCORES_WRITE_PATH, lf._guard(lambda _: (503, {'message': 'score failure'})))
+        first = L.export_experiment(conn, EXP, root=tmp_path, client=client_for(svc), budget_s=30, environ={})
+        assert first['failed'] == 1 and len(lf.observations) == 3 and not lf.scores
+        conn.execute("update rsi_checkpoints set meta=meta || '{\"failures\":{}}'::jsonb where job='sync:langfuse'")
+        conn.commit()  # simulate the local fixture's completed backoff before exact recovery
+        svc.route('POST', L.SCORES_WRITE_PATH, lf._guard(real))
+        recovered = L.export_experiment(conn, EXP, root=tmp_path, client=client_for(svc), budget_s=30,
+                                        environ={}, retry_run_ids=frozenset({pa.stem}))
+        assert recovered['rows'] == 1 and recovered['already_confirmed_skipped'] == 0
+        assert recovered['score_delivery_incomplete'] == 0 and lf.scores
+        assert len(lf.observations) == 3 and len(svc.requests_to('POST', L.OTLP_PATH)) == 1
+        receipt = conn.execute("select meta from rsi_checkpoints where job='langfuse-export' and run_key=%s",
+                               (run.trace_id,)).fetchone()[0]
+        assert receipt['phase'] == 'confirmed' and receipt['scores_complete'] is True
+        conn.rollback()
+        again = L.export_experiment(conn, EXP, root=tmp_path, client=client_for(svc), budget_s=30,
+                                    environ={}, retry_run_ids=frozenset({pa.stem}))
+        assert again['rows'] == 0 and again['already_confirmed_skipped'] == 1
+
+
+def test_exact_retry_updates_changed_scores_without_duplicate_spans(app, tmp_path):
+    pa = write_run(tmp_path, run_id=EXP+'-claude-a-split-A-r0', stdout=json.dumps(claude_result()),
+                   sidecar={'case': 'claude.a-split', 'check_passed': True})
+    with MockService() as svc, psycopg.connect(app) as conn:
+        lf = FakeLangfuse(svc)
+        first = L.export_experiment(conn, EXP, root=tmp_path, client=client_for(svc), budget_s=30, environ={})
+        assert first['status'] == 'ok'
+        side = pa.with_name(pa.stem+'.rsi.json')
+        metadata = json.loads(side.read_text()); metadata['check_passed'] = False
+        side.write_text(json.dumps(metadata))
+        capped = L.export_experiment(conn, EXP, root=tmp_path, client=client_for(svc), budget_s=30,
+                                     environ={'AMEM_SYNC_LANGFUSE_MAX_ROWS_PER_DAY': '0'},
+                                     retry_run_ids=frozenset({pa.stem}))
+        assert capped['status'] == 'capped' and capped['score_delivery_incomplete'] == 1
+        again = L.export_experiment(conn, EXP, root=tmp_path, client=client_for(svc), budget_s=30,
+                                    environ={}, retry_run_ids=frozenset({pa.stem}))
+        assert again['rows'] == 1 and again['already_confirmed_skipped'] == 0
+        assert len(svc.requests_to('POST', L.OTLP_PATH)) == 1
+        assert [score['value'] for score in lf.scores.values() if score['name'] == 'check_passed'] == [0.0]
+
+
+def test_exact_retry_does_not_claim_unrelated_runs_backoff(app, tmp_path):
+    paths = [write_run(tmp_path, arm=arm, run_id=EXP+f'-claude-a-split-{arm}-r0',
+                       stdout=json.dumps(claude_result()), sidecar={'case': 'claude.a-split', 'check_passed': True})
+             for arm in ('A', 'B')]
+    with MockService() as svc, psycopg.connect(app) as conn:
+        lf = FakeLangfuse(svc)
+        failed_trace = L.load_run_log(paths[0]).trace_id
+        real = lf._create_scores
+        def first_fails(req):
+            if req.json[0]['traceId'] == failed_trace:
+                return 503, {'message': 'score failure'}
+            return real(req)
+        svc.route('POST', L.SCORES_WRITE_PATH, lf._guard(first_fails))
+        first = L.export_experiment(conn, EXP, root=tmp_path, client=client_for(svc), budget_s=30, environ={})
+        assert first['status'] == 'partial' and first['failed'] == first['rows'] == 1
+        selected = L.export_experiment(conn, EXP, root=tmp_path, client=client_for(svc), budget_s=30,
+                                       environ={}, retry_run_ids=frozenset({paths[1].stem}))
+        assert selected['status'] == 'ok' and selected['already_confirmed_skipped'] == 1
+        assert selected['persistent_failures'] == {} and selected['score_delivery_incomplete'] == 0
+        assert len(svc.requests_to('POST', L.OTLP_PATH)) == 2
+
+
+@pytest.mark.parametrize('partial_visible', [False, True])
+def test_lost_response_recovers_only_with_all_expected_spans_visible(app, tmp_path, monkeypatch, partial_visible):
+    pa, pb = _tree(tmp_path); pb.unlink()
+    with MockService() as svc, psycopg.connect(app) as conn:
+        lf = FakeLangfuse(svc); client = client_for(svc)
+        actual = client.export_spans
+        def lost(body):
+            actual(body)
+            raise L.http.HttpError(None, 'response lost', retryable=True)
+        monkeypatch.setattr(client, 'export_spans', lost)
+        first = L.export_experiment(conn, EXP, root=tmp_path, client=client, budget_s=30, environ={})
+        assert first['uncertain'] == 1
+        if partial_visible:
+            lf.observations.pop()
+        count = len(lf.observations)
+        conn.execute("update rsi_checkpoints set meta=meta || '{\"failures\":{}}'::jsonb where job='sync:langfuse'")
+        conn.commit()
+        recovered = L.export_experiment(conn, EXP, root=tmp_path, client=client, budget_s=30, environ={})
+        assert recovered['uncertain'] == 0 and len(lf.observations) == count
+        assert len(svc.requests_to('POST', L.OTLP_PATH)) == 1
+        assert recovered['readback_verified'] is False  # score write receipt is not score readback
+        if partial_visible:
+            assert recovered['status'] == 'partial' and recovered['issue_kind'] == 'readback_incomplete'
+            assert recovered['observed_incomplete_traces'] == 1 and not recovered['spans_readback_verified']
+        else:
+            assert recovered['status'] == 'ok' and recovered['verified_span_readbacks'] == 1
+            assert recovered['spans_readback_verified'] is True
 
 
 def test_scoped_export_never_commits_pending_caller_work(app, tmp_path):

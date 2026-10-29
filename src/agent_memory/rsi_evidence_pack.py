@@ -612,10 +612,17 @@ class _Runner:
             def body(r: Any = r, sts: list[_Step] = sts, box: list[tuple[_Step, QueryResult]] = box,
                      stop: threading.Event = stop,
                      deadline_at: float = self.clock() + self._left(retr)) -> None:
-                for st in sts:
+                for index, st in enumerate(sts):
                     if stop.is_set():
                         return
-                    box.append((st, self._query(st.retr, r, st, max(0.0, deadline_at - self.clock()))))
+                    remaining = max(0.0, deadline_at - self.clock())
+                    # A recovering first CH query used 18.9 of the shared 20s,
+                    # leaving the weekly query about one second. Reserve a fair
+                    # share for each pending query; fast reads release their
+                    # unused share. Keep the original provider deadline.
+                    if st.retr == 'ch':
+                        remaining /= len(sts) - index
+                    box.append((st, self._query(st.retr, r, st, remaining)))
 
             deadline = self.clock() + self._left(retr)
             t, spent = self._start(retr, body)

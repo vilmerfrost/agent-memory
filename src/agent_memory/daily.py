@@ -624,7 +624,7 @@ def step_escalations(result: DailyResult, *, push: bool = True, state_file: Path
 SYNC_KEY = "sync_last_day"
 SYNC_RECOVERY_KEY = "sync_incomplete_day"
 SYNC_BUDGET_S = 120.0  # per sink and day; sync.run stops between batches, and its client-side daily limits apply
-SYNC_STOP = ("failed", "unavailable")  # a sink that is configured and switched on but did not sync: a warning
+SYNC_STOP = ("failed", "unavailable", "partial", "capped")  # report every incomplete configured export
 
 
 def sync_configured(name: str, environ: Mapping[str, str] | None = None) -> bool:

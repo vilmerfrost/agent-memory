@@ -51,6 +51,7 @@ class Batch:
     watermark: str                                 # the cursor value after this batch
     evidence: list[EvidenceRef] = field(default_factory=list)   # links to record once pushed
     key: str = ""                                  # idempotency key for the sink, if it uses one
+    failure_key: str = ""                          # optional per-record retry scope, separate from cursor
 
 
 class Sink(Protocol):
@@ -78,6 +79,10 @@ class SyncReport:
     # Per cursor key, rows this run read: seen = delivered + dead + failed + backoff + stopped (coverage records).
     tables: dict[str, dict[str, int]] = field(default_factory=dict)
     last_ok_at: str | None = None  # the cursor's previous successful run (or try), before this one
+    persistent_failures: dict[str, Any] = field(default_factory=dict)
+    outstanding_dead_letters: int = 0
+    pending_rows: int = 0
+    settlement: dict[str, int] = field(default_factory=dict)
 
     def count(self, table: str, **n: int) -> None:
         t = self.tables.setdefault(table, dict.fromkeys(TABLE_COUNTS, 0))
@@ -87,6 +92,9 @@ class SyncReport:
     def line(self) -> str:
         extra = f" skipped={','.join(self.skipped_tables)}" if self.skipped_tables else ""
         extra += f" dead_letters={self.dead_letters}" if self.dead_letters else ""
+        extra += f" pending={self.pending_rows}" if self.pending_rows else ""
+        extra += f" unresolved={len(self.persistent_failures)}" if self.persistent_failures else ""
+        extra += f" outstanding_dead_letters={self.outstanding_dead_letters}" if self.outstanding_dead_letters else ""
         return (f"sync {self.sink}: {self.status} batches={self.batches} rows={self.rows} failed={self.failed}"
                 f"{extra} {self.seconds:.1f}s" + (f" ({self.detail})" if self.detail else ""))
 
@@ -252,7 +260,7 @@ def _run(sink: Sink, conn: psycopg.Connection, *, budget_s: float = 60.0, replay
         rep.status, rep.detail = "off", "kill switch"
         return rep
     meta = load(conn, sink.name)
-    rep.last_ok_at = meta.get("last_ok_at") or meta.get("last_try_at")
+    rep.last_ok_at = meta.get("last_ok_at")
     stored: dict[str, str] = dict(meta.get("watermarks") or {})
     watermarks: dict[str, str] = dict(stored)
     if replay:
@@ -273,15 +281,18 @@ def _run(sink: Sink, conn: psycopg.Connection, *, budget_s: float = 60.0, replay
         h = Health(False, f"health: {type(exc).__name__}")
     if not h.ok:
         rep.status, rep.detail = "unavailable", h.detail
-        _save(conn, sink.name, "skipped", {"last_error": f"unavailable: {h.detail}"[:300], "last_try_at": _iso(now)})
+        _save(conn, sink.name, "skipped", {"last_error": f"unavailable: {h.detail}"[:300],
+              "last_try_at": _iso(now), 'export_status': 'unavailable'})
         conn.commit()
         rep.seconds = clock() - start
         return rep
     blocked = {t for t, f in failures.items() if not _due(f, now)}
-    rep.skipped_tables = sorted(blocked)
+    in_scope = getattr(sink, 'failure_in_scope', lambda key: True)
+    rep.skipped_tables = sorted(k for k in blocked if in_scope(k))
     for batch in sink.batches(conn, {} if replay else stored, replay=replay):
         n = len(batch.rows)
-        if batch.table in blocked:
+        failure_key = batch.failure_key or batch.table
+        if failure_key in blocked or batch.table in blocked:
             rep.count(batch.table, seen=n, backoff=n)
             continue
         if clock() - start > budget_s:
@@ -310,12 +321,12 @@ def _run(sink: Sink, conn: psycopg.Connection, *, budget_s: float = 60.0, replay
             conn.commit()
             break
         if err is not None:                # retryable: the table backs off, its watermark stays
-            f = failures.get(batch.table, {})
+            f = failures.get(failure_key, {})
             n = int(f.get("attempts", 0)) + 1
             wait = BACKOFF_MIN[min(n - 1, len(BACKOFF_MIN) - 1)]
-            failures[batch.table] = {"attempts": n, "dead": n >= MAX_ATTEMPTS, "last_error": f"{type(err).__name__}: {err}"[:300],
+            failures[failure_key] = {"attempts": n, "dead": n >= MAX_ATTEMPTS, "last_error": f"{type(err).__name__}: {err}"[:300],
                                      "next_retry_at": _iso(now + timedelta(minutes=wait))}
-            blocked.add(batch.table)
+            blocked.add(failure_key)
             rep.failed += 1
             _save(conn, sink.name, "running", {"failures": failures, "usage": usage})
             conn.commit()
@@ -327,7 +338,10 @@ def _run(sink: Sink, conn: psycopg.Connection, *, budget_s: float = 60.0, replay
         dead_letters = (dead_letters + dead)[-MAX_DEAD_LETTERS:]
         rep.dead_letters += len(dead)
         watermarks[batch.table] = batch.watermark
-        failures.pop(batch.table, None)
+        failures.pop(failure_key, None)
+        checkpoint = getattr(sink, 'checkpoint', None)
+        if callable(checkpoint):
+            checkpoint(batch, watermarks)
         _save(conn, sink.name, "running", {"watermarks": watermarks, "failures": failures, "usage": usage,
                                            "dead_letters": dead_letters})
         conn.commit()          # the links and the advanced watermark land together
@@ -341,9 +355,30 @@ def _run(sink: Sink, conn: psycopg.Connection, *, budget_s: float = 60.0, replay
         dead_letters = [d for d in dead_letters if d.get("key") not in held]
     if rep.failed and rep.status == "ok":
         rep.status = "failed" if not rep.batches else "partial"
+    rep.persistent_failures = {k: v for k, v in failures.items() if in_scope(k)}
+    rep.outstanding_dead_letters = sum(in_scope(str(d.get('table', ''))) for d in dead_letters)
+    completion = getattr(sink, 'completion', None)
+    if callable(completion):
+        rep.settlement = completion(conn)
+        rep.pending_rows = rep.settlement.get('queued', 0)
+    incomplete = []
+    if rep.persistent_failures:
+        incomplete.append(f"{len(rep.persistent_failures)} unresolved retry scopes")
+    if rep.outstanding_dead_letters:
+        incomplete.append(f"{rep.outstanding_dead_letters} outstanding dead letters")
+    if rep.pending_rows:
+        incomplete.append(f"{rep.pending_rows} records awaiting provider processing")
+    rejected = rep.settlement.get('failed', 0) + rep.settlement.get('rejected', 0)
+    if rejected:
+        incomplete.append(f"{rejected} failed or rejected records")
+    if incomplete:
+        if rep.status == 'ok':
+            rep.status = 'partial'
+        rep.detail = '; '.join(filter(None, [rep.detail, *incomplete]))
     final = {"watermarks": watermarks, "failures": failures, "last_try_at": _iso(now), "usage": usage,
-             "dead_letters": dead_letters}
-    if rep.status in ("ok", "partial", "capped"):
+             "dead_letters": dead_letters, "export_status": rep.status, "settlement": rep.settlement,
+             "last_error": rep.detail if rep.status != 'ok' else None}
+    if rep.status == "ok":
         final["last_ok_at"] = _iso(now)
     _save(conn, sink.name, "failed" if rep.status == "failed" else "done", final)
     conn.commit()
@@ -433,10 +468,10 @@ def status(conn: psycopg.Connection) -> list[dict[str, Any]]:
     for j, st, fin, meta in rows:
         meta = meta or {}
         fails = meta.get("failures") or {}
-        out.append({"sink": j.split(":", 1)[1], "status": st, "finished_at": fin.isoformat() if fin else None,
+        out.append({"sink": j.split(":", 1)[1], "status": st if st == 'running' else meta.get('export_status', st), "finished_at": fin.isoformat() if fin else None,
                     "tables": sorted((meta.get("watermarks") or {}).keys()), "last_ok_at": meta.get("last_ok_at"),
                     "dead": sorted(t for t, f in fails.items() if f.get("dead")),
                     "failing": sorted(t for t, f in fails.items() if not f.get("dead")),
                     "dead_letters": len(meta.get("dead_letters") or []), "usage": meta.get("usage") or {},
-                    "last_error": meta.get("last_error")})
+                    "last_error": meta.get("last_error"), "settlement": meta.get('settlement', {})})
     return out

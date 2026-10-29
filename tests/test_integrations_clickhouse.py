@@ -69,12 +69,12 @@ class FakeClickHouse:
         self.svc.route("POST", "/", self._post)
 
     # FINAL: per id the highest version; a tie keeps the last insert
-    def final(self, table: str) -> list[dict[str, Any]]:
+    def final(self, table: str, *, include_deleted: bool = False) -> list[dict[str, Any]]:
         best: dict[str, dict[str, Any]] = {}
         for r in self.rows[table]:
             if r["id"] not in best or r["version"] >= best[r["id"]]["version"]:
                 best[r["id"]] = r
-        return list(best.values())
+        return [r for r in best.values() if include_deleted or not r.get("_amem_deleted", 0)]
 
     def by_id(self, table: str) -> dict[str, dict[str, Any]]:
         return {r["id"]: r for r in self.final(table)}
@@ -98,11 +98,18 @@ class FakeClickHouse:
                 return 503, "injected: committed, response lost"
             return 200, ""
         text = req.body.decode()
-        if text.startswith("CREATE "):
+        if text.startswith(("CREATE ", "ALTER ")):
             self.ddl.append(text)
             return 200, ""
         if req.q("database") != "amem":
             return 400, "no database"
+        if re.fullmatch(r"SELECT _amem_deleted FROM [a-z_]+ LIMIT 0 FORMAT JSONEachRow", text):
+            return 200, ""
+        if text.startswith("SELECT id, _amem_deleted FROM "):
+            m = re.fullmatch(r"SELECT id, _amem_deleted FROM ([a-z_]+) FINAL WHERE id > \{after:String\} ORDER BY id LIMIT \{limit:UInt32\} FORMAT JSONEachRow", text)
+            if m:
+                rows = sorted((r for r in self.final(m.group(1), include_deleted=True) if r['id'] > (req.q('param_after') or '')), key=lambda r:r['id'])
+                return 200, self._jsonl([{'id': r['id'], '_amem_deleted': r.get('_amem_deleted', 0)} for r in rows[:int(req.q('param_limit') or 500)]])
         for t, s in CH.VERIFY_SQL.items():
             if text == s:
                 return 200, self._jsonl(self._verify(t, req.q("param_since") or ""))
@@ -441,6 +448,8 @@ def test_map_row_keeps_only_the_allowlist() -> None:
 def test_ensure_schema_sends_one_statement_per_request_with_auth(fake: FakeClickHouse) -> None:
     n = CH.ensure_schema(client_for(fake.svc.url))
     assert n == len(fake.ddl) == 1 + len(CH.TABLES)
+    assert not any(statement.startswith('ALTER') for statement in fake.ddl)
+    assert all('_amem_deleted UInt8 DEFAULT 0' in statement for statement in fake.ddl[1:])
     for r in fake.svc.requests_to("POST", "/"):
         h = {k.lower(): v for k, v in r.headers.items()}                  # header names are case-insensitive
         assert h.get("x-clickhouse-user") == CH_USER and h.get("x-clickhouse-key") == CH_KEY
@@ -493,7 +502,8 @@ def test_incremental_watermark(seed: Seed, pg_url: str, app: str, fake: FakeClic
         rep = sync.run(sink, conn, environ={})
         assert rep.status == "ok" and rep.rows == sum(counts(seed).values())
         marks = sync.load(conn, "clickhouse")["watermarks"]
-        assert set(marks) == set(TABLES) and all(CH.parse_mark(m) for m in marks.values())
+        assert set(TABLES) <= set(marks) and all(CH.parse_mark(marks[t]) for t in TABLES)
+        assert all(k in TABLES or k.endswith(":reconcile") or k == "ch:schedule" for k in marks)
         assert marks["sessions"].endswith("|chs-sbx")                 # newest change, ties broken by id
         n_inserts = len(fake.inserts())
         assert sync.run(sink, conn, environ={}).rows == 0 and len(fake.inserts()) == n_inserts   # nothing new
@@ -502,7 +512,8 @@ def test_incremental_watermark(seed: Seed, pg_url: str, app: str, fake: FakeClic
         conn.execute("update sessions set outcome = 'abandoned', outcome_at = now() where session_id = 'chs-2'")
     with psycopg.connect(app) as conn:
         rep = sync.run(sink, conn, environ={})
-        assert rep.rows == 2 and rep.batches == 2
+        assert rep.rows == 2
+        assert len(fake.inserts()) == n_inserts + 2  # control-only reconciliation checkpoints do not INSERT
     assert {r["id"] for r in fake.rows["deviations"][-1:]} == {new_dev}
     assert fake.by_id("sessions")["chs-2"]["outcome"] == "abandoned"
     assert len(fake.by_id("deviations")) == len(seed.ids["deviations"])
@@ -519,7 +530,7 @@ def test_lookback_resends_silent_updates(seed: Seed, pg_url: str, app: str, fake
         assert fake.by_id("deviations")[dev]["objective_result"] != 0.11   # missed without the lookback
         rep = sync.run(CH.ClickHouseSink(client_for(fake.svc.url), lookback_days=7), conn, environ={})
         n_mutable = sum(len(seed.ids[t.name]) for t in CH.TABLES if t.lookback)
-        assert rep.rows == n_mutable                                       # append-only tables are not re-sent
+        assert rep.rows == n_mutable                                       # append-only tables also recover late commits
     assert fake.by_id("deviations")[dev]["objective_result"] == 0.11
     assert all(len(fake.by_id(t)) == n for t, n in counts(seed).items())
 
@@ -909,7 +920,7 @@ def test_sink_narrowed_to_tables_and_since(seed: Seed, pg_url: str, app: str, fa
     assert [t.name for t in sink.tables] == ["runs", "skill_calls"]
     with psycopg.connect(app) as conn:
         rep = sync.run(sink, conn, replay=True, environ={})
-        assert rep.status == "ok" and set(sync.load(conn, "clickhouse")["watermarks"]) == {"runs", "skill_calls"}
+        assert rep.status == "ok" and set(sync.load(conn, "clickhouse")["watermarks"]) - {"ch:schedule"} == {"runs", "skill_calls", "runs:reconcile", "skill_calls:reconcile"}
     assert {r.q("query").split()[2] for r in fake.inserts()} == {"amem.runs", "amem.skill_calls"}
     runs = fake.by_id("runs")
     assert old not in runs and len(runs) == len(seed.ids["runs"]) - 1 and len(fake.by_id("skill_calls")) == 1
@@ -917,13 +928,13 @@ def test_sink_narrowed_to_tables_and_since(seed: Seed, pg_url: str, app: str, fa
         assert sync.run(CH.ClickHouseSink(client_for(fake.svc.url)), conn, environ={}).status == "ok"
         assert old not in fake.by_id("runs")                                # behind the cursor, as documented
         marks = sync.load(conn, "clickhouse")["watermarks"]
-        assert set(marks) == set(TABLES)
+        assert set(TABLES) <= set(marks)
         # a narrowed replay without --since sends the old row, and keeps the other tables' cursors
         sync.run(CH.ClickHouseSink(client_for(fake.svc.url), tables=CH.tables_named(["runs"])), conn, replay=True,
                  environ={})
         after = sync.load(conn, "clickhouse")["watermarks"]
-    assert old in fake.by_id("runs") and set(after) == set(TABLES)
-    assert {t: m for t, m in after.items() if t != "runs"} == {t: m for t, m in marks.items() if t != "runs"}
+    assert old in fake.by_id("runs") and set(TABLES) <= set(after)
+    assert {t: m for t, m in after.items() if t in TABLES and t != "runs"} == {t: m for t, m in marks.items() if t in TABLES and t != "runs"}
     with pytest.raises(ValueError, match="unknown table.*nope"):
         CH.tables_named(["runs", "nope"])
 
@@ -936,3 +947,117 @@ def test_config_from_env_never_shows_the_key() -> None:
     assert CH.config({"AMEM_CLICKHOUSE_LOOKBACK_DAYS": "nope"}).lookback_days == CH.LOOKBACK_DAYS
     mark = (datetime(2026, 10, 16, 9, 0, 0, 123456, tzinfo=UTC), "codex:019a|x")
     assert CH.parse_mark(CH.format_mark(mark)) == mark and CH.parse_mark("garbage") is None
+
+
+@pytest.mark.parametrize('table', ['rsi_decisions', 'rsi_eval_results'])
+def test_append_only_late_commit_is_recovered(seed: Seed, pg_url: str, app: str,
+                                             fake: FakeClickHouse, table: str) -> None:
+    """An older open transaction commits after a newer exported row."""
+    with psycopg.connect(pg_url) as owner:
+        art = owner.execute('select hash from rsi_artifacts limit 1').fetchone()[0]
+        proposal = owner.execute('select id from rsi_proposals limit 1').fetchone()[0]
+    def insert(conn, suffix):
+        if table == 'rsi_decisions':
+            return str(conn.execute("insert into rsi_decisions(proposal_id,action,artifact_hash,source,verified,expires_at,decided_at) "
+                "values(%s,%s,%s,'cli','cli-tty',now()+interval '1 day',%s) returning id",
+                (proposal, 'apply' if suffix == 'old' else 'undo', art,
+                 datetime.now(UTC)-timedelta(days=90) if suffix == 'old' else datetime.now(UTC))).fetchone()[0])
+        return str(conn.execute("insert into rsi_eval_results(artifact_hash,baseline_id,suite,suite_version,verdict,record,record_sha,created_at) "
+            "values(%s,'base','late','1','pass','{\"format\":\"rsi-eval/1\"}',%s,%s) returning id",
+            (art, hashlib.sha256(suffix.encode()).hexdigest(),
+             datetime.now(UTC)-timedelta(days=90) if suffix == 'old' else datetime.now(UTC))).fetchone()[0])
+    with psycopg.connect(pg_url) as older:
+        missing = insert(older, 'old')
+        with psycopg.connect(pg_url) as newer:
+            recent = insert(newer, 'new')
+        with psycopg.connect(app) as conn:
+            sink = CH.ClickHouseSink(client_for(fake.svc.url), tables=CH.tables_named([table]))
+            assert sync.run(sink, conn, environ={}).status == 'ok'
+            assert recent in fake.by_id(table) and missing not in fake.by_id(table)
+        older.commit()
+    with psycopg.connect(app) as conn:
+        assert sync.run(sink, conn, environ={}).status == 'ok'
+    assert missing in fake.by_id(table)
+
+
+def test_source_deletion_is_tombstoned_and_removed_from_queries(seed: Seed, pg_url: str, app: str,
+                                                              fake: FakeClickHouse) -> None:
+    target = seed.last_run
+    sink = CH.ClickHouseSink(client_for(fake.svc.url), tables=CH.tables_named(['runs']), lookback_days=0)
+    with psycopg.connect(app) as conn:
+        assert sync.run(sink, conn, environ={}).status == 'ok'
+    assert target in fake.by_id('runs')
+    with psycopg.connect(pg_url) as owner:
+        owner.execute('delete from runs where id=%s', (target,))
+    with psycopg.connect(app) as conn:
+        assert sync.run(sink, conn, environ={}).status == 'ok'
+        assert CH.verify(conn, client=client_for(fake.svc.url), tables=sink.tables).parity
+    assert target not in fake.by_id('runs')
+    assert any(r['id'] == target and r['_amem_deleted'] == 1 for r in fake.rows['runs'])
+    result = E.run_query(CH.ClickHouseRetriever(client_for(fake.svc.url)), 'routine_streaks', {})
+    assert result.status == 'ok'
+    assert all('_amem_deleted = 0' in q.sql for q in CH.QUERIES.values())
+    assert all('_amem_deleted = 0' in q for q in CH.VERIFY_SQL.values())
+    with psycopg.connect(pg_url) as owner:
+        owner.execute("insert into runs(id,routine,source,status,started_at,created_at) values(%s,'restored','launchd','pass',now()-interval '90 days',now()-interval '90 days')", (target,))
+    with psycopg.connect(app) as conn:
+        assert sync.run(sink, conn, environ={}).status == 'ok'
+    assert fake.by_id('runs')[target]['routine'] == 'restored'
+    assert fake.by_id('runs')[target]['_amem_deleted'] == 0
+
+
+def test_reconciliation_never_deletes_on_failed_source_lookup(fake: FakeClickHouse) -> None:
+    from types import SimpleNamespace
+    client = client_for(fake.svc.url)
+    fake.rows['runs'] = [{'id': 'known-run', 'version': 1, 'created_at': '2026-10-29 00:00:00.000000'}]
+    sink = CH.ClickHouseSink(client, tables=CH.tables_named(['runs']))
+    def unavailable(*a, **k):
+        raise psycopg.OperationalError('source unavailable')
+    with pytest.raises(psycopg.OperationalError):
+        list(sink._reconcile(SimpleNamespace(execute=unavailable), sink.tables[0], 2, None))
+    assert fake.by_id('runs')['known-run'].get('_amem_deleted', 0) == 0 and not fake.inserts()
+
+
+def test_cloud_old_schema_fails_closed_without_owner_upgrade(fake: FakeClickHouse) -> None:
+    original = fake._post
+    def old_schema(req):
+        if req.body.decode().startswith('SELECT _amem_deleted'):
+            return 500, 'UNKNOWN_IDENTIFIER: _amem_deleted'
+        return original(req)
+    fake.svc.route('POST', '/', old_schema)
+    client = CH.Client(CH.Config(fake.svc.url, CH_USER, CH_KEY, cloud=True), retries=0)
+    sink = CH.ClickHouseSink(client, tables=CH.tables_named(['runs']))
+    state = sink.health()
+    assert not state.ok and 'owner upgrade' in state.detail
+    assert fake.ddl == [] and fake.inserts() == []
+    assert all('ADD COLUMN IF NOT EXISTS _amem_deleted UInt8 DEFAULT 0' in s for s in CH.schema_upgrade_sql())
+
+
+def test_single_batch_budget_rotates_and_resumes_families(seed: Seed, app: str, fake: FakeClickHouse, monkeypatch) -> None:
+    monkeypatch.setenv('AMEM_SYNC_CLICKHOUSE_MAX_ROWS_PER_DAY', '1')
+    monkeypatch.setenv('AMEM_SYNC_CLICKHOUSE_MAX_REQUESTS_PER_DAY', '1')
+    visited = []
+    with psycopg.connect(app) as conn:
+        for day in range(40):
+            sink = CH.ClickHouseSink(client_for(fake.svc.url), tables=CH.tables_named(['sessions', 'runs']),
+                                     lookback_days=0)
+            assert sink.batch_size == 1
+            report = sync.run(sink, conn, now=seed.now + timedelta(days=day))
+            assert report.usage['requests'] <= 1 and report.usage['rows'] <= 1
+            visited.append(sync.load(conn, 'clickhouse')['watermarks']['ch:schedule'])
+    assert any(p.startswith('sessions') for p in visited[:4])
+    assert any(p.startswith('runs') for p in visited[:4])
+    assert len(fake.by_id('sessions')) == len(seed.ids['sessions'])
+    assert len(fake.by_id('runs')) == len(seed.ids['runs'])
+
+
+def test_durable_lookback_cursor_continues_after_one_batch(seed: Seed, app: str, fake: FakeClickHouse) -> None:
+    table = CH.tables_named(['runs'])[0]
+    with psycopg.connect(app) as conn:
+        sink = CH.ClickHouseSink(client_for(fake.svc.url), tables=[table], batch_size=1)
+        assert sync.run(sink, conn, environ={}).status == 'ok'
+        mark = CH.parse_mark(sync.load(conn, 'clickhouse')['watermarks']['runs'])
+        first = next(sink._lookback(conn, table, CH.next_version(), mark, seed.now-timedelta(days=7), None))
+        second = next(sink._lookback(conn, table, CH.next_version(), mark, seed.now-timedelta(days=7), first.watermark))
+    assert first.rows[0]['id'] != second.rows[0]['id']
+    assert CH.parse_mark(json.loads(second.watermark)['after']) > CH.parse_mark(json.loads(first.watermark)['after'])

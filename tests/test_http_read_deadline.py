@@ -5,7 +5,7 @@ import time
 
 import pytest
 
-from agent_memory.integrations import http, langfuse as LF
+from agent_memory.integrations import http, langfuse as LF, clickhouse as CH
 
 
 @contextmanager
@@ -54,6 +54,24 @@ def test_langfuse_budget_reaches_transport_body_not_only_next_page():
         with client.read_budget(.1),pytest.raises(LF.ReadDeadline):
             client._call('GET','/api/public/projects')
         assert time.monotonic()-started<.45 and finished.wait(.4)
+
+
+def test_clickhouse_health_ping_obeys_the_active_read_deadline():
+    with drip_server() as (url, finished):
+        client = CH.Client(CH.Config(url=url), retries=0)
+        started = time.monotonic()
+        with client.read_budget(.1), pytest.raises(http.HttpError):
+            client.ping()
+        assert time.monotonic() - started < .45 and finished.wait(.4)
+
+
+def test_expired_clickhouse_health_budget_starts_no_request(monkeypatch):
+    calls = []
+    monkeypatch.setattr(CH.http, 'request', lambda *a, **k: calls.append(k))
+    client = CH.Client(CH.Config(url='http://127.0.0.1'), retries=0)
+    with client.read_budget(0), pytest.raises(TimeoutError):
+        client.ping()
+    assert calls == []
 
 
 def test_expired_budget_starts_no_request():

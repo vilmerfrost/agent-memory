@@ -443,7 +443,7 @@ def test_202_is_polled_until_completed_or_the_budget(db: Db, pdev: FakePastDev) 
     clock = Clock()
     with psycopg.connect(db.app) as conn:
         rep = sync.run(sink(pdev, clock, poll_s=1.0), conn, environ={})
-    assert rep.status == "ok" and all(s <= 1.0 for s in clock.slept)
+    assert rep.status == "partial" and rep.pending_rows > 0 and all(s <= 1.0 for s in clock.slept)
     queued = {ext: ln["metrics"] for ext, ln in links(db).items() if ln["metrics"]["status"] == "queued"}
     assert queued and all(m["ingestion_id"] in pdev.ingestions for m in queued.values())   # accepted, not completed
     # Mission 004C (G-PD0): a later run checks each running ingestion by its id; nothing is sent again
@@ -458,6 +458,51 @@ def test_202_is_polled_until_completed_or_the_budget(db: Db, pdev: FakePastDev) 
     assert all(links(db)[ext]["metrics"]["status"] == "completed" for ext in queued)
 
 
+def test_settle_pending_refreshes_completion_without_any_provider_write(db: Db, pdev: FakePastDev) -> None:
+    seed(db)
+    pdev.polls = ['processing'] * 50
+    with psycopg.connect(db.app) as conn:
+        rep = sync.run(sink(pdev, poll_s=0), conn, environ={})
+        assert rep.status == 'partial' and rep.pending_rows > 0
+        sends = len(pdev.ingest_requests())
+        retries = len(pdev.retries)
+        pdev.polls = []
+        report = PD.settle_pending(conn, client=PD.Client(pdev.cfg()), environ={})
+        assert report['status'] == 'ok' and report['completed_records'] == rep.pending_rows
+        assert report['pending_records'] == 0
+        assert len(pdev.ingest_requests()) == sends and len(pdev.retries) == retries
+    assert {v['metrics']['status'] for v in links(db).values()} == {'completed'}
+
+
+def test_settle_pending_keeps_unfinished_processing_partial(db: Db, pdev: FakePastDev) -> None:
+    seed(db)
+    pdev.polls = ['processing'] * 50
+    with psycopg.connect(db.app) as conn:
+        rep = sync.run(sink(pdev, poll_s=0), conn, environ={})
+        report = PD.settle_pending(conn, client=PD.Client(pdev.cfg()), environ={})
+    assert report['status'] == 'partial' and report['pending_records'] == rep.pending_rows
+    assert report['completed_records'] == 0 and not pdev.retries
+
+
+def test_settle_pending_respects_kill_switch_without_reading_or_writing(db: Db, pdev: FakePastDev) -> None:
+    with psycopg.connect(db.app) as conn:
+        assert PD.settle_pending(conn, client=PD.Client(pdev.cfg()), environ={'AMEM_PASTDEV': 'off'})['status'] == 'off'
+    assert not pdev.ingest_requests() and not pdev.retries
+
+
+def test_settle_pending_reports_rejected_processing_without_retrying(db: Db, pdev: FakePastDev) -> None:
+    seed(db)
+    pdev.polls = ['processing'] * 50
+    with psycopg.connect(db.app) as conn:
+        sync.run(sink(pdev, poll_s=0), conn, environ={})
+        pdev.polls = ['failed'] * 50
+        pdev.failure_code = 'content-rejected'
+        result = PD.settle_pending(conn, client=PD.Client(pdev.cfg()), environ={})
+    assert result['status'] == 'partial' and result['provider_failed_jobs'] > 0
+    assert result['pending_records'] == 0 and not pdev.retries
+    assert {v['metrics']['status'] for v in links(db).values()} == {'rejected'}
+
+
 def test_a_failed_ingestion_is_retried_by_its_id_and_never_re_sent(db: Db, pdev: FakePastDev) -> None:
     """Mission 004C (G-PD0). A re-send of content past.dev holds is answered `200 unchanged` even when its
     ingestion failed, so the sink never re-sends to recover: it keeps the ingestion id, uses the free
@@ -467,7 +512,8 @@ def test_a_failed_ingestion_is_retried_by_its_id_and_never_re_sent(db: Db, pdev:
                                                                  # this run's free retry
     with psycopg.connect(db.app) as conn:
         rep = sync.run(sink(pdev), conn, environ={})
-        assert (rep.status, rep.failed, rep.dead_letters) == ("ok", 0, 0)
+        assert (rep.status, rep.failed, rep.dead_letters) == ("partial", 0, 0)
+        assert rep.pending_rows == 1
         ln = links(db)[f"past:{refs_['proposal']}"]["metrics"]
         assert (ln["status"], ln["retries"], ln["failure"]) == ("queued", 1, "model-unavailable")   # not sent yet
         iid = ln["ingestion_id"]
@@ -494,7 +540,8 @@ def test_retries_are_capped_then_the_records_are_dead_lettered(db: Db, pdev: Fak
         pdev.polls = ["failed"]
         rep = sync.run(sink(pdev), conn, environ={})              # used up: dead-lettered, not sent again
         meta = sync.load(conn, "pastdev")
-    assert rep.status == "ok" and rep.dead_letters == 1 and pdev.retries == [iid] * PD.MAX_FREE_RETRIES
+    assert rep.status == "partial" and rep.dead_letters == 1 and pdev.retries == [iid] * PD.MAX_FREE_RETRIES
+    assert rep.outstanding_dead_letters == 1 and rep.settlement["failed"] == 1
     assert [d["key"] for d in meta["dead_letters"]] == [refs_["proposal"]] and "model-unavailable" in \
         meta["dead_letters"][0]["error"]
     assert links(db)[f"past:{refs_['proposal']}"]["metrics"]["status"] == "failed"
@@ -513,7 +560,8 @@ def test_content_rejected_is_dead_lettered_not_split_and_re_sent(db: Db, pdev: F
     with psycopg.connect(db.app) as conn:
         rep = sync.run(sink(pdev), conn, environ={})
         meta = sync.load(conn, "pastdev")
-        assert (rep.status, rep.rows, rep.dead_letters) == ("ok", 0, 3)
+        assert (rep.status, rep.rows, rep.dead_letters) == ("partial", 0, 3)
+        assert rep.settlement["rejected"] == 3
         assert len(pdev.ingest_requests()) == 1 and pdev.retries == []          # no split, no re-send, no retry
         assert meta["watermarks"]["edits"] and all("content-rejected" in d["error"] for d in meta["dead_letters"])
         assert {ln["metrics"]["status"] for ln in links(db).values()} == {"rejected"}
@@ -834,10 +882,25 @@ def test_recall_maps_source_ids_and_drops_refs_that_no_longer_exist(db: Db, pdev
     assert pd.refs[0].observed_at == "2026-10-16T09:14:00+00:00"
     assert "IGNORE" not in json.dumps(pd.to_json())
     (req,) = pdev.svc.requests_to("POST", "/api/v1/recall")
-    assert req.json == {"query": "why did the shell habits edit work?", "identity": "rsi", "limit": 5,
+    assert req.json == {"query": "why did the shell habits edit work?", "identity": "rsi", "limit": 10,
                         "occurredFrom": "2026-10-01T00:00:00Z", "occurredTo": "2026-10-16T23:59:59Z"}
     pdev.recall_answer["results"] = pdev.recall_answer["results"] * 5
     assert len(r.query("recall", {"query": "shell", "limit": "2"})) == 2
+
+
+def test_recall_overfetch_fills_after_stale_sources_without_second_provider_call(db, pdev):
+    real = seed(db)['edit']
+    missing = 'amem:edit/'+str(uuid.uuid4())
+    calls = []
+    class Reader:
+        def recall(self, body):
+            calls.append(body)
+            rows = [{'rank': n, 'sources': [{'sourceId': PD.wire(ref)}]} for n, ref in enumerate((missing, real))]
+            return {'results': rows[:body['limit']]}
+    retriever = PD.PastDevRetriever(lambda: psycopg.connect(db.app), pdev.cfg(), client=Reader(), environ={})
+    results = retriever.query('recall', {'query': 'shell', 'limit': '1'})
+    assert len(results) == 1 and results[0].subject_refs == [real]
+    assert len(calls) == 1 and calls[0]['limit'] == 2
 
 
 @pytest.mark.parametrize(("params", "status"), [
@@ -1163,7 +1226,7 @@ def test_an_id_invalid_dead_letter_is_sent_again_after_the_fix(db: Db, pdev: Fak
     with psycopg.connect(db.app) as conn:
         rep = sync.run(sink(pdev), conn, replay=True, environ={})
         meta = sync.load(conn, "pastdev")
-    assert (rep.status, rep.rows, rep.dead_letters) == ("ok", 0, len(SENT)) and pdev.points == {}
+    assert (rep.status, rep.rows, rep.dead_letters) == ("partial", 0, len(SENT)) and pdev.points == {}
     assert sorted(d["key"] for d in meta["dead_letters"]) == sorted(refs_[k] for k in SENT)          # the refs
     assert all("id-invalid" in d["error"] for d in meta["dead_letters"]) and links(db) == {}
     monkeypatch.undo()

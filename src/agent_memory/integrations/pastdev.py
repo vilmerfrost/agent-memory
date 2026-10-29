@@ -92,11 +92,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import time
 import uuid
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
+import threading
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from typing import Any
@@ -172,12 +175,29 @@ class Client:
     def __init__(self, cfg: Config, *, sleep: Callable[[float], None] = time.sleep, timeout: float = 10.0,
                  retries: int = 3):
         self.cfg, self.sleep, self.timeout, self.retries = cfg, sleep, timeout, retries
+        self._reads = threading.local()
+
+    @contextmanager
+    def read_budget(self, seconds: float):
+        if not math.isfinite(seconds) or seconds < 0:
+            raise ValueError('finite nonnegative read budget required')
+        old = getattr(self._reads, 'deadline', None)
+        self._reads.deadline = min(old, time.monotonic()+seconds) if old is not None else time.monotonic()+seconds
+        try:
+            yield
+        finally:
+            self._reads.deadline = old
 
     def _call(self, method: str, path: str, body: Any = None, *, ok: Callable[[int], bool] | None = None,
               retries: int | None = None) -> http.Response:
-        return http.request(method, self.cfg.base_url + path, body=body, timeout=self.timeout,
+        deadline = getattr(self._reads, 'deadline', None) if method == 'GET' else None
+        left = deadline-time.monotonic() if deadline is not None else None
+        if left is not None and left <= 0:
+            raise TimeoutError('past.dev status read budget exhausted')
+        return http.request(method, self.cfg.base_url + path, body=body, timeout=min(self.timeout,left) if left is not None else self.timeout,
                             headers={"Authorization": f"Bearer {self.cfg.key}", "Accept": "application/json"},
-                            retries=self.retries if retries is None else retries, backoff=1.0, sleep=self.sleep,
+                            retries=0 if left is not None else self.retries if retries is None else retries,
+                            total_timeout=left, backoff=1.0, sleep=self.sleep,
                             ok=ok or (lambda s: 200 <= s < 300), final=cap_reached)
 
     def health(self) -> Health:
@@ -749,6 +769,17 @@ class PastDevSink:
         """Refs past.dev holds (a sent, not deleted link): sync drops their stale dead letters."""
         return {sid for sid, m in _links(conn).items() if m.get("status") in SENT and not m.get("deleted")}
 
+    def completion(self, conn: psycopg.Connection) -> dict[str, int]:
+        """Stored provider settlement, separate from transport acceptance."""
+        counts = {COMPLETED: 0, QUEUED: 0, FAILED: 0, REJECTED: 0}
+        for ref, metrics in _links(conn).items():
+            if metrics.get('deleted') or (self.only is not None and ref not in self.only):
+                continue
+            status = metrics.get('status')
+            if status in counts:
+                counts[status] += 1
+        return counts
+
     def dead_key(self, row: Mapping[str, Any]) -> str:
         """sync's dead-letter key for one row: the record's ref (an ingest item carries the wired id)."""
         return unwire(str(row.get("id") or ""))
@@ -827,6 +858,67 @@ class PastDevSink:
                 return QUEUED, code, retries
             self.sleep(wait)
             wait = min(wait * 2, 4.0)
+
+
+def settle_pending(conn: psycopg.Connection, *, client: Client | None = None,
+                   budget_s: float = 30, limit: int = 20,
+                   environ: Mapping[str, str] | None = None) -> dict[str, Any]:
+    """Read pending provider jobs and refresh local receipts. Never ingest, retry or delete content."""
+    if not math.isfinite(budget_s) or budget_s <= 0 or not 1 <= limit <= 100:
+        raise ValueError('positive settlement budget and limit1..100 required')
+    if switched_off(environ):
+        return {'status': 'off', 'checked_jobs': 0, 'completed_records': 0}
+    client = client or _client(config(environ), None, time.sleep)
+    if client is None:
+        return {'status': 'unavailable', 'checked_jobs': 0, 'completed_records': 0}
+    lock = 'amem:sync:pastdev'
+    if not conn.execute('select pg_try_advisory_lock(hashtextextended(%s,0))', (lock,)).fetchone()[0]:
+        return {'status': 'partial', 'detail': 'another past.dev sync is active', 'checked_jobs': 0, 'completed_records': 0}
+    deadline = time.monotonic()+budget_s
+    checked = completed = failed_reads = provider_failed_jobs = 0
+    try:
+        jobs = conn.execute("select metrics->>'ingestion_id' from rsi_evidence where system='pastdev' "
+            "and metrics->>'status'='queued' and not coalesce((metrics->>'deleted')::boolean,false) "
+            "group by metrics->>'ingestion_id' order by min(observed_at) limit %s", (limit,)).fetchall()
+        for (iid,) in jobs:
+            if time.monotonic() >= deadline:
+                break
+            if _ingestion_id(iid) is None:
+                failed_reads += 1
+                continue
+            try:
+                with client.read_budget(max(0.001, deadline-time.monotonic())):
+                    state = client.ingestion(iid)
+                checked += 1
+            except (http.HttpError, TimeoutError, ValueError):
+                failed_reads += 1
+                continue
+            if state.get('status') == COMPLETED:
+                completed += conn.execute("update rsi_evidence set metrics=(metrics-'failure') || %s, "
+                    "observed_at=clock_timestamp() where system='pastdev' and metrics->>'status'='queued' "
+                    "and metrics->>'ingestion_id'=%s", (Jsonb({'status': COMPLETED}), iid)).rowcount
+                conn.commit()
+            elif state.get('status') == 'failed':
+                provider_failed_jobs += 1
+                failure = state.get('failure')
+                code = failure.get('code') if isinstance(failure, Mapping) else None
+                code = code if code in FAILURE_CODES else 'unknown'
+                status = REJECTED if code == 'content-rejected' else QUEUED
+                conn.execute("update rsi_evidence set metrics=metrics || %s, observed_at=clock_timestamp() "
+                    "where system='pastdev' and metrics->>'status'='queued' and metrics->>'ingestion_id'=%s",
+                    (Jsonb({'status': status, 'failure': code}), iid))
+                conn.commit()
+            elif state.get('status') not in ('queued', 'processing', 'failed'):
+                failed_reads += 1  # malformed or unknown state cannot become successful settlement
+        pending = conn.execute("select count(*) from rsi_evidence where system='pastdev' and metrics->>'status'='queued' "
+            "and not coalesce((metrics->>'deleted')::boolean,false)").fetchone()[0]
+        return {'status': 'partial' if pending or failed_reads or provider_failed_jobs else 'ok', 'checked_jobs': checked,
+                'completed_records': completed, 'pending_records': pending, 'failed_reads': failed_reads,
+                'provider_failed_jobs': provider_failed_jobs}
+    finally:
+        conn.rollback()
+        conn.execute('select pg_advisory_unlock(hashtextextended(%s,0))', (lock,))
+        conn.commit()
 
 
 # ---------------------------------------------------------------- deletion
@@ -946,7 +1038,9 @@ class PastDevRetriever:
         if secret_like(q) or scrub_text(q)[0] != q:
             raise ValueError("the query holds text the sanitizer would scrub")
         limit = min(int(params.get("limit", "10")), RECALL_MAX)
-        body: dict[str, Any] = {"query": q, "identity": IDENTITY, "limit": limit}
+        # Leave room for stale/deleted source references removed by the authority
+        # check. One recall only, the existing20-result cap remains unchanged.
+        body: dict[str, Any] = {"query": q, "identity": IDENTITY, "limit": min(RECALL_MAX, limit * 2)}
         if "from" in params:
             body["occurredFrom"] = f"{date.fromisoformat(params['from']).isoformat()}T00:00:00Z"
         if "to" in params:

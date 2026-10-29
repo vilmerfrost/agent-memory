@@ -117,6 +117,7 @@ import re
 import threading
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections import Counter
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -127,7 +128,7 @@ from urllib.parse import quote, urlencode, urlsplit
 import psycopg
 
 from agent_memory import redact as _redact
-from agent_memory.integrations import egress, http, refs
+from agent_memory.integrations import egress, http, refs, sync
 from agent_memory.integrations.evidence import EvidenceRef, Health, NamedQuery
 from agent_memory.integrations.sync import Batch
 
@@ -927,7 +928,14 @@ class LangfuseClient:
 
     def create_scores(self, items: Sequence[Mapping[str, Any]]) -> None:
         """202: all accepted. 207: counts and errors; never retried (the accepted ones already landed)."""
-        data = self._json(self._call("POST", SCORES_WRITE_PATH, body=list(items))) or {}
+        try:
+            data = self._json(self._call("POST", SCORES_WRITE_PATH, body=list(items))) or {}
+        except http.HttpError as exc:
+            if exc.status in sync.RECORD_ERRORS:
+                # Preserve the span receipt and remember this exact score
+                # payload's permanent refusal, just like a rejected207 body.
+                raise Rejected(f'score request rejected (HTTP {exc.status})') from None
+            raise  # auth, rate limits and temporary transport failures retain backoff
         rejected = int(data.get("rejected") or 0) if isinstance(data, dict) else 0
         if rejected:
             msgs = "; ".join(str(e.get("message"))[:80] for e in (data.get("errors") or [])[:3] if isinstance(e, dict))
@@ -977,6 +985,20 @@ class LangfuseClient:
         # An existence probe intentionally needs one row, not a complete trace.
         return bool(self.observations(max_pages=1, require_complete=False, traceId=trace, fields="core", limit=1, **window))
 
+    def trace_complete(self, run: SandboxRun) -> bool:
+        """Verify every expected span ID, not merely one visible observation.
+
+        The bounded, fully paginated read never authorizes a span resend. A
+        partial visible trace remains incomplete instead of becoming confirmed.
+        """
+        rows = self.observations(traceId=run.trace_id, fields="core", limit=100,
+                                 fromStartTime=_iso(run.started_at - timedelta(days=1)),
+                                 toStartTime=_iso(run.ended_at + timedelta(days=1)))
+        expected = {span['spanId'] for resource in build_spans(run)['resourceSpans']
+                    for scope in resource['scopeSpans'] for span in scope['spans']}
+        visible = {row.get('id') for row in rows if row.get('traceId') == run.trace_id}
+        return bool(expected) and expected <= visible
+
     def dataset_id(self, name: str) -> str | None:
         try:
             data = self._json(self._call("GET", f"{DATASETS_PATH}/{quote(name, safe='')}"))
@@ -1020,7 +1042,7 @@ class UploadResult:
 
 
 def upload_run(run: SandboxRun, client: LangfuseClient, *, datasets: bool = False,
-               exported: bool = False, include_result: bool = False,
+               exported: bool = False, include_result: bool = False, scores_exported: bool = False,
                before_export: Callable[[], None] | None = None,
                after_export: Callable[[], None] | None = None,
                on_existing: Callable[[], None] | None = None) -> UploadResult:
@@ -1048,7 +1070,7 @@ def upload_run(run: SandboxRun, client: LangfuseClient, *, datasets: bool = Fals
             after_export()
         res.spans = len(body["resourceSpans"][0]["scopeSpans"][0]["spans"])
     scores = build_scores(run)
-    if scores:
+    if scores and not scores_exported:
         client.create_scores(scores)
         res.scores = len(scores)
     return res
@@ -1104,11 +1126,35 @@ class LangfuseSink:
         self._runs: dict[str, SandboxRun] = {}
         self._exported: set[str] = set()
         self._receipt_phase: dict[str, str] = {}
+        self._receipt_meta: dict[str, dict[str, Any]] = {}
+        self.considered: set[str] = set()
+        self.expected_scores: dict[str, str] = {}
+        self._selected_trace_ids: set[str] | None = None
         self.uncertain: list[str] = []
         self._conn: psycopg.Connection | None = None
 
     def health(self) -> Health:
         return self.client.health()
+
+    def failure_in_scope(self, key: str) -> bool:
+        if self.experiment_id is None:
+            return key == TABLE or key.startswith(TABLE + ':')
+        experiment_scope = f'{TABLE}:{self.experiment_id}'
+        if self.retry_run_ids is not None:
+            if key in {TABLE, experiment_scope, self.table}:
+                return True  # legacy scope-wide debt cannot be attributed to another run
+            if self._selected_trace_ids is None:
+                selected = set()
+                for _, path in self._logs():
+                    try:
+                        run = load_run_log(path)
+                    except (LangfuseError, refs.RefError, ValueError, OSError):
+                        continue  # batches() records validation failures; no request is made here
+                    if run.experiment_id == self.experiment_id and run.run_id in self.retry_run_ids:
+                        selected.add(run.trace_id)
+                self._selected_trace_ids = selected
+            return key in {f'{experiment_scope}:run:{trace}' for trace in self._selected_trace_ids}
+        return key in {TABLE, experiment_scope} or key.startswith(experiment_scope + ':')
 
     def _logs(self) -> list[tuple[str, Path]]:
         out = []
@@ -1156,9 +1202,10 @@ class LangfuseSink:
         mark = "" if replay else watermarks.get(self.table, "")
         egress.use_team_names(egress.team_names(conn))      # Mission 004C: sensitive() denies team/private repos too
         self.skipped = []
+        # Per-run failures survive advancement of the scope's forward cursor.
+        # This lets healthy later runs land without losing the earlier retry.
+        failure_keys = set(sync.load(conn, SINK).get('failures', {}))
         for wm, path in self._logs():
-            if wm <= mark:
-                continue
             try:
                 run = load_run_log(path)
                 check(run)
@@ -1166,28 +1213,44 @@ class LangfuseSink:
                     raise Refused("scoped log names another experiment")
                 self._guard_session(conn, run)
             except (LangfuseError, refs.RefError, ValueError, OSError) as exc:
+                if wm <= mark:
+                    continue
                 self.refused.append((wm.split("|", 1)[1], str(exc)[:200]))
                 yield Batch(self.table, [], wm)
                 continue
             if self.since is not None and run.started_at < self.since:
+                if wm <= mark:
+                    continue
                 self.skipped.append(wm.split("|", 1)[1])
                 yield Batch(self.table, [], wm)
                 continue
+            self.considered.add(run.trace_id)
+            self.expected_scores[run.trace_id] = self._scores_hash(run)
             self._runs[run.trace_id] = run
             ref = refs.lf("trace", run.trace_id)
             if conn.execute("select 1 from rsi_evidence where system = %s and external_ref = %s",
                             (refs.parse(ref).system, ref)).fetchone():
                 self._exported.add(run.trace_id)        # uploaded before: the spans are there, maybe hidden
-            receipt = conn.execute("select meta->>'phase' from rsi_checkpoints where job='langfuse-export' "
+            receipt = conn.execute("select meta from rsi_checkpoints where job='langfuse-export' "
                                    "and run_key=%s", (run.trace_id,)).fetchone()
             if receipt:
-                self._receipt_phase[run.trace_id] = receipt[0]
-            if self.retry_run_ids is not None and (run.trace_id in self._exported or (receipt and receipt[0] == "confirmed")):
+                self._receipt_meta[run.trace_id] = dict(receipt[0] or {})
+                self._receipt_phase[run.trace_id] = self._receipt_meta[run.trace_id].get('phase', '')
+            phase = self._receipt_phase.get(run.trace_id)
+            scores_done = self._scores_done(run)
+            failure_key = f'{TABLE}:{run.experiment_id}:run:{run.trace_id}'
+            unfinished = phase in {'pending', 'observed', 'not-sent'} or (
+                phase in {'confirmed', 'verified'} and not scores_done and not self._scores_rejected(run)) or failure_key in failure_keys
+            if wm <= mark and not unfinished:
+                self._runs.pop(run.trace_id, None)
+                continue
+            if self.retry_run_ids is not None and phase in {'confirmed', 'verified'} and scores_done and failure_key not in failure_keys:
                 self.confirmed_skipped += 1
                 self._runs.pop(run.trace_id, None)
-                yield Batch(self.table, [], wm)
+                yield Batch(self.table, [], max(mark, wm))
                 continue
-            yield Batch(self.table, [{"trace_id": run.trace_id, **run.metrics()}], wm, [evidence_for(run)], key=run.trace_id)
+            yield Batch(self.table, [{"trace_id": run.trace_id, **run.metrics()}], max(mark, wm),
+                        [evidence_for(run)], key=run.trace_id, failure_key=failure_key)
 
     def push(self, batch: Batch) -> None:
         if not batch.key:
@@ -1196,7 +1259,11 @@ class LangfuseSink:
         phase = self._receipt_phase.get(batch.key)
         if phase == "rejected":
             raise Rejected("previous span upload was rejected; no automatic span re-export")
-        exported = batch.key in self._exported or phase == "confirmed"
+        if self._scores_rejected(run):
+            raise Rejected('previous score upload was rejected; unchanged scores are not retried')
+        exported = batch.key in self._exported or phase in {"confirmed", "verified"}
+        if exported and phase is None:
+            self._save_export_phase(run, 'observed')  # legacy link proves existence, not full readback
         if phase in {"pending", "observed"} and not exported:
             self.uncertain.append(batch.key)
             if phase == "pending" and not self.client.trace_exists(run.trace_id, run.started_at, run.ended_at):
@@ -1205,29 +1272,60 @@ class LangfuseSink:
             self._save_export_phase(run, "observed")
         try:
             result = upload_run(run, self.client, datasets=self.datasets, exported=exported,
+                                scores_exported=self._scores_done(run),
                                 before_export=lambda: self._save_export_phase(run, "pending"),
                                 after_export=lambda: self._save_export_phase(run, "confirmed"),
                                 on_existing=lambda: self._save_export_phase(run, "observed"))
         except Rejected:
             if self._receipt_phase.get(batch.key) == "pending":
                 self._save_export_phase(run, "rejected")
+            else:
+                self._save_scores_state(run, 'rejected')
             raise
         except http.HttpError as exc:
             if self._receipt_phase.get(batch.key) == "pending" and exc.status in {400, 401, 403, 404, 413, 415}:
                 self._save_export_phase(run, "not-sent")
             raise
         self.uploads.append(result)
+        self._save_scores_complete(run)
+        if self._receipt_phase.get(batch.key) == 'observed' and self.client.trace_complete(run):
+            self._save_export_phase(run, 'verified')
         self._runs.pop(batch.key, None)
+
+    @staticmethod
+    def _scores_hash(run: SandboxRun) -> str:
+        return hashlib.sha256(json.dumps(build_scores(run), sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+
+    def _scores_done(self, run: SandboxRun) -> bool:
+        receipt = self._receipt_meta.get(run.trace_id, {})
+        return receipt.get('scores_complete') is True and receipt.get('scores_sha256') == self._scores_hash(run)
+
+    def _scores_rejected(self, run: SandboxRun) -> bool:
+        receipt = self._receipt_meta.get(run.trace_id, {})
+        return receipt.get('scores_state') == 'rejected' and receipt.get('scores_sha256') == self._scores_hash(run)
+
+    def _save_scores_complete(self, run: SandboxRun) -> None:
+        self._save_scores_state(run, 'confirmed')
+
+    def _save_scores_state(self, run: SandboxRun, state: str) -> None:
+        assert self._conn is not None
+        from agent_memory import rsi_approval
+        meta = {'scores_complete': state == 'confirmed', 'scores_state': state,
+                'scores_sha256': self._scores_hash(run)}
+        rsi_approval.checkpoint(self._conn, 'langfuse-export', run.trace_id, 'done', meta)
+        self._conn.commit()
+        self._receipt_meta.setdefault(run.trace_id, {}).update(meta)
 
     def _save_export_phase(self, run: SandboxRun, phase: str) -> None:
         """Receipt of request phase, not invented proof that every span arrived."""
         assert self._conn is not None
         from agent_memory import rsi_approval
         rsi_approval.checkpoint(self._conn, "langfuse-export", run.trace_id,
-                               "done" if phase == "confirmed" else "running",
+                               "done" if phase in {"confirmed", "verified"} else "running",
                                {"phase": phase, "experiment_id": run.experiment_id})
         self._conn.commit()
         self._receipt_phase[run.trace_id] = phase
+        self._receipt_meta.setdefault(run.trace_id, {}).update({'phase': phase, 'experiment_id': run.experiment_id})
 
 
 
@@ -1261,25 +1359,58 @@ def export_experiment(conn: psycopg.Connection, experiment_id: str, *, budget_s:
     except Exception as exc:
         return {"status": "failed", "experiment_id": experiment_id, "rows": 0,
                 "detail": f"export: {type(exc).__name__}"}
-    phases = dict(conn.execute("select meta->>'phase',count(*) from rsi_checkpoints where job='langfuse-export' "
-                               "and meta->>'experiment_id'=%s group by meta->>'phase'", (experiment_id,)).fetchall())
+    receipts = conn.execute("select run_key,meta from rsi_checkpoints where job='langfuse-export' "
+                            "and meta->>'experiment_id'=%s", (experiment_id,)).fetchall()
     conn.commit()
-    pending = phases.get("pending", 0) + phases.get("observed", 0)
-    status = "partial" if (pending or sink.refused) and rep.status == "ok" else rep.status
-    issue_kind = ("upload_failure" if rep.failed or rep.status not in ("ok", "off") else
-                  "upload_uncertain" if pending else "local_refusal" if sink.refused else None)
+    phases = Counter(meta.get('phase') for _, meta in receipts)
+    scoped_receipts = [(trace_id, meta) for trace_id, meta in receipts if trace_id in sink.considered]
+    pending = sum(meta.get('phase') == 'pending' for _, meta in scoped_receipts)
+    observed = sum(meta.get('phase') == 'observed' for _, meta in scoped_receipts)
+    score_incomplete = sum(meta.get('scores_complete') is not True or
+                           meta.get('scores_sha256') != sink.expected_scores.get(trace_id)
+                           for trace_id, meta in scoped_receipts)
+    persistent = getattr(rep, 'persistent_failures', {})
+    outstanding_dead = getattr(rep, 'outstanding_dead_letters', rep.dead_letters)
+    incomplete = pending or observed or score_incomplete or sink.refused or rep.skipped_tables or persistent or outstanding_dead
+    status = "partial" if incomplete and rep.status == "ok" else rep.status
+    issue_kind = ("upload_failure" if rep.failed or rep.status in {"failed", "unavailable"} else
+                  "export_capped" if rep.status == 'capped' else
+                  "upload_uncertain" if pending else "readback_incomplete" if observed else
+                  "export_blocked" if persistent or rep.skipped_tables else
+                  "records_rejected" if outstanding_dead else
+                  "score_delivery_incomplete" if score_incomplete else
+                  "local_refusal" if sink.refused else
+                  "export_incomplete" if rep.status == 'partial' else None)
+    local_refusals = [{"run": _redact.redact(run)[:200],
+        "reason": reason if reason in {"case looks sensitive", "run id looks sensitive", "experiment id looks sensitive",
+                                       "scoped log names another experiment", "bad run id"}
+        else "invalid or unreadable run metadata"} for run, reason in sink.refused]
+    refusal_counts = dict(sorted(Counter(r['reason'] for r in local_refusals).items()))
+    detail = _redact.redact(rep.detail)[:300]
+    if issue_kind == 'local_refusal':
+        detail = (f"{len(local_refusals)} records withheld locally before upload: " +
+                  "; ".join(f"{reason} ({count})" for reason, count in refusal_counts.items()))[:300]
+    elif issue_kind == 'readback_incomplete':
+        detail = f'{observed} traces visible, but not every expected span was verified; no spans resent'
+    elif issue_kind == 'score_delivery_incomplete':
+        detail = f'{score_incomplete} trace receipts have no matching completed score delivery'
+    elif issue_kind == 'export_blocked':
+        detail = 'export work remains in backoff or dead state'
     return {"status": status, "experiment_id": experiment_id, "rows": rep.rows, "batches": rep.batches,
-            "issue_kind": issue_kind, "local_refusals": [{"run": _redact.redact(run)[:200],
-                "reason": reason if reason in {"case looks sensitive", "run id looks sensitive", "experiment id looks sensitive",
-                                               "scoped log names another experiment", "bad run id"}
-                else "invalid or unreadable run metadata"} for run, reason in sink.refused],
+            "issue_kind": issue_kind, "local_refusals": local_refusals, "local_refusal_counts": refusal_counts,
             "retry_selected": len(retry_run_ids) if retry_run_ids is not None else None,
             "already_confirmed_skipped": sink.confirmed_skipped,
             "failed": rep.failed, "refused": len(sink.refused), "uncertain": int(pending),
+            "observed_incomplete_traces": observed, "score_delivery_incomplete": score_incomplete,
+            "persistent_failures": persistent, "skipped_scopes": rep.skipped_tables,
+            "dead_letters": outstanding_dead,
             "skipped_non_agent": len(sink.skipped), "delivered_rows": rep.rows,
             "confirmed_trace_uploads": int(phases.get("confirmed", 0)),
+            "verified_span_readbacks": int(phases.get('verified', 0)),
+            "spans_readback_verified": bool(scoped_receipts) and not sink.refused and
+                len(scoped_receipts) == len(sink.considered) and all(meta.get('phase') == 'verified' for _, meta in scoped_receipts),
             "visible_rows": None, "readback_verified": False,
-            "seconds": rep.seconds, "detail": _redact.redact(rep.detail)[:300], "scope": sink.table}
+            "seconds": rep.seconds, "detail": detail, "scope": sink.table}
 
 
 # ---------------------------------------------------------------- the retriever
