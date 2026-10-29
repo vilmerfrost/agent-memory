@@ -82,7 +82,7 @@ def test_redaction_and_speech_bounds():
     data = snap([run('a', 'fail', '2026-10-29T02:00:00Z', reason='Read /Users/name/private/file for user@example.com')])
     text = m.render(data)
     assert '/Users/name' not in text and 'user@example.com' not in text
-    data['facts'][0]['text'] = 'a' * 9001
+    data['facts'][0]['text'] = 'a' * (m.MAX_CHARS + 1)
     with pytest.raises(ValueError, match='script_too_long'):
         m.render(data)
     def request(*args, **kwargs):
@@ -144,9 +144,9 @@ def test_upload_resume_reuses_bytes_without_another_provider_call(tmp_path, monk
         return b'ID3' + b'\0'*200, dict(characters=len(text))
     def broken_upload(*_):
         raise w.AudioError('outcome_unknown')
-    def bad_outline(_):
-        raise ValueError('malformed')
-    w.work(None, job, tmp_path, now=NOW, make_outline=bad_outline, make_speech=speech, do_upload=broken_upload)
+    def draft(data):
+        return {'paragraphs': [{'text': 'The worker timed out. Check the Mac connection, then verify the next result.', 'fact_ids': [f['id'] for f in data['facts']]}]}, {}
+    w.work(None, job, tmp_path, now=NOW, make_script=draft, make_speech=speech, do_upload=broken_upload)
     assert states[-1] == 'uploading' and calls == ['speech']
     monkeypatch.setattr(w, 'upload', lambda *_: calls.append('upload'))
     w.resume_uploads(None, tmp_path)
@@ -165,7 +165,7 @@ def test_ambiguous_speech_outcome_never_automatically_repeats(tmp_path, monkeypa
         calls.append('speech')
         raise w.AudioError('outcome_unknown')
     job = dict(id=str(uuid.uuid4()), claim_id=str(uuid.uuid4()), night='2026-10-28')
-    w.work(None, job, tmp_path, now=NOW, make_outline=lambda d: ({'fact_ids':[f['id'] for f in d['facts']]}, {}), make_speech=speech)
+    w.work(None, job, tmp_path, now=NOW, make_script=lambda d: ({'paragraphs':[{'text':'The night finished. No routine results were recorded. Cost is unknown.', 'fact_ids':[f['id'] for f in d['facts']]}]}, {}), make_speech=speech)
     w.resume_uploads(None, tmp_path)
     assert calls == ['speech'] and states[-1] == 'outcome_unknown'
 
@@ -211,26 +211,93 @@ def test_api_default_grants_do_not_expose_worker_functions(pg_url):
                 c.execute(f'drop role {role}')
 
 
-def test_outline_resolves_macos_symlinked_temporary_paths(tmp_path, monkeypatch):
-    from contextlib import nullcontext
-    from types import SimpleNamespace
-    from agent_memory import rsi_subscription as subscription, rsi_subscription_config as profiles
-    real=tmp_path/'real';real.mkdir()
-    alias=tmp_path/'alias';alias.symlink_to(real,target_is_directory=True)
-    (tmp_path/'config').mkdir()
-    (tmp_path/'config/rsi-night.subscription.json').write_text(json.dumps({'replay':{'provider_profiles':{'claude':{'model':'claude-opus-5-5','effort':'high','auth':{}}}}}))
-    monkeypatch.setattr(w.config,'REPO_ROOT',tmp_path)
-    monkeypatch.setattr(w.tempfile,'TemporaryDirectory',lambda **_:nullcontext(str(alias)))
-    monkeypatch.setattr(profiles,'auth_for',lambda *_,**__:None)
-    data=snap()
-    def run(provider,prompt,**kwargs):
-        assert kwargs['workspace']==kwargs['workspace'].resolve()
-        assert kwargs['arm_home']==kwargs['arm_home'].resolve()
-        assert kwargs['tools_allowed'] is False
-        return SimpleNamespace(text=json.dumps({'fact_ids':[f['id'] for f in data['facts']]}),usage={'input_tokens':1,'output_tokens':1},tool_calls=[])
-    monkeypatch.setattr(subscription,'run',run)
-    result,usage=w.outline(data)
-    assert m.render(data,result) and usage['output_tokens']==1
+def draft_for(data, text='The night finished. Check the recorded results and costs.'):
+    return {'paragraphs': [{'text': text, 'fact_ids': [f['id'] for f in data['facts']]}]}
+
+
+def test_direct_sonnet_api_request_and_usage():
+    def request(url, **kw):
+        assert url == 'https://api.anthropic.com/v1/messages'
+        body = json.loads(kw['body'])
+        assert body['model'] == 'claude-sonnet-5-5' and 'tools' not in body
+        assert kw['headers']['x-api-key'] == 'fixture-only'
+        return json.dumps({'model': w.SCRIPT_MODEL, 'stop_reason': 'end_turn',
+            'content': [{'type': 'thinking', 'thinking': 'private reasoning'}, {'type': 'text', 'text': '{"approved":true}'}],
+            'usage': {'input_tokens': 15, 'output_tokens': 5}}).encode(), {'request-id': 'test-id'}
+    value, usage = w.claude_json('Write a briefing', {}, request=request, key='fixture-only')
+    assert value == {'approved': True} and usage['input_tokens'] == 15
+    assert usage['provider_request_id'] == 'test-id'
+
+
+def test_complete_natural_prose_requires_review_and_preserves_metadata():
+    data = snap()
+    calls = []
+    def call(system, evidence):
+        calls.append(system)
+        return (draft_for(data) if len(calls) == 1 else {'approved': True, 'missing_fact_ids': [], 'concerns': []}), {'output_tokens': 10}
+    draft, usage = w.write_script(data, call=call)
+    assert m.narration(data, draft).startswith('The night finished.')
+    assert len(calls) == 2 and usage['review']['approved']
+    assert 'No duration target' in calls[0]
+
+
+@pytest.mark.parametrize('review', [
+    {'approved': False, 'missing_fact_ids': [], 'concerns': ['unsupported cause']},
+    {'approved': True, 'missing_fact_ids': ['costs'], 'concerns': []},
+    {'approved': True},
+])
+def test_semantic_review_rejects_unsupported_or_missing_content(review):
+    data = snap()
+    def call(system, evidence):
+        return (draft_for(data) if system == w.WRITER_PROMPT else review), {}
+    with pytest.raises(w.AudioError, match='script_review_failed'):
+        w.write_script(data, call=call)
+
+
+def test_narration_rejects_missing_sources_and_private_data():
+    data = snap()
+    draft = draft_for(data)
+    draft['paragraphs'][0]['fact_ids'].remove('costs')
+    with pytest.raises(ValueError, match='script_coverage'):
+        m.narration(data, draft)
+    with pytest.raises(ValueError, match='script_private_data'):
+        m.narration(data, draft_for(data, 'Read /Users/test/private for user@example.com'))
+
+
+def test_full_evidence_preserves_long_details_costs_and_all_patterns():
+    detail = 'Important technical detail ' * 100
+    data = snap([run('a', 'fail', '2026-10-29T02:00:00Z', reason='OAuth session expired')],
+        row={'night': '2026-10-28', 'status': 'partial', 'brief': {'patterns': {'items': [
+            {'summary': f'Pattern {n}'} for n in range(8)]}, 'costs': {'estimated_usd': 0.06}},
+            'report': {'details': detail, 'access_token': 'fixture-sensitive', 'costs': {'subscription': {'tokens_in': 300}}}})
+    evidence = data['evidence']
+    assert evidence['night_record']['report']['details'] == detail.strip()
+    assert evidence['night_record']['report']['access_token'] == '[redacted]'
+    assert evidence['night_record']['report']['costs']['subscription']['tokens_in'] == 300
+    assert len([f for f in data['facts'] if f['id'].startswith('pattern:')]) == 8
+    assert 'sign-in' in data['issues'][0]['next_step']
+
+
+def test_script_failure_never_uses_canned_fallback_or_calls_speech(tmp_path, monkeypatch):
+    monkeypatch.setattr(w, 'collect', lambda *_: snap())
+    states = []
+    monkeypatch.setattr(w, 'update', lambda c, j, state, payload: states.append((state, payload)))
+    def fail(_):
+        raise w.AudioError('script_review_failed')
+    def forbidden(_):
+        pytest.fail('Rejected script must not be narrated')
+    job = {'id': str(uuid.uuid4()), 'claim_id': str(uuid.uuid4()), 'night': '2026-10-28'}
+    w.work(None, job, tmp_path, now=NOW, make_script=fail, make_speech=forbidden)
+    assert states == [('failed', {'error': 'script_review_failed'})]
+
+
+def test_api_truncation_and_oversized_context_are_not_silently_accepted():
+    def truncated(*_, **kw):
+        return json.dumps({'model': w.SCRIPT_MODEL, 'stop_reason': 'max_tokens'}).encode(), {}
+    with pytest.raises(w.AudioError, match='script_incomplete'):
+        w.claude_json('system', {}, request=truncated, key='fixture-only')
+    with pytest.raises(w.AudioError, match='script_context_too_large'):
+        w.claude_json('system', {'large': 'a' * w.MAX_CONTEXT_BYTES}, request=truncated, key='fixture-only')
 
 
 def test_unchanged_snapshot_retains_audio_without_model_or_speech_calls(tmp_path,monkeypatch):
@@ -243,5 +310,5 @@ def test_unchanged_snapshot_retains_audio_without_model_or_speech_calls(tmp_path
     def forbidden(*_):
         pytest.fail('Unchanged content must not call an LLM or speech provider')
     job={'id':str(uuid.uuid4()),'claim_id':str(uuid.uuid4()),'night':data['night']}
-    w.work(None,job,tmp_path,now=NOW,make_outline=forbidden,make_speech=forbidden)
+    w.work(None,job,tmp_path,now=NOW,make_script=forbidden,make_speech=forbidden)
     assert states==[('failed',{'error':'no_new_results','as_of':data['as_of'],'existing_overview_id':old.name})]
