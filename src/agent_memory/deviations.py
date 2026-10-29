@@ -738,6 +738,10 @@ def reply_text(stdout: str) -> str:
     if env.get("subtype") == "error_max_structured_output_retries":
         raise FindingError(f"no reply matched the schema: {error}")
     if error is not None:
+        from agent_memory import claude_auth
+        if claude_auth.is_auth_error(error):
+            claude_auth.mark_failed()
+            raise distill.WriterAuthError(claude_auth.AUTH_FAILURE)
         raise distill.WriterError(f"CLI reported an error: {error}")
     structured = env.get("structured_output")
     if structured is not None:
@@ -1053,6 +1057,7 @@ class Outcome:
     title: str | None = None     # the session's name, shown when known
     session_outcome: str | None = None   # sessions.outcome at scan time (stored as result_outcome)
     objective: float | None = None       # objective_result of that outcome
+    auth_failed: bool = False
 
     @property
     def skipped(self) -> int:
@@ -1089,6 +1094,8 @@ class Outcome:
 class ScanReport:
     dry_run: bool = False
     outcomes: list[Outcome] = field(default_factory=list)
+    auth_failed: bool = False
+    pending: int = 0
 
     @property
     def errors(self) -> int:
@@ -1388,6 +1395,9 @@ def _scan_one(row: SessionRow, *, dry_run: bool, timeout: float, qset: questions
     try:
         findings, reasons = write(writer_prompt(row, instructions, digest), {s.name for s in instructions},
                                   timeout=timeout)
+    except distill.WriterAuthError as exc:
+        out.status, out.reason, out.auth_failed = "error", f"writer: {exc}", True
+        return out
     except distill.WriterError as exc:
         out.status, out.reason = "error", f"writer: {exc}"
         return out
@@ -1422,12 +1432,19 @@ def scan(*, days: int = DEFAULT_DAYS, limit: int = DEFAULT_LIMIT, session_id: st
     qset = None if dry_run else question_set()
     recurrence = None if dry_run else _Recurrence(since, db_url)
     report = ScanReport(dry_run=dry_run)
-    for row in pick_sessions(since=since, limit=limit, session_id=session_id, db_url=db_url):
+    rows = list(pick_sessions(since=since, limit=limit, session_id=session_id, db_url=db_url))
+    for row in rows:
         try:
             o = _scan_one(row, dry_run=dry_run, timeout=timeout, qset=qset, recurrence=recurrence,
                           db_url=db_url)
         except Exception as exc:  # never block: one session's crash is that session's error
             o = Outcome.of(row, "error", _one_line(f"{type(exc).__name__}: {exc}", 300))
+        if o.auth_failed:
+            # Do not charge a credential failure to the session's retry allowance.
+            report.outcomes.append(o)
+            report.auth_failed = True
+            report.pending = len(rows) - len(report.outcomes) + 1
+            break
         if not dry_run:
             if o.status == "error":
                 _record_error(o, db_url)

@@ -21,6 +21,44 @@ is written. The 01:30 night waits up to 30 minutes while that marker is live (do
 
 ## Steps
 
+### Claude authentication and recovery
+
+All host Claude model calls (deviation scanner, lesson and edit writers, session
+summaries, and legacy host night stages) load the same private subscription token
+as the RSI replay adapter: `.subscription-auth/claude/.env`, key
+`CLAUDE_CODE_OAUTH_TOKEN`. `AMEM_CLAUDE_AUTH_HOME` can explicitly select its private
+directory. Tokens are loaded inside the application, passed only to Claude's
+child process, and never printed. API credential overrides are removed from that
+child. Missing or unsafe credentials fail closed; personal login and API billing
+are never fallback paths. Tests disable automatic discovery with `AMEM_NO_DOTENV=1`.
+
+A Claude authentication error stops the deviation scan immediately. It fails the
+daily prerequisite even if only one session was attempted. Unattempted sessions
+stay pending. The failed session does not consume a transcript retry, and the
+last successful scan timestamp stays unchanged. Other non-Claude daily steps
+can still finish. A per-run circuit prevents subsequent host model calls after
+the same authentication failure.
+
+The daily job saves recovery state beside its normal state file and sends one
+authentication alert per affected night (unless `--no-push`). The phone transport
+falls back to a best-effort Mac notification. The recovery LaunchAgent runs
+`amem daily-recover` every 15 minutes; idle checks call no model. It resumes the
+daily job, then retries the missed night through its existing prerequisite,
+credential, overlap and already-completed checks. It never bypasses those gates.
+Successful daily scans are not repeated while another prerequisite is missing.
+Recovery stops at local noon or 40 attempts, whichever comes first, and reports
+the incomplete night. After successful processing it sends a recovery notice;
+partial experiment results remain partial in the night report.
+
+Install `deploy/launchd/com.vilmerfrost.amem-auth-recovery.plist` only after this
+code is available in the installed main checkout. Keep matching copies in
+`~/agent-config/launchd/` and `~/Library/LaunchAgents/`, and register
+`amem-auth-recovery` in `~/agent-config/parent/routines.tsv` with a 1-hour
+freshness limit. No token belongs in a plist. Renew it with the official
+`claude setup-token` flow and the native secret popup; never paste it into chat.
+
+### Daily steps
+
 A failed step is recorded, and the next step still runs.
 
 First the job waits for the database: it tries `select 1` up to 10 times, 60 seconds apart

@@ -57,6 +57,10 @@ class WriterError(RuntimeError):
     """The writer CLI failed: not found, timed out, or exited non-zero."""
 
 
+class WriterAuthError(WriterError):
+    """A job-wide authentication failure; another session cannot repair it."""
+
+
 class DraftError(ValueError):
     """The writer answered, but the envelope or the model's JSON is invalid."""
 
@@ -196,7 +200,7 @@ def writer_argv(exe_env: str = CLAUDE_ENV, model: str = WRITER_MODEL,
     No skills and no MCP servers either: a plain `claude -p` loads the user's whole setup
     (every skill, plugin and MCP tool listing), which measured ~1.27M tokens and failed with
     "Prompt is too long". With both off the call is ~8.5k tokens. `--bare` is not an option:
-    it disables OAuth, and the daily job runs on the user's subscription login.
+    it disables OAuth. Host jobs use the dedicated automation subscription token.
 
     `exe_env` names the env var that may point at another executable (tests, demos):
     `AMEM_DISTILL_CLAUDE` here, `AMEM_DEVIATIONS_CLAUDE` for the deviation writer.
@@ -237,13 +241,29 @@ def run_cli(argv: list[str], prompt: str, *, timeout: float = DEFAULT_TIMEOUT,
     envelope on stdout. With this flag such a stdout is returned, so the caller can tell a
     malformed reply from a failed run; a non-zero exit without a result envelope still raises.
     """
-    env = {**(os.environ if env is None else env), "AMEM_HOOK_OFF": "1"}
+    from agent_memory import claude_auth
+    if claude_auth.failed():
+        raise WriterAuthError(claude_auth.AUTH_FAILURE)
+    try:
+        env = claude_auth.environment({**(os.environ if env is None else env), "AMEM_HOOK_OFF": "1"})
+    except claude_auth.AuthUnavailable:
+        claude_auth.mark_failed()
+        raise WriterAuthError(claude_auth.AUTH_FAILURE) from None
     try:
         proc = subprocess.run(argv, input=prompt, capture_output=True, text=True, timeout=timeout, env=env)
     except subprocess.TimeoutExpired:
         raise WriterError(f"timed out after {timeout:g}s") from None
     except OSError as exc:
         raise WriterError(f"cannot run {argv[0]}: {type(exc).__name__}: {exc}") from None
+    # Successful process exit does not guarantee a successful CLI result envelope.
+    error_text = proc.stderr if proc.returncode else ""
+    if _is_result_envelope(proc.stdout):
+        error_text += " " + (envelope_error(json.loads(proc.stdout)) or "")
+    elif proc.returncode:
+        error_text += " " + proc.stdout
+    if claude_auth.is_auth_error(error_text):
+        claude_auth.mark_failed()
+        raise WriterAuthError(claude_auth.AUTH_FAILURE)
     if proc.returncode != 0:
         if keep_error_envelope and _is_result_envelope(proc.stdout):
             return proc.stdout
@@ -555,5 +575,8 @@ def distill(*, since: datetime | None = None, limit: int = DEFAULT_LIMIT, dry_ru
         except Exception as exc:  # never block: one run's crash is that run's error
             plan = _Plan(Outcome(run["id"], repo_of(run), "error", "error",
                                  _one_line(f"{type(exc).__name__}: {exc}", REASON_MAX)))
-        report.outcomes.append(plan.outcome if dry_run else _apply(plan, db_url))
+        from agent_memory import claude_auth
+        report.outcomes.append(plan.outcome if dry_run or claude_auth.failed() else _apply(plan, db_url))
+        if claude_auth.failed():
+            break
     return report
