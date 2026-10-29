@@ -122,6 +122,13 @@ def snapshot(night_row, runs, *, now, annotations=None, extras=None, ingestion_f
         if not failed:
             if latest.get('status') == 'skip':
                 fact('skip:' + routine, f'{clean(routine, 80)} was skipped. Recorded reason: {clean(latest.get("failure_reason") or latest.get("summary")) or "No reason was recorded."}', 'skips', [f'run:{latest.get("id")}'])
+            else:
+                meta = latest.get('meta') or {}
+                flagged = any(isinstance(meta.get(key), (int, float)) and meta[key] > 0 for key in ('problems', 'suggest_undo'))
+                if flagged or re.search(r'\bskipped:', str(latest.get('summary') or ''), re.I):
+                    fact('routine-note:' + routine, f'{clean(routine, 80)} completed its check but reported findings: '
+                         + clean(json.dumps({'summary': latest.get('summary'), 'meta': meta}, default=str), 4000),
+                         'outcome', [f'run:{latest.get("id")}'])
             continue
         recent = failed[0]
         failures = (recent.get('meta') or {}).get('failures') or []

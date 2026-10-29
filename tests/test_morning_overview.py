@@ -342,3 +342,18 @@ def test_provider_name_inside_behavior_test_does_not_prescribe_login_repair():
     assert issue['action_kind'] == 'investigate'
     assert 'sign-in' not in issue['next_step']
     assert 'subscription' not in issue['next_step']
+
+
+def test_successful_checks_keep_audit_undo_and_internal_skip_findings():
+    audit = run('audit', 'pass', '2026-10-29T02:00:00Z', routine='routine-audit')
+    audit['meta'] = {'problems': 10, 'failures': ['dep-audit: last run FAIL']}
+    outcome = run('outcome', 'pass', '2026-10-29T02:00:00Z', routine='amem-rsi-outcome')
+    outcome['meta'] = {'suggest_undo': 1, 'mixed': 2}
+    harvest = run('harvest', 'pass', '2026-10-29T02:00:00Z', routine='rsi-harvest')
+    harvest['summary'] = 'rc=0 skipped: 187 drafts wait (max 30)'
+    data = snap([audit, outcome, harvest])
+    facts = {f['id']: f['text'] for f in data['facts']}
+    assert 'dep-audit' in facts['routine-note:routine-audit']
+    assert 'suggest_undo' in facts['routine-note:amem-rsi-outcome']
+    assert '187 drafts' in facts['routine-note:rsi-harvest']
+    assert data['issues'] == []  # passing checks are not reclassified as failed runs
