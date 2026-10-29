@@ -513,6 +513,11 @@ def paid_plan(cfg: Any, *, cases: int | None = None) -> dict[str, Any]:
                      "expected_usd": round(count * expected, 6) if expected is not None else None,
                      "worst_usd": round(count * worst, 6), "note": note})
 
+    from agent_memory.client_readiness import roles
+    readiness = roles(cfg) if b.subscription_models else []
+    for provider, settings, tools in readiness:
+        add("client-readiness", settings["model"], 1, once=True,
+            note=f"{provider}: bounded {'isolated tool' if tools else 'response'} and usage probe before experiments")
     jev_model = "jev-1.14.0"
     if st["triage"] == "live":
         add("triage", jev_model, int(cfg.candidates["max_considered"]), once=True,
@@ -596,7 +601,10 @@ def night_room(cfg: Any, *, pairs: int, per_exp: Mapping[str, int], per_night: M
     for model in sorted(set(per_exp) | set(per_night)):
         check(f"calls {model}", per_night.get(model, 0) + exps * per_exp.get(model, 0), b.call_cap(model))
     check("A/B pairs per experiment", pairs * len(profiles), b.max_ab_pairs)
-    check("sandbox runs", exps * runs, b.max_sandbox_runs)
+    from agent_memory.client_readiness import roles
+    readiness = roles(cfg) if b.subscription_models else []
+    readiness_runs = sum(tools for _, _, tools in readiness)
+    check("sandbox runs", exps * runs + readiness_runs, b.max_sandbox_runs)
     check("wall clock", NIGHT_OVERHEAD_S + exps * one_s, b.wall_clock_s, "s")
     if b.subscription_models:
         check("subscription tokens", exps * SUBSCRIPTION_TOKENS_PER_EXPERIMENT, b.max_subscription_tokens)
@@ -612,7 +620,9 @@ def night_room(cfg: Any, *, pairs: int, per_exp: Mapping[str, int], per_night: M
                                "wall_clock_parts_s": secs, "case_timeout_s": case_s,
                                **({"subscription_tokens": SUBSCRIPTION_TOKENS_PER_EXPERIMENT}
                                   if b.subscription_models else {})},
-            "per_night": {"calls": dict(sorted(per_night.items())), "overhead_s": NIGHT_OVERHEAD_S}}
+            "per_night": {"calls": dict(sorted(per_night.items())), "overhead_s": NIGHT_OVERHEAD_S,
+                          "readiness_calls": len(readiness), "readiness_sandbox_runs": readiness_runs,
+                          "readiness_tokens": "measured at runtime within the subscription cap"}}
 
 
 def render_room(room: Mapping[str, Any]) -> list[str]:
@@ -804,7 +814,7 @@ class Watchdog:
         self._done.set()
 
 
-def run_night_job(*, config_path: Path | None = None, night: str | None = None, now: datetime | None = None,
+def _run_night_job_locked(*, config_path: Path | None = None, night: str | None = None, now: datetime | None = None,
                   routines_log: Path | None = None, db_url: str | None = None, adapters: Any = None,
                   runner: Callable[..., Any] | None = None, watchdog: bool = True,
                   write_log: bool = True, sleep: Callable[[float], None] = time.sleep,
@@ -1061,3 +1071,18 @@ def register(sub: argparse._SubParsersAction) -> None:
                         "or ~/.claude/parent/amem-daily-state.json)")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_brief_job)
+
+
+def run_night_job(**kwargs):
+    from agent_memory.client_maintenance import lease
+    log = routines_log_path(kwargs.get('routines_log'))
+    with lease(log) as acquired:
+        if acquired:
+            return _run_night_job_locked(**kwargs)
+        now = kwargs.get('now') or datetime.now().astimezone()
+        night = kwargs.get('night') or AP.night_key(now)
+        result = JobResult(NIGHT_ROUTINE, 'SKIP', night, fields={'night':night,'skipped':'client_maintenance'})
+        result.lines = log_lines(result, now=now, secs=0)
+        if kwargs.get('write_log',True):
+            append_log(log,result.lines)
+        return result
