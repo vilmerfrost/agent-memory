@@ -250,8 +250,11 @@ def test_semantic_review_rejects_unsupported_or_missing_content(review):
     data = snap()
     def call(system, evidence):
         return (draft_for(data) if system == w.WRITER_PROMPT else review), {}
-    with pytest.raises(w.AudioError, match='script_review_failed'):
+    with pytest.raises(w.AudioError, match='script_review_failed') as error:
         w.write_script(data, call=call)
+    assert error.value.details['script_draft'] == draft_for(data)
+    assert error.value.details['llm_usage']['review'] == review
+    assert error.value.details['snapshot']['input_digest'] == data['input_digest']
 
 
 def test_narration_rejects_missing_sources_and_private_data():
@@ -312,3 +315,45 @@ def test_unchanged_snapshot_retains_audio_without_model_or_speech_calls(tmp_path
     job={'id':str(uuid.uuid4()),'claim_id':str(uuid.uuid4()),'night':data['night']}
     w.work(None,job,tmp_path,now=NOW,make_script=forbidden,make_speech=forbidden)
     assert states==[('failed',{'error':'no_new_results','as_of':data['as_of'],'existing_overview_id':old.name})]
+
+
+def test_rejected_draft_and_usage_survive_in_db_payload_and_receipt(tmp_path, monkeypatch):
+    data = snap()
+    draft = draft_for(data)
+    details = {'script_draft': draft, 'llm_usage': {'review': {'approved': False, 'concerns': ['missing cost scope']}}}
+    monkeypatch.setattr(w, 'collect', lambda *_: data)
+    states = []
+    monkeypatch.setattr(w, 'update', lambda c, j, state, payload: states.append((state, payload)))
+    def rejected(_):
+        raise w.AudioError('script_review_failed', details=details)
+    def forbidden(_):
+        pytest.fail('Rejected narration must not call speech')
+    job = {'id': str(uuid.uuid4()), 'claim_id': str(uuid.uuid4()), 'night': data['night']}
+    w.work(None, job, tmp_path, now=NOW, make_script=rejected, make_speech=forbidden)
+    assert states == [('failed', {'error': 'script_review_failed', **details})]
+    receipt = json.loads((tmp_path / job['id'] / 'receipt.json').read_text())
+    assert receipt['failure']['script_draft'] == draft
+    assert receipt['failure']['llm_usage']['review']['concerns'] == ['missing cost scope']
+
+
+def test_provider_name_inside_behavior_test_does_not_prescribe_login_repair():
+    issue = snap([run('a', 'fail', '2026-10-29T02:00:00Z', routine='evals-parent',
+                      reason='parent asked questions; i-claude-mode-merge-named failed')])['issues'][0]
+    assert issue['action_kind'] == 'investigate'
+    assert 'sign-in' not in issue['next_step']
+    assert 'subscription' not in issue['next_step']
+
+
+def test_successful_checks_keep_audit_undo_and_internal_skip_findings():
+    audit = run('audit', 'pass', '2026-10-29T02:00:00Z', routine='routine-audit')
+    audit['meta'] = {'problems': 10, 'failures': ['dep-audit: last run FAIL']}
+    outcome = run('outcome', 'pass', '2026-10-29T02:00:00Z', routine='amem-rsi-outcome')
+    outcome['meta'] = {'suggest_undo': 1, 'mixed': 2}
+    harvest = run('harvest', 'pass', '2026-10-29T02:00:00Z', routine='rsi-harvest')
+    harvest['summary'] = 'rc=0 skipped: 187 drafts wait (max 30)'
+    data = snap([audit, outcome, harvest])
+    facts = {f['id']: f['text'] for f in data['facts']}
+    assert 'dep-audit' in facts['routine-note:routine-audit']
+    assert 'suggest_undo' in facts['routine-note:amem-rsi-outcome']
+    assert '187 drafts' in facts['routine-note:rsi-harvest']
+    assert data['issues'] == []  # passing checks are not reclassified as failed runs
