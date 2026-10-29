@@ -78,7 +78,7 @@ def test_recall_requires_exact_derived_query_and_known_origin():
 def test_night_keeps_policy_exclusions_out_of_transport_reasons():
     night=N.Night.__new__(N.Night)
     night.health={'clickhouse':'ok'};night.health_reasons={};night.report={'connection_recovery':{'checks':[]}}
-    night._merge_health({'clickhouse':'skipped'},[{'step':'ch.rule_gap','status':'unavailable','detail':'policy-excluded: withheld'}])
+    night._merge_health({'clickhouse':'error'},[{'step':'ch.rule_gap','status':'unavailable','detail':'policy-excluded: withheld'}])
     assert night.health['clickhouse']=='ok' and night.health_reasons=={}
     assert night.report['connection_recovery']['checks'][0]['status']=='excluded'
 
@@ -86,7 +86,9 @@ def test_night_keeps_policy_exclusions_out_of_transport_reasons():
 def test_historical_labels_do_not_rewrite_raw_health_or_hide_transport_failures():
     from agent_memory.rsi_brief import service_labels
     report={'health':{'langfuse':'unavailable','clickhouse':'error'},
-            'experiments':[{'langfuse_export':{'status':'partial','refused':8,'failed':0,'uncertain':0}}],
+            'experiments':[{'langfuse_export':{'experiment_id':EXP,'status':'partial','refused':8,'failed':0,'uncertain':0}}],
+            'health_reasons':{'langfuse':[f'current replay export {EXP}: partial:'],
+                              'clickhouse':['ch.rule_gap: unavailable (policy-excluded: withheld)']},
             'connection_recovery':{'checks':[{'source':'clickhouse','status':'excluded'}]}}
     labels=service_labels(report)
     assert labels['langfuse'].startswith('traces withheld locally (8)')
@@ -101,3 +103,37 @@ def test_malformed_export_counts_cannot_claim_local_only_failure():
     for invalid in (None,False,'0',1):
         r={'experiments':[{'langfuse_export':{'status':'partial','refused':8,'failed':invalid,'uncertain':0}}]}
         assert 'langfuse' not in service_labels(r)
+
+
+@pytest.mark.parametrize('reasons', [[], ['HTTP 401 authentication failed'], ['other error'], [None], 'partial'])
+def test_local_trace_counts_cannot_hide_unexplained_aggregate_failure(reasons):
+    from agent_memory.rsi_brief import service_labels
+    report={'health':{'langfuse':'unavailable'},'health_reasons':{'langfuse':reasons},
+            'experiments':[{'langfuse_export':{'experiment_id':EXP,'status':'partial','refused':8,'failed':0,'uncertain':0}}]}
+    assert 'langfuse' not in service_labels(report)
+
+
+@pytest.mark.parametrize('kind',['upload_failure','upload_uncertain','unknown'])
+def test_explicit_nonlocal_export_kind_wins_over_counts(kind):
+    from agent_memory.rsi_brief import service_labels
+    report={'health':{'langfuse':'ok'},'experiments':[{'langfuse_export':{
+        'experiment_id':EXP,'status':'partial','refused':8,'failed':0,'uncertain':0,'issue_kind':kind}}]}
+    assert 'langfuse' not in service_labels(report)
+
+
+def test_policy_exclusion_does_not_erase_real_query_or_previous_failure():
+    night=N.Night.__new__(N.Night)
+    night.health={'clickhouse':'ok'};night.health_reasons={};night.report={'connection_recovery':{'checks':[]}}
+    excluded={'step':'ch.rule_gap','status':'unavailable','detail':'policy-excluded: withheld'}
+    failed={'step':'ch.rule_weekly_rate','status':'error','detail':'HTTP 401'}
+    night._merge_health({'clickhouse':'error'},[excluded,failed])
+    assert night.health['clickhouse']=='error' and any('HTTP 401' in x for x in night.health_reasons['clickhouse'])
+    night._merge_health({'clickhouse':'error'},[excluded])
+    assert night.health['clickhouse']=='error'
+
+
+def test_query_exclusion_label_does_not_hide_unlogged_auth_error():
+    from agent_memory.rsi_brief import service_labels
+    report={'health':{'clickhouse':'error'},'health_reasons':{'clickhouse':['HTTP 401']},
+            'connection_recovery':{'checks':[{'source':'clickhouse','status':'excluded'}]}}
+    assert service_labels(report)=={}

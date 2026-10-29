@@ -921,13 +921,23 @@ def service_labels(rep: Mapping[str, Any]) -> dict[str, str]:
         own = [c for c in checks if c.get("source") == source]
         excluded = sum(c.get("status") == "excluded" for c in own)
         failed = any(c.get("status") == "failed" for c in own)
-        if excluded and not failed:
+        reasons = (rep.get("health_reasons") or {}).get(source, [])
+        explained = isinstance(reasons, list) and all(isinstance(x, str) and "policy-excluded:" in x for x in reasons)
+        status_explained = explained and ((rep.get("health") or {}).get(source) == "ok" or bool(reasons))
+        if excluded and not failed and status_explained:
             labels[source] = f"queries withheld by privacy policy ({excluded})"
     exports = [e.get("langfuse_export") for e in rep.get("experiments", []) if isinstance(e.get("langfuse_export"), dict)]
     partial = [e for e in exports if e.get("status") not in ("ok", "off")]
-    local = (partial and all(e.get("status") == "partial" and all(type(e.get(k)) is int for k in ("refused", "failed", "uncertain")) and e["refused"] > 0
+    local = (partial and all(e.get("issue_kind") in (None, "local_refusal") for e in exports)
+             and all(e.get("status") == "partial" and all(type(e.get(k)) is int for k in ("refused", "failed", "uncertain")) and e["refused"] > 0
                             and e.get("failed") == 0 and e.get("uncertain") == 0 for e in partial))
-    if local and not any(c.get("source") == "langfuse" and c.get("status") == "failed" for c in checks):
+    raw_reasons = (rep.get("health_reasons") or {}).get("langfuse", [])
+    reason_ids = {e.get("experiment_id") for e in partial if isinstance(e.get("experiment_id"), str)}
+    reasons_explained = (isinstance(raw_reasons, list) and all(isinstance(reason, str) and
+        any(reason.startswith(f"current replay export {experiment}: partial:") for experiment in reason_ids)
+        for reason in raw_reasons))
+    status_explained = reasons_explained and ((rep.get("health") or {}).get("langfuse") == "ok" or bool(raw_reasons))
+    if local and status_explained and not any(c.get("source") == "langfuse" and c.get("status") == "failed" for c in checks):
         labels["langfuse"] = f"traces withheld locally ({sum(e['refused'] for e in partial)}); upload readback not verified"
     return labels
 

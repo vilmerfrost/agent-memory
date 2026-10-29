@@ -1920,6 +1920,14 @@ class Night:
         for k, v in (h or {}).items():
             if k not in PROVIDERS or not isinstance(v, str):
                 continue
+            provider_steps = [s for s in steps or [] if isinstance(s, Mapping)
+                              and _RETRIEVER.get(str(s.get("step", "")).split(".", 1)[0]) == k]
+            non_ok = [s for s in provider_steps if s.get("status") not in (None, "ok")]
+            if non_ok and all(str(s.get("detail", "")).startswith("policy-excluded:")
+                              and s.get("recovery_status") != "failed" for s in non_ok):
+                # These steps establish an exclusion, not a transport failure.
+                # Retain earlier real failures; this merge cannot upgrade them.
+                continue
             if self.health.get(k) == "skipped" or _SEVERITY.get(v, 2) > _SEVERITY.get(self.health[k], 0):
                 self.health[k] = v if v in HEALTH_VALUES else "error"
                 if self.health[k] in UNHEALTHY:
@@ -1950,7 +1958,7 @@ class Night:
         for st in steps or []:
             if not isinstance(st, Mapping) or st.get("status") in (None, "ok"):
                 continue
-            if str(st.get("detail", "")).startswith("policy-excluded:"):
+            if str(st.get("detail", "")).startswith("policy-excluded:") and st.get("recovery_status") != "failed":
                 continue  # retained in coverage/recovery checks, not a connection failure
             prov = _RETRIEVER.get(str(st.get("step") or "").split(".", 1)[0])
             if prov is None:
