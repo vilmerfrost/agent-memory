@@ -1,0 +1,62 @@
+{
+  "sandbox": {
+    "name": "Docker sandbox",
+    "impact": "Nightly experiments cannot run in Docker. The Night Desk website and saved reports may still work.",
+    "step": "Start Docker on your Mac. If it is already running, check why the heartbeat cannot reach it. Wait up to a minute, then refresh its status."
+  },
+  "mac": {
+    "name": "Mac heartbeat",
+    "impact": "Night Desk cannot confirm that the Mac can pick up jobs or manual tests.",
+    "step": "Wake the Mac and check its internet connection. If it is already online, check the Night Desk heartbeat service."
+  },
+  "clickhouse": {
+    "name": "ClickHouse",
+    "impact": "Nightly data sync or analysis may fail.",
+    "step": "Check ClickHouse access from the Mac, using the same account and tables as the nightly run. Then test again."
+  },
+  "langfuse": {
+    "name": "Langfuse",
+    "impact": "Saving or viewing nightly traces and scores is not verified.",
+    "step": "Check the Langfuse project, service access and ingestion result on the Mac. Then test again."
+  },
+  "pastdev": {
+    "name": "past.dev",
+    "impact": "The nightly memory service may be unavailable.",
+    "step": "Check the memory service credentials and account access on the Mac. Then refresh status."
+  },
+  "jev": {
+    "name": "Jev",
+    "impact": "Nightly model access or judgment may be unavailable.",
+    "step": "Check the configured Jev account, endpoint and model access on the Mac. Then refresh status."
+  },
+  "auth": {
+    "name": "Night Desk sign-in",
+    "impact": "Your current Night Desk account could not be verified.",
+    "step": "Check this device’s internet connection. If sign-in has expired, sign in again."
+  },
+  "database": {
+    "name": "Supabase database",
+    "impact": "Night Desk may be unable to read your reports.",
+    "step": "Check the database connection and your account’s access to reports. Then refresh status."
+  },
+  "approvals": {
+    "name": "Approvals",
+    "impact": "Approving or undoing changes may be unavailable.",
+    "step": "Check your Night Desk sign-in and approval passkey setup in Settings."
+  },
+  "hosting": {
+    "name": "Night Desk hosting",
+    "impact": "The backend could not verify the website deployment.",
+    "step": "Check the production deployment and its public health endpoint. Then refresh status."
+  },
+  "codex": {
+    "name": "Codex",
+    "impact": "A nightly Codex subscription call has not been verified.",
+    "step": "Open Codex on your Mac and check its sign-in, selected model and subscription allowance. Then test again."
+  },
+  "claude": {
+    "name": "Claude",
+    "impact": "A nightly Claude subscription call has not been verified.",
+    "step": "Open Claude on your Mac and check its sign-in, selected model and subscription allowance. Then test again."
+  }
+}
