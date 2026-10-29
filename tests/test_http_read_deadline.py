@@ -2,10 +2,36 @@ from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import Event, Thread
 import time
+import socket
+import ssl
+import urllib.error
 
 import pytest
 
 from agent_memory.integrations import http, langfuse as LF, clickhouse as CH
+
+
+@pytest.mark.parametrize('error,kind', [
+    (TimeoutError('fixture private detail'), 'timeout'),
+    (socket.gaierror(-2, 'fixture private host'), 'dns'),
+    (ssl.SSLError('fixture private certificate'), 'tls'),
+    (ConnectionResetError('fixture private connection'), 'connection'),
+    (OSError('fixture private transport'), 'transport'),
+])
+def test_transport_error_retains_safe_typed_cause(monkeypatch, error, kind):
+    def fail(*args, **kwargs):
+        raise urllib.error.URLError(error)
+    monkeypatch.setattr(http, '_read_attempt', fail)
+    with pytest.raises(http.HttpError) as caught:
+        http.request('GET', 'http://127.0.0.1/', retries=0, total_timeout=1)
+    assert caught.value.failure_kind == kind
+    assert caught.value.status is None
+
+
+def test_expired_read_retains_deadline_cause():
+    with pytest.raises(http.HttpError) as caught:
+        http.request('GET', 'http://127.0.0.1/', total_timeout=0)
+    assert caught.value.failure_kind == 'deadline'
 
 
 @contextmanager

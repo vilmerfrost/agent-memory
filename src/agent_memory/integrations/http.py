@@ -57,10 +57,30 @@ def tls_context(environ: Mapping[str, str] | None = None) -> ssl.SSLContext:
 
 
 class HttpError(Exception):
-    def __init__(self, status: int | None, message: str, *, retryable: bool | None = None):
+    def __init__(self, status: int | None, message: str, *, retryable: bool | None = None,
+                 failure_kind: str | None = None):
         super().__init__(f"HTTP {status}: {message}" if status else message)
         self.status = status
         self.retryable = status in {500, 502, 503, 504} if retryable is None else retryable
+        self.failure_kind = failure_kind
+
+
+def _transport_failure_kind(exc: Exception, deadline: float | None) -> str:
+    """Diagnostic categories from exception types only, never private error text."""
+    if deadline is not None and time.monotonic() >= deadline:
+        return "deadline"
+    reason = getattr(exc, "reason", exc)
+    if isinstance(reason, ssl.SSLError):
+        return "tls"
+    if isinstance(reason, socket.gaierror):
+        return "dns"
+    if isinstance(reason, TimeoutError):
+        return "timeout"
+    if isinstance(reason, ConnectionError):
+        return "connection"
+    if isinstance(reason, http_client.HTTPException):
+        return "http_protocol"
+    return "transport"
 
 
 @dataclass
@@ -209,7 +229,7 @@ def request(method: str, url: str, *, headers: Mapping[str, str] | None = None, 
         data = json.dumps(body, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
         hdrs.setdefault("Content-Type", "application/json")
     if total_timeout is not None and (not math.isfinite(total_timeout) or total_timeout <= 0):
-        raise HttpError(None, "total HTTP read deadline exhausted")
+        raise HttpError(None, "total HTTP read deadline exhausted", failure_kind="deadline")
     deadline = time.monotonic()+total_timeout if total_timeout is not None else None
     attempt = 0
     while True:
@@ -220,11 +240,13 @@ def request(method: str, url: str, *, headers: Mapping[str, str] | None = None, 
         except http_client.HTTPException as exc:
             if deadline is None:
                 raise  # preserve the non-budgeted retry contract, especially billed POST reads
-            raise HttpError(None, f"{type(exc).__name__}: bounded response interrupted", retryable=True) from None
+            raise HttpError(None, f"{type(exc).__name__}: bounded response interrupted", retryable=True,
+                            failure_kind=_transport_failure_kind(exc, deadline)) from None
         except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as e:
             if attempt >= retries or deadline is not None:
                 raise HttpError(None, f"{type(e).__name__}: {getattr(e, 'reason', e)!s}"[:300],
-                                retryable=not isinstance(getattr(e, "reason", e), ssl.SSLError)) from None
+                                retryable=not isinstance(getattr(e, "reason", e), ssl.SSLError),
+                                failure_kind=_transport_failure_kind(e, deadline)) from None
             attempt += 1
             sleep(backoff * 2 ** (attempt - 1))
             continue
