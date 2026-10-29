@@ -2,6 +2,9 @@
 
 A setup that edits itself, for Vilmer only.
 
+Deferred work and future questions: [roadmap.md](roadmap.md). Consult it when
+discussing what to improve or do next; entries are not automatic work approval.
+
 ## Vision (v2)
 
 A routine reads every session: chats, parent dispatches, workers and routines. It finds
