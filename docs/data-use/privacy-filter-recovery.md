@@ -21,6 +21,13 @@ Only typed `rule` parameters for the named rule queries receive this treatment.
 Past.dev recall must equal the words derived from the verified subject rule.
 Arbitrary query text and recall requests without a known subject remain blocked.
 
+ClickHouse's mapper applies the same treatment to catalog-verified global
+`instruction_source`/`rule_id` pairs, but only when the caller supplies separate
+derived-name provenance. The sink loads explicit and derived terms separately;
+ordinary `map_row(..., deny=...)` callers remain fully strict. Other labels and
+IDs keep substring checks, and repo-scoped team/private rule IDs remain null.
+This fixes future projections. It does not backfill historical ClickHouse rows.
+
 ## Status meaning
 
 Policy-excluded queries remain visible as coverage gaps and `excluded` recovery

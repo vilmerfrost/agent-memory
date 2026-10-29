@@ -137,3 +137,37 @@ def test_query_exclusion_label_does_not_hide_unlogged_auth_error():
     report={'health':{'clickhouse':'error'},'health_reasons':{'clickhouse':['HTTP 401']},
             'connection_recovery':{'checks':[{'source':'clickhouse','status':'excluded'}]}}
     assert service_labels(report)=={}
+
+
+def test_clickhouse_mapper_requires_distinct_derived_provenance():
+    from agent_memory.integrations import clickhouse as C
+    table=next(t for t in C.TABLES if t.name=='deviations')
+    raw={'id':'d1','session_id':'s1','instruction_source':'agent:worker','rule_id':'final-report',
+         'writer_model':'report-model','_own':'private'}
+    deny=egress.Deny(('repo',))
+    assert C.map_row(table,raw,1,deny)['rule_id'] is None
+    mapped=C.map_row(table,raw,1,derived_deny=deny)
+    assert (mapped['instruction_source'],mapped['rule_id'])==('agent:worker','final-report')
+    assert mapped['writer_model'] is None  # no exception for other text in a canonical row
+    assert C.map_row(table,raw,1,deny,derived_deny=deny)['rule_id'] is None
+    assert C.map_row(table,{**raw,'rule_id':'unknown-final-report'},1,derived_deny=deny)['rule_id'] is None
+    assert C.map_row(table,raw,1,derived_deny=egress.Deny(('report',)))['rule_id'] is None
+    for ownership in ('private','team',None,'unrecognized'):
+        scoped={**raw,'instruction_source':'claude-md:project','_own':ownership}
+        result=C.map_row(table,scoped,1,derived_deny=deny)
+        assert result['instruction_source']=='claude-md:'+('team' if ownership=='team' else 'private')
+        assert result['rule_id'] is None
+
+
+def test_clickhouse_sink_passes_derived_and_explicit_sets_separately(monkeypatch):
+    from agent_memory.integrations import clickhouse as C
+    table=next(t for t in C.TABLES if t.name=='deviations')
+    raw={'id':'d1','session_id':'s1','instruction_source':'agent:worker','rule_id':'final-report',
+         '_own':'private','_key':'d1','_changed':datetime.now(timezone.utc)}
+    monkeypatch.setattr(egress,'team_names',lambda *a,**k:egress.Deny(('repo',)))
+    monkeypatch.setattr(egress,'env_terms',lambda *a,**k:egress.NONE)
+    sink=C.ClickHouseSink(SimpleNamespace(cfg=SimpleNamespace(lookback_days=0,cloud=False)),tables=[table])
+    monkeypatch.setattr(sink,'_pages',lambda *a,**k:iter([[raw]]))
+    assert list(sink.batches(None,{},replay=False))[0].rows[0]['rule_id']=='final-report'
+    monkeypatch.setattr(egress,'env_terms',lambda *a,**k:egress.Deny(('repo',)))
+    assert list(sink.batches(None,{},replay=False))[0].rows[0]['rule_id'] is None
