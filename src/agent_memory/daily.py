@@ -837,7 +837,7 @@ def _run_daily(
     return result
 
 
-def run_daily(*, push: bool = True, routines_log: Path | None = None, state: Path | None = None,
+def _run_daily_locked(*, push: bool = True, routines_log: Path | None = None, state: Path | None = None,
               now: datetime | None = None, notify: Mapping[str, str] | None = None,
               parent_dir: Path | None = None) -> DailyResult:
     from agent_memory import claude_auth, daily_recovery
@@ -855,3 +855,19 @@ def run_daily(*, push: bool = True, routines_log: Path | None = None, state: Pat
                                 notify=notify, parent_dir=parent_dir)
             result.auth_failed = result.auth_failed or auth.failed
         return result
+
+
+def run_daily(**kwargs):
+    from agent_memory.client_maintenance import lease
+    log = routines_log_path(kwargs.get('routines_log'))
+    with lease(log) as acquired:
+        if not acquired:
+            result = DailyResult()
+            result.fail('client maintenance: update in progress')
+            now = kwargs.get('now') or datetime.now().astimezone()
+            result.lines = log_lines(now.strftime(TS_FORMAT), result, 0)
+            log.parent.mkdir(parents=True,exist_ok=True)
+            with log.open('a') as fh:
+                fh.write('\n'.join(result.lines)+'\n')
+            return result
+        return _run_daily_locked(**kwargs)

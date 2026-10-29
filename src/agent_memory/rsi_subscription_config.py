@@ -25,7 +25,7 @@ def validate_role(provider: str, model: str | None, effort: str | None, mode: st
             raise ValueError("unknown subscription auth configuration (never put secrets in config)")
 
 
-def auth_for(provider: str, settings: Mapping, *, tools: bool):
+def _auth_for(provider: str, settings: Mapping, *, tools: bool):
     from agent_memory.rsi_subscription import SubscriptionAuth, SubscriptionError
     from agent_memory.rsi_replay import sandbox_module
     def executable(key: str, default: str) -> Path:
@@ -56,6 +56,15 @@ def auth_for(provider: str, settings: Mapping, *, tools: bool):
                             worker_image=sandbox_module().image_id("worker") if tools else None,
                             docker_host=settings.get("docker_host"),
                             claude_token=claude_token if provider == "claude" else None)
+
+
+def auth_for(provider: str, settings: Mapping, *, tools: bool):
+    from agent_memory.rsi_subscription import SubscriptionError
+    try:
+        return _auth_for(provider, settings, tools=tools)
+    except SubscriptionError as exc:
+        exc.inference_started = False
+        raise
 
 
 def usage_fields(usage: Mapping) -> dict[str, int]:

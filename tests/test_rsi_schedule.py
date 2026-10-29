@@ -508,13 +508,13 @@ def test_subscription_plan_has_room_for_three_experiments() -> None:
                                          "replay": 2 * (10 * (240 + S.CHECK_RUN_S) + 5 * 300 + S.JEV_CALL_S)}
     assert one["wall_clock_s"] == 8960
     assert room_needs(plan) == {
-        "calls claude-opus-5-5": (36, 40), "calls gpt-6.1-sol": (60, 64), "calls jev-1.14.0": (5 + 6, 12),
-        "A/B pairs per experiment": (10, 10), "sandbox runs": (540, 540), "wall clock": (600 + 3 * 8960, 17940),
+        "calls claude-opus-5-5": (38, 40), "calls gpt-6.1-sol": (62, 64), "calls jev-1.14.0": (5 + 6, 12),
+        "A/B pairs per experiment": (10, 10), "sandbox runs": (542, 540), "wall clock": (600 + 3 * 8960, 17940),
         "subscription tokens": (6_000_000, 6_000_000)}
     assert plan["max_experiments"] == 3 and plan["within_cap"]
-    # Every cap fits except the worst-case wall clock, which the room reports instead of hiding: at every
+    # Readiness adds four calls and two containers; worst-case container and wall-clock caps do not fit. At every
     # timeout one experiment finishes inside the night; the night stops cleanly at the wall clock.
-    assert [c["limit"] for c in plan["room"]["checks"] if not c["fits"]] == ["wall clock"]
+    assert [c["limit"] for c in plan["room"]["checks"] if not c["fits"]] == ["sandbox runs", "wall clock"]
     assert plan["room"]["worst_case_experiments_in_wall_clock"] == 1
     text = S.render_plan(plan)
     assert "- wall clock: need 27,480s of 17,940s DOES NOT FIT" in text
@@ -533,11 +533,11 @@ def test_room_flags_caps_sized_for_one_experiment(tmp_path: Path) -> None:
     assert failing == ["calls claude-opus-5-5", "calls gpt-6.1-sol", "calls jev-1.14.0", "sandbox runs",
                        "subscription tokens", "wall clock"]
     assert not plan["room"]["fits"] and "DOES NOT FIT" in S.render_plan(plan)
-    d["budget"]["max_experiments"] = 1                   # the same caps did fit one experiment, except the wall clock
+    d["budget"]["max_experiments"] = 1                   # these old caps omit readiness calls and containers
     d["triage"]["target_experiments"] = 1                # keep this one-experiment calibration profile consistent
     p.write_text(json.dumps(d))
     one = S.paid_plan(N.load_config(p))
-    assert [c["limit"] for c in one["room"]["checks"] if not c["fits"]] == ["wall clock"]
+    assert [c["limit"] for c in one["room"]["checks"] if not c["fits"]] == ["calls claude-opus-5-5", "calls gpt-6.1-sol", "sandbox runs", "wall clock"]
 
 
 def test_three_experiment_night_ends_before_the_brief() -> None:
@@ -557,7 +557,7 @@ def test_cli_plan_prints_the_room(tmp_path: Path) -> None:
     assert r.returncode == 0, r.stderr
     room = json.loads(r.stdout)["room"]
     assert room["experiments"] == 3 and room["per_experiment"]["ab_pairs"] == 10
-    assert [c["limit"] for c in room["checks"] if not c["fits"]] == ["wall clock"]   # reported, not hidden
+    assert [c["limit"] for c in room["checks"] if not c["fits"]] == ["sandbox runs", "wall clock"]   # reported, not hidden
     assert not (tmp_path / "sandbox").exists()
 
 

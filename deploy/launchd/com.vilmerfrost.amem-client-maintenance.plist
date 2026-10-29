@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>AMEM_DEVIATIONS_LIVE</key>
+		<string>1</string>
+		<key>AMEM_HOOK_OFF</key>
+		<string>1</string>
+		<key>AMEM_JEV_LIVE</key>
+		<string>1</string>
+		<key>AMEM_REQUIRE_REMOTE</key>
+		<string>1</string>
+		<key>PATH</key>
+		<string>/Users/vilmerfrost/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+		<key>RSI_SANDBOX_DIR</key>
+		<string>/Users/vilmerfrost/sandbox</string>
+	</dict>
+	<key>Label</key>
+	<string>com.vilmerfrost.amem-client-maintenance</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/opt/homebrew/bin/uv</string>
+		<string>run</string>
+		<string>--directory</string>
+		<string>/Users/vilmerfrost/Projects/agent-memory</string>
+		<string>--quiet</string>
+		<string>amem</string>
+		<string>client-maintenance</string>
+	</array>
+	<key>RunAtLoad</key>
+	<false/>
+	<key>StandardErrorPath</key>
+	<string>/Users/vilmerfrost/.claude/parent/reports/launchd.log</string>
+	<key>StandardInPath</key>
+	<string>/dev/null</string>
+	<key>StandardOutPath</key>
+	<string>/Users/vilmerfrost/.claude/parent/reports/launchd.log</string>
+	<key>StartCalendarInterval</key>
+	<dict>
+		<key>Hour</key>
+		<integer>0</integer>
+		<key>Minute</key>
+		<integer>0</integer>
+	</dict>
+</dict>
+</plist>

@@ -45,7 +45,26 @@ def cmd_daily(args: argparse.Namespace) -> int:
     return 0 if result.verdict == "PASS" else 1
 
 
+def cmd_maintenance(args):
+    from agent_memory import client_maintenance, config
+    log = daily.routines_log_path(args.routines_log)
+    result = client_maintenance.run(log=log, config_path=args.config or config.REPO_ROOT/'config/rsi-night.subscription.json',
+                                    push=not args.no_push)
+    status = 'FAIL' if result['status']=='failed' else 'PASS' if result['status']=='ready' else 'SKIP'
+    line = f"{datetime.now().astimezone().strftime(daily.TS_FORMAT)} amem-client-maintenance {status} status={result['status']} reason={result.get('reason','none')}"
+    log.parent.mkdir(parents=True,exist_ok=True)
+    with log.open('a') as fh:
+        fh.write(line+'\n')
+    print(line)
+    return 1 if status=='FAIL' else 0
+
+
 def register(sub: Any) -> None:
+    maintenance = sub.add_parser('client-maintenance', help='bounded midnight CLI updates and readiness')
+    maintenance.add_argument('--no-push',action='store_true')
+    maintenance.add_argument('--routines-log',type=Path)
+    maintenance.add_argument('--config',type=Path)
+    maintenance.set_defaults(func=cmd_maintenance)
     recovery = sub.add_parser("daily-recover", help="resume auth-blocked daily and night jobs, bounded until noon")
     recovery.add_argument("--no-push", action="store_true")
     recovery.add_argument("--state", type=Path)
