@@ -2028,6 +2028,12 @@ class Night:
                 "attempts": 1, "checked_at": _now_iso(), "elapsed_ms": None,
                 "reason": "sandbox unavailable; no automatic service restart configured",
                 "impact": "paid triage and experiments deferred; deterministic evidence collection continues"})
+        if not self.dry_run and self.execution_ready and isinstance(self.ad.replayer, SandboxReplayer):
+            from agent_memory import client_readiness
+            try:
+                self.report['client_readiness'] = client_readiness.check(self.cfg, self.budget)
+            except Exception as exc:
+                raise PreflightFailed(f"client compatibility: {type(exc).__name__}: {exc}") from None
         self.allowlist = list(self.ad.targets())
         self.pinned = [t for t in self.allowlist if _refused_by_improve(t)]
         if self.pinned:                # improve refuses these: a candidate on one only burns triage and model money

@@ -100,12 +100,25 @@ def test_unapproved_model_effort_fail_before_process(setup, model, effort):
               arm_home=arm, timeout_s=10, _process=lambda *a, **k: pytest.fail("started"))
 
 
-def test_codex_rejects_unverified_client_version_before_inference(setup, monkeypatch):
-    monkeypatch.setattr(S, "CODEX_NATIVE_BOUNDARY_VERIFIED", True)
+@pytest.mark.parametrize('version', ['codex-cli 0.165.0', 'codex-cli 9.999.0'])
+def test_codex_accepts_version_when_runtime_contract_matches(setup, version):
     auth, workspace, arm = setup
-    with pytest.raises(S.SubscriptionError, match="codex_client_version_unverified"):
-        S.run("codex", "test", model=S.MODELS["codex"], effort="high", auth=auth, workspace=workspace,
-              arm_home=arm, timeout_s=10, _process=lambda *a, **k: (0, "codex-cli 0.162.0", ""))
+    rpc = FakeRpc()
+    result = S.run('codex', 'Test', model=S.MODELS['codex'], effort='high', auth=auth,
+                   workspace=workspace, arm_home=arm, timeout_s=20, tools_allowed=False,
+                   _process=lambda *a, **k: (0, version, ''), _rpc_factory=lambda *a, **k: rpc)
+    assert result.evidence['client_version'] == version
+    assert result.text == 'answer'
+
+
+def test_metadata_preflight_never_starts_inference(setup):
+    rpc = FakeRpc()
+    result = S.preflight('codex', model=S.MODELS['codex'], effort='high', auth=setup[0],
+                         _process=lambda *a, **k: (0, 'codex-cli 0.165.0', ''),
+                         _rpc_factory=lambda *a, **k: rpc)
+    assert result['inference_started'] is False
+    assert not any(method == 'turn/start' for method, _ in rpc.requests)
+    assert rpc.closed
 
 
 def test_auth_store_never_mounted(setup):
@@ -267,7 +280,10 @@ class FakeRpc:
         if method == "thread/start":
             assert params.get("permissions") == S.CODEX_PERMISSION_PROFILE and "sandbox" not in params
             return {"thread": {"id": "t"}, "model": self.model, "reasoningEffort": self.effort,
-                    "modelProvider": "openai", "instructionSources": []}
+                    "modelProvider": "openai", "instructionSources": [],
+                    "activePermissionProfile": {"id": S.CODEX_PERMISSION_PROFILE, "extends": None},
+                    "sandbox": {"type":"readOnly", "networkAccess": False},
+                    "approvalPolicy": "never", "approvalsReviewer": "user"}
         if method == "turn/start":
             assert params.get("permissions") == S.CODEX_PERMISSION_PROFILE and "sandboxPolicy" not in params
             return {"turn": {"id": "u"}}
@@ -398,3 +414,14 @@ def test_claude_preserves_only_numeric_client_api_time(value, expected):
                                     model=S.MODELS['claude'], tools_allowed=False)
     assert evidence['api_duration_ms'] == expected
     assert evidence['api_duration_source'] == 'client_result_duration_api_ms'
+
+
+def test_early_config_rejection_is_proven_unstarted(setup):
+    auth, workspace, arm = setup
+    rpc = FakeRpc(feature_override={'shell_tool': True})
+    with pytest.raises(S.SubscriptionError) as error:
+        S.run('codex', 'Test', model=S.MODELS['codex'], effort='high', auth=auth,
+              workspace=workspace, arm_home=arm, timeout_s=20, tools_allowed=False,
+              _process=lambda *a, **k:(0,'codex-cli 0.165.0',''), _rpc_factory=lambda *a, **k:rpc)
+    assert error.value.inference_started is False
+    assert not any(m=='turn/start' for m,p in rpc.requests)

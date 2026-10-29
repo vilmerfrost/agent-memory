@@ -522,6 +522,9 @@ class Budget:
                                  duration_s=self._clock() - t0, attempt=attempt, reservation_id=reservation)
                 raise
             except BaseException as exc:
+                if getattr(exc, "inference_started", None) is False:
+                    self.cancel_call(reservation)
+                    raise
                 usage = getattr(exc, "usage", None) or Usage()
                 self.record_call(model, stage=stage, tokens_in=usage.tokens_in, tokens_out=usage.tokens_out,
                                  usd=usage.usd, duration_s=self._clock() - t0, ok=False,

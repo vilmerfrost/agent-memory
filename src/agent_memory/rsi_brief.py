@@ -832,6 +832,8 @@ def failed_item(e: Mapping[str, Any]) -> dict[str, Any]:
     if e["status"] == "skipped_budget" and isinstance(decision, dict):
         why = (f"stopped by budget limit {decision.get('resource') or 'unknown'}: "
                f"{text(decision.get('detail'), 200) or e.get('skip_reason') or 'no detail recorded'}")
+    if isinstance(decision, dict) and decision.get('resource') == 'subscription_usage_unknown':
+        why = 'stopped: subscription usage accounting was unavailable; monetary budget was not exhausted'
     return {"experiment_id": e.get("experiment_id"), "candidate_key": text(e.get("candidate_key"), 120) or None,
             "verdict": v, "status": e["status"], "why_not_staged": why,
             "reasons": [text(r, 200) for r in (e.get("verdict_reasons") or [])[:6]],
@@ -897,6 +899,8 @@ def headline(rep: Mapping[str, Any]) -> str:
     sk = skip_info(rep)
     if sk:
         return _sentence(f"The night did not run: {sk['summary']}")
+    if rep['status'] == 'budget_exhausted' and any('subscription_usage_unknown' in str(n) for n in rep.get('notes', [])):
+        return 'The night stopped early: subscription usage accounting was unavailable.'
     return HEADLINES[rep["status"]]
 
 
@@ -964,7 +968,7 @@ def build_brief(rep: Mapping[str, Any], db: Db, *, artifacts_root: Path, report:
                           for k, v in sorted(_obj(c.get("by_basis")).items())],
              "reported_usd": c.get("reported_usd") if _num(c.get("reported_usd")) else None,
              "estimated_usd": c.get("estimated_usd") if _num(c.get("estimated_usd")) else None,
-             "total_usd": c.get("total_usd") or 0.0, "budget_exhausted": rep["status"] == "budget_exhausted"}
+             "total_usd": c.get("total_usd") or 0.0, "budget_exhausted": rep["status"] == "budget_exhausted" and not any("subscription_usage_unknown" in str(n) for n in rep.get("notes", []))}
     services = {text(k, 32): text(v, 80) for k, v in rep["health"].items()}
     writer = writer_info(rep)
     writer_warning = ([f"{WRITER_NEVER_RAN}: {writer['fell_back']}/{writer['experiments']} experiments fell back to the "
