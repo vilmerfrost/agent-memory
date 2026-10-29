@@ -36,7 +36,9 @@ MAX_LINE = 32768
 VITALS_TIMEOUT = 0.5
 SAME_WINDOW_S = 300          # Vitals rounds rolling reset times; a real reset moves hours
 MIN_BUCKET_RUNS = 3          # time: fewer runs in a worker bucket -> use the tool's pooled runs
-MIN_CLEAN_USAGE = 5          # usage: fewer clean runs in a bucket -> token ratio fallback
+MIN_CLEAN_USAGE = 5          # usage: fewer clean runs in a bucket -> seed, then token ratio
+MIN_SEED_INTERVALS = 3       # Codex seed: fewer >=3-point intervals -> no tokens-per-1% number
+MIN_SEED_ROUNDS = 3          # round tokens: fewer rounds in a bucket -> the tool's pooled rounds
 DEFAULT_MINUTES = 30         # only when no run has ever been recorded
 TOOLS = ("claude", "codex")
 PRIMARY_LIMIT = {"claude": "claude:session", "codex": "codex:week"}
@@ -360,23 +362,54 @@ def estimate(lookup: dict | None, tool: str, workers: int) -> dict[str, Any]:
             break
     usage_table = (lookup or {}).get("usage", {})
     tokens = (lookup or {}).get("tokens", {}).get(tool, {})
-    for key, info in usage_table.items():
-        if not key.startswith(tool + ":") or not isinstance(info, dict):
-            continue
+    seed = (lookup or {}).get("seed") if isinstance((lookup or {}).get("seed"), dict) else {}
+    rates = (seed.get("codex_rate") or {}).get("limits") or {}
+    typical = typical_tokens(seed, tool, b)
+    result["tokens_typical"] = typical
+    result["per_pct"] = {k: {"median": v["fresh_per_pct"]["median"], "n": v.get("n", 0), "source": v.get("source")}
+                         for k, v in rates.items() if k.startswith(tool + ":") and isinstance(v, dict)
+                         and isinstance(v.get("fresh_per_pct"), dict) and v["fresh_per_pct"].get("median")}
+    keys = {k for k, v in usage_table.items() if k.startswith(tool + ":") and isinstance(v, dict)}
+    keys |= {k for k, v in rates.items() if k.startswith(tool + ":") and isinstance(v, dict)}
+    for key in sorted(keys):
+        info = usage_table.get(key) or {}
         clean = info.get("buckets", {}).get(b) or {}
         ratio = info.get("pct_per_mtoken")
         tok = (tokens.get(b) or tokens.get("all") or {}).get("median_fresh")
+        per_pct = ((rates.get(key) or {}).get("fresh_per_pct") or {}).get("median")
         if clean.get("n", 0) >= MIN_CLEAN_USAGE and clean.get("median") is not None:
             result["usage"][key] = {"pct": clean["median"], "slow_pct": clean.get("p80"),
                                     "method": "clean_runs", "basis": clean["n"]}
+        elif per_pct and typical:
+            # Seed: real tokens per round / real tokens per 1% (both with their source records).
+            result["usage"][key] = {"pct": _round(typical["median_fresh"] / per_pct, 1),
+                                    "slow_pct": _round(typical["p80_fresh"] / per_pct, 1),
+                                    "method": "seed", "basis": rates[key]["n"], "rounds": typical["n"],
+                                    "source": rates[key].get("source")}
         elif ratio is not None and tok:
             result["usage"][key] = {"pct": _round(ratio * tok / 1e6, 1), "slow_pct": None,
                                     "method": "token_ratio", "basis": info.get("n_ratio", 0)}
     return result
 
 
+def typical_tokens(seed: dict | None, tool: str, b: str) -> dict[str, Any] | None:
+    """Worker tokens of a typical round from the seed: the bucket, else the tool's pooled rounds."""
+    entry = ((seed or {}).get("round_tokens") or {}).get(tool) or {}
+    buckets = entry.get("buckets") if isinstance(entry.get("buckets"), dict) else {}
+    for scope, key in ((f"{b} workers", b), ("all sizes", "all")):
+        stats = buckets.get(key)
+        if isinstance(stats, dict) and stats.get("n", 0) >= MIN_SEED_ROUNDS and stats.get("median_fresh"):
+            return {"n": stats["n"], "median_fresh": stats["median_fresh"],
+                    "p80_fresh": stats.get("p80_fresh") or stats["median_fresh"], "scope": scope}
+    return None
+
+
 def _pct(value: float) -> str:
     return "<1%" if value < 1 else f"{round(value)}%"
+
+
+def _tokens(value: float) -> str:
+    return f"{value / 1e6:.1f}M" if value >= 1e6 else f"{round(value / 1e3)}k" if value >= 1e3 else str(round(value))
 
 
 def expect_line(est: dict[str, Any], tool: str, current: dict[str, float] | None = None,
@@ -391,9 +424,19 @@ def expect_line(est: dict[str, Any], tool: str, current: dict[str, float] | None
     usage = est["usage"].get(key)
     now_used = (current or {}).get(key)
     now_text = f", now {round(now_used)}% used" if now_used is not None else ""
+    typical = est.get("tokens_typical")
+    rate = (est.get("per_pct") or {}).get(key)
     if usage:
-        tail = " from tokens" if usage["method"] == "token_ratio" else ""
+        tail = (" from tokens" if usage["method"] == "token_ratio" else
+                f" (seed: {usage.get('source') or 'history'}, {usage['basis']} intervals x {usage['rounds']} rounds)"
+                if usage["method"] == "seed" else f" ({usage['basis']} clean runs)")
         head += f", ~{_pct(usage['pct'])} of {label}{tail}{now_text}"
+    elif typical:
+        head += (f", {label} use: no % history yet, ~{_tokens(typical['median_fresh'])} fresh tokens typical"
+                 f" ({typical['n']} rounds){now_text}")
+    elif rate:
+        head += (f", {label} use: no round token history yet, 1% ~ {_tokens(rate['median'])} fresh tokens"
+                 f" (seed: {rate.get('source') or 'history'}, {rate['n']} intervals){now_text}")
     else:
         head += f", {label} use: no usage history{now_text}"
     if est["minutes"] is not None:
@@ -452,6 +495,7 @@ def start(repo: str, workers: int, *, brief_chars: int | None = None, files_clai
     records.append({"v": SCHEMA, "type": "estimate", "run_id": run_id, "at": iso(at),
                     "est_minutes": est["minutes"], "est_slow_minutes": est["slow_minutes"],
                     "est_usage": {k: v["pct"] for k, v in est["usage"].items()},
+                    "usage_method": {k: v["method"] for k, v in est["usage"].items()},
                     "basis_runs": est["basis_runs"], "method_version": METHOD,
                     "time_scope": est["time_scope"]})
     append_records(spool, records)
@@ -712,11 +756,12 @@ def build_lookup(runs: dict[str, dict], rounds: list[dict], *, test_ms: dict[str
 
 
 def refresh(parent: Path | None = None, *, repo: str | None = None,
-            db: Any = None) -> dict[str, Any]:
+            db: Any = None, codex_home: Path | None = None, codex: bool = True) -> dict[str, Any]:
     """Recompute the lookup file. `db` (optional) supplies tokens and test medians.
 
     db: an object with `test_medians() -> dict[repo, ms]` and
     `tokens(run) -> (fresh, cache_read, workers) | None`; errors are skipped.
+    codex_home: where the Codex rollouts for the usage seed live (dispatch_seed.codex_home).
     """
     parent = parent or parent_dir()
     previous = load_lookup(parent) or {}
@@ -747,10 +792,40 @@ def refresh(parent: Path | None = None, *, repo: str | None = None,
                                     "sessions_counted": workers, "scope": "workers"}))
         for run, record in added:
             append_records(repo_dir(run["repo"], parent) / SPOOL, [record])
-    lookup = build_lookup(runs, task_rounds(parent), test_ms=test_ms)
+    rounds = task_rounds(parent)
+    lookup = build_lookup(runs, rounds, test_ms=test_ms)
+    lookup["seed"] = seed_block(previous, rounds, db, notes, codex_home=codex_home, codex=codex,
+                                made_at=lookup["made_at"])
     write_json(parent / LOOKUP, lookup)
     lookup["notes"] = notes
     return lookup
+
+
+def seed_block(previous: dict, rounds: list[dict], db: Any, notes: list[str], *, codex_home: Path | None,
+               codex: bool, made_at: str) -> dict[str, Any]:
+    """The `seed` part of the lookup: Codex tokens per 1% and tokens per round, real data only."""
+    from agent_memory import dispatch_seed as S    # refresh only: start/end never import it
+
+    seed: dict[str, Any] = {"method_version": S.SEED_METHOD, "codex_rate": None, "round_tokens": {},
+                            "round_tokens_made_at": None}
+    if codex:
+        home = S.codex_home(codex_home)
+        rate = S.codex_rate(home)
+        seed["codex_rate"] = rate
+        if not rate["rollouts"]:
+            notes.append(f"Codex seed: no rollouts under {home}")
+        for key, entry in rate["limits"].items():
+            if entry.get("why_none"):
+                notes.append(f"Codex seed {key}: no usage history ({entry['why_none']})")
+    old = previous.get("seed") if isinstance(previous.get("seed"), dict) else {}
+    table, round_notes = S.round_tokens(rounds, db) if db is not None else ({}, ["round tokens skipped: no database"])
+    notes.extend(round_notes)
+    if db is not None and not any(n.startswith("round tokens skipped") for n in round_notes):
+        seed.update(round_tokens=table, round_tokens_made_at=made_at)
+    elif old.get("round_tokens"):          # offline: keep the last database result, with its date
+        seed.update(round_tokens=old["round_tokens"], round_tokens_made_at=old.get("round_tokens_made_at"))
+        notes.append(f"round tokens kept from {old.get('round_tokens_made_at')}")
+    return seed
 
 
 def refresh_line(lookup: dict) -> str:
@@ -761,9 +836,34 @@ def refresh_line(lookup: dict) -> str:
             parts.append(tool + " " + ", ".join(f"{b}:n={v['n']} med={round(v['median'])}m p80={round(v['p80'])}m"
                                                 for b, v in table.items() if b != "all"))
     usage = ", ".join(f"{k} clean n={v['buckets'].get('all', {}).get('n', 0)}" for k, v in lookup["usage"].items())
-    return (f"Refreshed: {lookup['runs']} measured runs, {lookup['backfill_rounds']} backfill rounds, "
-            f"{lookup['clean_usage_runs']} clean usage runs. " + "; ".join(parts)
-            + (f". Usage: {usage}" if usage else ". Usage: no clean runs yet"))
+    line = (f"Refreshed: {lookup['runs']} measured runs, {lookup['backfill_rounds']} backfill rounds, "
+            f"{lookup['clean_usage_runs']} clean usage runs. " + "; ".join(parts) + (". " if parts else "")
+            + (f"Usage: {usage}" if usage else "Usage: no clean runs yet"))
+    return line + "\n" + seed_line(lookup.get("seed") or {})
+
+
+def seed_line(seed: dict) -> str:
+    """`Seed: codex:week 1% = 27k fresh tokens (p20 15k, p80 108k; 137 intervals, 87 rollouts); ...`"""
+    parts = []
+    rate = seed.get("codex_rate")
+    if isinstance(rate, dict):
+        for key, e in rate.get("limits", {}).items():
+            if e.get("fresh_per_pct"):
+                f, t = e["fresh_per_pct"], e["total_per_pct"]
+                parts.append(f"{key} 1% = {_tokens(f['median'])} fresh tokens (p20 {_tokens(f['p20'])}, "
+                             f"p80 {_tokens(f['p80'])}), {_tokens(t['median'])} total "
+                             f"({e['n']} intervals, {rate['rollouts']} rollouts)")
+            else:
+                parts.append(f"{key} no usage history ({e.get('why_none')})")
+        if not rate.get("limits"):
+            parts.append(f"Codex: no usage history ({rate.get('rollouts', 0)} rollouts, no rate limits seen)")
+    for tool, entry in (seed.get("round_tokens") or {}).items():
+        stats = ", ".join(f"{b}:n={v['n']} med={_tokens(v['median_fresh'])}"
+                          for b, v in entry.get("buckets", {}).items())
+        parts.append(f"{tool} round tokens {stats}")
+    if not seed.get("round_tokens"):
+        parts.append("round tokens: none")
+    return "Seed: " + "; ".join(parts)
 
 
 def report(parent: Path | None = None, limit: int = 20) -> list[dict]:
