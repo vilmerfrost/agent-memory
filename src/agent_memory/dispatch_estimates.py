@@ -147,6 +147,46 @@ def read_vitals(timeout: float = VITALS_TIMEOUT) -> tuple[dict | None, dict | No
     return out["limits"], out["agents"], notes
 
 
+LATE_TIMEOUT = 15.0
+SLOW_NOTE = "Vitals limits slow: usage snapshot follows in the background"
+
+
+def late_snapshot(notes: list[str], spool: Path, run_id: str, phase: str) -> None:
+    """`vitals limits` blocks for seconds when its data is about a minute old (it asks the
+    providers again). Instead of waiting, a detached helper takes the snapshot and
+    appends it to the spool; its taken_at is Vitals' own measurement time."""
+    if "Vitals limits timed out" not in notes:
+        return
+    import sys
+    try:
+        subprocess.Popen([sys.executable, "-m", "agent_memory.dispatch_estimates", "late-snapshot",
+                          str(spool), run_id, phase], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True, close_fds=True)
+    except OSError:
+        return
+    notes[notes.index("Vitals limits timed out")] = SLOW_NOTE
+
+
+def _late_main(argv: list[str]) -> int:
+    spool, run_id, phase = Path(argv[0]), argv[1], argv[2]
+    if spool.name != SPOOL or spool.is_symlink() or phase not in ("start", "end"):
+        return 2
+    binary = shutil.which("vitals")
+    if not binary:
+        return 1
+    try:
+        out = subprocess.run([binary, "limits", "--json"], capture_output=True, timeout=LATE_TIMEOUT,
+                             stdin=subprocess.DEVNULL)
+        data = json.loads(out.stdout) if out.returncode == 0 else None
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return 1
+    snaps = limit_snapshots(data if isinstance(data, dict) else None, str(uuid.UUID(run_id)), phase)
+    for snap in snaps:
+        snap["late"] = True
+    append_records(spool, snaps)
+    return 0
+
+
 def limit_snapshots(data: dict | None, run_id: str, phase: str) -> list[dict]:
     """Plan limits as snapshot records. Emails become a short hash; the lead block is dropped."""
     if not isinstance(data, dict):
@@ -416,6 +456,7 @@ def start(repo: str, workers: int, *, brief_chars: int | None = None, files_clai
                     "time_scope": est["time_scope"]})
     append_records(spool, records)
     write_json(open_file, {**start_rec, "est_minutes": est["minutes"], "est_slow_minutes": est["slow_minutes"]})
+    late_snapshot(notes, spool, run_id, "start")      # after the start record: upload order
     return {"run_id": run_id, "line": expect_line(est, tool, current_usage(snaps), notes),
             "estimate": est, "session": session, "tool": tool}
 
@@ -469,6 +510,7 @@ def end(run_id: str | None = None, *, session: str | None = None, status: str = 
     record = _end_record(opened, at, status, integration_test_ms, conc)
     append_records(path.parent.parent / SPOOL, [record, *snaps])
     path.unlink(missing_ok=True)
+    late_snapshot(notes, path.parent.parent / SPOOL, opened["run_id"], "end")
     started = parse_ts(opened.get("at"))
     minutes = (at - started).total_seconds() / 60 if started else None
     run = {"tool": opened.get("tool"), "concurrent_by_tool": record["concurrent_by_tool"],
@@ -481,7 +523,10 @@ def end(run_id: str | None = None, *, session: str | None = None, status: str = 
     line = f"Actual: {round(minutes) if minutes is not None else '?'} min"
     if opened.get("est_minutes") is not None:
         line += f" (estimate {opened['est_minutes']}, slow case {opened['est_slow_minutes']})"
-    if key in deltas:
+    if SLOW_NOTE in notes:
+        line += f", {LIMIT_LABEL.get(key, key)} use: end snapshot pending (see `amem dispatch report`)"
+        notes = [n for n in notes if n != SLOW_NOTE]
+    elif key in deltas:
         d = deltas[key]
         line += f", {LIMIT_LABEL.get(key, key)} +{_round(d['delta'], 1)}%"
         line += " (clean)" if d["clean"] else " (not clean: " + d["why"] + ")"
@@ -610,7 +655,6 @@ def build_lookup(runs: dict[str, dict], rounds: list[dict], *, test_ms: dict[str
             measured.setdefault(run["repo"], []).append(float(run["integration_test_ms"]))
     for repo, values in measured.items():
         test_ms[repo] = quantile(values, .5)
-    fallback_test = quantile(list(test_ms.values()), .5) or 0.0
     samples: list[tuple[str, str, float, bool]] = []     # tool, bucket, minutes, backfill
     finished = [r for r in runs.values() if r.get("minutes") is not None and r.get("status") != "abandoned"
                 and r.get("tool") in TOOLS and isinstance(r.get("n_workers"), int)]
@@ -620,7 +664,7 @@ def build_lookup(runs: dict[str, dict], rounds: list[dict], *, test_ms: dict[str
     for rd in rounds:
         if _covered(rd, runs.values()):
             continue
-        extra = test_ms.get(rd["repo"], fallback_test) / 60000
+        extra = (test_ms.get(rd["repo"]) or 0) / 60000     # a repo without a known test time adds nothing
         samples.append((rd["tool"], bucket(rd["n_workers"]), rd["minutes_raw"] + extra, True))
         backfilled += 1
     time_table: dict[str, dict[str, dict]] = {}
@@ -740,3 +784,13 @@ def report(parent: Path | None = None, limit: int = 20) -> list[dict]:
                     "actual_pct": _round(actual_use["delta"], 1) if actual_use else None,
                     "clean": actual_use["clean"] if actual_use else None})
     return out
+
+
+if __name__ == "__main__":   # the detached late-snapshot helper only
+    import sys
+    if sys.argv[1:2] == ["late-snapshot"] and len(sys.argv) == 5:
+        try:
+            sys.exit(_late_main(sys.argv[2:]))
+        except (OSError, ValueError):
+            sys.exit(1)
+    sys.exit(2)

@@ -44,16 +44,25 @@ make the line say what is missing; they never stop a dispatch.
 ## Speed
 
 `start` and `end` read `vitals limits --json` and `vitals agents --json` in
-parallel, with a 0.5 s timeout each. They import no database code. Measured on
-2026-10-29 (median of 5 runs):
+parallel, with a 0.5 s timeout each. They import no database code. Wall time with
+real Vitals, measured on 2026-10-29 (median of 5 runs):
 
 | Entry point | start | end |
 |---|---|---|
-| `~/Projects/agent-memory/.venv/bin/amem` | see the worker report | see the worker report |
-| `uv run --project ~/Projects/agent-memory amem` | see the worker report | see the worker report |
+| `.venv/bin/python -m agent_memory.cli_dispatch start ...` | 62 ms | 62 ms |
+| `.venv/bin/amem dispatch start ...` | 422 ms | 429 ms |
+| `uv run --project <checkout> amem dispatch start ...` | 486 ms | 448 ms |
 
-Most of the time is `amem` startup (the main CLI imports every subcommand), not
-the dispatch code. Use the venv entry point from hooks.
+About 280 ms of `amem` is its own startup: the main CLI imports every subcommand.
+`python -m agent_memory.cli_dispatch` takes the same arguments (without the word
+`dispatch`) and prints the same lines; use it from hooks.
+
+`vitals limits` itself takes about 20 ms, but when its reading is about a minute
+old it asks the providers again and blocks for 2 to 4 seconds (seen in 2 of 9
+calls). Then `start`/`end` do not wait: they say "usage snapshot follows in the
+background" and a detached helper (`python -m agent_memory.dispatch_estimates
+late-snapshot`, 15 s limit) appends the snapshot to the spool when Vitals answers.
+The worst case is then about 0.9 s.
 
 ## Files
 
@@ -103,7 +112,8 @@ Time estimates use every finished run, clean or not.
 - `tasks.jsonl` rounds fill in time history. A round runs from the first spawn to
   the last handback, so refresh adds the repo's median integration-test time
   (measured `--integration-test-ms` first, else the database median of full, passing
-  runs in `test_timing_runs`). Rounds that a measured run already covers are skipped.
+  runs in `test_timing_runs`; a repo with neither adds nothing). Rounds that a
+  measured run already covers are skipped.
 - Usage, per limit and bucket: median and 80th percentile delta over clean runs.
   With fewer than 5 clean runs in the bucket, the estimate is
   `median worker tokens x learned percent per million tokens` (marked "from tokens").

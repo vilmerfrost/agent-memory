@@ -44,11 +44,13 @@ def home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     script = bin_dir / "vitals"
     script.write_text('#!/bin/sh\n'
                       'if [ -n "$FAKE_VITALS_SLEEP" ]; then exec /bin/sleep "$FAKE_VITALS_SLEEP"; fi\n'
+                      # like real Vitals with a minute-old reading: limits blocks while it asks again
+                      'if [ "$1" = limits ] && [ -n "$FAKE_VITALS_DELAY" ]; then /bin/sleep "$FAKE_VITALS_DELAY"; fi\n'
                       'exec /bin/cat "$FAKE_VITALS_DIR/$1.json"\n')
     script.chmod(0o755)
     claude_home = tmp_path / "claude"
     write_vitals(tmp_path / "vitals")
-    for name in ("CODEX_THREAD_ID", "CLAUDE_CODE_SESSION_ID", "FAKE_VITALS_SLEEP"):
+    for name in ("CODEX_THREAD_ID", "CLAUDE_CODE_SESSION_ID", "FAKE_VITALS_SLEEP", "FAKE_VITALS_DELAY"):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("AMEM_CLAUDE_HOME", str(claude_home))
     monkeypatch.setenv("FAKE_VITALS_DIR", str(tmp_path / "vitals"))
@@ -163,7 +165,34 @@ def test_slow_vitals_times_out_without_blocking(home: Path, monkeypatch: pytest.
     began = time.monotonic()
     result = D.start("demo", 2, session="s1")
     assert time.monotonic() - began < 2
-    assert "Vitals limits timed out" in result["line"]
+    assert D.SLOW_NOTE in result["line"] and "Vitals agents timed out" in result["line"]
+
+
+def wait_for(predicate, seconds: float = 10.0):
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if found := predicate():
+            return found
+        time.sleep(0.1)
+    return None
+
+
+def test_slow_limits_snapshot_arrives_late_from_a_detached_helper(home: Path, tmp_path: Path,
+                                                                   monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("FAKE_VITALS_DELAY", "1.5")
+    began = time.monotonic()
+    result = D.start("demo", 2, session="parent-session")
+    assert time.monotonic() - began < 1.5
+    assert D.SLOW_NOTE in result["line"]
+    snaps = wait_for(lambda: [r for r in spool(home) if r["type"] == "snapshot"])
+    assert snaps and all(s["late"] and s["phase"] == "start" and s["run_id"] == result["run_id"] for s in snaps)
+    assert [r["type"] for r in spool(home)].index("start") < [r["type"] for r in spool(home)].index("snapshot")
+    write_vitals(tmp_path / "vitals", claude_session=29)
+    ended = D.end(session="parent-session")
+    assert "end snapshot pending" in ended["line"]
+    assert wait_for(lambda: [r for r in spool(home) if r["type"] == "snapshot" and r["phase"] == "end"])
+    row, = D.report()
+    assert row["actual_pct"] == 4 and row["clean"] is True
 
 
 def test_vitals_without_claude_limits_says_so(home: Path, tmp_path: Path) -> None:
@@ -274,11 +303,15 @@ def test_refresh_backfills_tasks_rounds_with_median_test_time(home: Path) -> Non
          "session": "sess-a", "started": D.iso(T0 + timedelta(days=3, minutes=1))},
         {"ended": "2026-10-27T10:00:00Z", "n_workers": 2, "repo": "demo", "session": "codex:t1",
          "started": "2026-10-27T09:00:00Z"},
+        # a repo without a known test time adds nothing
+        {"ended": "2026-10-28T10:30:00Z", "n_workers": 6, "repo": "other", "session": "s-o",
+         "started": "2026-10-28T10:00:00Z"},
         {"started": "broken"},
     ]
     (parent / "demo" / "tasks.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rounds) + "{not json\n")
     lookup = D.refresh()
-    assert lookup["backfill_rounds"] == 2 and lookup["runs"] == 1
+    assert lookup["backfill_rounds"] == 3 and lookup["runs"] == 1
+    assert lookup["time"]["claude"]["5+"]["median"] == pytest.approx(30)
     one = lookup["time"]["claude"]["1"]
     assert one["n"] == 2 and one["backfill"] == 1
     # measured 30 min; backfill 13.8 min round + 2 min measured integration test
@@ -347,6 +380,26 @@ def test_cli_start_end_refresh_contract(home: Path, tmp_path: Path) -> None:
     assert not (tmp_path / "fake-home" / ".claude").exists()
     end = [r for r in spool(home) if r["type"] == "end"][0]
     assert end["status"] == "partial" and end["integration_test_ms"] == 93000
+
+
+def test_fast_module_entry_has_the_same_contract(home: Path, tmp_path: Path) -> None:
+    import subprocess
+    import sys
+
+    env = cli_env(home, tmp_path)
+    cmd = [sys.executable, "-m", "agent_memory.cli_dispatch"]
+    started = subprocess.run(cmd + ["start", "--repo", "demo", "--workers", "1", "--session", "fast"],
+                             env=env, capture_output=True, text=True, timeout=30)
+    assert started.returncode == 0, started.stderr
+    run_line, expect = started.stdout.splitlines()[:2]
+    assert run_line.startswith("run_id=") and expect.startswith("Expect: ")
+    ended = subprocess.run(cmd + ["end", "--session", "fast"], env=env, capture_output=True, text=True, timeout=30)
+    assert ended.stdout.splitlines()[0] == run_line
+    loaded = subprocess.run(
+        [sys.executable, "-c", "import sys, agent_memory.cli_dispatch, agent_memory.dispatch_estimates;"
+         "print(sum(m.startswith('psycopg') for m in sys.modules))"],
+        env=env, capture_output=True, text=True, timeout=30)
+    assert loaded.stdout.strip() == "0", loaded.stderr     # no database code on the start/end path
 
 
 def test_cli_start_exits_zero_when_the_spool_cannot_be_written(home: Path, tmp_path: Path) -> None:

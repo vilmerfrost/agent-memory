@@ -47,6 +47,7 @@ def _db_source():
     """A read-only database source for refresh, or None (offline, unset or REST backend)."""
     from agent_memory import config
 
+    config.load_env()
     if not os.environ.get("AMEM_DB_URL", "").strip() or config.backend() != "postgres":
         return None, None
     import psycopg
@@ -146,3 +147,19 @@ def register(sub: argparse._SubParsersAction) -> None:
 
     p = actions.add_parser("ingest", help="upload dispatch-events.jsonl spools now (the collector does it too)")
     p.set_defaults(func=_ingest)
+
+
+def main(argv: list[str] | None = None) -> int:
+    """`python -m agent_memory.cli_dispatch start ...`: the same commands without the
+    full `amem` import (about 280 ms of the ~410 ms `amem dispatch start`)."""
+    top = argparse.ArgumentParser(prog="amem")
+    register(top.add_subparsers(dest="command", required=True))
+    args = top.parse_args(["dispatch", *(sys.argv[1:] if argv is None else argv)])
+    if args.dispatch_action == "ingest":
+        from agent_memory import config
+        config.load_env()
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
