@@ -204,6 +204,18 @@ def cmd_sync_delete(args: argparse.Namespace) -> int:
                            f"{out['not_linked']} never sent ({out['calls']} call(s)); deleted ids are retired")
 
 
+def cmd_sync_settle(args: argparse.Namespace) -> int:
+    from agent_memory.integrations import pastdev
+    try:
+        with store.connect() as conn:
+            result = pastdev.settle_pending(conn, budget_s=args.budget, limit=args.limit)
+    except (psycopg.Error, ValueError) as exc:
+        return _out(args, {'status': 'failed', 'error': type(exc).__name__},
+                    f'sync settle pastdev failed: {type(exc).__name__}', 1)
+    return _out(args, result, 'sync settle pastdev: '+json.dumps(result, sort_keys=True),
+                1 if result['status'] == 'unavailable' or result.get('failed_reads', 0) or result.get('provider_failed_jobs', 0) else 0)
+
+
 def cmd_sync_status(args: argparse.Namespace) -> int:
     try:
         with store.connect() as conn:
@@ -494,6 +506,12 @@ def register(sub: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
     _only_arg(q, "check this reviewed set as `run --only` would (read-only) and narrow the plan to it")
     q.add_argument("--json", action="store_true")
     q.set_defaults(func=cmd_sync_plan)
+    q = s.add_parser('settle', help='refresh pending past.dev receipts using status reads only; no content is sent')
+    q.add_argument('--sink', required=True, choices=['pastdev'])
+    q.add_argument('--budget', type=float, default=30)
+    q.add_argument('--limit', type=_count_arg, default=20)
+    q.add_argument('--json', action='store_true')
+    q.set_defaults(func=cmd_sync_settle)
     q = s.add_parser("delete", help="past.dev rollback: delete the data points of a reviewed set (only refs with a "
                                     "live link); the ids are retired")
     q.add_argument("--sink", required=True, choices=["pastdev"])

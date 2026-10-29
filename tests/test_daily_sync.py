@@ -117,6 +117,15 @@ def test_a_sync_failure_is_a_warning_and_never_blocks_the_night(sinks: Sinks, tm
     assert gate.reasons == []                                                   # the night may run
 
 
+@pytest.mark.parametrize('state', ['partial', 'capped'])
+def test_incomplete_exports_are_reported_even_without_transport_failure(sinks, tmp_path, state):
+    sinks.outcome = {'pastdev': state}
+    result = daily.DailyResult()
+    daily.step_sync(result, state_file=tmp_path/'state.json', now=NOW)
+    assert any(w.startswith(f'sync pastdev: {state}') for w in result.warnings)
+    assert result.failures == []  # export warning does not block independent daily analysis
+
+
 def test_a_database_that_is_not_postgres_is_a_warning(sinks: Sinks, tmp_path: Path,
                                                       monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(config, "backend", lambda: "sqlite")

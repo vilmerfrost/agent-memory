@@ -281,7 +281,8 @@ def _run(sink: Sink, conn: psycopg.Connection, *, budget_s: float = 60.0, replay
         h = Health(False, f"health: {type(exc).__name__}")
     if not h.ok:
         rep.status, rep.detail = "unavailable", h.detail
-        _save(conn, sink.name, "skipped", {"last_error": f"unavailable: {h.detail}"[:300], "last_try_at": _iso(now)})
+        _save(conn, sink.name, "skipped", {"last_error": f"unavailable: {h.detail}"[:300],
+              "last_try_at": _iso(now), 'export_status': 'unavailable'})
         conn.commit()
         rep.seconds = clock() - start
         return rep
@@ -467,7 +468,7 @@ def status(conn: psycopg.Connection) -> list[dict[str, Any]]:
     for j, st, fin, meta in rows:
         meta = meta or {}
         fails = meta.get("failures") or {}
-        out.append({"sink": j.split(":", 1)[1], "status": meta.get('export_status', st), "finished_at": fin.isoformat() if fin else None,
+        out.append({"sink": j.split(":", 1)[1], "status": st if st == 'running' else meta.get('export_status', st), "finished_at": fin.isoformat() if fin else None,
                     "tables": sorted((meta.get("watermarks") or {}).keys()), "last_ok_at": meta.get("last_ok_at"),
                     "dead": sorted(t for t, f in fails.items() if f.get("dead")),
                     "failing": sorted(t for t, f in fails.items() if not f.get("dead")),

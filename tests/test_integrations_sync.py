@@ -100,3 +100,16 @@ def test_checkpoint_progress_is_committed_with_delivered_batch(pg_url):
     with psycopg.connect(pg_url) as conn:
         assert sync.run(Progress(), conn, environ={}).status == 'ok'
         assert sync.load(conn, Progress.name)['watermarks'] == {'sessions': 'mark', 'schedule': 'next-table'}
+
+
+def test_failed_health_does_not_reuse_an_old_success_label(pg_url):
+    class Down(Sink):
+        name = 'completeness-health'
+        def health(self):
+            return Health(False, 'fixture unavailable')
+    with psycopg.connect(pg_url) as conn:
+        sync._save(conn, Down.name, 'done', {'export_status': 'ok', 'last_ok_at': '2026-10-28T00:00:00Z'})
+        conn.commit()
+        assert sync.run(Down(), conn, environ={}).status == 'unavailable'
+        state = next(s for s in sync.status(conn) if s['sink'] == Down.name)
+        assert state['status'] == 'unavailable' and state['last_ok_at'] == '2026-10-28T00:00:00Z'

@@ -2891,6 +2891,14 @@ class Night:
             if result.get("issue_kind") == "local_refusal":
                 reason = (f"current replay export {exp_id}: {result.get('refused', 0)} records withheld locally; "
                           f"{result.get('confirmed_trace_uploads', 0)} upload receipts confirmed; readback not verified")
+            elif result.get('issue_kind') in {
+                'readback_incomplete', 'export_blocked', 'export_capped', 'export_incomplete',
+                'records_rejected', 'score_delivery_incomplete', 'upload_uncertain',
+            }:
+                # Incomplete evidence is not a failed service-access check.
+                # Keep the night's degradation and the export's own details.
+                reason = _one_line(f"current replay export {exp_id}: {result['issue_kind']}: "
+                                   f"{result.get('detail', '')}; service access checked separately", 240)
             else:
                 self.health["langfuse"] = "unavailable"
                 reason = _one_line(f"current replay export {exp_id}: {result.get('issue_kind') or result.get('status')}: {result.get('detail', '')}", 200)

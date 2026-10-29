@@ -337,12 +337,14 @@ def test_slow_first_clickhouse_query_cannot_starve_the_next(monkeypatch):
 
 
 @pytest.mark.parametrize('initial_health', ['ok', 'unavailable'])
-def test_local_export_refusal_preserves_connection_health(initial_health):
+@pytest.mark.parametrize('issue', ['local_refusal', 'readback_incomplete', 'export_blocked',
+    'export_capped', 'export_incomplete', 'records_rejected', 'score_delivery_incomplete', 'upload_uncertain'])
+def test_local_export_refusal_preserves_connection_health(initial_health, issue):
     from contextlib import nullcontext
     from types import SimpleNamespace
     from agent_memory import rsi_night as N
     result = {'experiment_id': 'exp-20261028-bebfd909', 'status': 'partial',
-              'issue_kind': 'local_refusal', 'refused': 8, 'failed': 0, 'uncertain': 0,
+              'issue_kind': issue, 'refused': 8, 'failed': 0, 'uncertain': 0,
               'confirmed_trace_uploads': 12, 'readback_verified': False}
     night = N.Night.__new__(N.Night)
     night.ad = SimpleNamespace(exporter=lambda *a, **k: result)
@@ -355,4 +357,4 @@ def test_local_export_refusal_preserves_connection_health(initial_health):
     night._export_current_replay(result['experiment_id'], entry)
     assert night.health['langfuse'] == initial_health
     assert night.degraded and entry['langfuse_export']['readback_verified'] is False
-    assert '8 records withheld locally' in night.notes[0]
+    assert ('8 records withheld locally' if issue == 'local_refusal' else issue) in night.notes[0]

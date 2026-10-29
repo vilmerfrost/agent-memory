@@ -34,6 +34,18 @@ def test_status_before_any_sync(app: str, capsys: pytest.CaptureFixture[str]) ->
     assert capsys.readouterr().out.strip() == "no sync has run"
 
 
+def test_settle_cli_keeps_processing_distinct_from_failed_status_reads(app, monkeypatch, capsys):
+    from agent_memory.integrations import pastdev
+    monkeypatch.setattr(pastdev, 'settle_pending', lambda *a, **k: {
+        'status': 'partial', 'checked_jobs': 1, 'completed_records': 0, 'pending_records': 2, 'failed_reads': 0})
+    assert cli.main(['sync', 'settle', '--sink', 'pastdev', '--json']) == 0
+    assert json.loads(capsys.readouterr().out)['pending_records'] == 2
+    monkeypatch.setattr(pastdev, 'settle_pending', lambda *a, **k: {
+        'status': 'partial', 'checked_jobs': 0, 'completed_records': 0, 'pending_records': 2, 'failed_reads': 1})
+    assert cli.main(['sync', 'settle', '--sink', 'pastdev', '--json']) == 1
+    assert json.loads(capsys.readouterr().out)['failed_reads'] == 1
+
+
 @pytest.mark.parametrize("sink", ["clickhouse", "langfuse", "pastdev"])
 def test_unconfigured_sinks_are_unavailable_and_move_nothing(app: str, sink: str, capsys: pytest.CaptureFixture[str]) -> None:
     assert cli.main(["sync", "run", "--sink", sink, "--json"]) == 0

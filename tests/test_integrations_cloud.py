@@ -157,7 +157,8 @@ def test_a_refused_record_is_dead_lettered_and_the_rest_lands(app: str) -> None:
     s = _Sink(bad=("r2",))
     with psycopg.connect(app) as conn:
         rep = sync.run(s, conn, environ={})
-        assert (rep.status, rep.rows, rep.dead_letters) == ("ok", 3, 1)
+        assert (rep.status, rep.rows, rep.dead_letters) == ("partial", 3, 1)
+        assert rep.outstanding_dead_letters == 1
         assert s.pushed == [["r0"], ["r1"], ["r3"]]
         meta = sync.load(conn, "pastdev")
         assert meta["watermarks"] == {"t": "done"}                    # the table moved on
