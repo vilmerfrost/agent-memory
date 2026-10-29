@@ -10,7 +10,7 @@ from pathlib import Path
 
 from agent_memory import rsi_brief
 
-VERSION = 'morning-overview/2'
+VERSION = 'morning-overview/3'
 ZONE = ZoneInfo('Europe/Stockholm')
 MAX_CHARS = 9000
 SERVICES = json.loads(Path(__file__).with_name('morning_remedies.json').read_text())
@@ -23,7 +23,7 @@ CORRECTIONS = {
 
 def clean(value, limit=350):
     # Existing scrub removes secret patterns, home paths and emails. Free text is
-    # source data, never a prompt or a command. No raw model prose is narrated.
+    # source data, never a prompt or a command.
     return rsi_brief.scrub(rsi_brief.text(value, limit)).strip()
 
 
@@ -56,7 +56,7 @@ def remedy(routine, reason, recovered=False):
         return ('Check whether Docker is running on the Mac.', 'If it is running, inspect the worker’s Docker connection.', 'Check docker info and a fresh Docker heartbeat in Night Desk; this does not verify the whole night.', 'investigate')
     if re.search(r'quota|rate.?limit|usage.?limit|allowance', lower):
         return ('Check the provider’s allowance and reset time.', 'Wait for an explicitly reported limit to reset before retrying.', 'Check the relevant connection, then the next routine result.', 'check')
-    if re.search(r'401|403|credential|unauthori[sz]ed|sign.?in|authentication', lower):
+    if re.search(r'401|403|credential|unauthori[sz]ed|sign.?in|authenticat|oauth|session expired', lower):
         return ('Check the named service’s account sign-in and permissions on the Mac.', 'If sign-in has expired, reconnect through its normal sign-in flow.', 'Test that service again and check the next routine result.', 'check')
     if re.search(r'timeout|timed out', lower):
         return ('Check that the Mac is awake and online, then inspect the service response time.', 'If the service is unavailable, wait until it is ready before one retry.', 'Check that the affected routine completes on its next authorized run.', 'investigate')
@@ -107,13 +107,11 @@ def snapshot(night_row, runs, *, now, annotations=None, extras=None, ingestion_f
     if isinstance(sessions, int) and not isinstance(sessions, bool) and sessions >= 0 and status != 'preflight_failed':
         fact('sessions', f'The report analyzed {sessions} sessions in its recorded checkpoint window. That window can extend beyond last night.', 'outcome', [f'night:{night}'])
     for index, pattern in enumerate((brief.get('patterns') or {}).get('items') or []):
-        if index >= 3:
-            break
         summary = clean(pattern.get('summary'), 260)
         if summary:
             fact(f'pattern:{index}', 'A recorded pattern: ' + summary, 'outcome', [f'night:{night}'])
     warnings = brief.get('prerequisite_warnings') or []
-    for index, warning in enumerate(warnings[:3]):
+    for index, warning in enumerate(warnings):
         fact(f'warning:{index}', 'A prerequisite warning was recorded: ' + clean(warning, 220), 'skips', [f'night:{night}'])
     issues = []
     for routine, history in sorted(grouped.items()):
@@ -126,7 +124,7 @@ def snapshot(night_row, runs, *, now, annotations=None, extras=None, ingestion_f
             continue
         recent = failed[0]
         failures = (recent.get('meta') or {}).get('failures') or []
-        reason = clean(recent.get('failure_reason') or '; '.join(str(x) for x in failures[:3]))
+        reason = clean(recent.get('failure_reason') or '; '.join(str(x) for x in failures), 1600)
         recovered = latest.get('status') == 'pass'
         next_step, alternative, verify, kind = remedy(routine, reason, recovered)
         state = 'recovered' if recovered else 'skipped_after_failure' if latest.get('status') == 'skip' else 'failing' if latest.get('status') in ('fail', 'error') else 'unknown'
@@ -157,6 +155,18 @@ def snapshot(night_row, runs, *, now, annotations=None, extras=None, ingestion_f
         else:
             detail = {'IMPROVES': 'The stored comparison reported improvement; acceptance and your approval are separate requirements.', 'WORSE': 'The comparison reported a regression.', 'NO_EFFECT': 'The comparison found no clear difference.', 'INCONCLUSIVE': 'The comparison was inconclusive.'}.get(exp.get('verdict'), 'No supported comparison conclusion was recorded.')
         fact('experiment:' + ident, detail, 'outcome', ['experiment:' + ident])
+    counts = {status: sum(r.get('status') == status for history in grouped.values() for r in history)
+              for status in ('pass', 'fail', 'error', 'skip')}
+    fact('routine-summary', f'The recorded routine window contains {sum(len(h) for h in grouped.values())} runs across {len(grouped)} routines. Status counts: {json.dumps(counts)}.', 'outcome')
+    costs = brief.get('costs') or report.get('costs') or {}
+    fact('costs', 'Recorded night costs and usage: ' + (clean(json.dumps(costs, default=str), 12000) if costs else 'No cost or usage accounting was recorded. Do not treat missing spend as zero.'), 'outcome', [f'night:{night}'])
+    for key, value in (
+        ('service-health', brief.get('health') or report.get('health')),
+        ('candidate-readiness', brief.get('candidates') or report.get('candidates')),
+        ('report-notes', {'brief': brief.get('notes'), 'report': report.get('notes')} if brief.get('notes') or report.get('notes') else None),
+    ):
+        if value:
+            fact(key, clean(json.dumps(value, default=str), 12000), 'outcome', [f'night:{night}'])
     decisions = (brief.get('pending_decisions') or {}).get('items') or []
     if decisions:
         fact('decisions', f'{len(decisions)} decisions were waiting when the brief was saved. Review their current status in Night Desk before acting.', 'decisions', [f'night:{night}'])
@@ -171,9 +181,55 @@ def snapshot(night_row, runs, *, now, annotations=None, extras=None, ingestion_f
     result = dict(format=VERSION, night=night, as_of=as_of.isoformat(), window_start=start.isoformat(), window_end=end.isoformat(),
                   brief_generated_at=brief.get('generated_at'), coverage='limited' if missing else 'complete',
                   coverage_reasons=missing, status=status, facts=facts, issues=issues,
-                  annotations=corrections, decisions=decisions, remedy_version=VERSION + ':' + digest(SERVICES)[:12])
+                  annotations=corrections, decisions=decisions, remedy_version=VERSION + ':' + digest(SERVICES)[:12],
+                  evidence=sanitize({'night_record': row, 'routine_runs': [r for h in grouped.values() for r in h],
+                                     'morning_alerts': extras or []}), routine_counts=counts)
     result['input_digest'] = digest({key: value for key, value in result.items() if key not in ('as_of', 'window_end', 'facts')} | {'facts': [f for f in facts if f['id'] != 'cutoff']})
     return result
+
+
+def sanitize(value):
+    """Preserve relevant structured evidence, redacting credentials and private paths.
+
+    No field-length slicing: oversized context is refused by the writer rather
+    than silently dropping the tail of a report or its accounting.
+    """
+    if isinstance(value, dict):
+        return {clean(k, 300): '[redacted]' if re.fullmatch(
+            r'(?i)(?:.*[_-])?(?:api[_-]?key|password|passwd|secret|access[_-]?token|refresh[_-]?token|authorization|credentials?|private[_-]?key|service[_-]?role[_-]?key)', str(k))
+            else sanitize(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [sanitize(v) for v in value]
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    return clean(value, max(len(str(value)) + 1, 350))
+
+
+def narration(data, draft):
+    """Check source-linked prose and exhaustive fact coverage, not semantic truth."""
+    paragraphs = draft.get('paragraphs') if isinstance(draft, dict) else None
+    if not isinstance(paragraphs, list) or not paragraphs:
+        raise ValueError('script_invalid')
+    allowed = {f['id'] for f in data['facts']}
+    covered, texts = set(), []
+    for paragraph in paragraphs:
+        if not isinstance(paragraph, dict):
+            raise ValueError('script_invalid')
+        text, ids = paragraph.get('text'), paragraph.get('fact_ids')
+        if not isinstance(text, str) or not text.strip() or not isinstance(ids, list) or not ids:
+            raise ValueError('script_invalid')
+        if any(not isinstance(i, str) or i not in allowed for i in ids):
+            raise ValueError('script_coverage')
+        if rsi_brief.scrub(text) != text or '\x00' in text:
+            raise ValueError('script_private_data')
+        covered.update(ids)
+        texts.append(text.strip())
+    if covered != allowed:
+        raise ValueError('script_coverage')
+    script = '\n\n'.join(texts)
+    if len(script) > MAX_CHARS:
+        raise ValueError('script_too_long')
+    return script
 
 
 def render(data, outline=None):
