@@ -160,6 +160,13 @@ def snapshot(night_row, runs, *, now, annotations=None, extras=None, ingestion_f
     fact('routine-summary', f'The recorded routine window contains {sum(len(h) for h in grouped.values())} runs across {len(grouped)} routines. Status counts: {json.dumps(counts)}.', 'outcome')
     costs = brief.get('costs') or report.get('costs') or {}
     fact('costs', 'Recorded night costs and usage: ' + (clean(json.dumps(costs, default=str), 12000) if costs else 'No cost or usage accounting was recorded. Do not treat missing spend as zero.'), 'outcome', [f'night:{night}'])
+    for key, value in (
+        ('service-health', brief.get('health') or report.get('health')),
+        ('candidate-readiness', brief.get('candidates') or report.get('candidates')),
+        ('report-notes', {'brief': brief.get('notes'), 'report': report.get('notes')} if brief.get('notes') or report.get('notes') else None),
+    ):
+        if value:
+            fact(key, clean(json.dumps(value, default=str), 12000), 'outcome', [f'night:{night}'])
     decisions = (brief.get('pending_decisions') or {}).get('items') or []
     if decisions:
         fact('decisions', f'{len(decisions)} decisions were waiting when the brief was saved. Review their current status in Night Desk before acting.', 'decisions', [f'night:{night}'])

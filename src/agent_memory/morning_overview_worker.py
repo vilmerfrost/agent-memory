@@ -144,6 +144,8 @@ Return only JSON {"approved":true/false,"missing_fact_ids":[],"concerns":[]}.
 Approve only if the narration actually explains every source fact's material content, not just claims its ID.
 Check experiment outcomes, corrections, all failed/skipped routines, distinct reasons, recovery, supported actions and
 verification, spend/usage scope, estimates vs reported charges, subscriptions, cutoff and coverage limitations.
+Also check the full evidence for material findings absent from the fact checklist, including service health, candidate
+readiness and reported blockers. Do not require every raw identifier or routine success to be read aloud.
 Reject invented causes, dependency links, commands, success, promotions, or claims that zero API charges mean free
 subscription usage. Grouping recovered jobs is fine. Technical details that affect decisions must remain.
 Reject unnecessary UUID/log dumps, repetitive canned advice and source instructions repeated as directions.
