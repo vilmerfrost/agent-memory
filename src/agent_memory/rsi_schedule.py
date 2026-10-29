@@ -264,7 +264,9 @@ def evaluate_prerequisites(log: Path, night: str, now: datetime, prereqs: Sequen
         if p.same_night and p.match == "night_key" and run_night_key(last.started_at) != night:
             g.block(f"prerequisite {r}: no PASS for night {night} (last {done} {ts})",
                     f"prerequisite {r} did not complete for night {night} (last {done} {ts})", r)
-        elif p.same_night and p.match != "night_key" and last.started_at.date() != _night_date(night):
+        elif p.same_night and p.match != "night_key" and last.started_at.date() != _night_date(night) and not (
+            r == "amem-archive" and last.status == "pass" and last.started_at.date() > _night_date(night)
+            and now - last.started_at <= timedelta(hours=26)):
             g.block(f"prerequisite {r}: no PASS on {night} (last {done} {ts})",
                     f"prerequisite {r} did not complete on {night} (last {done} {ts})", r)
         if p.max_age_h is not None and now - last.started_at > timedelta(hours=p.max_age_h):
