@@ -262,12 +262,13 @@ def test_subscription_night_budget_fits_three_experiments_at_five_pairs_per_prov
     assert plan["ab_pairs_per_provider"] == 5 and plan["ab_pairs_per_experiment"] == 10
     checks = {c["limit"]: c for c in plan["room"]["checks"]}
     for limit in ("calls claude-opus-5-5", "calls gpt-6.1-sol", "calls jev-1.14.0", "A/B pairs per experiment",
-                  "sandbox runs", "subscription tokens"):
+                  "subscription tokens"):
         assert checks[limit]["fits"], limit
-    assert checks["calls claude-opus-5-5"]["need"] == 3 * (1 + 1 + 10)       # hypothesis, writer, 10 agent runs
-    assert checks["calls gpt-6.1-sol"]["need"] == 3 * (10 + 10)              # 10 agent runs, 10 judge calls
+    assert checks["calls claude-opus-5-5"]["need"] == 2 + 3 * (1 + 1 + 10)  # readiness plus experiment calls
+    assert checks["calls gpt-6.1-sol"]["need"] == 2 + 3 * (10 + 10)
     assert checks["calls jev-1.14.0"]["need"] == 5 + 3 * 2
-    assert checks["sandbox runs"]["need"] == 540
+    assert checks["sandbox runs"]["need"] == 542
+    assert checks["sandbox runs"]["cap"] == 540 and not checks["sandbox runs"]["fits"]
     # The worst-case wall clock is reported honestly, not hidden: over the hard maximum, so not every
     # experiment finishes when every stage runs to its timeout; the night stops at the wall clock.
     room = plan["room"]
