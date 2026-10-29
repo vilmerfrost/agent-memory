@@ -1,0 +1,74 @@
+{
+  "case": "summary-report",
+  "you": "a coding agent in the Claude Code CLI that just finished each task below for Vilmer and now writes the final message for it",
+  "work_type_codes": ["trivial", "normal", "complex"],
+  "section_codes": [
+    "commands_run",
+    "diagram",
+    "important_changes",
+    "integrations_used",
+    "lower_priority_detail",
+    "next_action",
+    "result",
+    "task_restatement",
+    "verification",
+    "work_log"
+  ],
+  "scenarios": [
+    {
+      "id": "typo-fix",
+      "task": "fix the misspelling 'recieve' in README.md",
+      "what_happened": "Changed one word in README.md. Nothing else changed.",
+      "files_changed": 1,
+      "flow_or_structure_changed": false,
+      "tools_used": [{"name": "Read", "type": "builtin"}, {"name": "Edit", "type": "builtin"}],
+      "checks": []
+    },
+    {
+      "id": "retry-setting",
+      "task": "raise the HTTP client's retry count from 2 to 4 and cover it with a test",
+      "what_happened": "Changed the default in config.py, added one unit test, all 212 unit tests pass.",
+      "files_changed": 2,
+      "flow_or_structure_changed": false,
+      "tools_used": [{"name": "Bash", "type": "builtin"}, {"name": "Edit", "type": "builtin"}],
+      "checks": [{"code": "unit_tests", "ran": true, "result": "212 passed"}]
+    },
+    {
+      "id": "login-redirect",
+      "task": "send users back to the page they came from after login",
+      "what_happened": "The login route now stores the original URL, the callback reads it back and redirects there; middleware, route and callback changed. Integration tests pass. The page was not opened in a browser.",
+      "files_changed": 3,
+      "flow_or_structure_changed": true,
+      "flow": "browser -> middleware (saves return URL) -> login route -> auth callback (reads return URL) -> original page",
+      "tools_used": [
+        {"name": "Bash", "type": "builtin"},
+        {"name": "Edit", "type": "builtin"},
+        {"name": "Supabase", "type": "mcp"},
+        {"name": "systematic-debugging", "type": "skill"}
+      ],
+      "checks": [
+        {"code": "integration_tests", "ran": true, "result": "48 passed"},
+        {"code": "browser_check", "ran": false, "result": "not run"}
+      ]
+    },
+    {
+      "id": "queue-migration",
+      "task": "move the nightly import from cron to the job queue across the api, worker and scheduler services",
+      "what_happened": "The scheduler now enqueues one job per tenant, the worker consumes it with retries, the api exposes job status, and a database migration adds the jobs table. Ran 14 commands in this order: install, migrate, 6 test runs, 3 lint runs, 2 builds, a smoke run. Full suite green, smoke run green, the migration was not applied to the hosted database.",
+      "files_changed": 23,
+      "flow_or_structure_changed": true,
+      "flow": "scheduler -> queue -> worker -> database; api -> database (job status)",
+      "tools_used": [
+        {"name": "Bash", "type": "builtin"},
+        {"name": "Agent", "type": "builtin"},
+        {"name": "Vitals", "type": "mcp"},
+        {"name": "Railway", "type": "plugin"}
+      ],
+      "checks": [
+        {"code": "full_suite", "ran": true, "result": "1,204 passed"},
+        {"code": "smoke_run", "ran": true, "result": "ok"},
+        {"code": "hosted_migration", "ran": false, "result": "not applied"}
+      ]
+    }
+  ]
+}

@@ -1,0 +1,42 @@
+{
+  "id": "shell-habits",
+  "title": "Send zsh-safe command lines and run each one the right way",
+  "tags": [
+    "instruction",
+    "claude-md"
+  ],
+  "targets": [
+    {
+      "path": "~/.claude/CLAUDE.md",
+      "kind": "instruction",
+      "behavior": "Shell Habits: write a zsh command line that keeps pattern arguments intact and decide how to run it and wait for it",
+      "sections": [
+        "global-claude-code-context/shell-habits"
+      ]
+    }
+  ],
+  "fixture": "shell-habits",
+  "hidden_check": "rule-decisions",
+  "prompt": "Read ~/.claude/CLAUDE.md from the staged sandbox home first. You are the agent described in scenarios.json. For each scenario decide, by the rules in that file, the exact command line you send to the Bash tool for the given words, how you run it, and what you do while it runs. This is an offline decision replay: run nothing, use no network, and do not edit any input file. Write only result.json in this shape: {\"scenarios\": [{\"id\": <scenario id>, \"command\": <the command line as one string>, \"mode\": <one of mode_codes>, \"while_running\": <one of while_running_codes>}]}. One row per scenario. The command line must split into exactly the given words.",
+  "check": "python3 \"$HIDDEN_CHECK_DIR\"/check.py",
+  "timeout_s": 120,
+  "stub": [
+    {
+      "op": "read",
+      "path": "~/.claude/CLAUDE.md"
+    },
+    {
+      "op": "read",
+      "path": "scenarios.json"
+    },
+    {
+      "op": "write",
+      "path": "result.json",
+      "text": "{\"scenarios\": [{\"id\": \"grep-py\", \"command\": \"grep -rn '--include=*.py' TODO src\", \"mode\": \"foreground\", \"while_running\": \"wait_in_foreground\"}, {\"id\": \"find-md\", \"command\": \"find docs -name '*.md'\", \"mode\": \"foreground\", \"while_running\": \"wait_in_foreground\"}, {\"id\": \"one-param-test\", \"command\": \"uv run pytest -q 'tests/test_parser.py::test_unicode[emoji]'\", \"mode\": \"foreground\", \"while_running\": \"wait_in_foreground\"}, {\"id\": \"git-status\", \"command\": \"git status\", \"mode\": \"foreground\", \"while_running\": \"wait_in_foreground\"}, {\"id\": \"full-suite-fast\", \"command\": \"uv run pytest -q\", \"mode\": \"background\", \"while_running\": \"other_work_then_read_on_notification\"}, {\"id\": \"production-build\", \"command\": \"npm run build\", \"mode\": \"background\", \"while_running\": \"other_work_then_read_on_notification\"}, {\"id\": \"suite-next-step-waits\", \"command\": \"uv run pytest -q\", \"mode\": \"background\", \"while_running\": \"end_turn_then_read_on_notification\"}]}\n"
+    },
+    {
+      "op": "final",
+      "text": "Wrote result.json with one command and run decision per scenario."
+    }
+  ]
+}
