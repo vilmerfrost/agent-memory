@@ -2260,8 +2260,11 @@ class Night:
     def _suggest_only(self, target: str | None) -> str | None:
         """The lock code (lock_kind) when `target` is in scope but improve refuses it (self.pinned): tested like any
         other target, a win is recorded as a suggested hand edit. None for an editable or out-of-scope target."""
+        locked = getattr(self, "pinned", None) or []     # a night built without __init__ (tests) has none
+        if not locked:
+            return None
         scoped = self._scoped(target)
-        if scoped is None or scoped not in (getattr(self, "pinned", None) or []):
+        if scoped is None or scoped not in locked:
             return None
         cache = getattr(self, "_locks", None)
         if cache is None:
