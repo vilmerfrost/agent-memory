@@ -81,6 +81,21 @@ NO_RAW = "No transcript text, secrets or raw private content: only redacted, cap
 
 FAMILIES: tuple[Family, ...] = (
     Family(
+        key="morning_audio",
+        title="Morning audio overviews and report corrections",
+        purpose="Explain the morning results and evidence-backed next steps without executing repairs",
+        producers=("Night Desk owner audio request", "morning_overview_worker (independent Mac worker)"),
+        owner_job="com.vilmerfrost.night-desk-audio",
+        tables=("amem_private.morning_overviews", "report_annotations"),
+        local=("~/.claude/parent/night-desk/audio-results/*",),
+        external=("private Supabase morning-audio bucket", "ElevenLabs final redacted speech text"),
+        consumers=(_c(NIGHT_DESK, "supabase/migrations/20261029082003_morning_audio_overviews.sql", "report"),
+                   _c("exclusive audio generation and upload recovery", "src/agent_memory/morning_overview_worker.py", "operational")),
+        retention="Accepted overview revisions and correction history retained; no source reports deleted.",
+        exclusion="Never a learning input. Derived narration cannot become new evidence or approval. Claims stay private; only owner-bound status and short-lived media access leave the broker.",
+        learning_input=False,
+    ),
+    Family(
         key="connection_diagnostics",
         title="Manual subscription connection diagnostics",
         purpose="Verify one owner-requested real subscription call without automatic inference retries",
