@@ -16,6 +16,7 @@ from __future__ import annotations
 import ipaddress
 import os
 import socket
+import threading
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -29,20 +30,24 @@ MIGRATIONS_DIR = REPO_ROOT / "supabase" / "migrations"
 JEV_FIXTURES_DIR = REPO_ROOT / "tests" / "fixtures" / "jev"
 
 _loaded = False
+_load_lock = threading.Lock()
 
 
 def load_env() -> None:
-    """Load `.env.local` then `.env` once, if present. Never required."""
+    """Load once; concurrent consumers wait until both optional files are ready."""
     global _loaded
     if _loaded:
         return
-    _loaded = True
-    if os.environ.get("AMEM_NO_DOTENV") == "1":
-        return
-    for name in (".env.local", ".env"):
-        path = REPO_ROOT / name
-        if path.is_file():
-            load_dotenv(path, override=False)
+    with _load_lock:
+        if _loaded:
+            return
+        if os.environ.get("AMEM_NO_DOTENV") != "1":
+            for name in (".env.local", ".env"):
+                path = REPO_ROOT / name
+                if path.is_file():
+                    load_dotenv(path, override=False)
+        # Publish readiness only after a successful load, never on an exception.
+        _loaded = True
 
 
 def db_url() -> str:
