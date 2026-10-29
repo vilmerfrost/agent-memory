@@ -108,31 +108,44 @@ class SpoolReport:
     incomplete: int = 0
 
 
-def spool_paths(root: Path | None = None) -> list[Path]:
+def _kind(kind: str):
+    """(spool file name, record parser, batch upsert) per spool kind."""
+    if kind == "timing":
+        return "timing-events.jsonl", parse_record, upsert_conn
+    if kind == "dispatch":
+        from agent_memory import dispatch_store
+        return "dispatch-events.jsonl", dispatch_store.parse_record, dispatch_store.upsert_conn
+    raise ValueError(f"unknown spool kind {kind!r}")
+
+
+def spool_paths(root: Path | None = None, *, kind: str = "timing") -> list[Path]:
     parent = root or (Path(os.environ.get("AMEM_CLAUDE_HOME") or Path.home()/".claude")/"parent")
-    return sorted(p for pattern in ("timing-events.jsonl", "*/timing-events.jsonl")
+    name = _kind(kind)[0]
+    return sorted(p for pattern in (name, "*/" + name)
                   for p in parent.glob(pattern) if p.is_file() and not p.is_symlink())
 
 
 def ingest_spools(paths: list[Path] | None = None, *, root: Path | None = None,
                   db_url: str | None = None, cursor_path: Path | None = None,
-                  _locked: bool = False) -> SpoolReport:
+                  kind: str = "timing", _locked: bool = False) -> SpoolReport:
     if cursor_path is not None and not _locked:
         cursor_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         with cursor_path.with_suffix('.lock').open('a') as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
-            return ingest_spools(paths, root=root, db_url=db_url, cursor_path=cursor_path, _locked=True)
+            return ingest_spools(paths, root=root, db_url=db_url, cursor_path=cursor_path,
+                                 kind=kind, _locked=True)
+    _, parse, upsert_batch = _kind(kind)
     cursors = {}
     if cursor_path is not None and cursor_path.exists():
         try: cursors = json.loads(cursor_path.read_text())
         except (ValueError, OSError): cursors = {}
         if not isinstance(cursors, dict): cursors = {}
     report = SpoolReport()
-    for path in spool_paths(root) if paths is None else paths:
+    for path in spool_paths(root, kind=kind) if paths is None else paths:
         if path.name.startswith(".env") or path.is_symlink():
             raise ValueError("timing input must be a regular JSONL event file")
         report.files += 1
-        batch: list[Span] = []
+        batch: list = []
         stat = path.stat()
         previous = cursors.get(str(path.resolve()), {})
         offset = previous.get('offset', 0) if isinstance(previous, dict) and previous.get('inode') == stat.st_ino else 0
@@ -160,18 +173,18 @@ def ingest_spools(paths: list[Path] | None = None, *, root: Path | None = None,
                     row = json.loads(line) if len(line) <= 32768 else None
                 except ValueError:
                     row = None
-                span = parse_record(row)
-                if span is None:
+                item = parse(row)
+                if item is None:
                     report.invalid += 1
                     continue
                 report.records += 1
-                batch.append(span)
+                batch.append(item)
                 if len(batch) >= 500:
-                    n, u = upsert_conn(conn, batch)
+                    n, u = upsert_batch(conn, batch)
                     report.new += n
                     report.updated += u
                     batch.clear()
-            n, u = upsert_conn(conn, batch)
+            n, u = upsert_batch(conn, batch)
             report.new += n
             report.updated += u
         # The transaction committed before advancing its cursor. A crash before

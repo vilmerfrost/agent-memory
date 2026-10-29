@@ -196,6 +196,27 @@ FAMILIES: tuple[Family, ...] = (
         exclusion="Measurements and node ids only, never test logs or captured output.",
     ),
     Family(
+        key="dispatch_runs",
+        title="Parent dispatch runs, plan-limit usage and estimates",
+        purpose="Give each parent dispatch a data-based time and usage estimate (dispatch to brief)",
+        producers=("amem dispatch start / end (spool records with Vitals plan-limit snapshots)",
+                   "amem dispatch refresh (worker token totals as tokens records)",
+                   "timing collector flush_dispatch / amem dispatch ingest (upload)"),
+        owner_job="timing collector (amem timing collect, local service); refresh per dispatch",
+        tables=("dispatch_runs", "usage_snapshots", "dispatch_estimates"),
+        views=("dispatch_run_actuals",),
+        local=("~/.claude/parent/<repo>/dispatch-events.jsonl (spool)",
+               "~/.claude/parent/<repo>/dispatch-open/<session>.json (open run)",
+               "~/.claude/parent/dispatch-estimates.json (lookup)", "dispatch cursor file next to the spools"),
+        consumers=(_c("amem dispatch refresh -> estimates lookup (run after each dispatch)",
+                      "src/agent_memory/dispatch_estimates.py", "analysis"),
+                   _c("amem dispatch report", "src/agent_memory/cli_dispatch.py", "manual")),
+        retention="No pruning: runs, snapshots and estimates are kept indefinitely.",
+        exclusion="Plan-limit percent and counts only. Accounts are a 16-character SHA-256 prefix, never the "
+                  "email. A usage delta counts only when clean (no other session of the tool working, no "
+                  "limit reset).",
+    ),
+    Family(
         key="skills",
         title="Skill calls and scores",
         purpose="Identify weak or ineffective skills",

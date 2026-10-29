@@ -126,6 +126,23 @@ Learning families with no automatic analysis consumer:
 - Exclusion: Measurements and node ids only, never test logs or captured output.
 - Learning input: yes
 
+## Parent dispatch runs, plan-limit usage and estimates
+
+- Key: `dispatch_runs`
+- Purpose: Give each parent dispatch a data-based time and usage estimate (dispatch to brief)
+- Producers: amem dispatch start / end (spool records with Vitals plan-limit snapshots); amem dispatch refresh (worker token totals as tokens records); timing collector flush_dispatch / amem dispatch ingest (upload)
+- Owner job: timing collector (amem timing collect, local service); refresh per dispatch
+- Tables: `dispatch_runs`; `usage_snapshots`; `dispatch_estimates`
+- Views: `dispatch_run_actuals`
+- Local files: ~/.claude/parent/<repo>/dispatch-events.jsonl (spool); ~/.claude/parent/<repo>/dispatch-open/<session>.json (open run); ~/.claude/parent/dispatch-estimates.json (lookup); dispatch cursor file next to the spools
+- External sinks: none
+- Consumers:
+  - analysis: amem dispatch refresh -> estimates lookup (run after each dispatch) (`src/agent_memory/dispatch_estimates.py`)
+  - manual: amem dispatch report (`src/agent_memory/cli_dispatch.py`)
+- Retention: No pruning: runs, snapshots and estimates are kept indefinitely.
+- Exclusion: Plan-limit percent and counts only. Accounts are a 16-character SHA-256 prefix, never the email. A usage delta counts only when clean (no other session of the tool working, no limit reset).
+- Learning input: yes
+
 ## Skill calls and scores
 
 - Key: `skills`
