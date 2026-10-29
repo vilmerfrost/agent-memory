@@ -19,8 +19,8 @@ def test_profiles_pin_subscriptions_models_high_and_accounting(provider, model, 
     assert cfg.budget.call_cap(model) == calls
     assert S.paid_stages(cfg) == ["replay_jev","triage"]
     plan = S.paid_plan(cfg)
-    # 1 hypothesis + 1 section writer + 6 agent runs + 3 judgments
-    assert sum(x["count"] for x in plan["calls"] if x["billing_source"] == "subscription") == 11
+    # 1 hypothesis + 1 section writer + 6 agent runs + 3 judgments + 3 unique readiness probes
+    assert sum(x["count"] for x in plan["calls"] if x["billing_source"] == "subscription") == 14
     assert plan["worst_case_usd"] == .06
     assert "No API fallback" in S.render_plan(plan)
 

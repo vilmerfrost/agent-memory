@@ -32,19 +32,22 @@ def roles(cfg):
     return list(unique.values())
 
 
-def check(cfg, budget):
+def check(cfg, budget, *, progress=None):
+    progress = progress or (lambda text: None)
     selected = roles(cfg)
     receipts = []
     # All metadata checks precede every inference probe.
     for provider, settings, tools in selected:
-        auth = auth_for(provider, settings['auth'], tools=tools)
+        progress(f"{provider} {'agent' if tools else 'judge/writer'} metadata")
         try:
+            auth = auth_for(provider, settings['auth'], tools=tools)
             receipt = sub.preflight(provider, model=settings['model'], effort=settings['effort'], auth=auth)
         except sub.SubscriptionError as exc:
             raise sub.SubscriptionError(f"{provider} {'agent' if tools else 'judge/writer'} metadata: {exc}", inference_started=False) from None
         receipts.append({'provider': provider, 'tools': tools, **receipt})
     for (provider, settings, tools), receipt in zip(selected, receipts):
         model = settings['model']
+        progress(f"{provider} {'agent' if tools else 'judge/writer'} live probe")
         reservation = budget.take_call(model, stage='client-readiness')
         unstarted, usage, ok = True, {}, False
         started = time.monotonic()
