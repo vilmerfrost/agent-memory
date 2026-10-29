@@ -882,10 +882,25 @@ def test_recall_maps_source_ids_and_drops_refs_that_no_longer_exist(db: Db, pdev
     assert pd.refs[0].observed_at == "2026-10-16T09:14:00+00:00"
     assert "IGNORE" not in json.dumps(pd.to_json())
     (req,) = pdev.svc.requests_to("POST", "/api/v1/recall")
-    assert req.json == {"query": "why did the shell habits edit work?", "identity": "rsi", "limit": 5,
+    assert req.json == {"query": "why did the shell habits edit work?", "identity": "rsi", "limit": 10,
                         "occurredFrom": "2026-10-01T00:00:00Z", "occurredTo": "2026-10-16T23:59:59Z"}
     pdev.recall_answer["results"] = pdev.recall_answer["results"] * 5
     assert len(r.query("recall", {"query": "shell", "limit": "2"})) == 2
+
+
+def test_recall_overfetch_fills_after_stale_sources_without_second_provider_call(db, pdev):
+    real = seed(db)['edit']
+    missing = 'amem:edit/'+str(uuid.uuid4())
+    calls = []
+    class Reader:
+        def recall(self, body):
+            calls.append(body)
+            rows = [{'rank': n, 'sources': [{'sourceId': PD.wire(ref)}]} for n, ref in enumerate((missing, real))]
+            return {'results': rows[:body['limit']]}
+    retriever = PD.PastDevRetriever(lambda: psycopg.connect(db.app), pdev.cfg(), client=Reader(), environ={})
+    results = retriever.query('recall', {'query': 'shell', 'limit': '1'})
+    assert len(results) == 1 and results[0].subject_refs == [real]
+    assert len(calls) == 1 and calls[0]['limit'] == 2
 
 
 @pytest.mark.parametrize(("params", "status"), [

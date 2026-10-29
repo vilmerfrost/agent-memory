@@ -1038,7 +1038,9 @@ class PastDevRetriever:
         if secret_like(q) or scrub_text(q)[0] != q:
             raise ValueError("the query holds text the sanitizer would scrub")
         limit = min(int(params.get("limit", "10")), RECALL_MAX)
-        body: dict[str, Any] = {"query": q, "identity": IDENTITY, "limit": limit}
+        # Leave room for stale/deleted source references removed by the authority
+        # check. One recall only, the existing20-result cap remains unchanged.
+        body: dict[str, Any] = {"query": q, "identity": IDENTITY, "limit": min(RECALL_MAX, limit * 2)}
         if "from" in params:
             body["occurredFrom"] = f"{date.fromisoformat(params['from']).isoformat()}T00:00:00Z"
         if "to" in params:
