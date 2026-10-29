@@ -62,7 +62,8 @@ def speech(text, *, request=http, key=None, voice=None, model=None):
         raise AudioError('voice_or_model')
     audio, headers = request(f'https://api.elevenlabs.io/v1/text-to-speech/{voice}?output_format=mp3_44100_128',
         method='POST', headers={'xi-api-key': key, 'Content-Type': 'application/json'},
-        body=json.dumps({'text': text, 'model_id': model, 'voice_settings': {'stability': 0.5, 'similarity_boost': 0.75}}).encode())
+        body=json.dumps({'text': text, 'model_id': model, 'voice_settings': {'stability': 0.5, 'similarity_boost': 0.75}}).encode(),
+        timeout=300)  # A measured 8,441-character v4 generation took 150 seconds.
     if len(audio) < 100 or not (audio.startswith(b'ID3') or audio[0] == 255):
         raise AudioError('invalid_audio')
     return audio, {'model': model, 'voice': voice, 'characters': len(text),
