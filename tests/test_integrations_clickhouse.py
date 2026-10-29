@@ -447,8 +447,9 @@ def test_map_row_keeps_only_the_allowlist() -> None:
 
 def test_ensure_schema_sends_one_statement_per_request_with_auth(fake: FakeClickHouse) -> None:
     n = CH.ensure_schema(client_for(fake.svc.url))
-    assert n == len(fake.ddl) == 1 + 2 * len(CH.TABLES)
-    assert fake.ddl[-len(CH.TABLES):] == CH.schema_upgrade_sql()
+    assert n == len(fake.ddl) == 1 + len(CH.TABLES)
+    assert not any(statement.startswith('ALTER') for statement in fake.ddl)
+    assert all('_amem_deleted UInt8 DEFAULT 0' in statement for statement in fake.ddl[1:])
     for r in fake.svc.requests_to("POST", "/"):
         h = {k.lower(): v for k, v in r.headers.items()}                  # header names are case-insensitive
         assert h.get("x-clickhouse-user") == CH_USER and h.get("x-clickhouse-key") == CH_KEY

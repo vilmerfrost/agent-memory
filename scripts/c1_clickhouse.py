@@ -84,7 +84,7 @@ def _url_host(url: str) -> str | None:
 def _final_counts(client: CH.Client) -> dict[str, int]:
     out = {}
     for t in CH.TABLES:
-        rows = client.select(f"SELECT count() AS n FROM {client.cfg.db}.{t.name} FINAL FORMAT JSONEachRow", {})
+        rows = client.select(f"SELECT count() AS n FROM {client.cfg.db}.{t.name} FINAL WHERE _amem_deleted = 0 FORMAT JSONEachRow", {})
         out[t.name] = int(rows[0]["n"]) if rows else 0
     return out
 
@@ -258,8 +258,8 @@ def run_c1(db_url: str, gold: Mapping[str, Any], *, environ: Mapping[str, str] |
             masks = {"team": gold["team"], "private": gold.get("private", {})}
             want = {t: {i: m for m, rows in masks.items() for i in rows.get(t, [])} for t in ("sessions", "skill_calls")}
             bad = []
-            sess = client.select(f"SELECT id, project, repo FROM {cfg.db}.sessions FINAL FORMAT JSONEachRow", {})
-            calls = client.select(f"SELECT id, project FROM {cfg.db}.skill_calls FINAL FORMAT JSONEachRow", {})
+            sess = client.select(f"SELECT id, project, repo FROM {cfg.db}.sessions FINAL WHERE _amem_deleted = 0 FORMAT JSONEachRow", {})
+            calls = client.select(f"SELECT id, project FROM {cfg.db}.skill_calls FINAL WHERE _amem_deleted = 0 FORMAT JSONEachRow", {})
             for t, rows, cols in (("sessions", sess, ("project", "repo")), ("skill_calls", calls, ("project",))):
                 for r in rows:
                     for col in cols:

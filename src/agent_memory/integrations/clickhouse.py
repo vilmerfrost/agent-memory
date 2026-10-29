@@ -563,8 +563,8 @@ def check_grants(client: Client) -> list[dict[str, Any]]:
 
 def ensure_schema(client: Client) -> int:
     stmts = schema_sql(client.cfg.db, cloud=client.cfg.cloud)
-    if not client.cfg.cloud:
-        stmts += schema_upgrade_sql(client.cfg.db)
+    # Existing schemas require the explicit owner upgrade, even on a local
+    # server. Ordinary writer credentials must never attempt ALTER.
     for s in stmts:
         client.command(s)
     return len(stmts)

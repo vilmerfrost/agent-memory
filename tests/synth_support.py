@@ -80,7 +80,7 @@ class C1Fake(FakeClickHouse):
                 return 403, _DENIED
             if text.startswith("INSERT INTO amem.") and text.endswith(" WHERE 0"):
                 return 200, ""
-            m = re.fullmatch(r"SELECT count\(\) AS n FROM amem\.(\w+)( FINAL)? FORMAT JSONEachRow", text)
+            m = re.fullmatch(r"SELECT count\(\) AS n FROM amem\.(\w+)( FINAL)?(?: WHERE _amem_deleted = 0)? FORMAT JSONEachRow", text)
             if m:
                 return 200, _jsonl([{"n": str(len(self.final(m.group(1)) if m.group(2) else self.rows[m.group(1)]))}])
             m = re.fullmatch(r"SELECT count\(\) AS n FROM amem\.(\w+) WHERE multiSearchAnyCaseInsensitive\("
@@ -90,7 +90,7 @@ class C1Fake(FakeClickHouse):
                 hits = sum(any(n in json.dumps(r, ensure_ascii=False).lower() for n in needles)
                            for r in self.rows[m.group(1)])
                 return 200, _jsonl([{"n": str(hits)}])
-            m = re.fullmatch(r"SELECT (id, [a-z_, ]+) FROM amem\.(sessions|skill_calls) FINAL FORMAT JSONEachRow", text)
+            m = re.fullmatch(r"SELECT (id, [a-z_, ]+) FROM amem\.(sessions|skill_calls) FINAL(?: WHERE _amem_deleted = 0)? FORMAT JSONEachRow", text)
             if m:
                 cols = [c.strip() for c in m.group(1).split(",")]
                 return 200, _jsonl([{c: r.get(c) for c in cols} for r in self.final(m.group(2))])
