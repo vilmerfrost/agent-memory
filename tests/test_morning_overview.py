@@ -87,6 +87,7 @@ def test_redaction_and_speech_bounds():
         m.render(data)
     def request(*args, **kwargs):
         assert json.loads(kwargs['body'])['text'] == 'Calm English briefing.'
+        assert kwargs['timeout'] == 300
         return b'ID3' + b'\0' * 200, {'request-id':'receipt'}
     audio, usage = w.speech('Calm English briefing.', request=request, key='fixture-only')
     assert audio.startswith(b'ID3') and usage['provider_request_id'] == 'receipt'
