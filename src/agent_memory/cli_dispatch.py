@@ -61,11 +61,15 @@ def _db_source():
 
 
 def _refresh(args: argparse.Namespace) -> int:
+    import time
+    from pathlib import Path
     from agent_memory import dispatch_estimates as D
 
-    source, conn = _db_source()
+    began = time.monotonic()
+    source, conn = (None, None) if args.no_db else _db_source()
     try:
-        lookup = D.refresh(repo=args.repo, db=source)
+        lookup = D.refresh(repo=args.repo, db=source, codex=not args.no_codex,
+                           codex_home=Path(args.codex_home) if args.codex_home else None)
     except (OSError, ValueError) as exc:
         print(f"amem dispatch refresh failed: {type(exc).__name__}", file=sys.stderr)
         return 1
@@ -74,9 +78,11 @@ def _refresh(args: argparse.Namespace) -> int:
             conn.close()
     print(D.refresh_line(lookup))
     if source is None:
-        print("note: database not reached; tokens and test medians kept from the last refresh")
+        print("note: database " + ("not used (--no-db)" if args.no_db else "not reached")
+              + "; run tokens, round tokens and test medians kept from the last refresh")
     for note in lookup.get("notes", []):
         print("note: " + note)
+    print(f"refresh took {time.monotonic() - began:.2f} s")
     return 0
 
 
@@ -139,6 +145,10 @@ def register(sub: argparse._SubParsersAction) -> None:
 
     p = actions.add_parser("refresh", help="recompute ~/.claude/parent/dispatch-estimates.json")
     p.add_argument("--repo", help="only look up tokens for this repo's runs")
+    p.add_argument("--codex-home", help="Codex home with sessions/ rollouts for the usage seed "
+                                        "(default: AMEM_CODEX_HOME, else ~/.codex)")
+    p.add_argument("--no-db", action="store_true", help="do not use the database (no tokens, no test medians)")
+    p.add_argument("--no-codex", action="store_true", help="skip the Codex rollout seed")
     p.set_defaults(func=_refresh)
 
     p = actions.add_parser("report", help="estimate vs actual per finished run (JSON lines)")

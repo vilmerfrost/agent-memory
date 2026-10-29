@@ -17,7 +17,7 @@ week, Codex week), taken once at start and once at end, plus the workers' tokens
 ```sh
 amem dispatch start --repo agent-memory --workers 3 [--brief-chars N] [--files-claimed N] [--tool claude|codex] [--session S]
 amem dispatch end [run_id] [--session S] [--status done|partial|blocked|failed|abandoned] [--integration-test-ms N]
-amem dispatch refresh [--repo R]
+amem dispatch refresh [--repo R] [--codex-home DIR] [--no-db] [--no-codex]
 amem dispatch report [--limit N]
 amem dispatch ingest
 ```
@@ -29,7 +29,11 @@ amem dispatch ingest
   `run_id=<uuid>` and an `Actual: ...` line. A second `end` finds nothing open and
   changes nothing.
 - `refresh` recomputes the lookup file that `start` reads. It may use the database
-  (worker tokens, median integration-test time). `start` and `end` never do.
+  (worker tokens, median integration-test time) and it reads the local Codex
+  rollouts for the usage seed (below). `start` and `end` never do either.
+  `--no-db` skips the database, `--no-codex` skips the rollouts, `--codex-home`
+  points at another Codex home. It prints how long it took (about 0.3 s for 87
+  rollouts, 577 MB, without the database).
 - `report` prints estimate vs actual per finished run, as JSON lines.
 - `ingest` uploads the spools now. The timing collector also does it every flush.
 
@@ -70,10 +74,12 @@ The worst case is then about 0.9 s.
 |---|---|
 | `~/.claude/parent/<repo>/dispatch-events.jsonl` | Append-only spool. One JSON record per line, `v: 1`. Types: `start`, `snapshot`, `estimate`, `end`, `tokens`. Mode 0600, never a symlink, lines over 32 KB are skipped. |
 | `~/.claude/parent/<repo>/dispatch-open/<session>.json` | The open run of a session. `end` removes it. |
-| `~/.claude/parent/dispatch-estimates.json` | The lookup file `start` reads. Written by `refresh`. |
+| `~/.claude/parent/dispatch-estimates.json` | The lookup file `start` reads. Written by `refresh`. Keys `v`, `time`, `usage`, `tokens`, `runs`, plus `seed` (usage seed with its source records). |
 | `~/.claude/parent/dispatch-cursors.json` | Upload cursor (offset per spool file, with a lock). |
 
-`AMEM_CLAUDE_HOME` replaces `~/.claude` (tests use a tmp dir).
+`AMEM_CLAUDE_HOME` replaces `~/.claude` (tests use a tmp dir). The Codex home is
+`--codex-home`, else `AMEM_CODEX_HOME`, else `.codex` next to the Claude home, so a
+test with a tmp Claude home never reads the real `~/.codex`.
 
 ## Tables
 
@@ -114,14 +120,73 @@ Time estimates use every finished run, clean or not.
   (measured `--integration-test-ms` first, else the database median of full, passing
   runs in `test_timing_runs`; a repo with neither adds nothing). Rounds that a
   measured run already covers are skipped.
-- Usage, per limit and bucket: median and 80th percentile delta over clean runs.
-  With fewer than 5 clean runs in the bucket, the estimate is
-  `median worker tokens x learned percent per million tokens` (marked "from tokens").
-  Without either, the line says "no usage history".
+- Usage, per limit and bucket, first match wins:
+  1. Clean runs: with at least 5 clean runs in the bucket, their median and 80th
+     percentile delta (the line says `(5 clean runs)`).
+  2. Seed (Codex only): `median worker tokens per round / fresh tokens per 1%` from
+     the usage seed below (the line says `(seed: Codex rollouts, 138 intervals x 7 rounds)`).
+  3. Token ratio: `median worker tokens x learned percent per million tokens` from
+     clean runs with tokens (marked "from tokens").
+  Without any of them the line shows what real data there is, never a number made up:
+  `Claude 5h use: no % history yet, ~1.2M fresh tokens typical (12 rounds)`, or
+  `Codex week use: no round token history yet, 1% ~ 27k fresh tokens (seed: Codex rollouts, 138 intervals)`,
+  or `no usage history`.
 - Tokens per run come from the `sessions` table: worker rows whose parent is the run's
   session and that started inside the run. Fresh tokens are input + output + cache
   creation; cache reads are kept apart. Refresh appends them to the spool as a
   `tokens` record. Offline refresh skips this silently.
+
+## Usage seed (before clean runs exist)
+
+`refresh` seeds usage from real history only (`dispatch_seed.py`). Every number in
+the lookup file's `seed` block has its source records next to it, plus `source`, `n`
+and `method_version` (`usage-seed/1`). Too little data gives no number.
+
+**Codex: tokens per 1%, from local Codex rollouts.** Codex writes a `token_count`
+event per model call into `<codex home>/sessions/**/rollout-*.jsonl` (and
+`archived_sessions`): cumulative tokens and the account's plan-limit percent
+(`rate_limits.primary`: `used_percent`, `window_minutes`, `resets_at`). The percent is
+account-wide and sessions overlap, so one rollout's own ratio is wrong. Refresh uses
+one global timeline:
+
+1. Token deltas of all rollouts are merged by time. A forked subagent copies its
+   parent's history (ordinal below `subagent_history_start_ordinal`); the copies only
+   set the counter baseline, so those tokens count once. A counter that starts over
+   counts all of its new value.
+2. Percent sightings are grouped per limit window (`resets_at` within 5 minutes).
+3. Inside a window, an interval runs from the first sighting of one percent value to
+   the first sighting of a value at least 3 points higher. Its tokens are the deltas
+   of all rollouts in (start, end]. Anchoring on the first sighting of a new whole
+   percent keeps the rounding error small; 3 points keep it under about a third.
+   Shorter tails are dropped; so are intervals with no local tokens (the use came
+   from elsewhere).
+4. Per limit: fresh tokens (input - cached input + output) and total tokens per 1%,
+   as median, 20th and 80th percentile over the intervals. Fewer than 3 intervals:
+   no number ("no usage history").
+
+Each interval in the lookup file names its start and end record (file, timestamp,
+ordinal, percent), the tokens, the number of token events and rollouts.
+
+**Tokens per dispatch round, from the `sessions` table.** For each `tasks.jsonl`
+round, the worker rows whose parent is the round's session and that started inside
+the round (`DbSource.tokens`): fresh = input + output + cache creation, cache reads
+apart. Per parent tool and worker bucket: n, median and 80th percentile; a bucket
+with fewer than 3 rounds uses the tool's pooled rounds. A round with no matched
+worker row is skipped, never counted as zero. Without a database this source is
+skipped and refresh says so; the last database result is kept with its date.
+
+**Claude** has no historical percent source, so Claude lines show tokens only. The
+seed never invents a Claude ratio.
+
+Seed limits:
+
+- Codex use from other devices or Codex cloud is not in local rollouts. An interval
+  with such use shows too few tokens per 1%. The spread (p20 to p80 was 15k to 108k
+  fresh tokens on 2026-10-29) is real, not noise to hide.
+- A percent sighting can be late when no session runs: the next session's first call
+  ends the interval and its tokens count in it.
+- The round tokens of a Codex parent come from Codex worker rows in `sessions`, which
+  store input without cached input; both sides use the same fresh definition.
 
 ## Limits
 
