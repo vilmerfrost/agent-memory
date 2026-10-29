@@ -68,7 +68,8 @@ HYPOTHESES_FIXTURES = config.REPO_ROOT / "tests" / "fixtures" / "rsi-night" / "h
 STATUSES = ("ok", "partial", "aborted", "budget_exhausted", "preflight_failed")
 SKIP_REASONS = ("prerequisites", "credentials")     # report["skipped"]["reason"]: the night job did not start it
 MAX_PREREQ_WARNINGS = 10
-EXP_STATUSES = ("staged", "not_promotable", "failed", "interrupted", "skipped_budget", "deferred_policy")
+# suggested: an IMPROVES experiment on a file improve refuses (suggest-only): a hand edit, never a proposal
+EXP_STATUSES = ("staged", "not_promotable", "failed", "interrupted", "skipped_budget", "deferred_policy", "suggested")
 VERDICTS = ("IMPROVES", "NO_EFFECT", "WORSE", "INCONCLUSIVE")
 RISKS = ("low", "medium", "high")
 PROVIDERS = ("supabase", "clickhouse", "langfuse", "pastdev")
@@ -838,13 +839,29 @@ def _one_line(x: Any, n: int) -> str:
 def _refused_by_improve(target: str) -> bool:
     """True when improve would refuse an edit to `target`: a pinned file (improve/pins.json) or a path outside
     improve's scope (criteria.json `allowed_targets`, with the fence.txt nuance), read the way the edits step reads
-    them (edits_targets). An experiment on it always ends "improve stage refused" (night 2026-10-23: agents/worker.md
-    pinned after a hand edit; then parent/skills/dispatch/SKILL.md, not in allowed_targets)."""
+    them (edits_targets.lock_action: SUGGEST). improve never stages it (night 2026-10-23: agents/worker.md pinned
+    after a hand edit; then parent/skills/dispatch/SKILL.md, not in allowed_targets), so the night tests ideas on it
+    as suggest-only: ranked like any other, a win becomes a suggested hand edit, never a proposal."""
     try:
-        path = rsi_targets.untilde(target)
-        return ET.pinned_file(path) is not None or not ET.is_allowed(path)
+        return ET.lock_action(rsi_targets.untilde(target)).action == ET.SUGGEST
     except (OSError, RuntimeError, ValueError):
         return False
+
+
+# The locks whose files stay night targets as suggest-only (a win is a hand edit): an auto-pin after Vilmer's hand edit
+# and a file outside improve's allowed targets. `pinned` (an owner pin, a generated copy) and `grades_loop` (a judge
+# or eval prompt) stay excluded before triage: those files are locked on purpose.
+SUGGEST_LOCKS = ("hand_edited", "outside_allowed")
+
+
+def lock_kind(target: str) -> str:
+    """Why `target` is suggest-only, as a BLOCK_REASONS code (hand_edited | grades_loop | pinned | outside_allowed).
+    Only the code reaches the report, never the pin's reason text."""
+    try:
+        pin = ET.pinned_file(rsi_targets.untilde(target))
+    except (OSError, RuntimeError, ValueError):
+        pin = None
+    return pin_kind(pin) if pin is not None else "outside_allowed"
 
 
 # Why an idea in the queue cannot be tested (Night Desk decisions 2 and 9), most specific first:
@@ -1205,6 +1222,8 @@ def _section_for(text: str, rule_key: Any) -> Any:
     except edits_sections.SectionError:
         return None
     wanted = [rule, rule.split("--", 1)[-1]]
+    if (deleg := ET.delegation_rule_id(rule_key)) is not None:
+        wanted.append(deleg)       # a generated copy's delegation rule, read in the source parent/DELEGATION.md
     for w in wanted:
         for s in secs:
             if s.id == w or s.id.endswith("/" + w):
@@ -1350,7 +1369,9 @@ class WriterImplementer:
             pin = ET.pinned_file(path)
         except (OSError, RuntimeError, ValueError):
             pin = None
-        if pin is not None:
+        # A locked file is written only for a suggest-only experiment: the change is tested in the sandbox and shown
+        # as a hand edit, never staged with improve (Night passes suggest_only for those targets).
+        if pin is not None and not ctx.get("suggest_only"):
             return fallback("target file is pinned: no writer call")
         # The candidate's own rule section (a deviation's rule key names it); else the section the hypothesis names
         # (skill scores, routine failures and findings carry no section id: the 2026-10-25 night fell back 3 of 3).
@@ -1623,6 +1644,101 @@ class SandboxReplayer:
                              judge_prompt_version=_dget(r, "judge_prompt_version") or None)
 
 
+SUGGEST_KIND = "suggest_only"      # manifest.proposal_kind of a suggest-only artifact: never a proposal
+SUGGESTION_FORMAT = "rsi-suggestion/1"
+SUGGESTION_DIFF_MAX = 12_000
+
+
+class SuggestStager:
+    """S6 for a suggest-only experiment (a target improve refuses: a pinned file or outside allowed_targets). improve
+    stage refuses those files, so this writes the same rsi-artifact/1 layout itself, under the sandbox artifacts dir
+    only, with proposal_kind `suggest_only`, so the sandbox replay can test the exact bytes. It never runs improve,
+    never writes a production file and never creates a proposal: improve promote refuses the file anyway (pinned or
+    out of scope), and the night records a suggestion instead (Night._experiment)."""
+
+    def stage(self, *, experiment_id: str, baseline_dir: Path, key: str, new_text: str, rule_id: str,
+              timeout: float) -> StageResult:
+        try:
+            bm = rsi_targets.load_baseline(baseline_dir)
+            entry = next((f for f in bm["files"] if f["path"] == key), None)
+            if entry is None:
+                return StageResult("refused", reason=f"{key}: not in baseline {bm['baseline_id']}")
+            before = (baseline_dir / "files" / key[2:]).read_bytes()
+            live = rsi_targets.untilde(key).read_bytes()
+        except (OSError, ValueError, KeyError, rsi_targets.BaselineError) as exc:
+            return StageResult("refused", reason=f"suggest stage: {type(exc).__name__}: {_one_line(exc, 200)}")
+        if RA.sha256_bytes(live) != entry["sha256"]:
+            return StageResult("refused", reason=f"{key}: live file changed since baseline {bm['baseline_id']} (stale baseline)")
+        after = new_text.encode("utf-8")
+        if after == before:
+            return StageResult("refused", reason=f"{key}: after equals before (no change)")
+        kind = "skill" if "/skills/" in key else "lessons" if key.endswith("/lessons.md") else "instruction"
+        files = [{"path": key, "kind": kind, "rule_id": rule_id, "mode": str(entry.get("mode") or "0644"),
+                  "before_sha256": RA.sha256_bytes(before), "after_sha256": RA.sha256_bytes(after)}]
+        m = {"format": RA.ARTIFACT_FORMAT, "experiment_id": experiment_id, "baseline_id": bm["baseline_id"],
+             "proposal_kind": SUGGEST_KIND, "activation": "none", "files": files}
+        h = RA.artifact_hash(m)
+        root = RA.artifacts_dir()
+        root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        final = root / h
+        if final.exists():
+            try:
+                RA.load_artifact(final)
+            except RA.ArtifactError as exc:
+                return StageResult("refused", reason=f"existing artifact does not verify: {exc}")
+            return StageResult("staged", artifact_hash=h, artifact_dir=str(final))
+        tmp = Path(tempfile.mkdtemp(prefix=f".tmp-{h[:12]}-", dir=root))
+        for sub in ("files", "before", "evals"):
+            (tmp / sub).mkdir()
+        (tmp / "manifest.json").write_bytes(RA.canonical(m) + b"\n")
+        (tmp / "files" / files[0]["after_sha256"]).write_bytes(after)
+        (tmp / "before" / files[0]["before_sha256"]).write_bytes(before)
+        for sub in ("files", "before"):
+            for c in (tmp / sub).iterdir():
+                os.chmod(c, 0o444)
+            os.chmod(tmp / sub, 0o555)
+        os.chmod(tmp / "manifest.json", 0o444)
+        os.chmod(tmp / "evals", 0o755)
+        os.rename(tmp, final)
+        return StageResult("staged", artifact_hash=h, artifact_dir=str(final))
+
+
+def suggestion_record(*, target: str, lock: str, artifact_hash: str, baseline_id: str | None, section_id: str | None,
+                      diff: str | None, verdict: str, reasons: Sequence[str], arms: Mapping[str, Any],
+                      evidence_refs: Sequence[str], hyp: Hypothesis) -> dict[str, Any]:
+    """A suggest-only experiment's win (rsi_experiments.meta.suggestion and report experiments[].suggestion): the
+    tested change for a locked file, to apply by hand. No proposal, no decision token, no Apply command."""
+    d = str(diff or "")
+    lines = d.splitlines()
+    added = sum(1 for x in lines if x.startswith("+") and not x.startswith("+++"))
+    removed = sum(1 for x in lines if x.startswith("-") and not x.startswith("---"))
+    return {"format": SUGGESTION_FORMAT, "suggest_only": True, "applied_by": "hand", "target": target, "lock": lock,
+            "artifact_hash": artifact_hash, "baseline_id": baseline_id, "section_id": section_id,
+            "summary": hyp.what, "why": hyp.why, "diff": d[:SUGGESTION_DIFF_MAX],
+            "diff_summary": {"added": added, "removed": removed, "truncated": len(d) > SUGGESTION_DIFF_MAX},
+            "verdict": verdict, "verdict_reasons": [str(x)[:300] for x in reasons][:20], "arms": dict(arms),
+            "evidence_refs": [str(x)[:200] for x in evidence_refs][:20]}
+
+
+def suggestion_problems(e: Any, where: str) -> list[str]:
+    """A `suggested` report experiment: IMPROVES, an experiment id, the tested artifact hash, NO proposal, and a
+    suggestion record that matches them (suggest_only true, applied_by hand, the same target and hash)."""
+    if not isinstance(e, Mapping):
+        return [f"{where}: not an object"]
+    s = e.get("suggestion")
+    errs = []
+    if e.get("verdict") != "IMPROVES" or not e.get("experiment_id") or not e.get("artifact_hash"):
+        errs.append(f"{where}: suggested without an IMPROVES verdict, an experiment id and an artifact hash")
+    if e.get("proposal_id") is not None:
+        errs.append(f"{where}: a suggestion never has a proposal")
+    if not (isinstance(s, Mapping) and s.get("format") == SUGGESTION_FORMAT and s.get("suggest_only") is True
+            and s.get("applied_by") == "hand" and s.get("target") == e.get("target")
+            and s.get("artifact_hash") == e.get("artifact_hash") and s.get("lock") in BLOCK_REASONS[1:]
+            and isinstance(s.get("diff"), str) and isinstance(s.get("diff_summary"), Mapping)):
+        errs.append(f"{where}.suggestion must be an {SUGGESTION_FORMAT} record for the same target and artifact")
+    return errs
+
+
 class ApprovalProposer:
     """S8: rsi_approval.create_proposal for the exact staged bytes, only with a bound `improves` sandbox-replay
     record. Records a staged proposal; deciding and promoting stay with Vilmer and the promotion worker."""
@@ -1691,6 +1807,7 @@ class Adapters:
     targets: Callable[[], list[str]] = instruction_targets
     baseline: Callable[[str], tuple[str, Path]] = create_baseline
     exporter: Callable[..., Mapping[str, Any]] | None = None
+    suggest_stager: Stager = field(default_factory=SuggestStager)   # suggest-only targets: never improve stage
 
 
 def export_replay(conn: psycopg.Connection, experiment_id: str, *, budget_s: float) -> Mapping[str, Any]:
@@ -1817,7 +1934,8 @@ class Night:
         self.degraded = False          # a provider was down or an experiment failed: partial, but S1-S8 finished
         self.health_reasons: dict[str, list[str]] = {}   # provider -> why it was not ok (redacted, one line each)
         self.health_where: dict[str, str] = {}            # provider -> the stage that first reported it not ok
-        self.pinned: list[str] = []    # allowlisted targets improve refuses (pins.json / fence.txt): never selected
+        self.pinned: list[str] = []    # allowlisted targets improve refuses (pins.json / allowed_targets)
+        self.suggest: list[str] = []   # ... of them, the suggest-only ones (SUGGEST_LOCKS); the rest are never selected
         self.notes: list[str] = []
         self.health: dict[str, str] = {k: "skipped" for k in PROVIDERS}
         self.health["jev"] = "fixture" if cfg.stages["triage"] == "fixture" else "live"
@@ -2045,9 +2163,13 @@ class Night:
             except Exception as exc:
                 raise PreflightFailed(f"client compatibility: {type(exc).__name__}: {exc}") from None
         self.allowlist = list(self.ad.targets())
+        # improve refuses these files. A hand-edit auto-pin or a file outside allowed_targets (SUGGEST_LOCKS) stays in
+        # the allowlist: its ideas are ranked like any other, and a win becomes a suggested hand edit, never a staged
+        # proposal. An owner pin or a judge / eval prompt leaves the allowlist: Vilmer locked it on purpose.
         self.pinned = [t for t in self.allowlist if _refused_by_improve(t)]
-        if self.pinned:                # improve refuses these: a candidate on one only burns triage and model money
-            self.allowlist = [t for t in self.allowlist if t not in self.pinned]
+        self.suggest = [t for t in self.pinned if lock_kind(t) in SUGGEST_LOCKS]
+        if len(self.suggest) < len(self.pinned):     # a candidate on one only burns triage and model money
+            self.allowlist = [t for t in self.allowlist if t not in self.pinned or t in self.suggest]
         self.budget.check()
         if not self.dry_run:
             if not self.manual_run_id:
@@ -2146,6 +2268,37 @@ class Night:
             return None
         return real if real in self.allowlist else None
 
+    def _suggest_only(self, target: str | None) -> str | None:
+        """The lock code (lock_kind) when `target` is in scope but improve refuses it (self.suggest, SUGGEST_LOCKS):
+        tested like any other target, a win is recorded as a suggested hand edit. None for an editable or
+        out-of-scope target."""
+        locked = getattr(self, "suggest", None) or []    # a night built without __init__ (tests) has none
+        if not locked:
+            return None
+        scoped = self._scoped(target)
+        if scoped is None or scoped not in locked:
+            return None
+        cache = getattr(self, "_locks", None)
+        if cache is None:
+            cache = self._locks = {}
+        if scoped not in cache:
+            cache[scoped] = lock_kind(scoped)
+        return cache[scoped]
+
+    def _delegation_target(self) -> str | None:
+        """The allowlist's spelling of parent/DELEGATION.md (edits_targets.delegation_source), or None when the night
+        cannot target it (missing file): delegation ideas then keep the file they were sighted on."""
+        try:
+            return self._scoped(rsi_targets.tilde(ET.delegation_source()))
+        except (OSError, RuntimeError, ValueError):
+            return None
+
+    def _route(self, rule_key: Any, target: str | None) -> str | None:
+        """A delegation-policy rule of a generated copy (CLAUDE.md / AGENTS.md) targets its source DELEGATION.md."""
+        if ET.is_delegation_rule(rule_key):
+            return self._delegation_target() or target
+        return target
+
     def _block_reason(self, target: str | None) -> str | None:
         """Why no experiment can run on `target` (BLOCK_REASONS), or None when it is in scope tonight. Pins are read
         once per target; only the code is kept."""
@@ -2168,7 +2321,7 @@ class Night:
         """A report pattern (most-broken rules) with its file and, when the loop cannot edit it, why (additive)."""
         f = s.target or s.file
         return {"key": s.dedupe_key, **(s.pattern or {}), "target": _token(f, 300) if f else None,
-                "blocked": self._block_reason(f)}
+                "blocked": self._block_reason(f), "suggest_only": self._suggest_only(f)}
 
     def _blocked(self, rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         """report.blocked (additive, Night Desk decisions 2, 8 and 9): the open ideas no experiment can use, from the
@@ -2183,7 +2336,7 @@ class Night:
             if t:
                 targets.append({"target": _token(t, 300), "reason": why, "ideas": n})
         targets.sort(key=lambda x: (BLOCK_REASONS.index(x["reason"]), -x["ideas"], x["target"]))
-        refused = [{"target": _token(t, 300), "reason": self._block_reason(t) or "outside_allowed"}
+        refused = [{"target": _token(t, 300), "reason": self._suggest_only(t) or self._block_reason(t) or "outside_allowed"}
                    for t in sorted(self.pinned)]
         return {"total": sum(groups.values()), "groups": groups, "targets": targets[:BLOCKED_TARGETS_MAX],
                 "refused_files": refused[:BLOCKED_TARGETS_MAX]}
@@ -2214,8 +2367,9 @@ class Night:
             known = fresh + [i for i in ids if i not in fresh]
             rule = g.get("rule_id") or g.get("instruction_ref")
             key = f"dev:{g['instruction_source']}:{rule}"
-            target = next((s for s in map(self._scoped, g.get("target_paths") or []) if s),
-                          (g.get("target_paths") or [None])[0])
+            target = self._route(f"{g['instruction_source']}:{rule}",
+                                 next((s for s in map(self._scoped, g.get("target_paths") or []) if s),
+                                      (g.get("target_paths") or [None])[0]))
             jv = g.get("jev") or {}
             metrics = {"count": g.get("count"), "sessions": g.get("sessions"), "new": len(fresh),
                        "followed_grade_mean": g.get("followed_grade_mean"), "result_grade_mean": g.get("result_grade_mean"),
@@ -2365,6 +2519,18 @@ class Night:
                 self._sight(s)
         limit = int(self.cfg.candidates["max_considered"])
         with self.conn.cursor(row_factory=dict_row) as cur:
+            # open delegation-policy candidates sighted on a generated copy (CLAUDE.md / AGENTS.md) target the source
+            # parent/DELEGATION.md, the way a symlink alias gets the allowlist's spelling below
+            rerouted: dict[Any, str] = {}
+            deleg = self._delegation_target()
+            if deleg:
+                cur.execute("select id, rule_key from rsi_candidates where status in ('new', 'deferred') "
+                            "and (rule_key like any(%s)) and target is distinct from %s",
+                            ([f"{s}:%" for s in ET.DELEGATION_COPIES] + [f"dev:{s}:%" for s in ET.DELEGATION_COPIES],
+                             deleg))
+                rerouted = {r["id"]: deleg for r in cur.fetchall() if ET.is_delegation_rule(r["rule_key"])}
+                if rerouted and not self.dry_run:
+                    cur.execute("update rsi_candidates set target = %s where id = any(%s)", (deleg, list(rerouted)))
             # open candidates stored under a symlink of an allowlisted file get the allowlist's spelling
             cur.execute("select distinct target from rsi_candidates where status in ('new', 'deferred') "
                         "and target is not null and not target = any(%s)", (list(self.allowlist),))
@@ -2383,26 +2549,39 @@ class Night:
                         "and not dedupe_key = any(%s) "
                         f"order by rank desc nulls first, {RECURRENCE_SQL} desc, last_seen_at desc, dedupe_key "
                         "limit %s", (scope, list(MESSENGER_KEYS), limit * POOL_FETCH))
-            pool = [{**r, "target": aliases.get(r["target"], r["target"])} for r in cur.fetchall()]
+            pool = [{**r, "target": rerouted.get(r["id"]) or aliases.get(r["target"], r["target"])}
+                    for r in cur.fetchall()]
             cur.execute("select count(*) as n from rsi_candidates where status in ('new', 'deferred') "
                         "and not coalesce(target = any(%s), false)", (scope,))
             out_of_scope = int(cur.fetchone()["n"])
             cur.execute("select target, count(*) as n from rsi_candidates where status in ('new', 'deferred') "
                         "and not coalesce(target = any(%s), false) group by target", (scope,))
             blocked_rows = cur.fetchall()
-            pinned = 0
-            if self.pinned:
+            excluded = [t for t in self.pinned if t not in self.suggest]
+
+            def open_on(targets: list[str]) -> int:
+                if not targets:
+                    return 0
                 cur.execute("select count(*) as n from rsi_candidates where status in ('new', 'deferred') "
-                            "and target = any(%s)", (list(self.pinned),))
-                pinned = int(cur.fetchone()["n"])
+                            "and target = any(%s)", (list(targets),))
+                return int(cur.fetchone()["n"])
+            pinned, suggested = open_on(excluded), open_on(list(self.suggest))
         if messengers:
             self.notes.append(_one_line(f"candidates: {', '.join(messengers)} not considered: a messenger routine only "
                                         "reports other routines' failures", 300))
         if out_of_scope - pinned:
             self.notes.append(f"candidates: {out_of_scope - pinned} without an in-scope target, not considered")
-        if pinned:      # the full list (report.blocked has it per file); bounded only as a backstop
-            self.notes.append(f"candidates: {pinned} on a target improve refuses (pinned or out of scope: "
-                              f"{_one_line(', '.join(sorted(self.pinned)), 2000)}), not considered")
+        # the full lists (report.blocked.refused_files has them per file); bounded only as a backstop
+        if pinned:      # an owner pin, a generated copy, a judge or eval prompt: locked on purpose
+            self.notes.append(f"candidates: {pinned} on a target improve refuses (pinned on purpose: "
+                              f"{_one_line(', '.join(sorted(excluded)), 2000)}), not considered")
+        if suggested:   # a hand-edit auto-pin or a file outside allowed_targets
+            self.notes.append(f"candidates: {suggested} on a locked file kept as suggest-only (hand-edited or outside "
+                              f"improve's allowed targets: {_one_line(', '.join(sorted(self.suggest)), 2000)}): ranked "
+                              "like any other; a winning change becomes a suggested hand edit, never a proposal")
+        if rerouted:
+            self.notes.append(f"candidates: {len(rerouted)} delegation-policy idea(s) target the source "
+                              f"{deleg} instead of its generated copy")
         self.report["blocked"] = self._blocked(blocked_rows)
         if self.dry_run:                      # nothing was written: show tonight's sightings as they would be
             known = {c["dedupe_key"]: c for c in pool}
@@ -2482,7 +2661,7 @@ class Night:
             return None
         try:
             path = rsi_targets.untilde(c["target"])
-            if ET.pinned_file(path) is not None:
+            if ET.pinned_file(path) is not None and not self._suggest_only(c["target"]):
                 return "target file is pinned"
             sec = _section_for(path.read_text(), (c.get("meta") or {}).get("last_tested_rule_key") or c.get("rule_key"))
             if sec is not None:
@@ -2601,7 +2780,9 @@ class Night:
                                               # additive (Night Desk): the file, the cases that use it, or why not
                                               "target": c.get("target"), "test_cases": tests,
                                               "triage": {**ans.as_dict(), "explanation": triage_explanation(ans)},
-                                              "skip_reason": None if tests else NO_TEST_CASE})
+                                              "skip_reason": None if tests else NO_TEST_CASE,
+                                              # additive: the lock code when a win can only be a suggested hand edit
+                                              "suggest_only": self._suggest_only(c.get("target"))})
         self._pool_rows = {str(c.get("id") or c["dedupe_key"]): c for c, *_ in results}
 
     # -- S4-S8 -----------------------------------------------------------------------------------------
@@ -2839,6 +3020,7 @@ class Night:
                 "target": h.target, "artifact_hash": None, "baseline_id": None, "verdict": None, "verdict_reasons": [],
                 "arms": {"A": {}, "B": {}}, "risk": h.risk, "confidence": h.confidence, "cost_usd": 0.0,
                 "status": status, "proposal_id": None, "evidence_refs": refs[:20], "judge": None, "jev": None,
+                "suggest_only": self._suggest_only(h.target),    # additive: lock code; a win is a hand edit
                 **{k: [dict(x) for x in v] for k, v in detail.items()}}
 
     def _record_implementation(self, exp_id: str, entry: dict[str, Any], impl: Implementation) -> None:
@@ -2936,6 +3118,9 @@ class Night:
         pending = [x.as_dict() for x in later]
         row: dict[str, Any] = {"status": "failed", "verdict": None, "meta": {}}
         cand_status, cand_reason = "deferred", "experiment failed"
+        # A file improve refuses (pinned / outside allowed_targets): the same experiment, but staged locally for the
+        # sandbox only, and a win is recorded as a suggested hand edit (never a proposal, never improve promote).
+        suggest = entry.get("suggest_only")
         try:
             # S6: the candidate content, staged as an immutable artifact against a fresh baseline
             bid, bdir = self.ad.baseline(h.target)
@@ -2944,7 +3129,8 @@ class Night:
             kw: dict[str, Any] = {}
             if getattr(self.ad.implementer, "wants_context", False):
                 kw["context"] = {"rule_key": c.get("rule_key"), "dedupe_key": c["dedupe_key"],
-                                 "evidence_text": self._evidence_text.get(str(c["dedupe_key"]), "")}
+                                 "evidence_text": self._evidence_text.get(str(c["dedupe_key"]), ""),
+                                 **({"suggest_only": True} if suggest else {})}
             with self._interruptible():
                 got = self.ad.implementer.implement(h, old_text=old, experiment_id=exp_id, baseline_id=bid,
                                                     budget=self.budget, **kw)
@@ -2962,8 +3148,10 @@ class Night:
                     impl.implementer == "stub-fallback" or not impl.contract_verified):
                 raise ExperimentFailed("writer intervention deferred: " + (impl.fallback_reason or "unverified edit contract"))
 
+            stager = self.ad.suggest_stager if suggest else self.ad.stager
+
             def stage(text: str) -> StageResult:
-                return self.ad.stager.stage(experiment_id=exp_id, baseline_dir=Path(bdir), key=h.target, new_text=text,
+                return stager.stage(experiment_id=exp_id, baseline_dir=Path(bdir), key=h.target, new_text=text,
                                             rule_id=(section_rule_id(h.target, impl.section_id) if impl.section_id and h.edit else
                                                      f"rsi-night-{_sha16(c['dedupe_key'])[:10]}"),
                                             timeout=max(1.0, min(float(self.cfg.staging.get("timeout_s") or 600),
@@ -2973,7 +3161,7 @@ class Night:
                 raise ExperimentFailed(f"writer intervention refused by staging: {_one_line(st.reason, 200)}")
             self._record_implementation(exp_id, entry, impl)
             if st.status != "staged" or not st.artifact_hash:
-                raise ExperimentFailed(f"improve stage refused: {st.reason}")
+                raise ExperimentFailed(f"{'suggest' if suggest else 'improve'} stage refused: {st.reason}")
             entry["artifact_hash"] = st.artifact_hash
             self.conn.execute("update rsi_experiments set baseline_id = %s, meta = meta || %s where id = %s",
                               (bid, Jsonb({"artifact_hash": st.artifact_hash}), exp_id))
@@ -3025,6 +3213,19 @@ class Night:
             if verdict == "IMPROVES" and self.manual_run_id:
                 entry["status"] = "not_promotable"
                 cand_status, cand_reason = "tested", "manual verification only; no proposal created"
+                pending = []
+            elif verdict == "IMPROVES" and suggest:
+                # S8 for a locked file: the tested change as a suggestion to apply by hand. No proposal: the
+                # proposer is never called, so there is no decision token and no `amem rsi decide ... apply`.
+                import difflib
+                diff = impl.diff or "\n".join(difflib.unified_diff(
+                    old.splitlines(), new.splitlines(), "a" + h.target[1:], "b" + h.target[1:], lineterm="", n=1))
+                rec = suggestion_record(target=h.target, lock=str(suggest), artifact_hash=st.artifact_hash,
+                                        baseline_id=bid, section_id=impl.section_id, diff=diff, verdict=verdict,
+                                        reasons=reasons, arms=entry["arms"], evidence_refs=refs, hyp=h)
+                entry.update(status="suggested", suggestion=rec)
+                row["meta"]["suggestion"] = rec
+                cand_status, cand_reason = "tested", f"suggested edit for a locked file ({exp_id}): apply by hand"
                 pending = []
             elif verdict == "IMPROVES":
                 pid = self.ad.proposer.propose(self.conn, adir=Path(st.artifact_dir or RA.artifacts_dir() / st.artifact_hash),
@@ -3508,6 +3709,10 @@ def validate_report(obj: Any) -> list[str]:
         if e.get("status") == "staged" and not (e.get("proposal_id") and e.get("verdict") == "IMPROVES"
                                                 and e.get("artifact_hash") and e.get("experiment_id")):
             errs.append(f"{w}: staged without an IMPROVES verdict, an experiment id, an artifact hash and a proposal")
+        if e.get("status") == "suggested":
+            errs += suggestion_problems(e, w)
+        if isinstance(e, dict) and e.get("suggest_only") is not None and e["suggest_only"] not in BLOCK_REASONS[1:]:
+            errs.append(f"{w}.suggest_only {e['suggest_only']!r} not in {BLOCK_REASONS[1:]}")
     co = need(obj, "costs", dict, "report")
     if isinstance(co, dict):
         nums: list[Any] = []

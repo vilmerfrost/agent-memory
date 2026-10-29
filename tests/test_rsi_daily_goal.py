@@ -61,9 +61,10 @@ def test_one_or_two_testable_candidates_meet_the_minimum_without_inventing_a_thi
 @pytest.mark.parametrize("blocked", ["empty", "pinned", "uncovered"])
 def test_minimum_never_overrides_scope_pins_or_missing_cases(env, blocked):
     if blocked == "pinned":
+        # an owner pin (a hand-edit auto-pin would be suggest-only since 2026-10-29: tests/test_rsi_night_suggest.py)
         seed_four(env.url)
         (env.home / "agent-config/improve/pins.json").write_text(json.dumps(
-            {"files": {"~/.claude/CLAUDE.md": {"reason": "hand edit"}}, "rules": {}}))
+            {"files": {"~/.claude/CLAUDE.md": {"reason": "Vilmer: owner pin"}}, "rules": {}}))
     elif blocked == "uncovered":
         import psycopg
         p = env.home / ".agents/skills/uncovered/SKILL.md"
