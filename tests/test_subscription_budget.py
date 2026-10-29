@@ -42,3 +42,14 @@ def test_missing_subscription_usage_stops_next_call():
 def test_invalid_subscription_budget_refuses(extra):
     with pytest.raises(BudgetConfigError):
         budget(**extra)
+
+
+def test_proven_unstarted_failure_preserves_cause_and_has_no_usage_record():
+    from agent_memory.rsi_subscription import SubscriptionError
+    b=budget()
+    def fail(): raise SubscriptionError('unsupported_protocol',inference_started=False)
+    with pytest.raises(SubscriptionError,match='unsupported_protocol'):
+        b.call(MODEL,'hypothesis',fail)
+    b.check()
+    assert b.calls==[]
+    assert b.snapshot()['calls_taken'][MODEL]==1

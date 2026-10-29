@@ -1120,7 +1120,7 @@ class _Replay:
         cfg = self.cfg
         if self.budget is None or cfg.model not in getattr(self.budget.cfg, "subscription_models", ()):
             raise ReplayError("subscription replay requires matching call and usage budgets")
-        self.budget.take_call(cfg.model, "replay-agent")
+        reservation = self.budget.take_call(cfg.model, "replay-agent")
         # Reserve the maximum credential-free tool containers before any inference. After the run, the slots it
         # did not use are given back (release_unused_tools); used and unknown slots stay taken.
         reserved = [f"{rec.run_id}-tool-{i}" for i in range(cfg.max_tool_calls)]
@@ -1135,6 +1135,7 @@ class _Replay:
         rec.started_at = started_at.isoformat(timespec="milliseconds")
         started = time.monotonic()
         usage_raw: Mapping[str, Any] = {}
+        unstarted = False
         crashed: str | None = None
         try:
             targets = self.relevance.get("eligible_cases", {}).get(case.id, [])
@@ -1154,6 +1155,11 @@ class _Replay:
             rec.verified_reads = result.evidence.get("verified_reads", [])
             rec.exit_code = 0
         except sub.SubscriptionError as exc:
+            unstarted = exc.inference_started is False
+            if unstarted:
+                from types import SimpleNamespace
+                self.budget.cancel_call(reservation)
+                result = SimpleNamespace(tool_calls=[])  # proof no tool container could start
             rec.error, rec.exit_code = str(exc), 1
             rec.native_session_id = AL.native_session_id(cfg.agent,getattr(exc,'native_session_id',None))
         except BaseException as exc:
@@ -1162,9 +1168,10 @@ class _Replay:
         finally:
             rec.duration_s = round(time.monotonic() - started, 3)
             rec.cost_usd, rec.cost_basis = 0.0, "subscription"
-            self.budget.record_call(cfg.model, stage="replay-agent", tokens_in=rec.tokens_in, tokens_out=rec.tokens_out,
-                                    tokens_cached=rec.tokens_cached, tokens_cache_write=rec.tokens_cache_write,
-                                    duration_s=rec.duration_s, ok=rec.error is None, error=rec.error)
+            if not unstarted:
+                self.budget.record_call(cfg.model, stage="replay-agent", tokens_in=rec.tokens_in, tokens_out=rec.tokens_out,
+                                        tokens_cached=rec.tokens_cached, tokens_cache_write=rec.tokens_cache_write,
+                                        duration_s=rec.duration_s, ok=rec.error is None, error=rec.error, reservation_id=reservation)
             self.release_unused_tools(rec, reserved, result)
             self.write_attempt_log(rec, started_at, usage_raw, error=rec.error or crashed)
         return rec
@@ -1423,7 +1430,7 @@ class _Replay:
         (jdir / "prompt.txt").write_text(prompt, encoding="utf-8")
         model = self.cfg.judge_model or JUDGE_MODEL_DEFAULT[self.cfg.judge]
         if self.budget is not None and hasattr(self.budget, "take_call"):
-            self.budget.take_call(model, stage="replay-judge")
+            reservation = self.budget.take_call(model, stage="replay-judge")
         if self.cfg.judge_auth_mode == "subscription":
             from agent_memory import rsi_subscription as sub
             from agent_memory.rsi_subscription_config import auth_for, usage_fields
@@ -1431,7 +1438,7 @@ class _Replay:
                 raise ReplayError("subscription judge requires matching call and usage budgets")
             workspace, arm_home = jdir / "workspace", jdir / "home"
             workspace.mkdir(); arm_home.mkdir()
-            started, usage, ok = time.monotonic(), {}, False
+            started, usage, ok, unstarted = time.monotonic(), {}, False, False
             try:
                 result = sub.run(self.cfg.judge, prompt, model=model, effort=self.cfg.judge_effort,
                                  workspace=workspace.resolve(), arm_home=arm_home.resolve(),
@@ -1442,10 +1449,16 @@ class _Replay:
                 ok = True
                 _write_json(jdir / "runtime.json", result.evidence)
                 return answer
+            except sub.SubscriptionError as exc:
+                unstarted = exc.inference_started is False
+                if unstarted:
+                    self.budget.cancel_call(reservation)
+                raise
             finally:
                 self.judge_costs[(case, rep)] = (0.0, "subscription")
-                self.budget.record_call(model, stage="replay-judge", **usage,
-                                        duration_s=round(time.monotonic() - started, 3), ok=ok)
+                if not unstarted:
+                    self.budget.record_call(model, stage="replay-judge", **usage,
+                                            duration_s=round(time.monotonic() - started, 3), ok=ok)
         # home-J was made empty at staging and is not replaced per call (SETTLE_S); it holds no instructions.
         entry = ["python3", "-I", "/mnt/agent/live_entry.py", "--prompt-file", "/mnt/case/prompt.txt",
                  "--work", "/work", "--"]
