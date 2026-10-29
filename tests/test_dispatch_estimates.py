@@ -265,7 +265,7 @@ def test_refresh_builds_buckets_and_the_expect_line_uses_them(home: Path) -> Non
     saved = json.loads((parent / D.LOOKUP).read_text())
     assert saved["time"] == lookup["time"]
     result = D.start("demo", 2, session="new")
-    assert result["line"].startswith("Expect: ~23 min (slow case 30), ~5% of Claude 5h, now 25% used "
+    assert result["line"].startswith("Expect: ~23 min (slow case 30), ~5% of Claude 5h (5 clean runs), now 25% used "
                                      "— based on 6 past runs")
     est = [r for r in spool(home) if r["type"] == "estimate"][-1]
     assert est["est_minutes"] == 23 and est["est_usage"] == {"claude:session": 5}
