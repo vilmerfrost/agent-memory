@@ -1,0 +1,69 @@
+{
+  "lead" : {
+    "account" : "codex-owner@example.invalid",
+    "left_percent" : 37,
+    "limit" : "This week",
+    "tool" : "Codex"
+  },
+  "measured_at" : "2026-10-29T10:54:48Z",
+  "measured_seconds_ago" : 51,
+  "plans" : [
+    {
+      "account" : "claude-owner@example.invalid",
+      "asked_minutes_ago" : 1,
+      "limits" : [
+        {
+          "kind" : "week",
+          "left_percent" : 92,
+          "name" : "This week",
+          "pace" : "on_pace",
+          "resets_at" : "2026-11-04T20:59:59Z",
+          "resets_in_hours" : 154.1,
+          "spare_at_reset_percent" : 4,
+          "used_percent" : 8
+        },
+        {
+          "kind" : "session",
+          "left_percent" : 75,
+          "name" : "5-hour session",
+          "pace" : "on_pace",
+          "resets_at" : "2026-10-29T13:29:59Z",
+          "resets_in_hours" : 2.6,
+          "spare_at_reset_percent" : 49,
+          "used_percent" : 25
+        },
+        {
+          "kind" : "model",
+          "left_percent" : 100,
+          "model" : "Fable",
+          "name" : "Fable this week",
+          "resets_at" : "2026-11-04T21:00:00Z",
+          "resets_in_hours" : 154.1,
+          "used_percent" : 0
+        }
+      ],
+      "plan" : "Max 20x",
+      "tool" : "Claude"
+    },
+    {
+      "account" : "codex-owner@example.invalid",
+      "asked_minutes_ago" : 1,
+      "limits" : [
+        {
+          "kind" : "week",
+          "left_percent" : 37,
+          "name" : "This week",
+          "pace" : "runs_out",
+          "resets_at" : "2026-11-04T07:30:42Z",
+          "resets_in_hours" : 140.6,
+          "runs_out_at" : "2026-10-30T03:01:44Z",
+          "runs_out_in_hours" : 16.1,
+          "used_percent" : 63
+        }
+      ],
+      "plan" : "Pro 100",
+      "tool" : "Codex"
+    }
+  ],
+  "shows" : "used"
+}

@@ -118,6 +118,26 @@ def server(state: CollectorState, port: int) -> ThreadingHTTPServer:
     return result
 
 
+def flush_dispatch(parent: Path, signatures: dict[Path, tuple[int, int]], *,
+                   db_url: str | None = None) -> dict[Path, tuple[int, int]]:
+    """Upload changed dispatch-events.jsonl spools (amem dispatch start/end).
+
+    Signatures advance only after a successful ingest, so a failed upload retries
+    on the next flush even when the file did not change.
+    """
+    from agent_memory import timing_store
+
+    latest = {}
+    for path in timing_store.spool_paths(parent, kind="dispatch"):
+        stat = path.stat()
+        latest[path] = (stat.st_mtime_ns, stat.st_size)
+    changed = [p for p, sig in latest.items() if sig != signatures.get(p)]
+    if changed:
+        timing_store.ingest_spools(changed, db_url=db_url, cursor_path=parent/'dispatch-cursors.json',
+                                   kind="dispatch")
+    return latest
+
+
 def serve(port: int, *, flush_seconds: float = 15, db_url: str | None = None) -> None:
     from agent_memory import sessions_ingest, timing_store
 
@@ -128,6 +148,7 @@ def serve(port: int, *, flush_seconds: float = 15, db_url: str | None = None) ->
 
     def flush() -> None:
         signatures: dict[Path, tuple[int, int]] = {}
+        dispatch_signatures: dict[Path, tuple[int, int]] = {}
         last_pruned = 0.0
         while not stop.wait(flush_seconds):
             try:
@@ -149,6 +170,7 @@ def serve(port: int, *, flush_seconds: float = 15, db_url: str | None = None) ->
                 # ingestion. Retry test batches after the original work commits.
                 for queue in parent.glob('*/test-timing-queue'):
                     test_timings.flush_queue(queue, db_url=db_url)
+                dispatch_signatures = flush_dispatch(parent, dispatch_signatures, db_url=db_url)
                 if time.monotonic()-last_pruned >= 3600:
                     test_timings.prune(db_url=db_url)
                     last_pruned = time.monotonic()
