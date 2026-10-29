@@ -25,7 +25,6 @@ from psycopg.types.json import Jsonb
 
 from agent_memory import config, morning_overview as brief
 
-API = 'https://uyolylfqjxoplpqmplpq.supabase.co/functions/v1/amem-audio'
 VOICE = 'JBFqnCBsd6RMkjVDRZzb'  # George, stock English narrator; overridable server-side.
 MODEL = 'eleven_v4'
 MAX_BYTES = 20_000_000
@@ -143,9 +142,12 @@ def save_receipt(path, value):
     os.replace(temporary, path)
 
 
-def upload(job, audio, *, request=http, api_url=API):
+def upload(job, audio, *, request=http, api_url=None):
     # The claim is obtained using the existing authenticated DB worker role. It
     # authorizes one fixed path at the broker; no Storage admin key leaves it.
+    api_url = api_url or os.environ.get('AMEM_AUDIO_API_URL')
+    if not api_url or not api_url.endswith('/functions/v1/amem-audio'):
+        raise AudioError('missing_audio_endpoint')
     body, _ = request(api_url, method='POST', body=json.dumps({'action': 'worker-upload', 'id': job['id'], 'claim': job['claim_id'], 'checksum': hashlib.sha256(audio).hexdigest()}).encode(), headers={'Content-Type': 'application/json'}, limit=65536)
     signed = json.loads(body)
     if signed.get('already_uploaded') is True:
@@ -250,6 +252,8 @@ def main():
     config.load_env()
     if os.environ.get('AMEM_AUDIO_ENABLED') != '1':
         print('Morning audio generation is disabled.'); return
+    if not os.environ.get('AMEM_AUDIO_API_URL'):
+        raise AudioError('missing_audio_endpoint')
     if not config.require_remote() or config.remote_write_error(for_backend='postgres'):
         raise AudioError('remote_only_required')
     now = datetime.now(timezone.utc)
