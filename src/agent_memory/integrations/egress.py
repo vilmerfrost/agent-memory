@@ -61,6 +61,8 @@ from __future__ import annotations
 
 import os
 import re
+import json
+from functools import lru_cache
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -163,6 +165,68 @@ class Deny:
 
 
 NONE = Deny()
+
+
+@lru_cache(maxsize=1)
+def internal_catalog() -> tuple[frozenset[str], frozenset[str]]:
+    """Fixed, shipped replay vocabulary. Never read an env-selected or external catalog."""
+    cases, rules = set(), set()
+    root = amem_config.REPO_ROOT / "bench" / "rsi-replay" / "cases"
+    for path in root.glob("*.json"):
+        if path.is_symlink():
+            continue
+        try:
+            row = json.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+        case = row.get("id")
+        if not isinstance(case, str) or case != path.stem or not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,79}", case):
+            continue
+        cases.add(case)
+        for target in row.get("targets", []):
+            p = target.get("path", "")
+            agent = re.fullmatch(r"~/agent-config/agents/([a-z0-9-]+)\.md", p)
+            source = "agent:" + agent[1] if agent else {
+                "~/agent-config/parent/PARENT.md": "parent-md",
+                "~/.claude/CLAUDE.md": "claude-md:global",
+                "~/.codex/AGENTS.md": "agents-md:global",
+            }.get(p)
+            if source:
+                for section in target.get("sections", []):
+                    if isinstance(section, str) and re.fullmatch(r"[a-z0-9][a-z0-9/-]*", section):
+                        rules.add(source + ":" + section)
+    return frozenset(cases), frozenset(rules)
+
+
+def catalog_rule(value: str) -> bool:
+    return value in internal_catalog()[1]
+
+
+def catalog_run(experiment: str, case: str, arm: str, rep: int, run_id: str) -> bool:
+    """Exact identity binding, not a permissive identifier-shaped-string exemption."""
+    if not re.fullmatch(r"exp-[0-9]{8}-[0-9a-f]{8}", experiment) or arm not in ("A", "B"):
+        return False
+    if isinstance(rep, bool) or not isinstance(rep, int) or rep < 0:
+        return False
+    profile, dot, bare = case.partition(".")
+    if dot:
+        if profile not in ("claude", "codex"):
+            return False
+    else:
+        bare, profile = case, ""
+    return bare in internal_catalog()[0] and run_id == f"{experiment}{'-' + profile if profile else ''}-{bare}-{arm}-r{rep}"
+
+
+def internal_match(deny: Deny, value: str, *, verified: bool) -> bool:
+    """Derived names in verified vocabulary match whole lexical words.
+
+    `repo` inside the shipped word `report` is not a repository reference.
+    Unknown/free text retains substring matching. Explicit deny terms must be
+    checked separately and ALWAYS retain substring semantics.
+    """
+    if not verified:
+        return deny.match(value)
+    return any(re.search(r"(?<![a-z0-9])" + re.escape(t) + r"(?![a-z0-9])", value.lower()) for t in deny.terms)
 
 
 def email_like(value: Any) -> bool:

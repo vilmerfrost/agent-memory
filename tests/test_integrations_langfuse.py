@@ -952,6 +952,39 @@ def test_scoped_export_preserves_daily_cursor_and_shared_receipts(app, tmp_path)
         assert sync.load(conn, 'langfuse')['usage']['rows'] == 4
 
 
+def test_exact_retry_recovers_refused_only_and_never_resends_confirmed(app, tmp_path, monkeypatch):
+    from agent_memory.integrations import egress
+    exp = 'exp-20261028-bebfd909'
+    monkeypatch.setattr(egress, 'team_names', lambda *a, **k: egress.Deny(('repo',)))
+    paths = []
+    for case, arm in (('worker-dod-gaps', 'A'), ('worker-final-report', 'A'), ('worker-final-report', 'B')):
+        paths.append(write_run(tmp_path, exp=exp, arm=arm, run_id=f'{exp}-claude-{case}-{arm}-r0',
+                               stdout=json.dumps(claude_result()), sidecar={'case':'claude.'+case,'rep':0,'check_passed':True}))
+    with MockService() as svc, psycopg.connect(app) as conn:
+        lf=FakeLangfuse(svc)
+        with monkeypatch.context() as old:
+            old.setattr(egress,'catalog_run',lambda *a:False)
+            first=L.export_experiment(conn,exp,root=tmp_path,client=client_for(svc),budget_s=30,environ={})
+        assert (first['status'],first['rows'],first['refused'],first['issue_kind'])==('partial',1,2,'local_refusal')
+        original=sync.load(conn,'langfuse')['watermarks']['sandbox_runs:'+exp]
+        conn.rollback()
+        already=L.load_run_log(paths[0]).trace_id
+        old_spans=[o for o in lf.observations if o['traceId']==already]
+        old_scores=[s for s in lf.scores.values() if s['traceId']==already]
+        selection=frozenset(p.stem for p in paths)
+        recovered=L.export_experiment(conn,exp,root=tmp_path,client=client_for(svc),budget_s=30,environ={},retry_run_ids=selection)
+        assert recovered['status']=='ok' and recovered['rows']==2 and recovered['already_confirmed_skipped']==1
+        assert recovered['confirmed_trace_uploads']==3 and recovered['readback_verified'] is False
+        assert old_spans==[o for o in lf.observations if o['traceId']==already]
+        assert old_scores==[s for s in lf.scores.values() if s['traceId']==already]
+        assert sync.load(conn,'langfuse')['watermarks']['sandbox_runs:'+exp]==original
+        conn.rollback()
+        counts=(len(lf.observations),len(lf.scores))
+        again=L.export_experiment(conn,exp,root=tmp_path,client=client_for(svc),budget_s=30,environ={},retry_run_ids=selection)
+        assert again['rows']==0 and again['already_confirmed_skipped']==3
+        assert counts==(len(lf.observations),len(lf.scores))
+
+
 def test_scoped_export_honors_shared_cap_and_kill_switch(app, tmp_path):
     _tree(tmp_path)
     with MockService() as svc, psycopg.connect(app) as conn:

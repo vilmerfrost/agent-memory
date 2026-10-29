@@ -593,14 +593,26 @@ def row_class(t: Table, raw: Mapping[str, Any]) -> str | None:
     return c if c in egress.CLASSES else egress.PRIVATE
 
 
-def map_row(t: Table, raw: Mapping[str, Any], version: int, deny: egress.Deny = egress.NONE) -> dict[str, Any] | None:
+def map_row(t: Table, raw: Mapping[str, Any], version: int, deny: egress.Deny = egress.NONE, *,
+            derived_deny: egress.Deny | None = None) -> dict[str, Any] | None:
     """The allowlist mapper: only t.cols, each coerced by kind; None when the key is not a valid id, or is
     denied or email-shaped (egress). A team or private row's project/repo and repo-scoped source are masks, and
     the rule of a masked source is null (F8)."""
     cls = row_class(t, raw) or egress.OWN
-    out = {c.name: _value(c.kind, raw.get(c.name), deny, cls) for c in t.cols}
+    # Without separately supplied derived provenance, every term remains strict.
+    combined = deny | (derived_deny or egress.NONE)
+    out = {c.name: _value(c.kind, raw.get(c.name), combined, cls) for c in t.cols}
     if not out.get("id"):
         return None
+    if derived_deny is not None and t.rule_of:
+        source, rule = (raw.get(k) for k in t.rule_of)
+        if isinstance(source, str) and isinstance(rule, str) and egress.catalog_rule(source + ":" + rule):
+            for col in t.cols:
+                if col.name in t.rule_of:
+                    value = raw[col.name]
+                    relevant = egress.Deny(tuple(term for term in derived_deny.terms
+                        if egress.internal_match(egress.Deny((term,)), value, verified=True)))
+                    out[col.name] = _value(col.kind, value, deny | relevant, cls)
     if t.rule_of and cls != egress.OWN and repo_scoped(str(raw.get(t.rule_of[0]) or "")):
         out[t.rule_of[1]] = None
     out["version"] = version
@@ -668,6 +680,8 @@ class ClickHouseSink:
         self.auto_schema = auto_schema and not self.client.cfg.cloud      # Cloud: the owner runs the DDL once
         self._schema_ready = False
         self.deny = egress.NONE         # the egress deny list, read at the start of every batches() call
+        self.explicit_deny = egress.NONE
+        self.derived_deny: egress.Deny | None = None
         # Mission 004C (F8): the owner accounts (egress.owner_accounts, read at the start of every batches() call
         # unless given) and, per table, the mapped rows by ownership class (`amem sync plan` shows them).
         self._owners = tuple(owners) if owners is not None else None
@@ -698,7 +712,9 @@ class ClickHouseSink:
     def batches(self, conn: psycopg.Connection, watermarks: Mapping[str, str], *, replay: bool) -> Iterator[Batch]:
         version = next_version()
         self.owners = self._owners if self._owners is not None else egress.owner_accounts()
-        self.deny = egress.env_terms() | egress.team_names(conn, owners=self.owners)
+        self.explicit_deny = egress.env_terms()
+        self.derived_deny = egress.team_names(conn, owners=self.owners)
+        self.deny = self.explicit_deny | self.derived_deny
         self.ownership, self.row_classes, self.dropped = {}, {}, {}
         since = None if replay or self.lookback_days <= 0 else self._now() - timedelta(days=self.lookback_days)
         if since is not None and self.since is not None:
@@ -755,7 +771,8 @@ class ClickHouseSink:
     def _batch(self, t: Table, rows: Sequence[Mapping[str, Any]], version: int, mark: Mark) -> Batch:
         mapped = []
         for r in rows:
-            m = map_row(t, r, version, self.deny)
+            m = map_row(t, r, version, self.deny if self.derived_deny is None else self.explicit_deny,
+                        derived_deny=self.derived_deny)
             if m is None:
                 self.dropped[t.name] = self.dropped.get(t.name, 0) + 1
                 continue
