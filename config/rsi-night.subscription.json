@@ -2,7 +2,7 @@
   "format": "rsi-night-config/1",
   "_note": "Subscription qualification profile. Inactive until dedicated login, client isolation and live qualification pass. No API fallback. Promotion freeze unchanged.",
   "budget": {
-    "_limits_note": "3 experiments per night (Vilmer, 2026-10-25); 5 A + 5 B pairs per provider (Vilmer, 2026-10-28). Per night: model_calls, max_sandbox_runs, wall_clock_s, max_usd, max_subscription_tokens. Per candidate: max_hypotheses. Per replay: max_ab_pairs (10 = 2 providers x 5). One shared-skill experiment at most: Opus 12 (1 hypothesis, 1 section writer, 10 agent runs), Sol 20 (10 agent runs, 10 judge calls), Jev 2, 180 sandbox runs (10 x 2 x (8 tool containers + 1 check), unused tool reservations are given back after each run); the night adds 5 Jev triage calls. Calls: Opus 36 of 40, Sol 60 of 64, Jev 11 of 12; sandbox 540 of 540. Wall clock: 600 + 3 x 8960 = 27480 s if every stage and case ran to its timeout, over the 18000 s hard maximum: the night stops cleanly at 17940 s (watchdog hard exit 06:41) and records later experiments as not run. Observed 10-27 at 3 pairs: 1350 s and 1.42M tokens for the night. `amem rsi night-job --plan` prints the room check.",
+    "_limits_note": "3 experiments per night (Vilmer, 2026-10-25); 5 A + 5 B pairs per provider (Vilmer, 2026-10-28). Per night: model_calls, max_sandbox_runs, wall_clock_s, max_usd, max_subscription_tokens. Per candidate: max_hypotheses. Per replay: max_ab_pairs (10 = 2 providers x 5). One shared-skill experiment at most: Opus 12 (1 hypothesis, 1 section writer, 10 agent runs), Sol 20 (10 agent runs, 10 judge calls), Jev 2, 180 sandbox runs (10 x 2 x (8 tool containers + 1 check), unused tool reservations are given back after each run); the night adds 10 Jev triage calls (10 ideas reviewed, Vilmer, 2026-10-29). Calls: Opus 36 of 40, Sol 60 of 64, Jev 16 of 40 (Jev is cheap, Vilmer, 2026-10-29); sandbox 540 of 540. Wall clock: 600 + 3 x 8960 = 27480 s if every stage and case ran to its timeout, over the 18000 s hard maximum: the night stops cleanly at 17940 s (watchdog hard exit 06:41) and records later experiments as not run. Observed 10-27 at 3 pairs: 1350 s and 1.42M tokens for the night. `amem rsi night-job --plan` prints the room check.",
     "max_hypotheses": 2,
     "max_experiments": 3,
     "max_ab_pairs": 10,
@@ -13,7 +13,7 @@
     "default_model_calls": 0,
     "free_model_calls": 200,
     "model_calls": {
-      "jev-1.14.0": 12,
+      "jev-1.14.0": 40,
       "claude-opus-5-5": 40,
       "gpt-6.1-sol": 64
     },
@@ -37,7 +37,7 @@
     "replay_jev": "live"
   },
   "candidates": {
-    "max_considered": 5,
+    "max_considered": 10,
     "max_attempts": 2,
     "window_days_max": 7,
     "skill_score_below": 0.5,
