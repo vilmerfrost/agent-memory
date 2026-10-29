@@ -10,7 +10,7 @@ from pathlib import Path
 
 from agent_memory import rsi_brief
 
-VERSION = 'morning-overview/1'
+VERSION = 'morning-overview/2'
 ZONE = ZoneInfo('Europe/Stockholm')
 MAX_CHARS = 9000
 SERVICES = json.loads(Path(__file__).with_name('morning_remedies.json').read_text())

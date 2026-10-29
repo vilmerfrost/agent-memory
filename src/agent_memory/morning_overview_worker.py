@@ -121,7 +121,7 @@ def outline(data):
               'Prioritize blocking unresolved failures inside their section. Do not invent facts or actions. '
               + json.dumps({'facts': data['facts'], 'issues': data['issues']}, default=str))
     with tempfile.TemporaryDirectory(prefix='morning-outline-') as directory:
-        base = Path(directory)
+        base = Path(directory).resolve()
         workspace, arm = base/'workspace', base/'arm'
         workspace.mkdir(); arm.mkdir()
         response = sub.run('claude', prompt, model=profile['model'], effort=profile['effort'],
@@ -177,6 +177,20 @@ def work(conn, job, spool, *, now, make_outline=outline, make_speech=speech, do_
         data = collect(conn, now)
         if data['night'] != str(job['night']):
             raise AudioError('night_no_longer_current')
+        # Completed receipts are written only after the DB confirms ready. Keep
+        # the prior recording and its original cutoff when nothing meaningful
+        # changed; polling timestamps are not a reason for another paid call.
+        for old_path in spool.glob('*/receipt.json'):
+            if old_path == receipt:
+                continue
+            cached = json.loads(old_path.read_text())
+            old_data = cached.get('data') or {}
+            old_snapshot = old_data.get('snapshot') or {}
+            if cached.get('stage') == 'ready' and old_snapshot.get('night') == data['night'] and old_snapshot.get('input_digest') == data['input_digest']:
+                update(conn, job, 'failed', {'error': 'no_new_results', 'as_of': old_data.get('as_of'), 'existing_overview_id': cached['job']['id']})
+                state.update(stage='stopped', error='no_new_results'); save_receipt(receipt,state)
+                print('Morning overview unchanged; previous audio retained without a model or speech call.',flush=True)
+                return
         method, usage = 'llm_outline', {}
         try:
             order, usage = make_outline(data)
@@ -188,7 +202,7 @@ def work(conn, job, spool, *, now, make_outline=outline, make_speech=speech, do_
             except ValueError:
                 update(conn, job, 'text_ready', {'snapshot': data, 'issues': [{**i, 'investigation_prompt': brief.investigation_prompt(i)} for i in data['issues']], 'coverage': data['coverage'], 'as_of': data['as_of']})
                 raise AudioError('script_too_long') from None
-        payload = {'snapshot': data, 'transcript': text, 'issues': [{**i, 'investigation_prompt': brief.investigation_prompt(i)} for i in data['issues']], 'script_method': method, 'llm_usage': usage, 'as_of': data['as_of'], 'coverage': data['coverage']}
+        payload = {'snapshot': data, 'transcript': text, 'issues': [{**i, 'investigation_prompt': brief.investigation_prompt(i)} for i in data['issues']], 'script_method': method, 'llm_usage': usage, 'as_of': data['window_end'], 'collected_at': data['as_of'], 'coverage': data['coverage']}
         update(conn, job, 'text_ready', payload)
         if not os.environ.get('ELEVENLABS_API_KEY'):
             raise AudioError('missing_speech_key')
