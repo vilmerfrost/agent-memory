@@ -117,6 +117,7 @@ import re
 import threading
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections import Counter
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -1268,18 +1269,24 @@ def export_experiment(conn: psycopg.Connection, experiment_id: str, *, budget_s:
     status = "partial" if (pending or sink.refused) and rep.status == "ok" else rep.status
     issue_kind = ("upload_failure" if rep.failed or rep.status not in ("ok", "off") else
                   "upload_uncertain" if pending else "local_refusal" if sink.refused else None)
+    local_refusals = [{"run": _redact.redact(run)[:200],
+        "reason": reason if reason in {"case looks sensitive", "run id looks sensitive", "experiment id looks sensitive",
+                                       "scoped log names another experiment", "bad run id"}
+        else "invalid or unreadable run metadata"} for run, reason in sink.refused]
+    refusal_counts = dict(sorted(Counter(r['reason'] for r in local_refusals).items()))
+    detail = _redact.redact(rep.detail)[:300]
+    if issue_kind == 'local_refusal':
+        detail = (f"{len(local_refusals)} records withheld locally before upload: " +
+                  "; ".join(f"{reason} ({count})" for reason, count in refusal_counts.items()))[:300]
     return {"status": status, "experiment_id": experiment_id, "rows": rep.rows, "batches": rep.batches,
-            "issue_kind": issue_kind, "local_refusals": [{"run": _redact.redact(run)[:200],
-                "reason": reason if reason in {"case looks sensitive", "run id looks sensitive", "experiment id looks sensitive",
-                                               "scoped log names another experiment", "bad run id"}
-                else "invalid or unreadable run metadata"} for run, reason in sink.refused],
+            "issue_kind": issue_kind, "local_refusals": local_refusals, "local_refusal_counts": refusal_counts,
             "retry_selected": len(retry_run_ids) if retry_run_ids is not None else None,
             "already_confirmed_skipped": sink.confirmed_skipped,
             "failed": rep.failed, "refused": len(sink.refused), "uncertain": int(pending),
             "skipped_non_agent": len(sink.skipped), "delivered_rows": rep.rows,
             "confirmed_trace_uploads": int(phases.get("confirmed", 0)),
             "visible_rows": None, "readback_verified": False,
-            "seconds": rep.seconds, "detail": _redact.redact(rep.detail)[:300], "scope": sink.table}
+            "seconds": rep.seconds, "detail": detail, "scope": sink.table}
 
 
 # ---------------------------------------------------------------- the retriever

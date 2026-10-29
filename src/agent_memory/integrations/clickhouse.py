@@ -213,7 +213,14 @@ class Client:
     def ping(self) -> None:
         self._check()
         wait = WAKE_TIMEOUT_S if self.cfg.cloud else min(self.timeout, 3.0)     # the ping is what wakes Cloud
-        r = http.request("GET", f"{self.cfg.url}/ping", timeout=wait, retries=0, sleep=self.sleep)
+        deadline = getattr(self._read_state, 'deadline', None)
+        left = deadline - time.monotonic() if deadline is not None else None
+        if left is not None:
+            if left <= 0:
+                raise TimeoutError("ClickHouse read budget exhausted before health check")
+            wait = min(wait, left)
+        r = http.request("GET", f"{self.cfg.url}/ping", timeout=wait, retries=0, sleep=self.sleep,
+                         total_timeout=left)
         if not r.text().startswith("Ok"):
             raise http.HttpError(r.status, "unexpected /ping answer")
 

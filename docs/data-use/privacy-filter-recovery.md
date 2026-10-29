@@ -69,3 +69,25 @@ retrievers. For the recorded final-report rule these are `rule_gap` with
 with the exact `_recall_query(rule)` and `limit`. Preserve the original query
 parameters and capture the new result or error. These clients are read-only.
 Do not use the broad evidence probe or a whole night to retry these few reads.
+
+## ClickHouse query time accounting
+
+The 29 October replay recorded a recovered rule-gap read taking18.9 seconds
+of a shared20-second provider allowance. The weekly-rate read then expired
+inside the same allowance. This does not establish a20-second server execution:
+server query logs are not readable by the least-privilege writer account.
+
+Within each ClickHouse phase, reserve an equal share of the remaining allowance
+for each pending query. A fast query releases its unused share to later queries.
+A slow query still fails and remains a coverage gap; it cannot spend the next
+query's share on recovery attempts. The provider's total allowance and maximum
+three attempts are unchanged. Langfuse pagination and spacing budgets are unchanged.
+
+ClickHouse health pings must honour the active read deadline, including response
+body reads. Outside a bounded evidence read, the existing Cloud wake allowance
+still applies. Do not infer server overload, cold start or network failure from
+a shared-provider timeout alone.
+
+Scoped Langfuse exports now include safe local-refusal reason counts and a
+nonempty explanation in detail. Reasons use the existing fixed allowlist; raw
+exception text and private names are not copied into that summary.

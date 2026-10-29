@@ -966,6 +966,8 @@ def test_exact_retry_recovers_refused_only_and_never_resends_confirmed(app, tmp_
             old.setattr(egress,'catalog_run',lambda *a:False)
             first=L.export_experiment(conn,exp,root=tmp_path,client=client_for(svc),budget_s=30,environ={})
         assert (first['status'],first['rows'],first['refused'],first['issue_kind'])==('partial',1,2,'local_refusal')
+        assert first['local_refusal_counts'] == {'case looks sensitive': 2}
+        assert first['detail'] == '2 records withheld locally before upload: case looks sensitive (2)'
         original=sync.load(conn,'langfuse')['watermarks']['sandbox_runs:'+exp]
         conn.rollback()
         already=L.load_run_log(paths[0]).trace_id

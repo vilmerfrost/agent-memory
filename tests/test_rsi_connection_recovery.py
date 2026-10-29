@@ -304,3 +304,55 @@ def test_langfuse_keeps_its_full_paginated_read_allowance(monkeypatch):
     result, check, _ = execute(monkeypatch, read, retr='lf', budget=20)
     assert result.status == 'ok' and check['attempts'] == 2
     assert read.budgets == pytest.approx([20, 19.65])
+
+
+def test_slow_first_clickhouse_query_cannot_starve_the_next(monkeypatch):
+    class FirstSlow(Read):
+        @contextmanager
+        def read_budget(self, seconds):
+            self.current_budget = seconds
+            yield
+
+        def named_queries(self):
+            return {n: E.NamedQuery(n, {}, 'fixed read') for n in ('gap', 'weekly')}
+
+        def query(self, name, params):
+            self.calls += 1
+            if name == 'gap':
+                self.clock.at += self.current_budget
+                raise TimeoutError('slow first query')
+            self.clock.at += 2
+            return []
+
+    clock = Clock()
+    read = FirstSlow(clock=clock)
+    monkeypatch.setattr(P.time, 'sleep', clock.sleep)
+    runner = P._Runner({'ch': read}, 20, clock)
+    steps = [P._Step('ch', n, {}, 'clickhouse') for n in ('gap', 'weekly')]
+    results = runner.phase(steps)
+    assert results[0][1].status == 'error'  # the real slow-query failure stays visible
+    assert results[1][1].status == 'ok'
+    assert runner.log[1]['attempts'] == 1
+    assert clock.at <= 20 and runner.used['ch'] <= 20
+
+
+@pytest.mark.parametrize('initial_health', ['ok', 'unavailable'])
+def test_local_export_refusal_preserves_connection_health(initial_health):
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+    from agent_memory import rsi_night as N
+    result = {'experiment_id': 'exp-20261028-bebfd909', 'status': 'partial',
+              'issue_kind': 'local_refusal', 'refused': 8, 'failed': 0, 'uncertain': 0,
+              'confirmed_trace_uploads': 12, 'readback_verified': False}
+    night = N.Night.__new__(N.Night)
+    night.ad = SimpleNamespace(exporter=lambda *a, **k: result)
+    night.budget = SimpleNamespace(remaining_s=lambda: 90)
+    night.conn = SimpleNamespace(execute=lambda *a: None)
+    night._interruptible = nullcontext
+    night.health = {'langfuse': initial_health}
+    night.health_reasons = {}; night.notes = []; night.degraded = False
+    entry = {}
+    night._export_current_replay(result['experiment_id'], entry)
+    assert night.health['langfuse'] == initial_health
+    assert night.degraded and entry['langfuse_export']['readback_verified'] is False
+    assert '8 records withheld locally' in night.notes[0]
