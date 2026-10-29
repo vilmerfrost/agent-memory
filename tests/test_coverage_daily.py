@@ -335,6 +335,18 @@ def test_sync_records_what_was_delivered_per_table(one_sink: ScoringDb, monkeypa
     assert {x["run_key"] for x in u.values()} == {KEY}
 
 
+def test_sync_coverage_keeps_recovery_and_reconciliation_attempts():
+    report = sync.SyncReport('clickhouse', tables={
+        'sessions': {'seen': 2, 'delivered': 2},
+        'sessions:lookback': {'seen': 3, 'delivered': 3},
+        'sessions:reconcile': {'seen': 1, 'delivered': 1}})
+    records = COV.sync_records(run_key=KEY, now=NOW, sink='clickhouse', report=report)
+    snapshots = [r for r in records if isinstance(r, CV.Snapshot)]
+    assert len(snapshots) == 1 and snapshots[0].collected == 6
+    assert 'including recovery and reconciliation' in snapshots[0].denominator
+    assert snapshots[0].unmeasured_fields == ('readback',)
+
+
 def test_an_unavailable_sink_fails_every_table_it_covers(one_sink: ScoringDb, monkeypatch: pytest.MonkeyPatch,
                                                          tmp_path: Any) -> None:
     monkeypatch.setattr(cli_integrations, "sink_for", lambda name, *a, **k: FakeSink({}, healthy=False))
