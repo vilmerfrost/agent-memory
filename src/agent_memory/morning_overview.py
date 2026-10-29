@@ -10,7 +10,7 @@ from pathlib import Path
 
 from agent_memory import rsi_brief
 
-VERSION = 'morning-overview/3'
+VERSION = 'morning-overview/4'
 ZONE = ZoneInfo('Europe/Stockholm')
 MAX_CHARS = 9000
 SERVICES = json.loads(Path(__file__).with_name('morning_remedies.json').read_text())
@@ -51,7 +51,8 @@ def remedy(routine, reason, recovered=False):
     if recovered:
         return ('No repair is indicated by the latest passing result.', '', 'Check the next scheduled result remains passing.', 'monitor')
     lower = reason.lower()
-    service_id = next((key for key in SERVICES if key == routine or (key not in ('auth','mac','database') and key in lower)), None)
+    # A provider name inside a test case is not evidence of a connection fault.
+    service_id = routine if routine in SERVICES else None
     if 'docker' in lower:
         return ('Check whether Docker is running on the Mac.', 'If it is running, inspect the worker’s Docker connection.', 'Check docker info and a fresh Docker heartbeat in Night Desk; this does not verify the whole night.', 'investigate')
     if re.search(r'quota|rate.?limit|usage.?limit|allowance', lower):
