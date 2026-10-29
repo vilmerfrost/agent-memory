@@ -154,11 +154,23 @@ Since 2026-10-23 (verify run of night 2026-10-23, partial, $0.14):
 - **The writer finds a section for every candidate** (2026-10-26). A deviation's rule key names its section. Skill-score (`skill:<name>`), routine-failure (`routine:<name>`) and finding candidates name none: on 2026-10-25 all three skill experiments fell back ("no rule section matches the candidate") before any writer call. Now the section comes from the hypothesis, without a model call (`section_for_hypothesis`): its words in a section's own heading (x3), its parent heading (x1), a "step N" / "Phase N" reference to a heading numbered N (+4), then its words in the body; a section too large for the writer's reply is never picked. Nothing qualifies: the fallback reason is `no section matches the candidate or the hypothesis: no writer call`. `implementation.section_from` says `rule_key` or `hypothesis`.
 - **S5 sees the whole target file** (2026-10-26). The hypothesizer prompt used to cut every target at 12,000 characters, mid-file and without saying so: on 2026-10-25 pepe's SKILL.md (12,370) was cut right after the opening fence of Return mode, and the hypothesis proposed fixing an "opened, empty output block" that is complete; anatomy (31,097) was shown at 39%. Now `max_prompt_chars` is 96,000 in the subscription profiles and the target gets up to `max_target_chars` (default 80,000, `TARGET_TEXT_MAX`). A file that still does not fit is cut at the last heading that fits and ends with `[truncated: the file continues for N more characters; sections not shown: ...]`; the prompt tells the model not to judge what it was not shown, and the report gets a note (`hypothesizer saw <target> cut at a section boundary: ...`).
 - **A night the writer never ran is loud.** In writer mode the report carries `writer` (`experiments`, `wrote`, `fell_back`, `all_fell_back`, `reasons` with counts). When every experiment fell back, the night is `partial`, its first note is `writer never ran: N/N experiments fell back to the stub (<top reason>)`, the brief shows it as a Warning line (and the phone push says so), and the routines.log FAIL line gets the same item.
-- **Targets improve refuses leave the pool.** Allowlisted targets that improve refuses (a file in
-  `improve/pins.json`, or a path outside `criteria.json` `allowed_targets` with the `fence.txt` nuance, read through
-  `edits_targets.pinned_file` / `is_allowed` like the edits step) are removed from the night's allowlist, so their
-  candidates are never triaged or hypothesized. The report notes
-  `candidates: N on a target improve refuses (pinned or out of scope: ...), not considered`.
+- **Targets improve refuses are suggest-only** (2026-10-29; until then they left the pool). Allowlisted targets that
+  improve refuses (a file in `improve/pins.json`, or a path outside `criteria.json` `allowed_targets` with the
+  `fence.txt` nuance, read through `edits_targets.lock_action` like the edits step) stay in the allowlist. Their
+  candidates are triaged and ranked with the same `rank()`, weights, slots and limits as every other candidate, and
+  still need a replay case for their section (`NO_TEST_CASE`). The experiment is staged locally for the sandbox only
+  (`SuggestStager`: rsi-artifact/1 with `proposal_kind` `suggest_only`, never `improve stage`). An IMPROVES verdict
+  becomes a suggestion, never a proposal: report `experiments[].status` `suggested` with `suggestion`
+  (rsi-suggestion/1), `rsi_experiments.meta.suggestion`, candidate `tested`. The brief shows it under
+  "Suggested edits for locked files" without an Apply command. `candidates[]`, `experiments[]` and `patterns[]` carry
+  `suggest_only` (the lock code, or null). The report notes
+  `candidates: N on a target improve refuses (pinned or out of scope: ...), considered suggest-only: ...`.
+- **Delegation-policy ideas target their source** (2026-10-29). A rule under `# Desktop delegation policy v1.1` in
+  `~/.claude/CLAUDE.md` or `~/.codex/AGENTS.md` (rule key `claude-md:global:desktop-delegation-policy-v1-1/<h2>` or
+  `agents-md:global:...`) targets `~/agent-config/parent/DELEGATION.md`, which both files copy (config-check requires
+  the copies to match). Open candidates are respelled the same way as symlink aliases. In DELEGATION.md the section
+  id is the bare `<h2>` slug (for example `approval-without-handing-work-back`; the H1 intro is `intro`).
+  DELEGATION.md is in `rsi_targets.discover` and outside `allowed_targets`, so it is suggest-only.
 - **Messenger routines are never candidates** (2026-10-26). `routine-audit` and `config-check` (`MESSENGER_ROUTINES`, as Night Desk decision 24) only report other routines' failures: their failures make no `routine:<name>` sighting (coverage `routine_failures` skipped `messenger: N`, plus a `candidates: N failure(s) of messenger routines not sighted` note), and an earlier night's open `routine:routine-audit` / `routine:config-check` stays in `rsi_candidates` unchanged but is not picked (note `candidates: <key> (<status>) not considered: ...`).
 - **A failed experiment or hypothesizer still advances the checkpoint.** The sightings are stored before S3 and the
   candidate stays `deferred` (or `retired` after repeated failures) in `rsi_candidates`, so the pool retries it;

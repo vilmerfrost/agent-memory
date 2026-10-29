@@ -80,25 +80,26 @@ def test_blocked_ideas_are_split_by_reason_with_every_file_listed(env: SimpleNam
                              ("dev:t:repo", "~/Projects/demo/AGENTS.md")])
     rep = run(env)
     assert rep["status"] == "ok", rep["notes"]
-    assert {c["key"] for c in rep["candidates"]} == {KEY_A, KEY_B}             # in scope: never blocked
+    # in scope: never blocked. Since 2026-10-29 an allowlisted file improve refuses (worker.md, the pinned skill) stays
+    # in scope as suggest-only, so its ideas are considered (tests/test_rsi_night_suggest.py)
+    assert {c["key"] for c in rep["candidates"]} == {KEY_A, KEY_B, "dev:t:worker-1", "dev:t:worker-2", "dev:t:skill-0"}
+    assert {c["key"]: c["suggest_only"] for c in rep["candidates"]}["dev:t:worker-1"] == "hand_edited"
     b = rep["blocked"]
-    assert b["groups"] == {"no_target": 2, "hand_edited": 3, "grades_loop": 1, "pinned": 1, "outside_allowed": 1}
-    assert b["total"] == 8
-    assert b["targets"] == [
-        {"target": "~/agent-config/agents/worker.md", "reason": "hand_edited", "ideas": 2},
-        {"target": f"~/.agents/skills/{skills[0]}/SKILL.md", "reason": "hand_edited", "ideas": 1},
+    assert b["groups"] == {"no_target": 2, "hand_edited": 0, "grades_loop": 1, "pinned": 1, "outside_allowed": 1}
+    assert b["total"] == 5
+    assert b["targets"] == [      # files the night cannot target at all (not discovered here: no such file)
         {"target": "~/.claude/scheduled-tasks/evals-parent/SKILL.md", "reason": "grades_loop", "ideas": 1},
         {"target": "~/.codex/AGENTS.md", "reason": "pinned", "ideas": 1},
         {"target": "~/Projects/demo/AGENTS.md", "reason": "outside_allowed", "ideas": 1}]
     # every allowlisted file improve refuses tonight, whether or not an idea names it
     assert b["refused_files"] == [{"target": t, "reason": "hand_edited"} for t in sorted(
         [f"~/.agents/skills/{s}/SKILL.md" for s in skills] + ["~/agent-config/agents/worker.md"])]
-    # the two notes count the same database read, and the refused list is no longer cut at 200 characters
+    # the without-note counts the blocked ideas; the refused note counts the suggest-only ones and is not cut at 200
     without = next(n for n in rep["notes"] if "without an in-scope target" in n)
     refused = next(n for n in rep["notes"] if "on a target improve refuses" in n)
-    assert int(without.split()[1]) + int(refused.split()[1]) == b["total"]
+    assert int(without.split()[1]) == b["total"] and int(refused.split()[1]) == 3
     assert len(refused) > 300 and all(f["target"] in refused for f in b["refused_files"]) and refused.endswith(
-        "), not considered")
+        "never a proposal")
     # most-broken rules carry their file and, when the loop cannot edit it, why
     pats = {p["key"]: p for p in rep["patterns"]}
     assert pats[KEY_A]["target"] == "~/.claude/CLAUDE.md" and pats[KEY_A]["blocked"] is None
@@ -110,9 +111,13 @@ def test_blocked_ideas_are_split_by_reason_with_every_file_listed(env: SimpleNam
 def test_pinned_rule_file_marks_its_pattern_blocked_and_no_pins_file_means_outside(env: SimpleNamespace) -> None:
     pin(env, {"~/.claude/CLAUDE.md": "auto-pin: edited by hand after imp-20261015-3"})
     rep = run(env)
-    assert rep["candidates"] == [] and rep["experiments"] == []
-    assert {p["key"]: p["blocked"] for p in rep["patterns"]} == {KEY_A: "hand_edited", KEY_B: "hand_edited"}
-    assert rep["blocked"]["groups"]["hand_edited"] == 2 and rep["blocked"]["total"] == 2
+    # since 2026-10-29 a pinned allowlisted file is suggest-only, not blocked: its ideas are considered
+    assert {c["key"] for c in rep["candidates"]} == {KEY_A, KEY_B}
+    assert [e["status"] for e in rep["experiments"] if e["experiment_id"]] == ["suggested"]
+    assert {p["key"]: p["blocked"] for p in rep["patterns"]} == {KEY_A: None, KEY_B: None}
+    assert {p["key"]: p["suggest_only"] for p in rep["patterns"]} == {KEY_A: "hand_edited", KEY_B: "hand_edited"}
+    assert rep["blocked"]["groups"]["hand_edited"] == 0 and rep["blocked"]["total"] == 0
+    assert rep["blocked"]["refused_files"] == [{"target": "~/.claude/CLAUDE.md", "reason": "hand_edited"}]
     # a chosen input outside the list: pins.json unreadable -> no pins, so the same file is plainly in scope
     (env.home / "agent-config" / "improve" / "pins.json").write_text("{not json")
     clean_db(env.url)

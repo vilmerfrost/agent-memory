@@ -907,15 +907,19 @@ def test_docker_unavailable_defers_paid_work_with_the_real_sandbox_check(env: Si
 # --------------------------------------------------------------------------- verify-run fixes (2026-10-23)
 
 
-def test_candidate_on_a_pinned_target_is_dropped_before_triage(env: SimpleNamespace) -> None:
-    # Night 2026-10-23 picked a candidate on agents/worker.md, which improve/pins.json pins: Jev triage and the
-    # Sonnet hypothesis were paid for, then "improve stage refused: file pinned". Pinned targets leave the pool.
+def test_candidate_on_a_pinned_target_is_suggest_only(env: SimpleNamespace) -> None:
+    # Night 2026-10-23 picked a candidate on agents/worker.md, which improve/pins.json pins, and ended "improve stage
+    # refused: file pinned". Since 2026-10-29 a pinned target stays in the pool (same rank) but is suggest-only: it is
+    # never sent to improve stage, and a win is a suggestion, not a proposal (tests/test_rsi_night_suggest.py).
     seed_ab(env)                                            # both rules target ~/.claude/CLAUDE.md
     (env.home / "agent-config" / "improve" / "pins.json").write_text(json.dumps(
         {"files": {"~/.claude/CLAUDE.md": {"reason": "auto-pin: edited by hand"}}, "rules": {}}))
-    rep = run(env)
-    assert rep["candidates"] == [] and rep["experiments"] == []
-    assert any("on a target improve refuses" in n and "CLAUDE.md" in n for n in rep["notes"]), rep["notes"]
+    stager = FakeStager()
+    rep = run(env, stager=stager)
+    assert {c["key"]: c["suggest_only"] for c in rep["candidates"]} == {KEY_A: "hand_edited", KEY_B: "hand_edited"}
+    assert [e["status"] for e in rep["experiments"] if e["experiment_id"]] == ["suggested"] and stager.calls == []
+    assert any("on a target improve refuses" in n and "CLAUDE.md" in n and "suggest-only" in n
+               for n in rep["notes"]), rep["notes"]
     assert not any("without an in-scope target" in n for n in rep["notes"])
     assert rep["checkpoint"]["advanced"]
 
@@ -943,14 +947,16 @@ def test_provider_error_records_its_reason() -> None:
                                     "langfuse": ["lf.traces: unavailable (not configured)"]}
 
 
-def test_target_outside_improves_allowed_targets_is_dropped(env: SimpleNamespace) -> None:
+def test_target_outside_improves_allowed_targets_is_suggest_only(env: SimpleNamespace) -> None:
     # The verify rerun of night 2026-10-23 picked parent/skills/dispatch/SKILL.md: allowlisted for the night, but not
-    # in improve's criteria.json allowed_targets, so improve refused it after the paid triage and hypothesis.
+    # in improve's criteria.json allowed_targets, so improve refused it. Since 2026-10-29 such a target is suggest-only.
     seed_ab(env)
     crit = env.home / "agent-config" / "improve" / "criteria.json"
     crit.write_text(json.dumps({"allowed_targets": [t for t in LIVE_ALLOWED if t != "~/.claude/CLAUDE.md"]}))
     rep = run(env)
-    assert rep["candidates"] == [] and rep["experiments"] == []
+    assert {c["suggest_only"] for c in rep["candidates"]} == {"outside_allowed"}
+    assert [e["status"] for e in rep["experiments"] if e["experiment_id"]] == ["suggested"]
+    assert rows(env.url, "select count(*) from rsi_proposals") == [(0,)]
     assert any("on a target improve refuses" in n and "CLAUDE.md" in n for n in rep["notes"]), rep["notes"]
 
 

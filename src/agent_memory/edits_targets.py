@@ -261,6 +261,53 @@ class Target:
     reason: str = ""
 
 
+def lock_action(path: Path) -> Target:
+    """EDIT when improve would accept a change to `path`; SUGGEST when it would refuse the file (a pins.json file pin,
+    or outside allowed_targets with the fence nuance), with the reason. The night tests ideas on a SUGGEST file like
+    any other, but a winning change becomes a suggested hand edit, never a staged proposal (docs/rsi/hand-edits.md).
+    Section and rule pins are not file locks: they block a rule on any file alike."""
+    pin = pinned_file(path)
+    if pin is not None:
+        return Target(SUGGEST, path, f"file pinned ({pin})")
+    if not is_allowed(path):
+        return Target(SUGGEST, path, "outside improve's allowed targets")
+    return Target(EDIT, path)
+
+
+# Generated copies of ~/agent-config/parent/DELEGATION.md (pins.json: "generated copy of parent/DELEGATION.md;
+# config-check requires it to match the source"). A rule under this heading in either copy is a rule of the source.
+DELEGATION_SECTION = "desktop-delegation-policy-v1-1"
+DELEGATION_COPIES = ("claude-md:global", "agents-md:global")
+
+
+def delegation_source() -> Path:
+    """The source file of the delegation policy: <agent-config>/parent/DELEGATION.md."""
+    return agent_config_dir() / "parent" / "DELEGATION.md"
+
+
+def delegation_rule_id(rule_key: Any) -> str | None:
+    """The section id in DELEGATION.md for a rule key (`<source>:<rule id>`, optionally `dev:`-prefixed or with a
+    `<namespace>--` rule id, as rsi_candidates stores it) of the delegation policy in a generated copy
+    (DELEGATION_COPIES), else None. The copies nest the policy under its H1 (`desktop-delegation-policy-v1-1/<h2>`);
+    the source has that H1 as its only top heading, so its ids are the bare `<h2>` slugs and its intro is `intro`."""
+    if not isinstance(rule_key, str):
+        return None
+    src, sep, rule = rule_key.removeprefix("dev:").rpartition(":")
+    if not sep or src not in DELEGATION_COPIES:
+        return None
+    rule = rule.split("--", 1)[-1]
+    if rule == DELEGATION_SECTION:
+        return "intro"
+    if rule.startswith(DELEGATION_SECTION + "/") and rule[len(DELEGATION_SECTION) + 1:]:
+        return rule[len(DELEGATION_SECTION) + 1:]
+    return None
+
+
+def is_delegation_rule(rule_key: Any) -> bool:
+    """True for a rule key of the delegation policy section in a generated copy (delegation_rule_id)."""
+    return delegation_rule_id(rule_key) is not None
+
+
 def _skill(name: str) -> Target:
     agents_skills = (agents_home() / "skills").resolve()
     for cand in (claude_home() / "skills" / name / "SKILL.md", agents_home() / "skills" / name / "SKILL.md"):
