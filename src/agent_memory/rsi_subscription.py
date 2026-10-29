@@ -13,6 +13,7 @@ https://learn.chatgpt.com/docs/app-server
 from __future__ import annotations
 
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 import fcntl
 import hashlib
@@ -38,9 +39,10 @@ BRIDGE_PATH = Path(__file__).resolve().parents[2] / "sandbox" / "subscription_to
 class SubscriptionError(RuntimeError):
     """Fixed, secret-free error code; never include raw client errors."""
 
-    def __init__(self, code: str, *, native_session_id: str | None = None):
+    def __init__(self, code: str, *, native_session_id: str | None = None, inference_started: bool | None = None):
         super().__init__(code)
         self.native_session_id = native_session_id
+        self.inference_started = inference_started
 
 
 @dataclass(frozen=True)
@@ -112,7 +114,7 @@ def _clean_env(auth: SubscriptionAuth, provider: str) -> dict[str, str]:
             try:
                 token = auth.claude_token()
             except Exception:
-                raise SubscriptionError("subscription_auth_unavailable") from None
+                raise SubscriptionError("subscription_auth_unavailable", inference_started=False) from None
             if not isinstance(token, str) or not token or "\n" in token:
                 raise SubscriptionError("subscription_auth_unavailable")
             env["CLAUDE_CODE_OAUTH_TOKEN"] = token
@@ -229,15 +231,15 @@ def _parse_claude(raw: str, *, model: str, tools_allowed: bool) -> tuple[str, di
                               "conflicting_client_ids" if len(native_ids) > 1 else "client_id_unavailable"}
 
 
-def _auth_status(auth: SubscriptionAuth, env: dict, cwd: Path, process) -> dict:
+def _auth_status(auth: SubscriptionAuth, env: dict, cwd: Path, process, timeout_s=20) -> dict:
     code, raw, _ = process([str(auth.client), "auth", "status"], env=env, cwd=str(cwd),
-                           timeout_s=20, max_output=65536)
+                           timeout_s=timeout_s, max_output=65536)
     try:
         status = json.loads(raw)
     except (ValueError, TypeError):
-        raise SubscriptionError("subscription_auth_unavailable") from None
+        raise SubscriptionError("subscription_auth_unavailable", inference_started=False) from None
     if code or not status.get("loggedIn") or status.get("authMethod") not in {"claude.ai", "oauth_token"}:
-        raise SubscriptionError("subscription_auth_required")
+        raise SubscriptionError("subscription_auth_required", inference_started=False)
     return {"auth_method": status["authMethod"], "subscription_type": status.get("subscriptionType")}
 
 
@@ -258,7 +260,10 @@ def _cleanup_tools(auth: SubscriptionAuth, control: Path, bridge) -> None:
             raise SubscriptionError("container_cleanup_failed") from None
 
 
-def run(provider: str, prompt: str, *, model: str, effort: str, workspace: Path,
+_inference_started = ContextVar("subscription_inference_started", default=False)
+
+
+def _run_impl(provider: str, prompt: str, *, model: str, effort: str, workspace: Path,
         arm_home: Path, timeout_s: int, auth: SubscriptionAuth, tools_allowed: bool = True,
         max_tool_calls: int = 8, _process=None, _rpc_factory=None) -> SubscriptionResult:
     """Run an official client; errors are fixed codes safe to persist as evidence.
@@ -271,7 +276,7 @@ def run(provider: str, prompt: str, *, model: str, effort: str, workspace: Path,
     if provider not in MODELS or model != MODELS[provider] or effort != EFFORT:
         raise SubscriptionError("subscription_model_effort_not_approved")
     if provider == "codex" and not CODEX_NATIVE_BOUNDARY_VERIFIED:
-        raise SubscriptionError("codex_native_tool_isolation_unverified")
+        raise SubscriptionError("codex_native_tool_isolation_unverified", inference_started=False)
     if isinstance(max_tool_calls, bool) or not isinstance(max_tool_calls, int) or not 1 <= max_tool_calls <= 64:
         raise SubscriptionError("invalid_tool_call_limit")
     if not isinstance(prompt, str) or not prompt.strip() or len(prompt.encode()) > MAX_PROMPT:
@@ -335,6 +340,7 @@ def run(provider: str, prompt: str, *, model: str, effort: str, workspace: Path,
                 if remaining <= 0:
                     raise SubscriptionError("client_timeout")
                 if provider == "claude":
+                    _inference_started.set(True)
                     code, stdout, _ = process(claude_command(auth, model=model, effort=effort,
                                              mcp_config=mcp_config, tools_allowed=tools_allowed),
                                              env=env, cwd=str(control), timeout_s=remaining,
@@ -345,14 +351,15 @@ def run(provider: str, prompt: str, *, model: str, effort: str, workspace: Path,
                 else:
                     code, version, _ = process([str(auth.client), "--version"], env=env, cwd=str(control),
                                                timeout_s=min(10, remaining), max_output=4096)
-                    if code or version.strip() != CODEX_VERSION:
-                        raise SubscriptionError("codex_client_version_unverified")
+                    if code:
+                        raise SubscriptionError("codex_client_unavailable", inference_started=False)
                     rpc = (_rpc_factory or _Rpc)(codex_command(auth), env=env, cwd=control,
                                                  timeout_s=max(0.001, timeout_s - (time.monotonic() - started)))
                     try:
                         value, usage, evidence = _codex_session(rpc, model=model, effort=effort,
                                                                prompt=context + prompt, cwd=control,
                                                                bridge_tools=bridge_tools)
+                        evidence["client_version"] = version.strip()[:120]
                     finally:
                         rpc.close()
                 calls_path = control / "tool-evidence.jsonl"
@@ -375,7 +382,8 @@ def run(provider: str, prompt: str, *, model: str, effort: str, workspace: Path,
                 if _process is None:
                     _cleanup_tools(auth, control, bridge)
 
-# Native-tool exclusion is source-pinned, not inferred from approvalPolicy=never.
+# Runtime configuration and no-host permission checks enforce the contract.
+# This source reference documents its origin; versions are never an admission rule.
 # openai/codex rust-v0.163.0 core/src/tools/spec_plan.rs gates shell, apply_patch,
 # view_image and request_permissions on stable_environment_tools OR an environment.
 CODEX_VERSION = "codex-cli 0.163.0"
@@ -388,6 +396,7 @@ CODEX_OTEL = {"environment": "rsi-subscription", "log_user_prompt": False,
 # No environments/executor roots => no native shell/file/permission handlers.
 # Skill tools require cloud skills or executor roots; host discovery is confined
 # to the dedicated trusted home/cwd, never the experimental arm's files.
+# Emergency operator kill switch, not evidence of runtime compatibility.
 CODEX_NATIVE_BOUNDARY_VERIFIED = True
 CODEX_FALSE_FEATURES = (
     "stable_environment_tools", "shell_tool", "shell_snapshot",
@@ -577,7 +586,7 @@ def _check_codex_config(config):
         raise SubscriptionError("codex_telemetry_configuration_unverified")
 
 
-def _codex_session(rpc, *, model, effort, prompt, cwd, bridge_tools):
+def _codex_prepare(rpc, *, model, effort, cwd, bridge_tools):
     rpc.request("initialize", {"clientInfo": {"name": "rsi_subscription", "version": "1"},
                                "capabilities": {"experimentalApi": True}})
     rpc.send({"method": "initialized", "params": {}})
@@ -617,9 +626,25 @@ def _codex_session(rpc, *, model, effort, prompt, cwd, bridge_tools):
     if (started.get("model") != model or started.get("reasoningEffort") != effort
             or started.get("modelProvider") != "openai" or started.get("instructionSources")):
         raise SubscriptionError("model_effort_or_instruction_mismatch")
+    profile = started.get("activePermissionProfile") or {}
+    sandbox = started.get("sandbox") or {}
+    if (sandbox.get("type") != "readOnly" or sandbox.get("networkAccess", False) is not False
+            or profile.get("id") != CODEX_PERMISSION_PROFILE or profile.get("extends")
+            or started.get("approvalPolicy") != "never" or started.get("approvalsReviewer") != "user"):
+        raise SubscriptionError("codex_permission_contract_mismatch")
     thread_id = (started.get("thread") or {}).get("id")
     if not isinstance(thread_id, str) or not thread_id:
         raise SubscriptionError("client_protocol_invalid")
+    return thread_id, account
+
+
+def _codex_session(rpc, *, model, effort, prompt, cwd, bridge_tools):
+    try:
+        thread_id, account = _codex_prepare(rpc, model=model, effort=effort, cwd=cwd, bridge_tools=bridge_tools)
+    except SubscriptionError as exc:
+        exc.inference_started = False
+        raise
+    _inference_started.set(True)
     turn = rpc.request("turn/start", {"threadId": thread_id, "model": model, "effort": effort,
         "environments": [], "approvalPolicy": "never", "approvalsReviewer": "user",
         "permissions": CODEX_PERMISSION_PROFILE,
@@ -661,10 +686,10 @@ def _codex_session(rpc, *, model, effort, prompt, cwd, bridge_tools):
             # Codex inputTokens already includes cache reads; normalize to the
             # Claude-shaped usage contract consumed by usage_fields().
             usage["input_tokens"] = max(0, usage.get("input_tokens", 0) - usage.get("cache_read_input_tokens", 0))
-        elif method == "item/completed":
+        elif method in ("item/started", "item/completed"):
             item = params.get("item") or {}
             kind = item.get("type")
-            if kind == "agentMessage":
+            if kind == "agentMessage" and method == "item/completed":
                 text_parts.append(item.get("text") or "")
             elif kind in {"commandExecution", "fileChange", "mcpToolCall", "webSearch", "imageView", "collabAgentToolCall"}:
                 raise SubscriptionError("unexpected_native_tool_execution")
@@ -679,9 +704,50 @@ def _codex_session(rpc, *, model, effort, prompt, cwd, bridge_tools):
             return "\n".join(text_parts), usage, {"auth_method": "chatgpt", "subscription_type": account.get("planType"),
                 "model_verified": True, "reported_model": model, "effort_verification": "thread_start_response",
                 "reported_effort": effort, "native_tools": "host_execution_and_file_access_disabled",
-                "native_tool_boundary": "codex-0.163.0/no-environments/no-stable-environment-tools",
+                "native_tool_boundary": "runtime-config/no-environments/no-host-permissions",
                 "native_session_id": "codex:" + thread_id,
                 "native_identity_source": "thread_start_response", "native_turn_id": turn_id,
                 "api_telemetry": "fixed-loopback-json", "api_telemetry_delivery": "unverified"}
         elif method == "error":
             raise SubscriptionError("client_run_failed",native_session_id="codex:"+thread_id)
+
+
+def preflight(provider, *, model, effort, auth, tools_allowed=False, timeout_s=30, _process=None, _rpc_factory=None):
+    """Verify the same runtime contract before inference; version is evidence only."""
+    deadline = time.monotonic() + timeout_s
+    home = _private_home(auth.home)
+    process = _process or _bridge().bounded_process
+    with _auth_lock(home, timeout_s):
+        (home / "tmp").mkdir(mode=0o700, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="compatibility-", dir=home / "tmp") as tmp:
+            cwd = Path(tmp).resolve()
+            env = _clean_env(auth, provider)
+            try:
+                code, version, _ = process([str(auth.client), "--version"], env=env, cwd=str(cwd),
+                                           timeout_s=max(0.001, min(10, deadline-time.monotonic())), max_output=4096)
+                if code:
+                    raise SubscriptionError("client_unavailable", inference_started=False)
+                if provider == "claude":
+                    status = _auth_status(auth, env, cwd, process, timeout_s=max(0.001, deadline-time.monotonic()))
+                    return {**status, "client_version": version.strip()[:120], "inference_started": False}
+                rpc = (_rpc_factory or _Rpc)(codex_command(auth), env=env, cwd=cwd, timeout_s=max(0.001, deadline-time.monotonic()))
+                try:
+                    _codex_prepare(rpc, model=model, effort=effort, cwd=cwd, bridge_tools=None)
+                finally:
+                    rpc.close()
+                return {"client_version": version.strip()[:120], "inference_started": False,
+                        "contract": "runtime-config/no-environments/no-host-permissions"}
+            finally:
+                env.clear()
+
+
+def run(provider, prompt, **kwargs):
+    token = _inference_started.set(False)
+    try:
+        return _run_impl(provider, prompt, **kwargs)
+    except SubscriptionError as exc:
+        if exc.inference_started is None:
+            exc.inference_started = _inference_started.get()
+        raise
+    finally:
+        _inference_started.reset(token)
