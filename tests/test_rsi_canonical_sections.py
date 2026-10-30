@@ -112,3 +112,40 @@ def test_live_adapter_binds_only_complete_displayed_payload_under_prompt_limit(m
     assert adapter.last_left_out > 0
     hyps, rejected = N.parse_hypotheses(result, allowlist=[TARGET], cap=1)
     assert not rejected and hyps[0].edit['before'] == ES.section_text(text, 'summary')
+
+
+def test_preferred_section_larger_than_one_third_takes_room_before_file_context(monkeypatch):
+    from agent_memory import distill
+    text = '# Rules\n\n## Summary\n\n' + '- Keep this requirement.\n'*240 + '\n---\n\n## Other\n\n- Leave this alone.\n'
+    before = ES.section_text(text, 'summary')
+    assert 5000 < len(before) < 8000
+    seen = []
+    evidence = 'BEGIN-EVIDENCE nonce\ncontext\nEND-EVIDENCE nonce'
+    def fake_cli(argv, prompt, **kwargs):
+        seen.append(prompt)
+        payloads = json.loads(prompt.split('Canonical sections (JSON, exact section bytes including any trailing separator):\n', 1)[1].split('\n\nBEGIN-EVIDENCE', 1)[0])
+        assert set(payloads) == {'summary'} and payloads['summary']['text'] == before
+        return reference(payloads)
+    monkeypatch.setattr(distill, 'run_cli', fake_cli)
+    monkeypatch.setattr(distill, 'parse_envelope', lambda text: text)
+    from agent_memory.rsi_budget import Budget, BudgetConfig
+    adapter = N.ClaudeCliHypothesizer({'model':'opus', 'max_prompt_chars':12_000})
+    result = adapter.reply({'target':TARGET, 'rule_key':'dev:summary'}, evidence_text=evidence,
+        targets=[TARGET], cap=1, target_text=text,
+        budget=Budget(BudgetConfig.from_dict({'max_usd':5, 'model_calls':{'opus':1}})))
+    assert len(seen) == 1 and len(seen[0]) <= 12_000 and evidence in seen[0]
+    hyps, rejected = N.parse_hypotheses(result, allowlist=[TARGET], cap=1)
+    assert not rejected and hyps[0].edit['before'] == before
+
+
+def test_preferred_section_that_cannot_fit_defers_without_model_or_unrelated_payload(monkeypatch):
+    from agent_memory import distill
+    text = '# Rules\n\n## Summary\n\n' + '- Keep this requirement.\n'*240 + '\n## Other\n\n- Leave this alone.\n'
+    monkeypatch.setattr(distill, 'run_cli', lambda *a, **kw: pytest.fail('model must not run'))
+    assert N.canonical_section_payloads(text, 500, 'dev:summary') == {}
+    from agent_memory.rsi_budget import Budget, BudgetConfig
+    adapter = N.ClaudeCliHypothesizer({'model':'opus', 'max_prompt_chars':4000})
+    with pytest.raises(ValueError, match='candidate section cannot fit.*no model call'):
+        adapter.reply({'target':TARGET, 'rule_key':'dev:summary'}, evidence_text='BEGIN-EVIDENCE nonce\nEND-EVIDENCE nonce',
+            targets=[TARGET], cap=1, target_text=text, budget=Budget(BudgetConfig.from_dict({})))
+    assert adapter.last_left_out == len(text)

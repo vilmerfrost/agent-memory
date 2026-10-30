@@ -1053,7 +1053,7 @@ def canonical_section_payloads(text: str, room: int, rule_key: Any = None) -> di
     preferred = _section_for(text, rule_key)
     secs = edits_sections.sections(text)
     if preferred:
-        secs.sort(key=lambda sec: sec.id != preferred.id)
+        secs = [preferred]  # a named candidate must not fall through to unrelated smaller sections
     payloads: dict[str, dict[str, str]] = {}
     for sec in secs:
         before = edits_sections.section_text(text, sec.id)
@@ -1168,7 +1168,13 @@ class ClaudeCliHypothesizer:
         # The target text gives way first, so a long prompt never cuts the nonce-delimited evidence block (its END
         # line) or the reply-shape instructions; the final cut stays as a backstop only.
         room = limit - len(HYPOTHESIS_PROMPT.format(target_text="", **fields))
-        payloads = canonical_section_payloads(target_text, max(0, min(16_000, room // 3)), candidate.get("rule_key"))
+        preferred = _section_for(target_text, candidate.get("rule_key"))
+        # Reserve the candidate's complete source first. Only the general file view gives way to it.
+        payload_room = room if preferred else min(16_000, room // 3)
+        payloads = canonical_section_payloads(target_text, max(0, payload_room), candidate.get("rule_key"))
+        if preferred and preferred.id not in payloads:
+            self.last_left_out = len(target_text)
+            raise ValueError("candidate section cannot fit the canonical prompt budget; no model call")
         fields["canonical_sections"] = json.dumps(payloads, ensure_ascii=True)
         room = limit - len(HYPOTHESIS_PROMPT.format(target_text="", **fields))
         shown, self.last_left_out = fit_target_text(
