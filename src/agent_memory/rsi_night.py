@@ -834,6 +834,29 @@ def evidence_detail(findings: Sequence[Any]) -> dict[str, list[dict[str, Any]]]:
     return {"evidence_measurements": measured, "unlinked_refs": unlinked}
 
 
+def report_finding_selection(value: Any) -> dict[str, dict[str, Any]]:
+    """Keep bounded selection accounting, never provider text or fabricated usage."""
+    if not isinstance(value, Mapping):
+        return {}
+    out = {}
+    for source in ("stored", "supabase", "clickhouse", "langfuse", "pastdev"):
+        row = value.get(source)
+        if not isinstance(row, Mapping):
+            continue
+        read, selected = row.get("read"), row.get("selected")
+        if type(read) is not int or type(selected) is not int or not 0 <= selected <= read <= 1_000_000:
+            continue
+        excluded = row.get("excluded") or {}
+        if not isinstance(excluded, Mapping):
+            continue
+        dropped = excluded.get("delta_limit", 0)
+        if type(dropped) is not int or dropped != read - selected:
+            continue
+        out[source] = {"read": read, "selected": selected,
+                       "excluded": {"delta_limit": dropped} if dropped else {}}
+    return out
+
+
 def _one_line(x: Any, n: int) -> str:
     s = " ".join(str(x).split())
     return s if len(s) <= n else s[: n - 3] + "..."
@@ -2147,6 +2170,14 @@ class Night:
                         "read succeeded" if state == "healthy" else "see recorded health reason"),
                     "impact": "supporting evidence unavailable; independent work continues" if state == "failed" else (
                         "query excluded; coverage gap retained" if state == "excluded" else "read completed")})
+                if isinstance(step.get("phase"), str) and step["phase"] in {"readiness", "query"}:
+                    checks[-1]["phase"] = step["phase"]
+                if isinstance(step.get("failure_kind"), str) and step["failure_kind"] in {"deadline", "timeout", "dns", "tls", "connection",
+                        "http_protocol", "transport", "auth", "health_rejected", "temporary_health_failure"}:
+                    checks[-1]["failure_kind"] = step["failure_kind"]
+                seconds = step.get("budget_s")
+                if type(seconds) in (int, float) and math.isfinite(seconds) and 0 <= seconds <= 300:
+                    checks[-1]["budget_s"] = seconds
         # Why a provider was not ok: the failing steps' own detail (the 2026-10-23 night logged only "error").
         for st in steps or []:
             if not isinstance(st, Mapping) or st.get("status") in (None, "ok"):
@@ -2301,6 +2332,9 @@ class Night:
         counts = counts() if callable(counts) else {}
         self.report["delta"] = {"since": since, **{k: int(counts.get(k, len(_dget(delta, k) or [])))
                                                    for k in ("sessions", "deviations", "eval_failures", "routine_failures")}}
+        selection = report_finding_selection(_dget(delta, "finding_selection"))
+        if selection:
+            self.report["delta"]["finding_selection"] = selection
         until = _parse_ts(_dget(delta, "until")) or datetime.now(UTC)
         self._cov().delta(delta, since=_parse_ts(since) or until, until=until, before=before,
                           next_checkpoint=self.next_checkpoint)
