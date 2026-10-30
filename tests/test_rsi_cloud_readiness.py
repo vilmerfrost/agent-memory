@@ -1,5 +1,6 @@
 """Cloud wake is bounded separately from analysis. All transports are offline stand-ins."""
 from contextlib import contextmanager
+import ssl
 import threading
 
 import pytest
@@ -100,6 +101,37 @@ def test_permanent_readiness_failures_are_not_retried_or_leaked(monkeypatch, hea
     assert all(result.detail == f'readiness: {cause}' for _, result in done)
     assert runner.log[0]['failure_kind'] == cause
     assert 'private body' not in str(runner.log)
+
+
+@pytest.mark.parametrize('kind', ['secret@example.com /Users/private', ['private body'], {'private': 'body'},
+                                401, None])
+def test_malformed_health_cause_is_generic_and_does_not_leak(monkeypatch, kind):
+    read = CloudRead(Clock(), wake=0, health=E.Health(False, 'private body', False, kind))
+    runner, done = run(monkeypatch, read)
+    assert read.health_calls == 1 and read.query_calls == 0
+    assert all(result.detail == 'readiness: health_rejected' for _, result in done)
+    assert runner.log[0]['failure_kind'] == 'health_rejected'
+    assert 'private' not in str(runner.log) and 'secret@example.com' not in str(runner.log)
+
+
+@pytest.mark.parametrize('failure,cause', [(ssl.SSLError('private TLS text'), 'tls'),
+    (ssl.SSLCertVerificationError('private cert text'), 'tls'),
+    (http.HttpError(401, 'private auth text', retryable=True), 'auth'),
+    (http.HttpError(403, 'private auth text', retryable=True), 'auth'),
+    (http.HttpError(None, 'private TLS text', retryable=True, failure_kind='tls'), 'tls'),
+    (ValueError('private malformed response'), 'health_rejected')])
+def test_direct_permanent_health_exception_stops_without_retry(monkeypatch, failure, cause):
+    read = CloudRead(Clock(), wake=0)
+    def health():
+        read.health_calls += 1
+        raise failure
+    read.health = health
+    runner, done = run(monkeypatch, read)
+    assert read.health_calls == 1 and read.query_calls == 0
+    assert all(result.detail == f'readiness: {cause}' for _, result in done)
+    assert runner.log[0]['failure_kind'] == cause
+    assert runner.log[0]['attempts'] == 1
+    assert 'private' not in str(runner.log)
 
 
 def test_temporary_health_recovery_resets_cache_once_then_keeps_it(monkeypatch):

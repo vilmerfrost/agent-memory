@@ -87,6 +87,7 @@ import json
 import math
 import re
 import secrets
+import ssl
 import sys
 import threading
 import time
@@ -475,6 +476,17 @@ class _HealthOnce:
 # experiment, 2 per trace): 21s of spacing alone, past the common 20s. Langfuse's budget adds the spacing its client
 # enforces (0 when unthrottled), so the other retrievers and an explicit short timeout_s keep their limit.
 LF_PACK_CALLS = 11
+_READINESS_CAUSES = frozenset({"auth", "tls", "dns", "timeout", "deadline", "connection",
+                              "http_protocol", "transport"})
+
+
+def _readiness_cause(kind: Any, status: Any, retryable: bool) -> str:
+    """Only fixed categories can leave the provider as readiness diagnostics."""
+    if type(status) is int and status in (401, 403):
+        return "auth"
+    if type(kind) is str and kind in _READINESS_CAUSES:
+        return kind
+    return "temporary_health_failure" if retryable else "health_rejected"
 
 
 def _spacing_s(r: Any) -> float:
@@ -639,13 +651,14 @@ class _Runner:
                     result = QueryResult(r.source, "ok")
                     break
                 retryable = health.retryable
-                cause = ("auth" if health.status in (401, 403) else health.failure_kind or
-                         ("temporary_health_failure" if retryable else "health_rejected"))
-                if cause in {"auth", "tls"}:
-                    retryable = False
-            except Exception as exc:  # noqa: BLE001 - safe type only; no provider text in readiness diagnostics
+                cause = _readiness_cause(health.failure_kind, health.status, retryable)
+            except Exception as exc:  # noqa: BLE001 - fixed categories only, never provider text or custom types
                 retryable = transient_read_error(exc)
-                cause = "timeout" if isinstance(exc, TimeoutError) else type(exc).__name__
+                kind = ("tls" if isinstance(exc, ssl.SSLError) else "timeout" if isinstance(exc, TimeoutError)
+                        else "connection" if isinstance(exc, ConnectionError) else getattr(exc, "failure_kind", None))
+                cause = _readiness_cause(kind, getattr(exc, "status", None), retryable)
+            if cause in {"auth", "tls"}:
+                retryable = False
             if stop.is_set():
                 return result
             if self.clock() >= deadline:
