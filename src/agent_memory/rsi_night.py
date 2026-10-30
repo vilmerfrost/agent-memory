@@ -828,6 +828,9 @@ def evidence_detail(findings: Sequence[Any]) -> dict[str, list[dict[str, Any]]]:
             why = _dget(f, "detail")
             unlinked.append({"ref": ref[:200], "source": src,
                              "why": _one_line(why, 120) if isinstance(why, str) and why.strip() else "unlinked"})
+            exclusion = _dget(f, "exclusion_reason")
+            if isinstance(exclusion, str) and re.fullmatch(r"[a-z][a-z0-9_]{0,79}", exclusion):
+                unlinked[-1]["exclusion_reason"] = exclusion
     return {"evidence_measurements": measured, "unlinked_refs": unlinked}
 
 
@@ -989,12 +992,13 @@ Reply with JSON only, exactly this shape and nothing else:
 {{"hypotheses": [{{"what": "<the concrete change to the instruction text, one sentence, <= 200 chars>",
   "why": "<the evidence-based reason, <= 400 chars>", "target": "<one path from the list below>",
   "expected": "<the measurable effect, <= 200 chars>", "risk": "low|medium|high", "confidence": <0..1>,
-  "edit": {{"section_id": "<existing section id>", "before": "<exact current full section text including heading>",
+  "edit": {{"section_id": "<existing section id>", "before_sha256": "<sha256 from the canonical section payload>",
            "after": "<exact proposed full section text including unchanged heading>"}}}}]}}
 
 Rules: "target" must be exactly one of: {targets}
-The edit object is the authoritative intervention. Copy before exactly from the displayed section; after must
-make only the proposed change in that same section. Preserve its heading and every unrelated requirement.
+The edit object is the authoritative intervention. Choose a displayed canonical section and copy its before_sha256; code supplies its exact before bytes. After must
+make only the proposed change in that same section. Preserve its heading, separators and every unrelated requirement.
+Only sections in the canonical payload are editable, even if other text is visible in the file view.
 Use the candidate's rule section when one is named. Do not move the change to another section or add reporting
 requirements that are absent from the proposed intervention. Legacy ideas without an edit object cannot run.
 For what/why/expected use plain prose only: no commands, code, links, file paths other than the target, or secrets.
@@ -1007,6 +1011,9 @@ file exists and is fine: do not judge or propose changes to what you were not sh
 <<<FILE
 {target_text}
 FILE>>>
+
+Canonical sections (JSON, exact section bytes including any trailing separator):
+{canonical_sections}
 
 {evidence}
 """
@@ -1038,6 +1045,56 @@ def fit_target_text(text: str, room: int) -> tuple[str, int]:
         cut = nl + 1 if nl > 0 else 0
     out = text[:cut] + marker(cut)
     return out[:room], len(text) - cut
+
+
+def canonical_section_payloads(text: str, room: int, rule_key: Any = None) -> dict[str, dict[str, str]]:
+    """Only whole parser-derived sections that fit the JSON budget. Never publish partial source bytes."""
+    from agent_memory import edits_sections
+    preferred = _section_for(text, rule_key)
+    secs = edits_sections.sections(text)
+    if preferred:
+        secs = [preferred]  # a named candidate must not fall through to unrelated smaller sections
+    payloads: dict[str, dict[str, str]] = {}
+    for sec in secs:
+        before = edits_sections.section_text(text, sec.id)
+        if len(before) > 16_000:
+            continue
+        payload = {"text": before, "before_sha256": hashlib.sha256(before.encode("utf-8")).hexdigest()}
+        proposed = {**payloads, sec.id: payload}
+        if len(json.dumps(proposed, ensure_ascii=True)) <= room:
+            payloads = proposed
+    return payloads
+
+
+def bind_canonical_sections(reply: str, payloads: Mapping[str, Mapping[str, str]], target: str) -> str:
+    """Bind a model's section reference to the exact displayed snapshot, before persistence/validation.
+
+    Invalid references fail the ordinary strict hypothesis parser. This is only for fresh model output;
+    persisted legacy byte contracts still use the existing parser and exact writer validation.
+    """
+    if not isinstance(reply, str) or len(reply) > 50_000:
+        return reply
+    text = reply.strip()
+    fenced = _FENCE.match(text)
+    try:
+        obj = json.loads(fenced.group(1).strip() if fenced else text)
+    except ValueError:
+        return reply
+    if not isinstance(obj, dict) or set(obj) != {"hypotheses"} or not isinstance(obj["hypotheses"], list):
+        return reply
+    for item in obj["hypotheses"][:10]:
+        if not isinstance(item, dict):
+            continue
+        edit = item.get("edit")
+        if not isinstance(edit, dict):
+            continue
+        if item.get("target") != target or set(edit) != {"section_id", "before_sha256", "after"}:
+            item["edit"] = {**edit, "invalid_source_binding": "canonical reference required"}
+            continue
+        source = payloads.get(edit["section_id"]) if isinstance(edit["section_id"], str) else None
+        if source and edit["before_sha256"] == source["before_sha256"]:
+            item["edit"] = {"section_id": edit["section_id"], "before": source["text"], "after": edit["after"]}
+    return json.dumps(obj)
 
 
 def _envelope_usage(stdout: str) -> Usage:
@@ -1107,9 +1164,18 @@ class ClaudeCliHypothesizer:
         cand["section_ids"] = {s.id: s.title for s in edits_sections.sections(target_text)}
         limit = int(self.cfg.get("max_prompt_chars") or 24_000)
         fields = dict(cap=cap, targets=", ".join(targets), candidate=json.dumps(cand, sort_keys=True, default=str),
-                      target=candidate.get("target") or "(choose from the list)", evidence=evidence_text)
+                      target=candidate.get("target") or "(choose from the list)", evidence=evidence_text, canonical_sections="{}")
         # The target text gives way first, so a long prompt never cuts the nonce-delimited evidence block (its END
         # line) or the reply-shape instructions; the final cut stays as a backstop only.
+        room = limit - len(HYPOTHESIS_PROMPT.format(target_text="", **fields))
+        preferred = _section_for(target_text, candidate.get("rule_key"))
+        # Reserve the candidate's complete source first. Only the general file view gives way to it.
+        payload_room = room if preferred else min(16_000, room // 3)
+        payloads = canonical_section_payloads(target_text, max(0, payload_room), candidate.get("rule_key"))
+        if preferred and preferred.id not in payloads:
+            self.last_left_out = len(target_text)
+            raise ValueError("candidate section cannot fit the canonical prompt budget; no model call")
+        fields["canonical_sections"] = json.dumps(payloads, ensure_ascii=True)
         room = limit - len(HYPOTHESIS_PROMPT.format(target_text="", **fields))
         shown, self.last_left_out = fit_target_text(
             target_text, max(0, min(int(self.cfg.get("max_target_chars") or TARGET_TEXT_MAX), room)))
@@ -1131,7 +1197,8 @@ class ClaudeCliHypothesizer:
             out = distill.run_cli(argv, prompt, timeout=max(1.0, min(timeout, budget.remaining_s())),
                                   env={**model_cli_env(), "AMEM_HOOK_OFF": "1"})
             return distill.parse_envelope(out), _envelope_usage(out)
-        return budget.call(model, "hypothesize", run, retry_on=(distill.WriterError,))
+        reply = budget.call(model, "hypothesize", run, retry_on=(distill.WriterError,))
+        return bind_canonical_sections(reply, payloads, str(candidate.get("target") or ""))
 
 
 def stub_change(old_text: str, hyp: Hypothesis) -> str:
@@ -1382,6 +1449,9 @@ class WriterImplementer:
                 return fallback("declared edit names another rule section: no writer call")
             sec, picked_by = declared, "declared_edit"
             if edits_sections.section_text(old_text, sec.id).strip("\r\n") != hyp.edit["before"].strip("\r\n"):
+                canonical = edits_sections.section_text(old_text, sec.id)
+                if canonical.endswith("\n\n---") and hyp.edit["before"].strip("\r\n") == canonical[:-5]:
+                    return fallback("malformed declared edit omits the section separator: no writer call")
                 return fallback("declared edit baseline is stale: no writer call")
         if sec is None:
             sec, picked_by = section_for_hypothesis(old_text, hyp.what), "hypothesis"
@@ -1395,6 +1465,11 @@ class WriterImplementer:
                         hyp.what, re.I):
                     return fallback("hypothesis placement conflicts with the declared section: no writer call")
         section_text = edits_sections.section_text(old_text, sec.id)
+        if hyp.edit is not None:
+            # A trailing Markdown separator belongs to this parser span, not to its neighbour.
+            separator = re.search(r"\n(?:[ \t]*\n)*([ ]{0,3}(?:-{3,}|\*{3,}|_{3,})[ \t]*)$", section_text)
+            if separator and not hyp.edit["after"].strip("\r\n").endswith(separator.group(0)):
+                return fallback("declared edit omits or changes the section separator: no writer call")
         if writer_rule_pin(hyp.target, sec.id, section_text, ctx.get("rule_key"), ctx.get("dedupe_key")):
             return fallback("the rule is pinned: no writer call")
         if ET.pinned_sections(path, section_text):
