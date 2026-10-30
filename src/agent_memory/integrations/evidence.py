@@ -58,6 +58,8 @@ class Health:
     ok: bool
     detail: str = ""
     retryable: bool = False
+    failure_kind: str | None = None
+    status: int | None = None
 
 
 @dataclass(frozen=True)

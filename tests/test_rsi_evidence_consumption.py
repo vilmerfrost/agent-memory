@@ -94,6 +94,8 @@ def test_wrong_target_and_missing_records_never_get_hydrated(memory_db):
     rows={f.ref:f for f in result.findings if f.source=='pastdev'}
     assert rows[f'past:{other}'].status=='unlinked' and rows[f'past:{other}'].summary is None
     assert rows[f'past:{missing}'].status=='stale' and rows[f'past:{missing}'].summary is None
+    assert rows[f'past:{other}'].exclusion_reason == 'unrelated_context'
+    assert rows[f'past:{missing}'].exclusion_reason == 'stale_authority'
 
 
 def test_private_authoritative_memory_stays_excluded(memory_db):
@@ -105,6 +107,7 @@ def test_private_authoritative_memory_stays_excluded(memory_db):
     result=pack(url,{'rule_key':synth.rule_key(synth.R1)},recalled(ref))
     f=next(x for x in result.findings if x.ref==f'past:{ref}')
     assert f.status=='unlinked' and f.authority is None and not f.summary
+    assert f.exclusion_reason == 'private_or_missing_memory'
     assert 'Confidential client change' not in json.dumps(f.to_json())
 
 

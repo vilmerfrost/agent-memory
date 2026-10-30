@@ -87,6 +87,7 @@ import json
 import math
 import re
 import secrets
+import ssl
 import sys
 import threading
 import time
@@ -100,7 +101,8 @@ from typing import Any
 import psycopg
 
 from agent_memory.integrations import refs, sb_queries
-from agent_memory.integrations.evidence import EvidenceRef, Health, QueryResult, Retriever, SupabaseRetriever, run_query
+from agent_memory.integrations.evidence import (EvidenceRef, Health, QueryResult, Retriever, SupabaseRetriever,
+                                                Unavailable, run_query, transient_read_error)
 from agent_memory.integrations.pastdev import QUERY_RE
 from agent_memory.integrations.sanitize import scrub_text
 
@@ -149,6 +151,8 @@ class Finding:
     via: str = ""                     # the step: sb.rule_pattern, ch.rule_gap, lf.trace ...
     summary: str | None = None        # short scrubbed text (Supabase rows only); untrusted
     detail: str = ""                  # why a step is unavailable or failed
+
+    exclusion_reason: str | None = None  # fixed label; status remains backwards compatible
 
     def to_json(self) -> dict[str, Any]:
         return asdict(self)
@@ -474,6 +478,17 @@ class _HealthOnce:
 # experiment, 2 per trace): 21s of spacing alone, past the common 20s. Langfuse's budget adds the spacing its client
 # enforces (0 when unthrottled), so the other retrievers and an explicit short timeout_s keep their limit.
 LF_PACK_CALLS = 11
+_READINESS_CAUSES = frozenset({"auth", "tls", "dns", "timeout", "deadline", "connection",
+                              "http_protocol", "transport"})
+
+
+def _readiness_cause(kind: Any, status: Any, retryable: bool) -> str:
+    """Only fixed categories can leave the provider as readiness diagnostics."""
+    if type(status) is int and status in (401, 403):
+        return "auth"
+    if type(kind) is str and kind in _READINESS_CAUSES:
+        return kind
+    return "temporary_health_failure" if retryable else "health_rejected"
 
 
 def _spacing_s(r: Any) -> float:
@@ -484,7 +499,8 @@ def _spacing_s(r: Any) -> float:
 class _Runner:
     """Runs steps per retriever in daemon threads, retrievers in parallel. Each retriever has timeout_s in all,
     charged only for the time its own thread runs (waiting on another retriever costs it nothing). A retriever
-    that runs past its budget is `dead`: its unfinished and later steps answer `error: timeout`."""
+    that runs past its budget is `dead`: its unfinished and later steps answer `error: timeout`. Configured
+    ClickHouse Cloud reads have one separate, bounded readiness phase before this analytical budget starts."""
 
     def __init__(self, retrievers: Mapping[str, Retriever | None], timeout_s: float,
                  clock: Callable[[], float] = time.monotonic):
@@ -495,6 +511,7 @@ class _Runner:
         self.dead: set[str] = set()
         self.log: list[dict[str, Any]] = []
         self.observations: dict[int, dict[str, Any]] = {}
+        self.readiness: dict[str, QueryResult] = {}
 
     def budget(self, retr: str) -> float:
         return self.timeout_s + self.extra.get(retr, 0.0)
@@ -584,7 +601,8 @@ class _Runner:
             if attempts >= limit or deadline - self.clock() <= 0.25:
                 break
             time.sleep(0.25)
-            r.reset_health()
+            if retr not in self.readiness:
+                r.reset_health()
         excluded = result.status == "unavailable" and (
             result.detail.startswith("policy-excluded:") or _owner_off(r._r))
         state = ("recovered" if failures else "healthy") if result.status == "ok" else (
@@ -600,13 +618,76 @@ class _Runner:
         }
         return result
 
+    def _preflight(self, r: _HealthOnce, st: _Step) -> QueryResult | None:
+        """A readiness request must follow the same query and privacy gates as run_query."""
+        spec = r.named_queries().get(st.query)
+        if spec is None:
+            return QueryResult(r.source, "unknown-query", detail=st.query)
+        try:
+            params = spec.check(st.params)
+        except ValueError as exc:
+            return QueryResult(r.source, "bad-params", detail=str(exc))
+        try:
+            r._preflight_query(st.query, params)
+        except Unavailable as exc:
+            return QueryResult(r.source, "unavailable", detail=str(exc)[:200])
+        return None
+
+    def _ready(self, retr: str, r: _HealthOnce, seconds: float, stop: threading.Event) -> QueryResult:
+        """One bounded Cloud health phase, using only sequential transport attempts."""
+        started = self.clock()
+        deadline = started + seconds
+        attempts = 0
+        cause = "timeout"
+        result = QueryResult(r.source, "unavailable", detail="readiness: timeout")
+        while attempts < 3 and self.clock() < deadline:
+            attempts += 1
+            retryable = False
+            try:
+                with r.read_budget(max(0.0, deadline - self.clock())):
+                    health = r.health()
+                if stop.is_set():
+                    return result  # the outer deadline already reported it; never publish a late success
+                if health.ok and self.clock() < deadline:
+                    cause = "ready"
+                    result = QueryResult(r.source, "ok")
+                    break
+                retryable = health.retryable
+                cause = _readiness_cause(health.failure_kind, health.status, retryable)
+            except Exception as exc:  # noqa: BLE001 - fixed categories only, never provider text or custom types
+                retryable = transient_read_error(exc)
+                kind = ("tls" if isinstance(exc, ssl.SSLError) else "timeout" if isinstance(exc, TimeoutError)
+                        else "connection" if isinstance(exc, ConnectionError) else getattr(exc, "failure_kind", None))
+                cause = _readiness_cause(kind, getattr(exc, "status", None), retryable)
+            if cause in {"auth", "tls"}:
+                retryable = False
+            if stop.is_set():
+                return result
+            if self.clock() >= deadline:
+                cause = "timeout"
+            result = QueryResult(r.source, "unavailable", detail=f"readiness: {cause}")
+            if not retryable or attempts >= 3 or deadline - self.clock() <= .25:
+                break
+            time.sleep(.25)
+            r.reset_health()
+        self.readiness[retr] = result
+        self.log.append({"step": f"{retr}.readiness", "phase": "readiness", "status": result.status,
+                         "found": 0, "detail": result.detail, "attempts": attempts,
+                         "elapsed_ms": round(max(0.0, self.clock() - started) * 1000, 3),
+                         "failure_kind": None if result.status == "ok" else cause,
+                         "budget_s": seconds,
+                         "checked_at": datetime.now(UTC).isoformat(timespec="seconds"),
+                         "recovery_status": ("recovered" if attempts > 1 else "healthy")
+                            if result.status == "ok" else "failed",
+                         "recovery_reason": "readiness succeeded" if result.status == "ok" else result.detail})
+        return result
+
     def phase(self, steps: Sequence[_Step]) -> list[tuple[_Step, QueryResult]]:
         groups: dict[str, list[_Step]] = defaultdict(list)
         for st in steps:
             groups[st.retr].append(st)
         results: dict[int, QueryResult] = {}
-        running: dict[str, tuple[threading.Thread, list[float], list[tuple[_Step, QueryResult]], threading.Event,
-                                 float]] = {}
+        running: dict[str, tuple[Any, ...]] = {}
         for retr, sts in groups.items():
             r = self.r.get(retr)
             if r is None:
@@ -619,13 +700,34 @@ class _Runner:
                 continue
             box: list[tuple[_Step, QueryResult]] = []
             stop = threading.Event()
+            ready = threading.Event()
+            ready_limit = float(getattr(r._r, "readiness_timeout_s", 0.0)) if retr not in self.readiness else 0.0
+            started_at = self.clock()
+            left = self._left(retr)
+            timing: dict[str, float] = {"deadline": started_at + left}
 
             def body(r: Any = r, sts: list[_Step] = sts, box: list[tuple[_Step, QueryResult]] = box,
-                     stop: threading.Event = stop,
-                     deadline_at: float = self.clock() + self._left(retr)) -> None:
+                     stop: threading.Event = stop, ready: threading.Event = ready,
+                     timing: dict[str, float] = timing, ready_limit: float = ready_limit,
+                     started_at: float = started_at, left: float = left, retr: str = retr) -> None:
+                excluded = {id(st): res for st in sts if (res := self._preflight(r, st)) is not None} \
+                    if ready_limit else {}
+                if ready_limit and len(excluded) < len(sts) and left > 0:
+                    self._ready(retr, r, ready_limit, stop)
+                timing["readiness"] = max(0.0, self.clock() - started_at) if ready_limit else 0.0
+                deadline_at = self.clock() + left
+                timing["deadline"] = deadline_at
+                ready.set()
                 for index, st in enumerate(sts):
                     if stop.is_set():
                         return
+                    if id(st) in excluded:
+                        box.append((st, excluded[id(st)]))
+                        continue
+                    failed_ready = self.readiness.get(retr)
+                    if failed_ready is not None and failed_ready.status != "ok":
+                        box.append((st, failed_ready))
+                        continue
                     remaining = max(0.0, deadline_at - self.clock())
                     # A recovering first CH query used 18.9 of the shared 20s,
                     # leaving the weekly query about one second. Reserve a fair
@@ -635,18 +737,34 @@ class _Runner:
                         remaining /= len(sts) - index
                     box.append((st, self._query(st.retr, r, st, remaining)))
 
-            deadline = self.clock() + self._left(retr)
             t, spent = self._start(retr, body)
-            running[retr] = (t, spent, box, stop, deadline)
-        for retr, (t, spent, box, stop, deadline) in running.items():
-            if not self._settle(retr, t, spent, deadline):
+            running[retr] = (t, spent, box, stop, ready, timing, started_at + ready_limit, ready_limit)
+        for retr, (t, spent, box, stop, ready, timing, ready_deadline, ready_limit) in running.items():
+            if ready_limit:
+                ready.wait(max(0.0, ready_deadline - self.clock()))
+            readiness_expired = ready_limit and (not ready.is_set() or timing.get("readiness", 0) > ready_limit)
+            if readiness_expired:
+                self.dead.add(retr)
+                self.used[retr] = self.budget(retr)
                 stop.set()
+                if retr not in self.readiness:
+                    self.log.append({"step": f"{retr}.readiness", "phase": "readiness", "status": "error",
+                                     "found": 0, "detail": "readiness: timeout", "failure_kind": "timeout",
+                                     "elapsed_ms": round(ready_limit * 1000, 3), "budget_s": ready_limit,
+                                     "checked_at": datetime.now(UTC).isoformat(timespec="seconds"),
+                                     "recovery_status": "failed", "recovery_reason": "readiness: timeout"})
+            else:
+                if not self._settle(retr, t, spent, timing["deadline"]):
+                    stop.set()
+                elif ready_limit:
+                    self.used[retr] = max(0.0, self.used[retr] - timing["readiness"])
             for st, res in list(box):
                 results[id(st)] = res
             for st in groups[retr]:
-                results.setdefault(id(st), QueryResult(retr, "error", detail=f"timeout after {self.budget(retr):g}s"))
+                detail = "readiness: timeout" if readiness_expired else f"timeout after {self.budget(retr):g}s"
+                results.setdefault(id(st), QueryResult(retr, "error", detail=detail))
         out = [(st, results[id(st)]) for st in steps]
-        self.log += [{"step": st.name, "status": res.status, "found": len(res.refs),
+        self.log += [{"step": st.name, "phase": "query", "status": res.status, "found": len(res.refs),
                       "detail": _free(res.detail, 120) or "",
                       **self.observations.get(id(st), {})} for st, res in out]
         return out
@@ -867,19 +985,23 @@ def _finding(raw: _Raw, found: set[str] | None, lim: PackLimits, c: _Cand | None
              scopes: Mapping[str, tuple[set[str], set[str]]] | None = None,
              memories: Mapping[str, Mapping[str, str]] | None = None) -> Finding:
     ev = raw.ev
+    reason = None
     subjects = [s for s in ev.subject_refs if s.startswith("amem:")]
     if ev.source == "sb":
         status, detail = "ok", ""
         authority = subjects[0] if subjects else (ev.ref if ev.ref.startswith("amem:") else None)
     elif not subjects:
         status, authority, detail = "unlinked", None, "no amem: subject"
+        reason = "missing_authority"
     elif found is None:
         status, authority, detail = "unlinked", None, "subjects not re-read: supabase unavailable"
+        reason = "authority_unavailable"
     else:
         resolved = [s for s in subjects if s in found]
         status = "ok" if len(resolved) == len(subjects) else "stale"
         authority = resolved[0] if resolved else None
         detail = "" if status == "ok" else f"{len(subjects) - len(resolved)} subject(s) no longer resolve"
+        reason = None if status == "ok" else "stale_authority"
     if raw.source == "pastdev" and status == "ok" and c is not None and not _about(c, subjects, scopes or {}):
         # a similar past record that is about another rule and another file: context, never support
         comparable = any((c.rule and rs) or (c.target and ts)
@@ -887,24 +1009,29 @@ def _finding(raw: _Raw, found: set[str] | None, lim: PackLimits, c: _Cand | None
         detail = ("about another rule or target: context only; authoritative record resolved" if comparable else
                   "authoritative record resolved, but rule/target binding is not recorded: context only")
         status, authority = "unlinked", None
+        reason = "unrelated_context" if comparable else "unknown_scope"
     if ev.kind == "production-outcome":
         status, authority, detail = "unlinked", None, "production observation needs current-version and coverage validation"
+        reason = "current_version_required"
     if ev.metrics.get("intended_intervention") is False:
         status, authority, detail = "unlinked", None, "fallback tested other bytes; artifact evidence only"
+        reason = "other_intervention"
     summary = _free(ev.summary, lim.text_max)
     if raw.source == 'pastdev':
         summary = None  # Even stand-in/provider text cannot bypass the authoritative read.
         if len(subjects) != 1 or ev.ref != refs.past(subjects[0]):
             status, authority, detail = 'unlinked', None, 'memory reference does not bind one authoritative subject'
+            reason = 'missing_authority'
         if status == 'ok' and memories is not None:
             fields = memories.get(authority or '')
             if fields is None:
                 status, authority, detail = 'unlinked', None, 'authoritative memory missing or withheld by privacy checks'
+                reason = 'private_or_missing_memory'
             else:
                 summary = _memory_summary(fields, lim.text_max)
     m = _measure(ev.metrics)
     return Finding(raw.source, ev.ref, ev.observed_at, m, _n(ev.metrics), status, ev.kind, authority, raw.step.name,
-                   summary, detail)
+                   summary, detail, exclusion_reason=reason)
 
 
 def _size(f: Finding) -> int:
@@ -1337,6 +1464,9 @@ class Delta:
     # not ok carries its reason into the night report (2026-10-25: langfuse "error" with no reason).
     steps: list[dict[str, Any]] = field(default_factory=list)
 
+    # Read denominators stay separate from selected findings. Exclusions never count as used.
+    finding_selection: dict[str, dict[str, Any]] = field(default_factory=dict)
+
     def counts(self) -> dict[str, int]:
         return {"sessions": len(self.sessions), "deviations": len(self.deviations),
                 "eval_failures": len(self.eval_failures), "routine_failures": len(self.routine_failures),
@@ -1424,19 +1554,53 @@ def _evidence_finding(row: tuple[Any, ...], found: set[str], lim_text: int) -> F
     if not subj:
         status, authority = "unlinked", None
         detail = "no authoritative subject refs recorded; producer identity required, not inferred"
+        reason = "missing_authority"
     else:
         resolved = [s for s in subj if s in found]
         status = "ok" if len(resolved) == len(subj) else "stale"
         authority = resolved[0] if resolved else None
         detail = "" if status == "ok" else f"{len(subj) - len(resolved)} recorded authoritative subject(s) no longer resolve"
+        reason = None if status == "ok" else "stale_authority"
     m = dict(metrics or {}) if isinstance(metrics, Mapping) else {}
     if kind == "production-outcome":
         # Delta reads have no freshly measured target bytes. The dedicated
         # consumer validates the full record before it becomes supporting input.
         status, authority = "unlinked", None
+        reason = "current_version_required"
     return Finding(source, ref, _ts_str(observed), _measure(m), _n(m), status, kind, authority, "sb.rsi_evidence",
                    _free(summary, lim_text), "requires current instruction version and complete coverage"
-                   if kind == "production-outcome" else detail)
+                   if kind == "production-outcome" else detail, exclusion_reason=reason)
+
+
+def _select_delta(groups: Mapping[str, Sequence[Finding]], cap: int
+                  ) -> tuple[list[Finding], dict[str, dict[str, Any]]]:
+    """Supported findings first, round-robin by source, preserving each source's query order.
+
+    Unsupported rows fill only spare slots. A source with no supported rows cannot displace support.
+    Selection is independent of the stored-row page/checkpoint: omitted rows are explicitly excluded.
+    """
+    sources = [s for s in ("stored", *SOURCES) if s in groups]
+    sources += sorted(set(groups) - set(sources))
+    chosen: list[Finding] = []
+    selected: Counter[str] = Counter()
+    for supported in (True, False):
+        if len(chosen) >= max(0, cap):
+            break
+        queues = {s: [f for f in groups[s] if (f.status == "ok") == supported] for s in sources}
+        for i in range(max(map(len, queues.values()), default=0)):
+            if len(chosen) >= max(0, cap):
+                break
+            for source in sources:
+                if len(chosen) >= max(0, cap):
+                    break
+                if i < len(queues[source]):
+                    chosen.append(queues[source][i])
+                    selected[source] += 1
+    accounting = {s: {"read": len(groups[s]), "selected": selected[s],
+                      "excluded": {"delta_limit": len(groups[s]) - selected[s]}
+                                  if len(groups[s]) > selected[s] else {}}
+                  for s in sources}
+    return chosen, accounting
 
 
 def delta_since(checkpoint_ts: str | datetime | None, *, conn: psycopg.Connection,
@@ -1513,12 +1677,15 @@ def delta_since(checkpoint_ts: str | datetime | None, *, conn: psycopg.Connectio
         for retr in ("ch", "lf", "pd"):
             if _owner_off(retrievers.get(retr)):
                 d.health[SERVICE[retr]] = "skipped"
-        live = _raws(done, 10)
+        live = _raws(done, max((len(res.refs) for _, res in done), default=0))
         subjects += [s for raw in live for s in raw.ev.subject_refs if s.startswith("amem:")]
     found = existing(conn, subjects) if subjects else set()
-    d.findings = [_evidence_finding(r, found, 200) for r in ev_rows]
+    stored = [_evidence_finding(r, found, 200) for r in ev_rows]
     plim = PackLimits()
-    d.findings += [_finding(raw, found, plim) for raw in live][: max(0, limits.findings - len(d.findings))]
+    groups = {"stored": stored}
+    for raw in live:
+        groups.setdefault(raw.source, []).append(_finding(raw, found, plim))
+    d.findings, d.finding_selection = _select_delta(groups, limits.findings)
     d.next_checkpoint = _iso(min(resume)) if resume else _iso(until)
     return d
 
