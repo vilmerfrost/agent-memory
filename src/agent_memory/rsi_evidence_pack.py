@@ -150,6 +150,8 @@ class Finding:
     summary: str | None = None        # short scrubbed text (Supabase rows only); untrusted
     detail: str = ""                  # why a step is unavailable or failed
 
+    exclusion_reason: str | None = None  # fixed label; status remains backwards compatible
+
     def to_json(self) -> dict[str, Any]:
         return asdict(self)
 
@@ -867,19 +869,23 @@ def _finding(raw: _Raw, found: set[str] | None, lim: PackLimits, c: _Cand | None
              scopes: Mapping[str, tuple[set[str], set[str]]] | None = None,
              memories: Mapping[str, Mapping[str, str]] | None = None) -> Finding:
     ev = raw.ev
+    reason = None
     subjects = [s for s in ev.subject_refs if s.startswith("amem:")]
     if ev.source == "sb":
         status, detail = "ok", ""
         authority = subjects[0] if subjects else (ev.ref if ev.ref.startswith("amem:") else None)
     elif not subjects:
         status, authority, detail = "unlinked", None, "no amem: subject"
+        reason = "missing_authority"
     elif found is None:
         status, authority, detail = "unlinked", None, "subjects not re-read: supabase unavailable"
+        reason = "authority_unavailable"
     else:
         resolved = [s for s in subjects if s in found]
         status = "ok" if len(resolved) == len(subjects) else "stale"
         authority = resolved[0] if resolved else None
         detail = "" if status == "ok" else f"{len(subjects) - len(resolved)} subject(s) no longer resolve"
+        reason = None if status == "ok" else "stale_authority"
     if raw.source == "pastdev" and status == "ok" and c is not None and not _about(c, subjects, scopes or {}):
         # a similar past record that is about another rule and another file: context, never support
         comparable = any((c.rule and rs) or (c.target and ts)
@@ -887,24 +893,29 @@ def _finding(raw: _Raw, found: set[str] | None, lim: PackLimits, c: _Cand | None
         detail = ("about another rule or target: context only; authoritative record resolved" if comparable else
                   "authoritative record resolved, but rule/target binding is not recorded: context only")
         status, authority = "unlinked", None
+        reason = "unrelated_context" if comparable else "unknown_scope"
     if ev.kind == "production-outcome":
         status, authority, detail = "unlinked", None, "production observation needs current-version and coverage validation"
+        reason = "current_version_required"
     if ev.metrics.get("intended_intervention") is False:
         status, authority, detail = "unlinked", None, "fallback tested other bytes; artifact evidence only"
+        reason = "other_intervention"
     summary = _free(ev.summary, lim.text_max)
     if raw.source == 'pastdev':
         summary = None  # Even stand-in/provider text cannot bypass the authoritative read.
         if len(subjects) != 1 or ev.ref != refs.past(subjects[0]):
             status, authority, detail = 'unlinked', None, 'memory reference does not bind one authoritative subject'
+            reason = 'missing_authority'
         if status == 'ok' and memories is not None:
             fields = memories.get(authority or '')
             if fields is None:
                 status, authority, detail = 'unlinked', None, 'authoritative memory missing or withheld by privacy checks'
+                reason = 'private_or_missing_memory'
             else:
                 summary = _memory_summary(fields, lim.text_max)
     m = _measure(ev.metrics)
     return Finding(raw.source, ev.ref, ev.observed_at, m, _n(ev.metrics), status, ev.kind, authority, raw.step.name,
-                   summary, detail)
+                   summary, detail, exclusion_reason=reason)
 
 
 def _size(f: Finding) -> int:
@@ -1337,6 +1348,9 @@ class Delta:
     # not ok carries its reason into the night report (2026-10-25: langfuse "error" with no reason).
     steps: list[dict[str, Any]] = field(default_factory=list)
 
+    # Read denominators stay separate from selected findings. Exclusions never count as used.
+    finding_selection: dict[str, dict[str, Any]] = field(default_factory=dict)
+
     def counts(self) -> dict[str, int]:
         return {"sessions": len(self.sessions), "deviations": len(self.deviations),
                 "eval_failures": len(self.eval_failures), "routine_failures": len(self.routine_failures),
@@ -1424,19 +1438,53 @@ def _evidence_finding(row: tuple[Any, ...], found: set[str], lim_text: int) -> F
     if not subj:
         status, authority = "unlinked", None
         detail = "no authoritative subject refs recorded; producer identity required, not inferred"
+        reason = "missing_authority"
     else:
         resolved = [s for s in subj if s in found]
         status = "ok" if len(resolved) == len(subj) else "stale"
         authority = resolved[0] if resolved else None
         detail = "" if status == "ok" else f"{len(subj) - len(resolved)} recorded authoritative subject(s) no longer resolve"
+        reason = None if status == "ok" else "stale_authority"
     m = dict(metrics or {}) if isinstance(metrics, Mapping) else {}
     if kind == "production-outcome":
         # Delta reads have no freshly measured target bytes. The dedicated
         # consumer validates the full record before it becomes supporting input.
         status, authority = "unlinked", None
+        reason = "current_version_required"
     return Finding(source, ref, _ts_str(observed), _measure(m), _n(m), status, kind, authority, "sb.rsi_evidence",
                    _free(summary, lim_text), "requires current instruction version and complete coverage"
-                   if kind == "production-outcome" else detail)
+                   if kind == "production-outcome" else detail, exclusion_reason=reason)
+
+
+def _select_delta(groups: Mapping[str, Sequence[Finding]], cap: int
+                  ) -> tuple[list[Finding], dict[str, dict[str, Any]]]:
+    """Supported findings first, round-robin by source, preserving each source's query order.
+
+    Unsupported rows fill only spare slots. A source with no supported rows cannot displace support.
+    Selection is independent of the stored-row page/checkpoint: omitted rows are explicitly excluded.
+    """
+    sources = [s for s in ("stored", *SOURCES) if s in groups]
+    sources += sorted(set(groups) - set(sources))
+    chosen: list[Finding] = []
+    selected: Counter[str] = Counter()
+    for supported in (True, False):
+        if len(chosen) >= max(0, cap):
+            break
+        queues = {s: [f for f in groups[s] if (f.status == "ok") == supported] for s in sources}
+        for i in range(max(map(len, queues.values()), default=0)):
+            if len(chosen) >= max(0, cap):
+                break
+            for source in sources:
+                if len(chosen) >= max(0, cap):
+                    break
+                if i < len(queues[source]):
+                    chosen.append(queues[source][i])
+                    selected[source] += 1
+    accounting = {s: {"read": len(groups[s]), "selected": selected[s],
+                      "excluded": {"delta_limit": len(groups[s]) - selected[s]}
+                                  if len(groups[s]) > selected[s] else {}}
+                  for s in sources}
+    return chosen, accounting
 
 
 def delta_since(checkpoint_ts: str | datetime | None, *, conn: psycopg.Connection,
@@ -1513,12 +1561,15 @@ def delta_since(checkpoint_ts: str | datetime | None, *, conn: psycopg.Connectio
         for retr in ("ch", "lf", "pd"):
             if _owner_off(retrievers.get(retr)):
                 d.health[SERVICE[retr]] = "skipped"
-        live = _raws(done, 10)
+        live = _raws(done, max((len(res.refs) for _, res in done), default=0))
         subjects += [s for raw in live for s in raw.ev.subject_refs if s.startswith("amem:")]
     found = existing(conn, subjects) if subjects else set()
-    d.findings = [_evidence_finding(r, found, 200) for r in ev_rows]
+    stored = [_evidence_finding(r, found, 200) for r in ev_rows]
     plim = PackLimits()
-    d.findings += [_finding(raw, found, plim) for raw in live][: max(0, limits.findings - len(d.findings))]
+    groups = {"stored": stored}
+    for raw in live:
+        groups.setdefault(raw.source, []).append(_finding(raw, found, plim))
+    d.findings, d.finding_selection = _select_delta(groups, limits.findings)
     d.next_checkpoint = _iso(min(resume)) if resume else _iso(until)
     return d
 

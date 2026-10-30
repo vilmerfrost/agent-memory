@@ -126,7 +126,10 @@ def test_past_hits_about_the_rule_stay_linked_and_others_are_unlinked(pack_db: s
     for r in other:
         f = past[f"past:{r}"]
         assert (f.status, f.authority) == ("unlinked", None) and "context only" in f.detail
+    assert past[f"past:{other[0]}"].exclusion_reason == "unknown_scope"
+    assert past[f"past:{other[1]}"].exclusion_reason == "unrelated_context"
     for r in same_rule:
+        assert past[f"past:{r}"].exclusion_reason is None
         assert past[f"past:{r}"].authority == r
     assert pack.health["pastdev"] == "ok"                       # context-only hits are not a provider fault
 
@@ -297,3 +300,15 @@ def test_evidence_detail_with_no_pack_is_empty_and_caps_hold() -> None:
              for _ in range(15)]
     d = N.evidence_detail(many)
     assert len(d["evidence_measurements"]) == len(d["unlinked_refs"]) == N.EVIDENCE_DETAIL_MAX
+
+
+def test_coverage_names_unrelated_context_separately_from_unlinked():
+    from agent_memory import night_coverage as NC
+    f = P.Finding("pastdev", "past:amem:experiment/exp-20261029-context", None, {}, None, "unlinked",
+                  authority=None, via="pd.recall", exclusion_reason="unrelated_context")
+    ledger = NC.Ledger("fixture", "fixture")
+    ledger.pack({"findings": [f], "steps": [{"step": "pd.recall", "status": "ok", "found": 1}]})
+    p = ledger.providers["pastdev"]
+    assert p.used == 0 and p.skipped == {"unrelated_context": 1}
+    ledger.finding(f, "unlinked")
+    assert p.used == 0 and p.skipped == {"unrelated_context": 2}
