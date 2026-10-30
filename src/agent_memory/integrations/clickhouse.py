@@ -1200,7 +1200,7 @@ class ClickHouseRetriever:
         try:
             self.client.ping()
         except http.HttpError as exc:
-            return Health(False, str(exc)[:200], exc.retryable)
+            return Health(False, str(exc)[:200], exc.retryable, exc.failure_kind, exc.status)
         return Health(True)
 
     def named_queries(self) -> Mapping[str, NamedQuery]:

@@ -87,6 +87,7 @@ import json
 import math
 import re
 import secrets
+import ssl
 import sys
 import threading
 import time
@@ -100,7 +101,8 @@ from typing import Any
 import psycopg
 
 from agent_memory.integrations import refs, sb_queries
-from agent_memory.integrations.evidence import EvidenceRef, Health, QueryResult, Retriever, SupabaseRetriever, run_query
+from agent_memory.integrations.evidence import (EvidenceRef, Health, QueryResult, Retriever, SupabaseRetriever,
+                                                Unavailable, run_query, transient_read_error)
 from agent_memory.integrations.pastdev import QUERY_RE
 from agent_memory.integrations.sanitize import scrub_text
 
@@ -476,6 +478,17 @@ class _HealthOnce:
 # experiment, 2 per trace): 21s of spacing alone, past the common 20s. Langfuse's budget adds the spacing its client
 # enforces (0 when unthrottled), so the other retrievers and an explicit short timeout_s keep their limit.
 LF_PACK_CALLS = 11
+_READINESS_CAUSES = frozenset({"auth", "tls", "dns", "timeout", "deadline", "connection",
+                              "http_protocol", "transport"})
+
+
+def _readiness_cause(kind: Any, status: Any, retryable: bool) -> str:
+    """Only fixed categories can leave the provider as readiness diagnostics."""
+    if type(status) is int and status in (401, 403):
+        return "auth"
+    if type(kind) is str and kind in _READINESS_CAUSES:
+        return kind
+    return "temporary_health_failure" if retryable else "health_rejected"
 
 
 def _spacing_s(r: Any) -> float:
@@ -486,7 +499,8 @@ def _spacing_s(r: Any) -> float:
 class _Runner:
     """Runs steps per retriever in daemon threads, retrievers in parallel. Each retriever has timeout_s in all,
     charged only for the time its own thread runs (waiting on another retriever costs it nothing). A retriever
-    that runs past its budget is `dead`: its unfinished and later steps answer `error: timeout`."""
+    that runs past its budget is `dead`: its unfinished and later steps answer `error: timeout`. Configured
+    ClickHouse Cloud reads have one separate, bounded readiness phase before this analytical budget starts."""
 
     def __init__(self, retrievers: Mapping[str, Retriever | None], timeout_s: float,
                  clock: Callable[[], float] = time.monotonic):
@@ -497,6 +511,7 @@ class _Runner:
         self.dead: set[str] = set()
         self.log: list[dict[str, Any]] = []
         self.observations: dict[int, dict[str, Any]] = {}
+        self.readiness: dict[str, QueryResult] = {}
 
     def budget(self, retr: str) -> float:
         return self.timeout_s + self.extra.get(retr, 0.0)
@@ -586,7 +601,8 @@ class _Runner:
             if attempts >= limit or deadline - self.clock() <= 0.25:
                 break
             time.sleep(0.25)
-            r.reset_health()
+            if retr not in self.readiness:
+                r.reset_health()
         excluded = result.status == "unavailable" and (
             result.detail.startswith("policy-excluded:") or _owner_off(r._r))
         state = ("recovered" if failures else "healthy") if result.status == "ok" else (
@@ -602,13 +618,76 @@ class _Runner:
         }
         return result
 
+    def _preflight(self, r: _HealthOnce, st: _Step) -> QueryResult | None:
+        """A readiness request must follow the same query and privacy gates as run_query."""
+        spec = r.named_queries().get(st.query)
+        if spec is None:
+            return QueryResult(r.source, "unknown-query", detail=st.query)
+        try:
+            params = spec.check(st.params)
+        except ValueError as exc:
+            return QueryResult(r.source, "bad-params", detail=str(exc))
+        try:
+            r._preflight_query(st.query, params)
+        except Unavailable as exc:
+            return QueryResult(r.source, "unavailable", detail=str(exc)[:200])
+        return None
+
+    def _ready(self, retr: str, r: _HealthOnce, seconds: float, stop: threading.Event) -> QueryResult:
+        """One bounded Cloud health phase, using only sequential transport attempts."""
+        started = self.clock()
+        deadline = started + seconds
+        attempts = 0
+        cause = "timeout"
+        result = QueryResult(r.source, "unavailable", detail="readiness: timeout")
+        while attempts < 3 and self.clock() < deadline:
+            attempts += 1
+            retryable = False
+            try:
+                with r.read_budget(max(0.0, deadline - self.clock())):
+                    health = r.health()
+                if stop.is_set():
+                    return result  # the outer deadline already reported it; never publish a late success
+                if health.ok and self.clock() < deadline:
+                    cause = "ready"
+                    result = QueryResult(r.source, "ok")
+                    break
+                retryable = health.retryable
+                cause = _readiness_cause(health.failure_kind, health.status, retryable)
+            except Exception as exc:  # noqa: BLE001 - fixed categories only, never provider text or custom types
+                retryable = transient_read_error(exc)
+                kind = ("tls" if isinstance(exc, ssl.SSLError) else "timeout" if isinstance(exc, TimeoutError)
+                        else "connection" if isinstance(exc, ConnectionError) else getattr(exc, "failure_kind", None))
+                cause = _readiness_cause(kind, getattr(exc, "status", None), retryable)
+            if cause in {"auth", "tls"}:
+                retryable = False
+            if stop.is_set():
+                return result
+            if self.clock() >= deadline:
+                cause = "timeout"
+            result = QueryResult(r.source, "unavailable", detail=f"readiness: {cause}")
+            if not retryable or attempts >= 3 or deadline - self.clock() <= .25:
+                break
+            time.sleep(.25)
+            r.reset_health()
+        self.readiness[retr] = result
+        self.log.append({"step": f"{retr}.readiness", "phase": "readiness", "status": result.status,
+                         "found": 0, "detail": result.detail, "attempts": attempts,
+                         "elapsed_ms": round(max(0.0, self.clock() - started) * 1000, 3),
+                         "failure_kind": None if result.status == "ok" else cause,
+                         "budget_s": seconds,
+                         "checked_at": datetime.now(UTC).isoformat(timespec="seconds"),
+                         "recovery_status": ("recovered" if attempts > 1 else "healthy")
+                            if result.status == "ok" else "failed",
+                         "recovery_reason": "readiness succeeded" if result.status == "ok" else result.detail})
+        return result
+
     def phase(self, steps: Sequence[_Step]) -> list[tuple[_Step, QueryResult]]:
         groups: dict[str, list[_Step]] = defaultdict(list)
         for st in steps:
             groups[st.retr].append(st)
         results: dict[int, QueryResult] = {}
-        running: dict[str, tuple[threading.Thread, list[float], list[tuple[_Step, QueryResult]], threading.Event,
-                                 float]] = {}
+        running: dict[str, tuple[Any, ...]] = {}
         for retr, sts in groups.items():
             r = self.r.get(retr)
             if r is None:
@@ -621,13 +700,34 @@ class _Runner:
                 continue
             box: list[tuple[_Step, QueryResult]] = []
             stop = threading.Event()
+            ready = threading.Event()
+            ready_limit = float(getattr(r._r, "readiness_timeout_s", 0.0)) if retr not in self.readiness else 0.0
+            started_at = self.clock()
+            left = self._left(retr)
+            timing: dict[str, float] = {"deadline": started_at + left}
 
             def body(r: Any = r, sts: list[_Step] = sts, box: list[tuple[_Step, QueryResult]] = box,
-                     stop: threading.Event = stop,
-                     deadline_at: float = self.clock() + self._left(retr)) -> None:
+                     stop: threading.Event = stop, ready: threading.Event = ready,
+                     timing: dict[str, float] = timing, ready_limit: float = ready_limit,
+                     started_at: float = started_at, left: float = left, retr: str = retr) -> None:
+                excluded = {id(st): res for st in sts if (res := self._preflight(r, st)) is not None} \
+                    if ready_limit else {}
+                if ready_limit and len(excluded) < len(sts) and left > 0:
+                    self._ready(retr, r, ready_limit, stop)
+                timing["readiness"] = max(0.0, self.clock() - started_at) if ready_limit else 0.0
+                deadline_at = self.clock() + left
+                timing["deadline"] = deadline_at
+                ready.set()
                 for index, st in enumerate(sts):
                     if stop.is_set():
                         return
+                    if id(st) in excluded:
+                        box.append((st, excluded[id(st)]))
+                        continue
+                    failed_ready = self.readiness.get(retr)
+                    if failed_ready is not None and failed_ready.status != "ok":
+                        box.append((st, failed_ready))
+                        continue
                     remaining = max(0.0, deadline_at - self.clock())
                     # A recovering first CH query used 18.9 of the shared 20s,
                     # leaving the weekly query about one second. Reserve a fair
@@ -637,18 +737,34 @@ class _Runner:
                         remaining /= len(sts) - index
                     box.append((st, self._query(st.retr, r, st, remaining)))
 
-            deadline = self.clock() + self._left(retr)
             t, spent = self._start(retr, body)
-            running[retr] = (t, spent, box, stop, deadline)
-        for retr, (t, spent, box, stop, deadline) in running.items():
-            if not self._settle(retr, t, spent, deadline):
+            running[retr] = (t, spent, box, stop, ready, timing, started_at + ready_limit, ready_limit)
+        for retr, (t, spent, box, stop, ready, timing, ready_deadline, ready_limit) in running.items():
+            if ready_limit:
+                ready.wait(max(0.0, ready_deadline - self.clock()))
+            readiness_expired = ready_limit and (not ready.is_set() or timing.get("readiness", 0) > ready_limit)
+            if readiness_expired:
+                self.dead.add(retr)
+                self.used[retr] = self.budget(retr)
                 stop.set()
+                if retr not in self.readiness:
+                    self.log.append({"step": f"{retr}.readiness", "phase": "readiness", "status": "error",
+                                     "found": 0, "detail": "readiness: timeout", "failure_kind": "timeout",
+                                     "elapsed_ms": round(ready_limit * 1000, 3), "budget_s": ready_limit,
+                                     "checked_at": datetime.now(UTC).isoformat(timespec="seconds"),
+                                     "recovery_status": "failed", "recovery_reason": "readiness: timeout"})
+            else:
+                if not self._settle(retr, t, spent, timing["deadline"]):
+                    stop.set()
+                elif ready_limit:
+                    self.used[retr] = max(0.0, self.used[retr] - timing["readiness"])
             for st, res in list(box):
                 results[id(st)] = res
             for st in groups[retr]:
-                results.setdefault(id(st), QueryResult(retr, "error", detail=f"timeout after {self.budget(retr):g}s"))
+                detail = "readiness: timeout" if readiness_expired else f"timeout after {self.budget(retr):g}s"
+                results.setdefault(id(st), QueryResult(retr, "error", detail=detail))
         out = [(st, results[id(st)]) for st in steps]
-        self.log += [{"step": st.name, "status": res.status, "found": len(res.refs),
+        self.log += [{"step": st.name, "phase": "query", "status": res.status, "found": len(res.refs),
                       "detail": _free(res.detail, 120) or "",
                       **self.observations.get(id(st), {})} for st, res in out]
         return out

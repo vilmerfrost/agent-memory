@@ -58,6 +58,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlencode
 
 import psycopg
 
@@ -190,7 +191,27 @@ class ReadOnlyClickHouseClient(clickhouse.Client):
         # Cloud's unauthenticated /ping wake path can take most of the pack's
         # budget while authenticated SELECTs are fast. Probe the exact read path.
         self.meter.hit()
-        rows = super().select(CH_HEALTH_SQL, {})
+        if self.cfg.cloud and not self.cfg.problem:
+            # Use the authenticated read path with Cloud's existing wake policy.
+            # Analytical SELECTs retain Client._post's shorter socket timeout.
+            deadline = getattr(self._read_state, 'deadline', None)
+            left = min(clickhouse.WAKE_TIMEOUT_S, deadline - time.monotonic()) if deadline is not None \
+                else clickhouse.WAKE_TIMEOUT_S
+            if left <= 0:
+                raise TimeoutError("ClickHouse readiness budget exhausted")
+            params = urlencode({"database": self.cfg.db, "wait_end_of_query": "1",
+                                "output_format_json_quote_64bit_integers": "0"})
+            headers = {"Content-Type": "text/plain; charset=utf-8"}
+            if self.cfg.user:
+                headers["X-ClickHouse-User"] = self.cfg.user
+            if self.cfg.key:
+                headers["X-ClickHouse-Key"] = self.cfg.key
+            response = clickhouse.http.request("POST", f"{self.cfg.url}/?{params}", headers=headers,
+                                               body=CH_HEALTH_SQL.encode(), timeout=left, total_timeout=left,
+                                               retries=0, sleep=self.sleep)
+            rows = [json.loads(line) for line in response.text().splitlines() if line.strip()]
+        else:
+            rows = super().select(CH_HEALTH_SQL, {})
         if rows != [{"ok": 1}]:
             raise clickhouse.http.HttpError(None, "unexpected ClickHouse read health answer")
 
@@ -392,6 +413,15 @@ class GatedRetriever:
     def read_budget(self, seconds: float):
         budget = getattr(self.inner, "read_budget", None) if not self.block else None
         return budget(seconds) if callable(budget) else nullcontext()
+
+    @property
+    def readiness_timeout_s(self) -> float:
+        """Only configured, permitted Cloud reads receive a separate wake allowance."""
+        cfg = getattr(getattr(self.inner, "client", None), "cfg", None)
+        if self.block or self.policy is None or not self.policy.read or self.service != "clickhouse" \
+                or cfg is None or cfg.problem or not cfg.cloud:
+            return 0.0
+        return clickhouse.WAKE_TIMEOUT_S
 
     @property
     def owner_off(self) -> bool:
