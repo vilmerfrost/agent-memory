@@ -163,11 +163,13 @@ class Ledger:
         self.checkpoint = _line(f"rsi-night checkpoint {before or 'first'} -> {next_checkpoint or '?'}", 300)
         trunc = _dget(delta, "truncated") or {}
         findings = list(_dget(delta, "findings") or [])
+        selection = _dget(delta, "finding_selection") or {}
         for kind, (ds, denom) in DELTA.items():
             rows = [f for f in findings if self._delta_provider(f) is None] if kind == "findings" \
                 else list(_dget(delta, kind) or [])
-            self.uses[ds].queried = len(rows)
-            self.snaps[ds] = {"kind": kind, "denominator": denom, "collected": len(rows),
+            count = selection.get("stored", {}).get("read", len(rows)) if kind == "findings" else len(rows)
+            self.uses[ds].queried = count
+            self.snaps[ds] = {"kind": kind, "denominator": denom, "collected": count,
                               "truncated": bool(isinstance(trunc, Mapping) and trunc.get(kind))}
         s = self.uses[SESSIONS]
         s.status, s.done = "analysis_not_run", True
@@ -175,6 +177,10 @@ class Ledger:
         for st in _dget(delta, "steps") or []:
             self._step(st, "s1")
         self._owner_off(_dget(delta, "health"))
+        for source, counts in selection.items():
+            u = self.uses[EVIDENCE] if source == "stored" else self.providers.get(source)
+            if u is not None:
+                u.skipped.update(counts.get("excluded") or {})
         self.delta_seen = True
 
     @staticmethod
@@ -195,7 +201,7 @@ class Ledger:
                 u.findings += 1
                 u.ref(_dget(f, "ref"))
         else:
-            u.skipped[outcome] += 1
+            u.skipped[_dget(f, "exclusion_reason") or outcome] += 1
 
     @_safe
     def deviations(self, *, used: int, team: int, other: int, sightings: Sequence[Any]) -> None:
@@ -295,7 +301,7 @@ class Ledger:
                 p.findings += 1               # supporting evidence for the candidate under investigation
                 p.ref(_dget(f, "ref"))
             else:
-                p.skipped[status or "unknown"] += 1
+                p.skipped[_dget(f, "exclusion_reason") or status or "unknown"] += 1
         if steps is None:                         # a pack without step records: its health says who answered
             for prov, h in (_dget(pack, "health") or {}).items():
                 if prov in self.providers and h != "skipped":
