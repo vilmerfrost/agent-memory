@@ -1056,8 +1056,16 @@ _FACT_ASSIGNMENTS = [
      if c in ("env", "experiment_id") else f"{c} = excluded.{c}") for c in _FACT_COLS]
 _TOKENS_DIFFER = (f"({', '.join('sessions.' + c for c in _TOKEN_COLS)}) is distinct from "
                   f"({', '.join('excluded.' + c for c in _TOKEN_COLS)})")
-_KEPT_DIFFER = (f"({', '.join(f'coalesce(excluded.{c}, sessions.{c})' for c in _KEEP_COLS)}) is distinct from "
-                f"({', '.join('sessions.' + c for c in _KEEP_COLS)})")
+
+
+def _kept_value(column: str, value: str) -> str:
+    """`tool_seconds` by the ingest's precision: the timing refresh stores the exact value, and an
+    ingest of the rounded one is no change."""
+    return f"round(({value})::numeric, 3)" if column == "tool_seconds" else value
+
+
+_KEPT_DIFFER = (f"({', '.join(_kept_value(c, f'coalesce(excluded.{c}, sessions.{c})') for c in _KEEP_COLS)}) "
+                f"is distinct from ({', '.join(_kept_value(c, 'sessions.' + c) for c in _KEEP_COLS)})")
 
 _UPSERT_SQL = f"""
 insert into sessions ({', '.join(_ALL_COLS)}, tokens_updated_at, title_updated_at, outcome_at)
