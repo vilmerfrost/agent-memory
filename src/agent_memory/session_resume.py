@@ -29,6 +29,7 @@ Reads only `uuid`, `sessionId` and `type`. Results are cached per file (path, mt
 from __future__ import annotations
 
 import json
+import os
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
@@ -107,11 +108,8 @@ def _is_subagent(path: Path) -> bool:
 def _folders(project: Path) -> list[Path]:
     """`project`, plus the folder of the same name in every other Claude root: a resume can start
     from a transcript in another root. One root: only `project`."""
-    roots = claude_roots.claude_roots()
-    if len(roots) < 2:
-        return [project]
-    others = {r.projects / project.name for r in roots}
-    return [project, *sorted(f for f in others if f.is_dir() and not f.samefile(project))]
+    here = os.path.realpath(project)
+    return [project, *sorted(f for f in claude_roots.project_folders(project.name) if os.path.realpath(f) != here)]
 
 
 def _siblings(path: Path) -> list[Path]:

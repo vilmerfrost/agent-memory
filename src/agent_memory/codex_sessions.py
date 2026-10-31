@@ -6,7 +6,7 @@ Where: `<codex home>/sessions/YYYY/MM/DD/rollout-<time>-<thread id>.jsonl` (and
 "type", "payload"}`. The types this module reads:
 
 - `session_meta` (first line): `id` (the thread id), `cwd`, `originator` (`Codex Desktop`,
-  `codex_exec`, `codex-tui`, `codex_vscode`), `source` (`vscode`, `exec`, or
+  `codex_exec`, `codex-tui`, `codex_vscode`, `T3 Code`), `source` (`vscode`, `exec`, or
   `{"subagent": {"thread_spawn": {"parent_thread_id", "agent_path", "agent_role", ...}}}`),
   `thread_source` (`user`, `subagent`, ...), `agent_path`, `git.repository_url`, and for a
   forked subagent `subagent_history_start_ordinal`: lines below that ordinal are a copy of

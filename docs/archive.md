@@ -40,11 +40,16 @@ Exit codes: 0 ok, 1 a problem, 2 usage.
 | claude | the `agent-<id>.meta.json` next to it | `<session>/agent-<id>` | `subagent-meta` |
 | `claude:<label>` | the same files in an added root (docs/sessions-live.md, "Transcript roots") | the same rules | the same roles |
 | codex | `<codex home>/sessions/**/rollout-*.jsonl`, `<codex home>/archived_sessions/**/rollout-*.jsonl` | `codex:<thread id>`: the first line's `session_meta` id, else the id in the file name, else the file name | `codex` |
+| `codex:<label>` | the same files in an added Codex home | the same rule | `codex` |
 
 Roots: `--projects-dir`, else `AMEM_PROJECTS_DIR`, else `<AMEM_CLAUDE_HOME or ~/.claude>/projects`
 plus the listed roots of `<claude home>/parent/claude-roots.tsv`. Old `claude` keys never change.
-`--codex-home`, else `AMEM_CODEX_HOME`, else `.codex` next to the Claude home. Symlinks are
-not followed. Files over 1 GiB are skipped (counted).
+`--codex-home`, else `AMEM_CODEX_HOME`, else `.codex` next to the Claude home plus the Codex homes
+of the same file. Old `codex` keys never change. Each home keeps its own key for its own file, so
+the same rollout in two folders gives two paths, and their versions do not alternate. A `restore`
+writes an added home's files below `codex-<label>/`. A hash folder that a pattern no longer
+matches is not read that run: its files are not gone at the source and not pruned for that reason.
+Symlinks are not followed. Files over 1 GiB are skipped (counted).
 
 Each version record holds: `source`, `path` (relative to its root), `role`, `session_id`,
 `sha256`, `size`, `mtime_ns`, `birthtime` (`st_birthtime`, when the OS has it), `first_seen`
@@ -135,7 +140,7 @@ Nothing to remove: only a `prune` record is appended, nothing is rewritten.
 
 The archive dir must not overlap the experiment sandbox root (`RSI_SANDBOX_DIR`, else
 `~/sandbox`), must not overlap a source root (the ones in use, the defaults
-`~/.claude/projects`, `~/.codex`, and every listed root), and must not be inside a git repository. `restore` refuses a
+`~/.claude/projects`, `~/.codex`, every listed root and the fixed folder of every pattern), and must not be inside a git repository. `restore` refuses a
 target inside a source root or the archive dir. `archive.forbidden_mount_roots()` returns the
 resolved archive dir (configured and default) and the key file, so the sandbox runner can
 refuse to mount them.

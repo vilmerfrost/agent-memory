@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 from psycopg.conninfo import conninfo_to_dict, make_conninfo
 
-from agent_memory import codex_sessions, sessions_ingest, config
+from agent_memory import claude_roots, codex_sessions, sessions_ingest, config
 
 
 def sync_transcript(path: Path, parent_session: str | None = None, *, db_url: str | None = None) -> dict:
@@ -14,13 +14,13 @@ def sync_transcript(path: Path, parent_session: str | None = None, *, db_url: st
         raise ValueError('secret-named files are not transcripts')
     path=path.expanduser().resolve()
     roots=(sessions_ingest.claude_home()/'projects',*(r.projects for r in sessions_ingest.transcript_roots()[1:]),
-           sessions_ingest.codex_home()/'sessions',sessions_ingest.codex_home()/'archived_sessions')
+           *(r.home/sub for r in sessions_ingest.codex_roots() for sub in sessions_ingest.CODEX_DIRS))
     if path.name.startswith('.env') or path.suffix!='.jsonl' or not any(path.is_relative_to(root.resolve()) for root in roots):
         raise ValueError('timing sync accepts only session JSONL inside configured agent homes')
     events=sessions_ingest.load_events(path)
     if not path.is_file() or not events:
         raise OSError('transcript is not ready; retain the queued request')
-    row=(sessions_ingest.codex_row(path,'timing-hook') if codex_sessions.is_codex(events)
+    row=(sessions_ingest.codex_row(path,'timing-hook',root_label=claude_roots.codex_label_of(path)) if codex_sessions.is_codex(events)
          else sessions_ingest.session_row(path,path.parent.name,parent_session=parent_session))
     if row.copy_only:
         return {'skipped':'copied history'}

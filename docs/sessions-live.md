@@ -214,19 +214,31 @@ Cloud chats use the repo of the session's cwd.
 ### Transcript roots
 
 `sessions ingest`, `archive run` and the transcript lookups read the default projects folder, plus
-the Claude homes listed in `<claude home>/parent/claude-roots.tsv` (`claude_roots.py`):
+the homes listed in `<claude home>/parent/claude-roots.tsv` (`claude_roots.py`):
 
 ```
-# label<TAB>Claude home: its projects/ folder is scanned
+# label<TAB>home: Claude reads its projects/ folder<TAB>codex: a Codex home instead
 t3	/path/to/another/claude-home
+t3	/path/to/control/native/*/home
+t3	/path/to/control/native/*/home	codex
+t3-admissions	/path/to/control/owner-admissions/*/home	codex
+t3-transitions	/path/to/control/transitions/*/home	codex
 ```
 
 - `claude_home()` stays `~/.claude`: `parent/` state stays there. No new job reads a root: the
   existing ingest and archive runs do.
-- Labels match `[a-z0-9][a-z0-9_-]*`. `default` and `claude` are reserved. A bad line, or a duplicate
-  label or path, is skipped with one warning on stderr. A root whose real path is already listed
-  (a symlink to the default root) gives no second copy.
-- No file, `--projects-dir` or `AMEM_PROJECTS_DIR`: the one default root, as before.
+- Labels match `[a-z0-9][a-z0-9_-]*`. `default` and `claude` are reserved. Each tool has its own
+  labels, so one pattern can be listed for both tools. A bad line, or a duplicate label or path, is
+  skipped with one warning on stderr. A root whose real path is already listed (a symlink to the
+  default root) gives no second copy.
+- A path component that is exactly `*` matches one folder level. There is no `**`, and a `*` inside
+  a name is a bad line. Each match with transcripts of that tool is one root, so a new hash folder
+  needs no file edit. Its label is `<label>-<first 12 characters>` of a hex digest folder, else
+  `<label>-<12 hex of its name's hash>` (dated names and time-ordered UUIDs share their first
+  characters). Only the folder's own name decides it, so a label does not change when other folders
+  appear. One ingest reads the file and its patterns once.
+- No file, `--projects-dir` or `AMEM_PROJECTS_DIR`: the one default Claude root, as before. No file,
+  `--codex-home` or `AMEM_CODEX_HOME`: the one default Codex home, as before.
 - A row of an added root stores `meta.claude_root` (the label). Missing means the default root, so
   default rows stay byte-identical.
 - Stored rows find their transcript through one resolver (`sessions_ingest.projects_for`). A label
@@ -236,10 +248,18 @@ t3	/path/to/another/claude-home
   in the list. The choice depends only on the files, so a re-ingest changes nothing. The other
   file counts as skipped. The archive keeps each file under its own root.
 - A resume chain crosses roots: the project folders of the same name count as one folder.
-- A listed root that is not there is skipped for that run. Its transcripts are unknown, not
-  deleted (docs/archive.md).
-- Codex is not a root. It is always read from the shared `codex_home()`, and an added Claude root
-  never changes that. A rollout reached twice through a symlink gives one row.
+- A listed root that is not there is skipped for that run, and so is a pattern's folder that is
+  gone. Its transcripts are unknown, not deleted (docs/archive.md). A stored row of a gone folder
+  resolves to a path that cannot exist.
+- Codex homes are listed only by a `codex` line. An added Claude root never adds a Codex home, even
+  though a guarded Claude home has a `sessions/` folder of its own. The default home is always first.
+  The row key stays `codex:<thread id>` and `project_dir` stays relative to its home. A row of an
+  added home stores `meta.codex_root` (the label). `sessions_ingest.codex_home_for` is the one
+  resolver for a stored row.
+- With more than one Codex home, the same thread in two homes, or in two folders of one home (a
+  transition can hold a rollout twice), gives one row: the newest file, a tie goes to the earlier
+  home. The other file counts as skipped. The archive keeps each file under its own key. With one
+  home nothing changes. A rollout reached twice through a symlink gives one row.
 
 ### Model, effort, duration
 

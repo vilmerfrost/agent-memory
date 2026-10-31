@@ -65,7 +65,6 @@ from agent_memory import redact as _redact
 from agent_memory.codex_sessions import payload
 from agent_memory.sessions_ingest import (
     SessionRow,
-    codex_home,
     is_human,
     load_events,
     own_events,
@@ -1176,9 +1175,10 @@ def pick_sessions(*, since: datetime, limit: int, session_id: str | None = None,
 def transcript_path(row: SessionRow, root: Path | None = None) -> Path:
     if row.tool == "codex":
         name = str(row.meta.get("file") or "")
+        home = sessions_ingest.codex_home_for(row.meta)
         if not re.fullmatch(r"rollout-[\w.-]+\.jsonl", name) or ".." in row.project_dir:
-            return codex_home() / "missing-transcript"
-        return codex_home() / row.project_dir / name
+            return home / "missing-transcript"
+        return home / row.project_dir / name
     root = root or sessions_ingest.projects_for(row.meta)
     parent = row.meta.get("parent_session")
     if parent:

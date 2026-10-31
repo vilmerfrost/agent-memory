@@ -9,7 +9,8 @@ Read (never written, never deleted):
   else `<AMEM_CLAUDE_HOME or ~/.claude>/projects` plus the roots of `<claude home>/parent/claude-roots.tsv`
   (claude_roots.py). Records of an added root use the source `claude:<label>`.
 - Codex: `<codex home>/sessions/**/rollout-*.jsonl` and `<codex home>/archived_sessions/**/rollout-*.jsonl`.
-  Codex home: `--codex-home`, `AMEM_CODEX_HOME`, else `.codex` next to the Claude home.
+  Codex home: `--codex-home`, `AMEM_CODEX_HOME`, else `.codex` next to the Claude home plus the Codex
+  homes of the same file. Records of an added home use the source `codex:<label>`.
 
 The archive dir (`AMEM_ARCHIVE_DIR`, default `~/Library/Application Support/amem-archive`, mode 700,
 every file mode 600):
@@ -82,7 +83,7 @@ _OBJ_NAME_RE = re.compile(r"([0-9a-f]{64})\.bin")
 _MAGIC = {"object": b"AMOB", "index": b"AMIX", "manifest": b"AMMF"}
 INDEX_IDENT = "index"
 MANIFEST_IDENT = "manifest"
-CODEX_DIRS = ("sessions", "archived_sessions")
+CODEX_DIRS = claude_roots.CODEX_DIRS
 
 
 class ArchiveError(Exception):
@@ -115,9 +116,7 @@ def projects_dir(arg: Path | None = None) -> Path:
 
 
 def codex_home(arg: Path | None = None) -> Path:
-    if arg is not None:
-        return arg.expanduser()
-    return _env_path("AMEM_CODEX_HOME") or claude_home().parent / ".codex"
+    return claude_roots.default_codex(arg)
 
 
 def default_archive_dir() -> Path:
@@ -161,11 +160,12 @@ def forbidden_mount_roots() -> tuple[Path, ...]:
 
 
 def source_roots(projects: Path | None = None, codex: Path | None = None) -> list[Path]:
-    """The transcript roots in use plus the default ones (~/.claude/projects, ~/.codex) and every
-    listed Claude root, present today or not, resolved."""
+    """The transcript roots in use plus the default ones (~/.claude/projects, ~/.codex), every
+    listed root, present today or not, and the fixed folder of every pattern, resolved."""
     out: list[Path] = []
     for p in (projects_dir(projects), codex_home(codex), Path.home() / ".claude" / "projects",
-              Path.home() / ".codex", *(root.projects for root in claude_roots.listed())):
+              Path.home() / ".codex", *(root.projects for root in claude_roots.listed()),
+              *(root.home for root in claude_roots.listed_codex()), *claude_roots.pattern_bases()):
         if (r := _real(p)) not in out:
             out.append(r)
     return out
@@ -779,7 +779,7 @@ def _object_files(layout: Layout) -> Iterator[tuple[str | None, Path]]:
 
 @dataclass(frozen=True)
 class Source:
-    source: str                 # claude | claude:<label> | codex
+    source: str                 # claude | claude:<label> | codex | codex:<label>
     path: Path                  # absolute
     rel: str                    # relative to its root, posix
     role: str                   # main | subagent | subagent-meta | codex
@@ -794,8 +794,9 @@ def _in_root(path: Path, real_root: Path) -> bool:
     return not path.is_symlink() and _inside(_real(path), real_root)
 
 
-def iter_sources(projects: Path | Sequence[claude_roots.ClaudeRoot], codex: Path) -> Iterator[Source]:
-    """Every transcript file below the Claude roots and the Codex home, in a stable order.
+def iter_sources(projects: Path | Sequence[claude_roots.ClaudeRoot],
+                 codex: Path | Sequence[claude_roots.CodexRoot]) -> Iterator[Source]:
+    """Every transcript file below the Claude roots and the Codex homes, in a stable order.
     Symlinks are skipped."""
     for root in [claude_roots.ClaudeRoot(None, projects)] if isinstance(projects, Path) else projects:
         if not root.projects.is_dir():
@@ -812,14 +813,15 @@ def iter_sources(projects: Path | Sequence[claude_roots.ClaudeRoot], codex: Path
             for f, role, sid in sorted(found):
                 if _in_root(f, real):
                     yield Source(root.source, f, f.relative_to(root.projects).as_posix(), role, sid)
-    for sub in CODEX_DIRS:
-        base = codex / sub
-        if not base.is_dir():
-            continue
-        real = _real(codex)
-        for f in sorted(base.rglob("rollout-*.jsonl")):
-            if _in_root(f, real):
-                yield Source("codex", f, f.relative_to(codex).as_posix(), "codex", None)
+    for home in [claude_roots.CodexRoot(None, codex)] if isinstance(codex, Path) else codex:
+        real = _real(home.home)
+        for sub in CODEX_DIRS:
+            base = home.home / sub
+            if not base.is_dir():
+                continue
+            for f in sorted(base.rglob("rollout-*.jsonl")):
+                if _in_root(f, real):
+                    yield Source(home.source, f, f.relative_to(home.home).as_posix(), "codex", None)
 
 
 def codex_session_id(data: bytes, stem: str) -> str:
@@ -964,8 +966,8 @@ def run(*, root: Path | None = None, projects: Path | None = None, codex: Path |
     """Archive every new version of every transcript. `dry_run` writes nothing, needs no key, and
     still counts what would be archived (against the index when the key can open it)."""
     layout = Layout(root or archive_dir())
-    roots, cdx = claude_roots.claude_roots(projects), codex_home(codex)
-    check_archive_dir(layout.root, source_roots(roots[0].projects, cdx))
+    roots, cdx = claude_roots.claude_roots(projects), claude_roots.codex_roots(codex)
+    check_archive_dir(layout.root, source_roots(roots[0].projects, cdx[0].home))
     stamp = _iso(now or _now())
     rep = RunReport(dry_run=dry_run)
     if dry_run:
@@ -1001,26 +1003,29 @@ def _dry_run_files(layout: Layout, store: KeyStore | None) -> dict[str, dict[str
     return json.loads(json.dumps(state.files))
 
 
-def _keep_unread_roots(files: dict[str, dict[str, Any]], roots: list[claude_roots.ClaudeRoot], stamp: str) -> None:
+def _keep_unread_roots(files: dict[str, dict[str, Any]], roots: list[claude_roots.ClaudeRoot],
+                       codex: list[claude_roots.CodexRoot], stamp: str) -> None:
     """An added root this run did not read (its folder is gone, or it left the roots file) says
     nothing about its files: they stay `last_seen` now, so `gone_at_source` and `prune` do not take
     them for deleted. A root that was read keeps the normal rule: a file not seen is gone."""
-    read = {root.source for root in roots}
+    read = {root.source for root in (*roots, *codex)}
+    added = (f"{claude_roots.DEFAULT_SOURCE}:", f"{claude_roots.CODEX_SOURCE}:")
     for key, entry in files.items():
         source = key.split("/", 1)[0]
-        if source.startswith(f"{claude_roots.DEFAULT_SOURCE}:") and source not in read:
+        if source.startswith(added) and source not in read:
             entry["last_seen"] = stamp
 
 
 def _scan(rep: RunReport, layout: Layout, keyring: Keyring | None, files: dict[str, dict[str, Any]],
-          roots: list[claude_roots.ClaudeRoot], codex: Path, stamp: str) -> list[dict[str, Any]]:
+          roots: list[claude_roots.ClaudeRoot], codex: list[claude_roots.CodexRoot],
+          stamp: str) -> list[dict[str, Any]]:
     """Count (and, with a keyring, write) every new version. Returns the new version records."""
     write = keyring is not None
     records: list[dict[str, Any]] = []
     seen_objects: set[str] = set()
     touched: set[Path] = set()
     if write:
-        _keep_unread_roots(files, roots, stamp)
+        _keep_unread_roots(files, roots, codex, stamp)
     for src in iter_sources(roots, codex):
         try:
             st = os.lstat(src.path)
@@ -1194,21 +1199,23 @@ def _safe_rel(rel: str) -> Path:
     return p
 
 
-_ADDED_SOURCE_RE = re.compile(rf"{claude_roots.DEFAULT_SOURCE}:({claude_roots.LABEL_RE.pattern})")
+_ADDED_SOURCE_RE = re.compile(rf"({claude_roots.DEFAULT_SOURCE}|{claude_roots.CODEX_SOURCE}):"
+                              rf"({claude_roots.LABEL_RE.pattern})")
 
 
 def _restore_rel(rec: dict[str, Any]) -> Path:
-    """Where a record goes below the target dir: its path; for an added root (`claude:<label>`)
-    below `claude-<label>/`, so one session id in two roots gives two files, not a collision."""
+    """Where a record goes below the target dir: its path; for an added root (`claude:<label>`,
+    `codex:<label>`) below `claude-<label>/` or `codex-<label>/`, so one session id in two roots
+    gives two files, not a collision."""
     m = _ADDED_SOURCE_RE.fullmatch(str(rec.get("source")))
-    return Path(f"{claude_roots.DEFAULT_SOURCE}-{m.group(1)}") / _safe_rel(rec["path"]) if m else _safe_rel(rec["path"])
+    return Path(f"{m.group(1)}-{m.group(2)}") / _safe_rel(rec["path"]) if m else _safe_rel(rec["path"])
 
 
 def restore(session_id: str, to: Path, *, version: int | str = "latest", as_of: datetime | None = None,
             root: Path | None = None, store: KeyStore | None = None) -> RestoreReport:
     """Write the selected version of every file of a session below `to` (at its path relative to
-    its source root; `claude-<label>/` first for an added root), mode 600, with the recorded mtime.
-    Never overwrites a file."""
+    its source root; `claude-<label>/` or `codex-<label>/` first for an added root), mode 600, with
+    the recorded mtime. Never overwrites a file."""
     layout = Layout(root or archive_dir())
     roots = source_roots()
     check_archive_dir(layout.root, roots)
