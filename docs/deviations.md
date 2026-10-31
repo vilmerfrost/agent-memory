@@ -61,8 +61,8 @@ id `<parent session>/agent-<id>`.
 | `eval` | The project folder is an eval clone, a probe or the memory observer, or the cwd is under `~/.cache/agent-evals` or `~/.cache/skill-evals`. |
 | `worker` | A subagent transcript. `meta.agent_type` holds the agent type (`worker`, `Explore`, ...). |
 | `routine` | A scheduled task: the first message holds a `<scheduled-task name=...>` block, or a turn has `turnOrigin = scheduled`. `meta.routine` = the name. |
-| `headless` | `claude -p` or the SDK: `entrypoint` starts with `sdk`. |
-| `parent` | The session ran `parent-lock`, used the `dispatch` skill or spawned a `worker`. |
+| `parent` | The session ran `parent-lock`, used the `dispatch` skill or spawned a `worker`, also through the SDK (`meta.entrypoints` keeps the entrypoint). |
+| `headless` | `claude -p` or the SDK without that evidence: `entrypoint` starts with `sdk`. |
 | `chat` | Everything else. |
 
 - `repo`: from the working directory (`.../worktrees/<repo>/<name>` → `<repo>`, else the
@@ -77,6 +77,8 @@ id `<parent session>/agent-<id>`.
 - Cloud routine sessions come from the `cloud_digests` table, not a transcript file: id
   `cloud:<session id>`, kind `routine`, `project_dir` `cloud`, `meta.cloud` true (docs/cloud.md).
 - `meta.team`: true for a team repo's session (see Team repos below).
+- `meta.claude_root`: the label of an added transcript root; missing means the default root
+  (docs/sessions-live.md, "Transcript roots").
 - Tokens: `tokens_input`, `tokens_output`, `tokens_cache_read`, `tokens_cache_creation`,
   `models`, `turns`, `last_activity_at`; a parent's `meta.subagent_tokens` sums its
   subagents (docs/sessions-live.md). A row a hook created (`meta.live`) is completed by ingest.

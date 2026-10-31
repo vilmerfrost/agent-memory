@@ -192,7 +192,10 @@ but it is user-typed, so it is redacted like other text and capped at 200 chars.
 ### Project and category
 
 `category` = the session kind: `routine`, `chat` (local or cloud), `parent`, `worker`
-(subagents, dispatch workers), `eval`, `headless` (`claude -p`, `codex exec`).
+(subagents, dispatch workers), `eval`, `headless` (`claude -p`, `codex exec`). An SDK session with
+parent evidence (`parent-lock`, the `dispatch` skill, a spawned `worker`) is a `parent`. A hook
+cannot see that evidence, so a ping files it as `headless` until ingest; a ping never changes the
+kind of a stored row.
 
 `project` = where the work happened, first match wins:
 
@@ -207,6 +210,36 @@ but it is user-typed, so it is redacted like other text and capped at 200 chars.
 | anything else | the folder's basename; never empty (`unknown`) |
 
 Cloud chats use the repo of the session's cwd.
+
+### Transcript roots
+
+`sessions ingest`, `archive run` and the transcript lookups read the default projects folder, plus
+the Claude homes listed in `<claude home>/parent/claude-roots.tsv` (`claude_roots.py`):
+
+```
+# label<TAB>Claude home: its projects/ folder is scanned
+t3	/path/to/another/claude-home
+```
+
+- `claude_home()` stays `~/.claude`: `parent/` state stays there. No new job reads a root: the
+  existing ingest and archive runs do.
+- Labels match `[a-z0-9][a-z0-9_-]*`. `default` and `claude` are reserved. A bad line, or a duplicate
+  label or path, is skipped with one warning on stderr. A root whose real path is already listed
+  (a symlink to the default root) gives no second copy.
+- No file, `--projects-dir` or `AMEM_PROJECTS_DIR`: the one default root, as before.
+- A row of an added root stores `meta.claude_root` (the label). Missing means the default root, so
+  default rows stay byte-identical.
+- Stored rows find their transcript through one resolver (`sessions_ingest.projects_for`). A label
+  the file no longer lists resolves to a path that cannot exist, never to a same-ID file in the
+  default root. The moved-session lookup stays inside the row's root.
+- The same session id in two roots gives one row: the newest file, a tie goes to the earlier root
+  in the list. The choice depends only on the files, so a re-ingest changes nothing. The other
+  file counts as skipped. The archive keeps each file under its own root.
+- A resume chain crosses roots: the project folders of the same name count as one folder.
+- A listed root that is not there is skipped for that run. Its transcripts are unknown, not
+  deleted (docs/archive.md).
+- Codex is not a root. It is always read from the shared `codex_home()`, and an added Claude root
+  never changes that. A rollout reached twice through a symlink gives one row.
 
 ### Model, effort, duration
 

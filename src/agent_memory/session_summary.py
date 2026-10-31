@@ -130,7 +130,7 @@ def skip_reason(rec: dict[str, Any], now: datetime, *, redo_bad: bool = False) -
 def transcript_of(rec: dict[str, Any]) -> Path:
     """The row's transcript. A top-level Claude Code transcript that is not in the stored
     project folder (the session changed directory, so Claude Code moved the file) is looked
-    up by its file name in the other project folders."""
+    up by its file name in the other project folders of the row's own root."""
     from agent_memory import deviations  # local import: deviations imports sessions_ingest
 
     row = sessions_ingest.SessionRow(rec["session_id"], rec["kind"], rec.get("repo"), rec.get("project_dir") or "",
@@ -141,7 +141,7 @@ def transcript_of(rec: dict[str, Any]) -> Path:
     if (path.is_file() or row.tool == "codex" or row.meta.get("parent_session")
             or not re.fullmatch(r"[\w-]+", sid)):
         return path
-    moved = sorted(sessions_ingest.projects_dir().glob(f"*/{sid}.jsonl"))
+    moved = sorted(sessions_ingest.projects_for(row.meta).glob(f"*/{sid}.jsonl"))
     return moved[0] if moved else path
 
 

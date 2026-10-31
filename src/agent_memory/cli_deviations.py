@@ -68,12 +68,12 @@ def cmd_sessions_ingest(args: argparse.Namespace) -> int:
     if (code := _write_guard("sessions ingest")) is not None:
         return code
     tools = sessions_ingest.TOOLS if args.tool == "all" else (args.tool,)
-    root = sessions_ingest.projects_dir(args.projects_dir)
-    if "claude" in tools and not root.is_dir():
-        print(f"amem: sessions ingest failed: no such directory: {root}", file=sys.stderr)
+    roots = sessions_ingest.transcript_roots(args.projects_dir)
+    if "claude" in tools and not roots[0].projects.is_dir():
+        print(f"amem: sessions ingest failed: no such directory: {roots[0].projects}", file=sys.stderr)
         return 1
     try:
-        report = sessions_ingest.ingest(root, days=args.days, codex=args.codex_home, tools=tools)
+        report = sessions_ingest.ingest(roots, days=args.days, codex=args.codex_home, tools=tools)
     except (OSError, psycopg.Error) as exc:
         return _err("sessions ingest", exc)
     print(report.line())
@@ -209,11 +209,11 @@ def cmd_sessions_find(args: argparse.Namespace) -> int:
         return code
     try:
         if args.ingest:
-            root = sessions_ingest.projects_dir(args.projects_dir)
-            files, new, updated = session_find.ingest(args.agent_id, root)
+            roots = [r.projects for r in sessions_ingest.transcript_roots(args.projects_dir)]
+            files, new, updated = session_find.ingest(args.agent_id, roots)
             if not files:
                 print(f"amem: sessions find: no transcript agent-{args.agent_id}.jsonl under "
-                      f"{root}/*/*/subagents/", file=sys.stderr)
+                      f"{roots[0]}/*/*/subagents/", file=sys.stderr)
                 return 1
             print(f"ingested {files} file(s): {new} new, {updated} updated", file=sys.stderr)
         rows = session_find.find(args.agent_id)

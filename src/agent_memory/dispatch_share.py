@@ -12,6 +12,7 @@ Refresh only: dispatch start/end never import this module.
 from __future__ import annotations
 
 import json
+from collections.abc import Iterable, Iterator
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -44,13 +45,20 @@ def _claude_owner(path: Path, projects: Path) -> str | None:
     return None
 
 
-def claude_window(projects: Path, start: datetime, end: datetime, session: str) -> dict[str, Any]:
+def _claude_files(projects: Path | Iterable[Path]) -> Iterator[tuple[Path, Path]]:
+    """(transcript, its root) for one projects folder or several (the Claude roots)."""
+    for root in [projects] if isinstance(projects, Path) else projects:
+        for path in root.glob("**/*.jsonl"):
+            yield path, root
+
+
+def claude_window(projects: Path | Iterable[Path], start: datetime, end: datetime, session: str) -> dict[str, Any]:
     """Fresh tokens (input + output + cache creation) inside the window: the run's and everyone's."""
     floor = start.timestamp()
     own = total = 0
     sessions: set[str] = set()
     files = 0
-    for path in projects.glob("**/*.jsonl"):
+    for path, root in _claude_files(projects):
         if path.is_symlink() or not path.is_file():
             continue
         try:
@@ -58,7 +66,7 @@ def claude_window(projects: Path, start: datetime, end: datetime, session: str) 
                 continue
         except OSError:
             continue
-        owner = _claude_owner(path, projects)
+        owner = _claude_owner(path, root)
         if owner is None:
             continue
         latest: dict[str, int] = {}          # message id -> fresh; the latest line of a message wins
@@ -143,7 +151,7 @@ def codex_window(home: Path, start: datetime, end: datetime, session: str) -> di
     return {"own": own, "total": total, "sessions": len(threads), "files": files}
 
 
-def run_share(run: dict, *, projects: Path, codex_home: Path) -> dict[str, Any] | None:
+def run_share(run: dict, *, projects: Path | Iterable[Path], codex_home: Path) -> dict[str, Any] | None:
     """The run's token share for its own tool, or None when it cannot be measured."""
     start, end = D.parse_ts(run.get("dispatched_at")), D.parse_ts(run.get("briefed_at"))
     session, tool = run.get("session"), run.get("tool")

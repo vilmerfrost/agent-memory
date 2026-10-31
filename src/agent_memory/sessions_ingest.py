@@ -17,9 +17,15 @@ Kind, first match wins:
 2. worker    the file is under a `subagents/` folder (meta.agent_type from `agent-*.meta.json`)
 3. routine   a scheduled task: the first user message holds a `<scheduled-task ...>` block,
              or a turn has `turnOrigin = scheduled`
-4. headless  `claude -p` / SDK: `entrypoint` starts with `sdk` (`sdk-cli`, `sdk-ts`)
-5. parent    the session ran `parent-lock`, the `dispatch` skill, or spawned a `worker`
+4. parent    the session ran `parent-lock`, the `dispatch` skill, or spawned a `worker`
+             (also through the SDK: `meta.entrypoints` keeps the entrypoint)
+5. headless  `claude -p` / SDK: `entrypoint` starts with `sdk` (`sdk-cli`, `sdk-ts`)
 6. chat      everything else
+
+Several roots (claude_roots.py, docs/sessions-live.md "Transcript roots"): `amem sessions ingest`
+reads the default projects folder and the roots listed in `<claude home>/parent/claude-roots.tsv`.
+A row of an added root stores `meta.claude_root`; a missing value means the default root. The same
+session id in two roots gives one row: the newest file, a tie goes to the earlier root.
 
 Codex sessions (`tool = codex`, codex_sessions.py) come from `<codex home>/sessions` and
 `<codex home>/archived_sessions`. Id `codex:<thread id>`, `project_dir` the folder relative
@@ -58,7 +64,7 @@ import json
 import os
 import re
 import sys
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -66,7 +72,7 @@ from typing import Any
 
 from psycopg.types.json import Jsonb
 
-from agent_memory import codex_sessions, config, session_commits, session_resume, session_tokens, store
+from agent_memory import claude_roots, codex_sessions, config, session_commits, session_resume, session_tokens, store
 
 KINDS = ("chat", "parent", "worker", "headless", "eval", "routine")
 TOOLS = ("claude", "codex")
@@ -108,6 +114,19 @@ def projects_dir(arg: Path | None = None) -> Path:
     config.load_env()
     env = os.environ.get("AMEM_PROJECTS_DIR", "").strip()
     return Path(env).expanduser() if env else claude_home() / "projects"
+
+
+def transcript_roots(arg: Path | None = None) -> list[claude_roots.ClaudeRoot]:
+    """The Claude roots to read now (claude_roots.claude_roots), after the env files."""
+    config.load_env()
+    return claude_roots.claude_roots(arg)
+
+
+def projects_for(meta: dict[str, Any] | None) -> Path:
+    """The one resolver for a stored row: the projects folder its `meta.claude_root` names. Every
+    lookup of a stored transcript goes through it (deviations, session_summary)."""
+    config.load_env()
+    return claude_roots.resolve((meta or {}).get("claude_root"))
 
 
 def agent_config_dir() -> Path:
@@ -566,10 +585,10 @@ def classify(f: Facts, *, project_dir: str, cwd: str, subagent: bool) -> str:
         return "worker"
     if f.scheduled is not None or "scheduled" in f.turn_origins:
         return "routine"
+    if f.ran_parent_lock or f.spawned_workers or "dispatch" in f.skills:
+        return "parent"   # before the entrypoint: a parent can run through the SDK
     if any(ep.startswith("sdk") for ep in f.entrypoints):
         return "headless"
-    if f.ran_parent_lock or f.spawned_workers or "dispatch" in f.skills:
-        return "parent"
     return "chat"
 
 
@@ -614,6 +633,9 @@ def session_row(path: Path, project_dir: str, *, parent_session: str | None = No
         "tool_calls": mine.tool_calls,
         "spawned_workers": mine.spawned_workers,
     }
+    root_label = claude_roots.label_of(path)
+    if root_label is not None:   # no key for the default root: its rows stay byte-identical
+        meta["claude_root"] = root_label
     if resume.resumed_from:
         meta["resumed_from"] = resume.resumed_from
     if mine is not facts:
@@ -800,17 +822,22 @@ CODEX_DIRS = ("sessions", "archived_sessions")
 
 
 def codex_transcripts(home: Path, since: datetime) -> Iterator[tuple[Path, str]]:
-    """(file, folder relative to the Codex home) for rollout files touched since `since`."""
-    for sub in CODEX_DIRS:
-        base = home / sub
-        if not base.is_dir():
+    """(file, folder relative to the Codex home) for rollout files touched since `since`. One
+    file gives one row: a symlink to a rollout that is also here as a plain file adds nothing,
+    and two links to one file give the first link."""
+    files = [f for sub in CODEX_DIRS if (home / sub).is_dir() for f in sorted((home / sub).rglob("rollout-*.jsonl"))]
+    plain = {os.path.realpath(f) for f in files if not f.is_symlink()}
+    seen: set[str] = set()
+    for f in files:
+        real = os.path.realpath(f)
+        if real in seen or (f.is_symlink() and real in plain):
             continue
-        for f in sorted(base.rglob("rollout-*.jsonl")):
-            try:
-                if f.is_file() and _mtime(f) >= since:
-                    yield f, str(f.parent.relative_to(home))
-            except (OSError, ValueError):
-                continue
+        seen.add(real)
+        try:
+            if f.is_file() and _mtime(f) >= since:
+                yield f, str(f.parent.relative_to(home))
+        except (OSError, ValueError):
+            continue
 
 
 @dataclass
@@ -818,7 +845,8 @@ class IngestReport:
     files: int = 0
     new: int = 0
     updated: int = 0
-    skipped: int = 0  # empty transcripts, pure copies of a resumed one, or ones that ended before the window
+    skipped: int = 0  # empty transcripts, pure copies of a resumed one, ones that ended before the window,
+    #                   or the older file of a session id found in two Claude roots
     kinds: dict[str, int] = field(default_factory=dict)
     tools: dict[str, int] = field(default_factory=dict)
     team: int = 0
@@ -852,19 +880,41 @@ class IngestReport:
                 f"{self.skipped} skipped ({kinds}) tools({tools}) team={self.team}{cloud}{bad}{spool}{fixed}{summ}")
 
 
-def collect(root: Path | None, *, days: int = DEFAULT_DAYS, now: datetime | None = None,
+def one_per_session(rows: list[SessionRow]) -> list[SessionRow]:
+    """One row per session id, for a session in two Claude roots. Newest file first; on a tie a
+    plain file beats a symlink, then the earlier row wins (`rows` is in roots order). The choice
+    depends only on the files, so a re-ingest makes the same one."""
+    def rank(r: SessionRow) -> tuple[int, bool]:
+        try:
+            return (r.path.stat().st_mtime_ns, not r.path.is_symlink()) if r.path is not None else (-1, False)
+        except OSError:
+            return (-1, False)
+
+    best: dict[str, SessionRow] = {}
+    for r in rows:
+        if r.session_id not in best or rank(r) > rank(best[r.session_id]):
+            best[r.session_id] = r
+    return list(best.values())
+
+
+ClaudeSource = Path | Sequence[claude_roots.ClaudeRoot] | None
+
+
+def collect(root: ClaudeSource, *, days: int = DEFAULT_DAYS, now: datetime | None = None,
             codex: Path | None = None, tools: tuple[str, ...] = TOOLS) -> tuple[list[SessionRow], int]:
-    """Rows for every transcript in the window, plus the number skipped. `root`: the Claude
-    projects folder; `codex`: the Codex home (default `codex_home()`)."""
+    """Rows for every transcript in the window, plus the number skipped. `root`: one Claude
+    projects folder, or the roots of `transcript_roots()`; `codex`: the Codex home (default
+    `codex_home()`, never derived from a Claude root)."""
     now = now or datetime.now(UTC)
     since = now - timedelta(days=days)
     from agent_memory import instruction_sources
 
+    roots = [claude_roots.ClaudeRoot(None, root)] if isinstance(root, Path) else list(root or ())
     found: list[SessionRow] = []
     with instruction_sources.batch():   # one set of git caches for every row of this run
-        if "claude" in tools and root is not None:
+        if "claude" in tools:
             found += [session_row(path, project, parent_session=parent)
-                      for path, project, parent in transcripts(root, since)]
+                      for r in roots for path, project, parent in transcripts(r.projects, since)]
         if "codex" in tools:
             home = codex_home(codex)
             titles = codex_titles(home)
@@ -876,20 +926,30 @@ def collect(root: Path | None, *, days: int = DEFAULT_DAYS, now: datetime | None
             skipped += 1
             continue
         rows.append(row)
+    several = len(roots) > 1
+    if several:   # after the filter above: a pure copy never hides a real transcript
+        claude = one_per_session([r for r in rows if r.tool == "claude"])
+        skipped += sum(r.tool == "claude" for r in rows) - len(claude)
+        rows = claude + [r for r in rows if r.tool != "claude"]
     spread_team(rows)
-    rollup_subagents(rows)
+    rollup_subagents(rows, several_roots=several)
     return rows, skipped
 
 
-def rollup_subagents(rows: list[SessionRow]) -> None:
+def rollup_subagents(rows: list[SessionRow], *, several_roots: bool = False) -> None:
     """`meta.subagent_tokens` on each parent row: the summed tokens of its subagents
     ({input, output, cache_read, cache_creation, sessions}). Claude Code: every
     `<session>/subagents/agent-*.jsonl` next to the parent transcript (a subagent file not in
-    this ingest is read for its tokens only; a pure copy, session_resume, adds nothing). Codex: the subagent rows of this ingest whose
+    this ingest is read for its tokens only; a pure copy, session_resume, adds nothing), and with
+    `several_roots` the subagent rows of this ingest in another root. Codex: the subagent rows of this ingest whose
     `meta.parent_session` is the parent. The subagents keep their own rows: a sum over all
     rows never adds this field."""
     by_id = {r.session_id: r for r in rows}
     sums: dict[str, tuple[session_tokens.Tokens, int]] = {}
+    sub_dirs: dict[str, set[Path]] = {}
+    for r in rows if several_roots else ():
+        if r.tool == "claude" and r.path is not None and "parent_session" in r.meta:
+            sub_dirs.setdefault(str(r.meta["parent_session"]), set()).add(r.path.parent)
 
     def add(parent: str, t: session_tokens.Tokens) -> None:
         total, n = sums.get(parent, (session_tokens.Tokens(), 0))
@@ -898,8 +958,9 @@ def rollup_subagents(rows: list[SessionRow]) -> None:
 
     for r in rows:
         if r.tool == "claude" and r.path is not None and "parent_session" not in r.meta:
-            sub_dir = r.path.parent / r.path.stem / "subagents"
-            for f in sorted(sub_dir.glob("agent-*.jsonl")) if sub_dir.is_dir() else []:
+            dirs = {r.path.parent / r.path.stem / "subagents", *sub_dirs.get(r.session_id, ())}
+            files = {f.stem: f for d in sorted(dirs, reverse=True) if d.is_dir() for f in d.glob("agent-*.jsonl")}
+            for f in (files[stem] for stem in sorted(files)):
                 got = by_id.get(f"{r.session_id}/{f.stem}")
                 if got is not None and got.tokens is not None:
                     add(r.session_id, got.tokens.tokens)
@@ -950,7 +1011,7 @@ values ({', '.join(f'%({c})s' for c in _ALL_COLS)},
         case when %(outcome)s::text is null then null else now() end)
 on conflict (session_id) do update
     set {', '.join(_FACT_ASSIGNMENTS)},
-        meta = sessions.meta || excluded.meta || case
+        meta = (sessions.meta - 'claude_root') || excluded.meta || case
           when sessions.meta->>'rsi_native_observation'='true' and excluded.transcript_bytes>0
           then jsonb_build_object('transcript_available',true) else '{{}}'::jsonb end,
         {', '.join(f'{c} = coalesce(excluded.{c}, sessions.{c})' for c in (*_TOKEN_COLS, *_KEEP_COLS))},
@@ -965,6 +1026,7 @@ on conflict (session_id) do update
     where ({', '.join('sessions.' + c for c in _FACT_COLS)})
           is distinct from ({', '.join('excluded.' + c for c in _FACT_COLS)})
        or not (sessions.meta @> excluded.meta)
+       or (sessions.meta ? 'claude_root' and not excluded.meta ? 'claude_root')
        or (excluded.tokens_input is not null and {_TOKENS_DIFFER})
        or {_KEPT_DIFFER}
        or (excluded.instruction_sources is not null
@@ -1328,7 +1390,7 @@ def refresh_stored(*, db_url: str | None = None, now: datetime | None = None) ->
     return outcomes, places
 
 
-def ingest(root: Path | None, *, days: int = DEFAULT_DAYS, now: datetime | None = None,
+def ingest(root: ClaudeSource, *, days: int = DEFAULT_DAYS, now: datetime | None = None,
            db_url: str | None = None, codex: Path | None = None,
            tools: tuple[str, ...] = TOOLS) -> IngestReport:
     from agent_memory import session_live  # local import: session_live imports this module

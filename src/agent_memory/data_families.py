@@ -123,7 +123,7 @@ FAMILIES: tuple[Family, ...] = (
         owner_job=DAILY,
         tables=("sessions", "cloud_digests"),
         views=("session_groups", "dashboard_sessions"),
-        local=("~/.claude/projects/**/*.jsonl (Claude transcripts, read in place)",
+        local=("~/.claude/projects/**/*.jsonl and the roots in parent/claude-roots.tsv (Claude transcripts, read in place)",
                "~/.codex/sessions/**/rollout-*.jsonl (Codex transcripts, read in place)",
                "~/.claude/parent/amem-session-spool.jsonl (ping spool)",
                "amem archive (encrypted transcript archive, docs/archive.md)"),

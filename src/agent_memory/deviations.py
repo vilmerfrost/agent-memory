@@ -69,7 +69,6 @@ from agent_memory.sessions_ingest import (
     is_human,
     load_events,
     own_events,
-    projects_dir,
     text_of,
 )
 
@@ -1180,7 +1179,7 @@ def transcript_path(row: SessionRow, root: Path | None = None) -> Path:
         if not re.fullmatch(r"rollout-[\w.-]+\.jsonl", name) or ".." in row.project_dir:
             return codex_home() / "missing-transcript"
         return codex_home() / row.project_dir / name
-    root = root or projects_dir()
+    root = root or sessions_ingest.projects_for(row.meta)
     parent = row.meta.get("parent_session")
     if parent:
         stem = row.session_id.split("/", 1)[1] if "/" in row.session_id else row.session_id
@@ -1200,7 +1199,7 @@ def released_marker(row: SessionRow, root: Path | None = None) -> Path | None:
     transcript went with its parent, so its marker is the parent's. Codex has no such marker."""
     if row.tool == "codex" or ".." in row.project_dir:
         return None
-    root = root or projects_dir()
+    root = root or sessions_ingest.projects_for(row.meta)
     top = str(row.meta.get("parent_session") or row.session_id)
     if "/" in top or ".." in top:
         return None

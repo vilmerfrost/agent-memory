@@ -841,7 +841,8 @@ def attach_shares(runs: dict[str, dict], previous: dict, notes: list[str], *,
 
     cache = previous.get("shares") if isinstance(previous.get("shares"), dict) else {}
     out: dict[str, dict] = {}
-    projects, home = sessions_ingest.projects_dir(), dispatch_seed.codex_home(codex_home)
+    home = dispatch_seed.codex_home(codex_home)
+    projects = [r.projects for r in sessions_ingest.transcript_roots()]   # a plan limit spans every root
     for run in runs.values():
         if run.get("minutes") is None or run.get("status") == "abandoned":
             continue

@@ -10,7 +10,8 @@ The rule here:
 
 - Chain: the transcripts of one project folder whose first line `uuid` is the same. Main
   transcripts (`<project>/*.jsonl`) and subagent files (`<project>/*/subagents/agent-*.jsonl`)
-  form separate chains.
+  form separate chains. With several Claude roots (claude_roots.py), the folders of the same name
+  in all roots count as one folder.
 - Order: the file's birth time (`st_birthtime`, macOS), else its mtime; then the file name. The
   copy is always written after the transcript it copies. The order never depends on which files
   an ingest reads or in which order.
@@ -32,6 +33,8 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+from agent_memory import claude_roots
 
 FIRST_UUID_LINES = 50   # the first uuid is on one of the first lines (a few lines carry none)
 MESSAGE_TYPES = ("user", "assistant")
@@ -101,10 +104,20 @@ def _is_subagent(path: Path) -> bool:
     return path.parent.name == "subagents"
 
 
+def _folders(project: Path) -> list[Path]:
+    """`project`, plus the folder of the same name in every other Claude root: a resume can start
+    from a transcript in another root. One root: only `project`."""
+    roots = claude_roots.claude_roots()
+    if len(roots) < 2:
+        return [project]
+    others = {r.projects / project.name for r in roots}
+    return [project, *sorted(f for f in others if f.is_dir() and not f.samefile(project))]
+
+
 def _siblings(path: Path) -> list[Path]:
     if _is_subagent(path):
-        return sorted(path.parent.parent.parent.glob("*/subagents/agent-*.jsonl"))
-    return sorted(path.parent.glob("*.jsonl"))
+        return sorted(f for d in _folders(path.parent.parent.parent) for f in d.glob("*/subagents/agent-*.jsonl"))
+    return sorted(f for d in _folders(path.parent) for f in d.glob("*.jsonl"))
 
 
 def session_id_of(path: Path) -> str:
@@ -151,8 +164,9 @@ def resume_of(path: Path) -> Resume:
     if first is None:
         return NONE
     mine = order_key(path)
+    own_id = session_id_of(path)   # the same session in another root is no earlier transcript of it
     earlier = sorted((p for p in _siblings(path)
-                      if p != path and order_key(p) < mine and first_uuid(p) == first), key=order_key)
+                      if session_id_of(p) != own_id and order_key(p) < mine and first_uuid(p) == first), key=order_key)
     if not earlier:
         return NONE
     mine_uuids = uuids(path)
