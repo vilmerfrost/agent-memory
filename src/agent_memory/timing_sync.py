@@ -14,7 +14,8 @@ def sync_transcript(path: Path, parent_session: str | None = None, *, db_url: st
         raise ValueError('secret-named files are not transcripts')
     path=path.expanduser().resolve()
     roots=(sessions_ingest.claude_home()/'projects',*(r.projects for r in sessions_ingest.transcript_roots()[1:]),
-           *(r.home/sub for r in sessions_ingest.codex_roots() for sub in sessions_ingest.CODEX_DIRS))
+           sessions_ingest.codex_home()/'sessions',sessions_ingest.codex_home()/'archived_sessions',
+           *(r.home/sub for r in sessions_ingest.codex_roots()[1:] for sub in sessions_ingest.CODEX_DIRS))
     if path.name.startswith('.env') or path.suffix!='.jsonl' or not any(path.is_relative_to(root.resolve()) for root in roots):
         raise ValueError('timing sync accepts only session JSONL inside configured agent homes')
     events=sessions_ingest.load_events(path)
