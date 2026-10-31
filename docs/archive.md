@@ -23,7 +23,7 @@ Code: `src/agent_memory/archive.py` (logic), `src/agent_memory/cli_archive.py` (
 | `amem archive run [--dry-run] [--projects-dir D] [--codex-home D]` | Archives every new version. Prints counts only: files seen, new versions, unchanged, new objects, bytes. Exit 1 when a file could not be read. |
 | `amem archive run --dry-run` | Writes nothing and needs no key. Counts what a run would archive: against the index when the key opens it, else every file counts as new (stored objects still dedupe by name). |
 | `amem archive verify [--sample N]` | Decrypts every (or N random) referenced object and checks its sha256. Checks the manifest chain and that the index agrees. Exit 1 on any problem. Names counts, line numbers and object ids only. |
-| `amem archive restore --session ID --to DIR [--version latest\|N \| --as-of ISO]` | Writes the session's files below DIR at their path relative to the source root, mode 600, with the recorded mtime. Never overwrites. Refuses a DIR inside a source root or the archive dir. |
+| `amem archive restore --session ID --to DIR [--version latest\|N \| --as-of ISO]` | Writes the session's files below DIR at their path relative to the source root (an added root: below `claude-<label>/`), mode 600, with the recorded mtime. Never overwrites. Refuses a DIR inside a source root or the archive dir. |
 | `amem archive prune [--days 180] [--dry-run]` | Retention (below). Writes a compacted manifest atomically, records the prune, then deletes unreferenced objects. |
 | `amem archive status` | Counts, total size, last run, and `key=yes\|no`. |
 | `amem archive key-export [--allow-non-tty]` | Prints the recovery string. Refuses when stdout is not a terminal, so the key does not land in a log or an agent transcript. |
@@ -38,11 +38,18 @@ Exit codes: 0 ok, 1 a problem, 2 usage.
 | claude | `<projects>/<project>/*.jsonl` | the file stem | `main` |
 | claude | `<projects>/<project>/<session>/subagents/agent-<id>.jsonl` | `<session>/agent-<id>` (the `sessions` table rule) | `subagent` |
 | claude | the `agent-<id>.meta.json` next to it | `<session>/agent-<id>` | `subagent-meta` |
+| `claude:<label>` | the same files in an added root (docs/sessions-live.md, "Transcript roots") | the same rules | the same roles |
 | codex | `<codex home>/sessions/**/rollout-*.jsonl`, `<codex home>/archived_sessions/**/rollout-*.jsonl` | `codex:<thread id>`: the first line's `session_meta` id, else the id in the file name, else the file name | `codex` |
+| `codex:<label>` | the same files in an added Codex home | the same rule | `codex` |
 
-Roots: `--projects-dir`, else `AMEM_PROJECTS_DIR`, else `<AMEM_CLAUDE_HOME or ~/.claude>/projects`.
-`--codex-home`, else `AMEM_CODEX_HOME`, else `.codex` next to the Claude home. Symlinks are
-not followed. Files over 1 GiB are skipped (counted).
+Roots: `--projects-dir`, else `AMEM_PROJECTS_DIR`, else `<AMEM_CLAUDE_HOME or ~/.claude>/projects`
+plus the listed roots of `<claude home>/parent/claude-roots.tsv`. Old `claude` keys never change.
+`--codex-home`, else `AMEM_CODEX_HOME`, else `.codex` next to the Claude home plus the Codex homes
+of the same file. Old `codex` keys never change. Each home keeps its own key for its own file, so
+the same rollout in two folders gives two paths, and their versions do not alternate. A `restore`
+writes an added home's files below `codex-<label>/`. A hash folder that a pattern no longer
+matches is not read that run: its files are not gone at the source and not pruned for that reason.
+Symlinks are not followed. Files over 1 GiB are skipped (counted).
 
 Each version record holds: `source`, `path` (relative to its root), `role`, `session_id`,
 `sha256`, `size`, `mtime_ns`, `birthtime` (`st_birthtime`, when the OS has it), `first_seen`
@@ -59,6 +66,12 @@ ones). It is its own session with its own versions. A byte-identical copy adds a
 record but no new object (dedupe by plaintext sha256).
 
 **Deleted at the source.** The archive keeps it. `status` counts it under `gone_at_source`.
+An added root the run could not read (its folder is gone, or it left the roots file) says nothing
+about its files: they do not count as gone, and `prune` still treats them as at the source.
+
+**One session id in two roots.** Each file keeps its own key and versions, so they never
+alternate. `restore` writes the default root's file at its path and the added root's below
+`claude-<label>/`.
 
 ## Storage layout
 
@@ -126,8 +139,8 @@ Nothing to remove: only a `prune` record is appended, nothing is rewritten.
 ## Refused locations
 
 The archive dir must not overlap the experiment sandbox root (`RSI_SANDBOX_DIR`, else
-`~/sandbox`), must not overlap a source root (the ones in use and the defaults
-`~/.claude/projects`, `~/.codex`), and must not be inside a git repository. `restore` refuses a
+`~/sandbox`), must not overlap a source root (the ones in use, the defaults
+`~/.claude/projects`, `~/.codex`, every listed root and the fixed folder of every pattern), and must not be inside a git repository. `restore` refuses a
 target inside a source root or the archive dir. `archive.forbidden_mount_roots()` returns the
 resolved archive dir (configured and default) and the key file, so the sandbox runner can
 refuse to mount them.

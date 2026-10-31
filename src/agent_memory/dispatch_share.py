@@ -12,6 +12,7 @@ Refresh only: dispatch start/end never import this module.
 from __future__ import annotations
 
 import json
+from collections.abc import Iterable, Iterator
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -44,13 +45,34 @@ def _claude_owner(path: Path, projects: Path) -> str | None:
     return None
 
 
-def claude_window(projects: Path, start: datetime, end: datetime, session: str) -> dict[str, Any]:
+def _claude_files(projects: Path | Iterable[Path]) -> Iterator[tuple[Path, Path]]:
+    """(transcript, its root) for one projects folder or several (the Claude roots)."""
+    roots = [projects] if isinstance(projects, Path) else list(projects)
+    if len(roots) == 1:
+        for path in roots[0].glob("**/*.jsonl"):
+            yield path, roots[0]
+        return
+    newest: dict[tuple[str | None, str], tuple[float, Path, Path]] = {}   # one session in two roots counts once
+    for root in roots:
+        for path in root.glob("**/*.jsonl"):
+            try:
+                when = path.stat().st_mtime
+            except OSError:
+                continue
+            key = (_claude_owner(path, root), path.name)
+            if key not in newest or when > newest[key][0]:
+                newest[key] = (when, path, root)
+    for _, path, root in newest.values():
+        yield path, root
+
+
+def claude_window(projects: Path | Iterable[Path], start: datetime, end: datetime, session: str) -> dict[str, Any]:
     """Fresh tokens (input + output + cache creation) inside the window: the run's and everyone's."""
     floor = start.timestamp()
     own = total = 0
     sessions: set[str] = set()
     files = 0
-    for path in projects.glob("**/*.jsonl"):
+    for path, root in _claude_files(projects):
         if path.is_symlink() or not path.is_file():
             continue
         try:
@@ -58,7 +80,7 @@ def claude_window(projects: Path, start: datetime, end: datetime, session: str) 
                 continue
         except OSError:
             continue
-        owner = _claude_owner(path, projects)
+        owner = _claude_owner(path, root)
         if owner is None:
             continue
         latest: dict[str, int] = {}          # message id -> fresh; the latest line of a message wins
@@ -115,7 +137,26 @@ def _codex_meta(path: Path) -> tuple[str | None, str | None]:
     return None, None
 
 
-def codex_window(home: Path, start: datetime, end: datetime, session: str) -> dict[str, Any]:
+def _codex_files(homes: Path | Iterable[Path]) -> list[Path]:
+    """The rollouts of one Codex home or several. A file in two homes (a transition copy) counts once."""
+    from agent_memory import dispatch_seed as S
+
+    roots = [homes] if isinstance(homes, Path) else list(homes)
+    if len(roots) == 1:
+        return S.rollout_files(roots[0])
+    newest: dict[str, tuple[float, Path]] = {}
+    for root in roots:
+        for path in S.rollout_files(root):
+            try:
+                when = path.stat().st_mtime
+            except OSError:
+                continue
+            if path.name not in newest or when > newest[path.name][0]:
+                newest[path.name] = (when, path)
+    return [path for _, path in newest.values()]
+
+
+def codex_window(home: Path | Iterable[Path], start: datetime, end: datetime, session: str) -> dict[str, Any]:
     """Fresh tokens (input - cached + output) of Codex rollouts inside the window."""
     from agent_memory import dispatch_seed as S
 
@@ -124,7 +165,7 @@ def codex_window(home: Path, start: datetime, end: datetime, session: str) -> di
     own = total = 0
     threads: set[str] = set()
     files = 0
-    for path in S.rollout_files(home):
+    for path in _codex_files(home):
         try:
             if path.stat().st_mtime < floor:
                 continue
@@ -143,7 +184,7 @@ def codex_window(home: Path, start: datetime, end: datetime, session: str) -> di
     return {"own": own, "total": total, "sessions": len(threads), "files": files}
 
 
-def run_share(run: dict, *, projects: Path, codex_home: Path) -> dict[str, Any] | None:
+def run_share(run: dict, *, projects: Path | Iterable[Path], codex_home: Path | Iterable[Path]) -> dict[str, Any] | None:
     """The run's token share for its own tool, or None when it cannot be measured."""
     start, end = D.parse_ts(run.get("dispatched_at")), D.parse_ts(run.get("briefed_at"))
     session, tool = run.get("session"), run.get("tool")

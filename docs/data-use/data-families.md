@@ -54,7 +54,7 @@ Learning families with no automatic analysis consumer:
 - Owner job: amem-daily (amem daily)
 - Tables: `sessions`; `cloud_digests`
 - Views: `session_groups`; `dashboard_sessions`
-- Local files: ~/.claude/projects/**/*.jsonl (Claude transcripts, read in place); ~/.codex/sessions/**/rollout-*.jsonl (Codex transcripts, read in place); ~/.claude/parent/amem-session-spool.jsonl (ping spool); amem archive (encrypted transcript archive, docs/archive.md)
+- Local files: ~/.claude/projects/**/*.jsonl and the roots in parent/claude-roots.tsv (Claude transcripts, read in place); ~/.codex/sessions/**/rollout-*.jsonl and the Codex homes in parent/claude-roots.tsv (Codex transcripts, read in place); ~/.claude/parent/amem-session-spool.jsonl (ping spool); amem archive (encrypted transcript archive, docs/archive.md)
 - External sinks: ClickHouse sessions (pseudonymized columns)
 - Consumers:
   - analysis: deviations scan (`src/agent_memory/deviations.py`)

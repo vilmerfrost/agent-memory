@@ -40,7 +40,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from agent_memory import config, session_resume, session_tokens, sessions_ingest
+from agent_memory import claude_roots, config, session_resume, session_tokens, sessions_ingest
 
 EVENTS = ("SessionStart", "Stop", "SessionEnd")
 DEBOUNCE_SECONDS = 20.0
@@ -393,10 +393,15 @@ def build_record(p: Ping, entry: dict[str, Any], now: datetime) -> dict[str, Any
     cwd, _scratch = sessions_ingest.work_cwd([p.cwd] if p.cwd else [], project_dir)
     repo = sessions_ingest.repo_of(cwd)
     meta: dict[str, Any] = {"cwd": cwd or None, "live": True}
+    root_label = claude_roots.label_of(p.transcript) if p.transcript is not None else None
+    if root_label is not None:
+        meta["claude_root"] = root_label
     meta.update(sessions_ingest.team_info(cwd, repo))
     if p.agent_type:
         meta["agent_type"] = p.agent_type
     kind = best_kind(project_dir, cwd)
+    if kind == "headless" and claude_roots.is_t3(root_label):
+        kind = "chat"      # a T3 root's SDK session; `sessions ingest` sets the real kind later
     rec: dict[str, Any] = {"v": RECORD_VERSION, "event": p.event, "session_id": p.session_id,
                            "kind": kind, "repo": repo, "project_dir": project_dir,
                            "started_at": _iso(now), "ended_at": None, "last_activity_at": _iso(now),

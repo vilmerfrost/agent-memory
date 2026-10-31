@@ -841,14 +841,16 @@ def attach_shares(runs: dict[str, dict], previous: dict, notes: list[str], *,
 
     cache = previous.get("shares") if isinstance(previous.get("shares"), dict) else {}
     out: dict[str, dict] = {}
-    projects, home = sessions_ingest.projects_dir(), dispatch_seed.codex_home(codex_home)
+    # a plan limit spans every root
+    homes = [dispatch_seed.codex_home(codex_home), *(r.home for r in sessions_ingest.codex_roots(codex_home)[1:])]
+    projects = [r.projects for r in sessions_ingest.transcript_roots()]
     for run in runs.values():
         if run.get("minutes") is None or run.get("status") == "abandoned":
             continue
         found = cache.get(run["run_id"])
         if not isinstance(found, dict) or found.get("method_version") != S.SHARE_METHOD:
             try:
-                found = S.run_share(run, projects=projects, codex_home=home)
+                found = S.run_share(run, projects=projects, codex_home=homes)
             except Exception as exc:        # a broken transcript must not stop refresh
                 notes.append(f"token share skipped for {run['run_id'][:8]}: {type(exc).__name__}")
                 continue

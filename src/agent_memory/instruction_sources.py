@@ -49,7 +49,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from agent_memory import rule_versions
+from agent_memory import claude_roots, rule_versions
 from agent_memory.redact import redact
 from agent_memory.sessions_ingest import (
     SessionRow,
@@ -260,6 +260,12 @@ class _Names:
         if real in self.parent:
             return "parent-md"
         fname = path.name
+        # A listed home's own file: one name for all guarded homes, whose hash differs per thread.
+        folder = Path(real).parent
+        if fname == "CLAUDE.md" and claude_roots.label_of(folder / "projects") is not None:
+            return "claude-md:guarded"
+        if fname in ("AGENTS.md", "AGENTS.override.md") and claude_roots.codex_label_of(folder) is not None:
+            return "agents-md:guarded"
         if memory_dir is None:
             memory_dir = path.parent.parent if path.parent.name == ".claude" and fname == "CLAUDE.md" else path.parent
         is_agents = fname in ("AGENTS.md", "AGENTS.override.md")

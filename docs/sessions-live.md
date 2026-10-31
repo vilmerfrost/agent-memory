@@ -192,7 +192,10 @@ but it is user-typed, so it is redacted like other text and capped at 200 chars.
 ### Project and category
 
 `category` = the session kind: `routine`, `chat` (local or cloud), `parent`, `worker`
-(subagents, dispatch workers), `eval`, `headless` (`claude -p`, `codex exec`).
+(subagents, dispatch workers), `eval`, `headless` (`claude -p`, `codex exec`). An SDK session with
+parent evidence (`parent-lock`, the `dispatch` skill, a spawned `worker`) is a `parent`. A hook
+cannot see that evidence, so a ping files it as `headless` until ingest; a ping never changes the
+kind of a stored row.
 
 `project` = where the work happened, first match wins:
 
@@ -207,6 +210,56 @@ but it is user-typed, so it is redacted like other text and capped at 200 chars.
 | anything else | the folder's basename; never empty (`unknown`) |
 
 Cloud chats use the repo of the session's cwd.
+
+### Transcript roots
+
+`sessions ingest`, `archive run` and the transcript lookups read the default projects folder, plus
+the homes listed in `<claude home>/parent/claude-roots.tsv` (`claude_roots.py`):
+
+```
+# label<TAB>home: Claude reads its projects/ folder<TAB>codex: a Codex home instead
+t3	/path/to/another/claude-home
+t3	/path/to/control/native/*/home
+t3	/path/to/control/native/*/home	codex
+t3-admissions	/path/to/control/owner-admissions/*/home	codex
+t3-transitions	/path/to/control/transitions/*/home	codex
+```
+
+- `claude_home()` stays `~/.claude`: `parent/` state stays there. No new job reads a root: the
+  existing ingest and archive runs do.
+- Labels match `[a-z0-9][a-z0-9_-]*`. `default` and `claude` are reserved. Each tool has its own
+  labels, so one pattern can be listed for both tools. A bad line, or a duplicate label or path, is
+  skipped with one warning on stderr. A root whose real path is already listed (a symlink to the
+  default root) gives no second copy.
+- A path component that is exactly `*` matches one folder level. There is no `**`, and a `*` inside
+  a name is a bad line. Each match with transcripts of that tool is one root, so a new hash folder
+  needs no file edit. Its label is `<label>-<first 12 characters>` of a hex digest folder, else
+  `<label>-<12 hex of its name's hash>` (dated names and time-ordered UUIDs share their first
+  characters). Only the folder's own name decides it, so a label does not change when other folders
+  appear. One ingest reads the file and its patterns once.
+- No file, `--projects-dir` or `AMEM_PROJECTS_DIR`: the one default Claude root, as before. No file,
+  `--codex-home` or `AMEM_CODEX_HOME`: the one default Codex home, as before.
+- A row of an added root stores `meta.claude_root` (the label). Missing means the default root, so
+  default rows stay byte-identical.
+- Stored rows find their transcript through one resolver (`sessions_ingest.projects_for`). A label
+  the file no longer lists resolves to a path that cannot exist, never to a same-ID file in the
+  default root. The moved-session lookup stays inside the row's root.
+- The same session id in two roots gives one row: the newest file, a tie goes to the earlier root
+  in the list. The choice depends only on the files, so a re-ingest changes nothing. The other
+  file counts as skipped. The archive keeps each file under its own root.
+- A resume chain crosses roots: the project folders of the same name count as one folder.
+- A listed root that is not there is skipped for that run, and so is a pattern's folder that is
+  gone. Its transcripts are unknown, not deleted (docs/archive.md). A stored row of a gone folder
+  resolves to a path that cannot exist.
+- Codex homes are listed only by a `codex` line. An added Claude root never adds a Codex home, even
+  though a guarded Claude home has a `sessions/` folder of its own. The default home is always first.
+  The row key stays `codex:<thread id>` and `project_dir` stays relative to its home. A row of an
+  added home stores `meta.codex_root` (the label). `sessions_ingest.codex_home_for` is the one
+  resolver for a stored row.
+- With more than one Codex home, the same thread in two homes, or in two folders of one home (a
+  transition can hold a rollout twice), gives one row: the newest file, a tie goes to the earlier
+  home. The other file counts as skipped. The archive keeps each file under its own key. With one
+  home nothing changes. A rollout reached twice through a symlink gives one row.
 
 ### Model, effort, duration
 
@@ -451,3 +504,8 @@ the cost of each kept change. Keep these keys:
 ```
 
 Without `--json`: a total line, a token / time line and one line per project.
+
+T3 details. `delegate_task` counts as parent evidence, in Claude (`mcp__t3-code__delegate_task`) and in Codex
+(`delegate_task` in namespace `mcp__t3_code`). A delegated child thread carries no parent link in its transcript, so
+it stays `chat`. A home listed in the roots file gives its own `CLAUDE.md` the source name `claude-md:guarded` and its
+`AGENTS.md` the name `agents-md:guarded`, one name across all threads. A ping from a `t3` root says `chat`.
