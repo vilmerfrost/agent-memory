@@ -61,8 +61,9 @@ id `<parent session>/agent-<id>`.
 | `eval` | The project folder is an eval clone, a probe or the memory observer, or the cwd is under `~/.cache/agent-evals` or `~/.cache/skill-evals`. |
 | `worker` | A subagent transcript. `meta.agent_type` holds the agent type (`worker`, `Explore`, ...). |
 | `routine` | A scheduled task: the first message holds a `<scheduled-task name=...>` block, or a turn has `turnOrigin = scheduled`. `meta.routine` = the name. |
-| `headless` | `claude -p` or the SDK: `entrypoint` starts with `sdk`. |
-| `parent` | The session ran `parent-lock`, used the `dispatch` skill or spawned a `worker`. |
+| `parent` | The session ran `parent-lock`, used the `dispatch` skill or spawned a `worker`, also through the SDK (`meta.entrypoints` keeps the entrypoint). |
+| `chat` | A T3 Code session: T3 runs chats through the SDK, so its `entrypoint` alone says nothing. Evidence: T3's system prompt sentence or `mcp__t3-code__` tools in the `prompt_snapshot` or `api-request-shape` line, or a root labelled `t3` or `t3-*`. `meta.client` = `t3`. |
+| `headless` | `claude -p` or the SDK without that evidence: `entrypoint` starts with `sdk`. |
 | `chat` | Everything else. |
 
 - `repo`: from the working directory (`.../worktrees/<repo>/<name>` → `<repo>`, else the
@@ -77,6 +78,8 @@ id `<parent session>/agent-<id>`.
 - Cloud routine sessions come from the `cloud_digests` table, not a transcript file: id
   `cloud:<session id>`, kind `routine`, `project_dir` `cloud`, `meta.cloud` true (docs/cloud.md).
 - `meta.team`: true for a team repo's session (see Team repos below).
+- `meta.claude_root`: the label of an added transcript root; missing means the default root
+  (docs/sessions-live.md, "Transcript roots").
 - Tokens: `tokens_input`, `tokens_output`, `tokens_cache_read`, `tokens_cache_creation`,
   `models`, `turns`, `last_activity_at`; a parent's `meta.subagent_tokens` sums its
   subagents (docs/sessions-live.md). A row a hook created (`meta.live`) is completed by ingest.
@@ -94,7 +97,8 @@ state, no transcripts. Parsing: `src/agent_memory/codex_sessions.py`.
 - Kind (first match wins): `eval` (cwd as above), `worker` (a subagent thread:
   `thread_source = subagent`; `meta.parent_session` = `codex:<parent thread>`), `headless`
   (`originator = codex_exec`), `parent` (used the `dispatch` skill), `chat`. Codex
-  automations have no marker in the rollout, so `routine` is not detected.
+  automations have no marker in the rollout, so `routine` is not detected. T3 Code
+  (`originator = T3 Code`, `source = vscode`) is a `chat`.
 - Repo: from the cwd; a Codex app worktree (`~/.codex/worktrees/<task>`) names the repo by
   its main checkout.
 - Skills: the `<skill><name>X</name>` block Codex adds when the user invokes a skill, plus

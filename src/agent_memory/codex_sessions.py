@@ -6,7 +6,7 @@ Where: `<codex home>/sessions/YYYY/MM/DD/rollout-<time>-<thread id>.jsonl` (and
 "type", "payload"}`. The types this module reads:
 
 - `session_meta` (first line): `id` (the thread id), `cwd`, `originator` (`Codex Desktop`,
-  `codex_exec`, `codex-tui`, `codex_vscode`), `source` (`vscode`, `exec`, or
+  `codex_exec`, `codex-tui`, `codex_vscode`, `T3 Code`), `source` (`vscode`, `exec`, or
   `{"subagent": {"thread_spawn": {"parent_thread_id", "agent_path", "agent_role", ...}}}`),
   `thread_source` (`user`, `subagent`, ...), `agent_path`, `git.repository_url`, and for a
   forked subagent `subagent_history_start_ordinal`: lines below that ordinal are a copy of
@@ -174,6 +174,7 @@ class CodexFacts:
     prompts: int = 0
     tool_calls: int = 0
     spawned_workers: int = 0
+    t3_delegated: bool = False   # called T3's delegate_task: parent evidence
 
     @property
     def headless(self) -> bool:
@@ -348,6 +349,9 @@ def scan_facts(events: list[dict[str, Any]], file_stem: str = "") -> CodexFacts:
             name = str(p.get("name") or "")
             if name == "spawn_agent":
                 f.spawned_workers += 1
+            elif name == "delegate_task" and p.get("namespace") == "mcp__t3_code":
+                f.spawned_workers += 1
+                f.t3_delegated = True
             if not (has_items and covered_by_items(p)):
                 f.tool_calls += 1
         elif t == "response_item" and pt in ("custom_tool_call", "local_shell_call") and not has_items:

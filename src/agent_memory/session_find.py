@@ -8,6 +8,7 @@ and `sessions_ingest` stores it as session_id `<parent session>/agent-<ID>`. Pos
 from __future__ import annotations
 
 import re
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -50,16 +51,19 @@ def locate(agent_id: str, root: Path) -> list[Path]:
     return sorted(p for p in root.glob(f"*/*/subagents/agent-{agent_id}.jsonl") if p.is_file())
 
 
-def ingest(agent_id: str, root: Path, *, db_url: str | None = None) -> tuple[int, int, int]:
-    """Ingest the transcript(s) of one subagent. Returns (files, new, updated); a file with no
-    timestamped event is skipped (files counts it, new / updated do not)."""
+def ingest(agent_id: str, root: Path | Sequence[Path], *, db_url: str | None = None) -> tuple[int, int, int]:
+    """Ingest the transcript(s) of one subagent from one projects folder or several (the Claude
+    roots). Returns (files, new, updated); a file with no timestamped event is skipped (files
+    counts it, new / updated do not)."""
     rows = []
-    paths = locate(agent_id, root)
+    paths = [p for r in ([root] if isinstance(root, Path) else root) for p in locate(agent_id, r)]
     for path in paths:
         project_dir = path.parent.parent.parent.name
         parent = path.parent.parent.name
         row = sessions_ingest.session_row(path, project_dir, parent_session=parent)
         if row.started_at is not None and not row.copy_only:   # a pure copy gets no row (session_resume)
             rows.append(row)
+    if not isinstance(root, Path) and len(root) > 1:
+        rows = sessions_ingest.one_per_session(rows)
     new, updated = sessions_ingest.upsert(rows, db_url=db_url) if rows else (0, 0)
     return len(paths), new, updated

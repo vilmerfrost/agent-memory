@@ -490,10 +490,10 @@ def step_deviations(result: DailyResult, *, state_file: Path, now: datetime) -> 
     ingested = before = None
     for attempt in (1, 2):
         try:
-            root = sessions_ingest.projects_dir()
-            if not root.is_dir():
-                raise FileNotFoundError(f"no projects folder at {root}")
-            ingested = sessions_ingest.ingest(root, days=deviations.DEFAULT_DAYS, now=now)
+            roots = sessions_ingest.transcript_roots()
+            if not roots[0].projects.is_dir():
+                raise FileNotFoundError(f"no projects folder at {roots[0].projects}")
+            ingested = sessions_ingest.ingest(roots, days=deviations.DEFAULT_DAYS, now=now)
             _err(f"deviations: {ingested.line()}")
             before = _cover_read(result, COV.scan_states, since)
             report = deviations.scan(days=deviations.DEFAULT_DAYS, limit=DEVIATIONS_LIMIT, now=now)
