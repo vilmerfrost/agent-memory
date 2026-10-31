@@ -400,6 +400,8 @@ def build_record(p: Ping, entry: dict[str, Any], now: datetime) -> dict[str, Any
     if p.agent_type:
         meta["agent_type"] = p.agent_type
     kind = best_kind(project_dir, cwd)
+    if kind == "headless" and claude_roots.is_t3(root_label):
+        kind = "chat"      # a T3 root's SDK session; `sessions ingest` sets the real kind later
     rec: dict[str, Any] = {"v": RECORD_VERSION, "event": p.event, "session_id": p.session_id,
                            "kind": kind, "repo": repo, "project_dir": project_dir,
                            "started_at": _iso(now), "ended_at": None, "last_activity_at": _iso(now),

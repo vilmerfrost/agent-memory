@@ -17,7 +17,7 @@ Kind, first match wins:
 2. worker    the file is under a `subagents/` folder (meta.agent_type from `agent-*.meta.json`)
 3. routine   a scheduled task: the first user message holds a `<scheduled-task ...>` block,
              or a turn has `turnOrigin = scheduled`
-4. parent    the session ran `parent-lock`, the `dispatch` skill, or spawned a `worker`
+4. parent    the session ran `parent-lock`, the `dispatch` skill, spawned a `worker`, or called T3's `delegate_task`
              (also through the SDK: `meta.entrypoints` keeps the entrypoint)
 5. chat      a T3 Code chat: T3 runs chats through the SDK, so `sdk-ts` alone says nothing. Evidence:
              T3's own system prompt sentence or `mcp__t3-code__` tools in the request the transcript
@@ -546,6 +546,7 @@ class Facts:
 # `t3-code` MCP server. A plain `claude -p` or another SDK run has neither.
 T3_SYSTEM_MARK = "you are running in T3 Code through the "
 T3_TOOL_PREFIX = "mcp__t3-code__"
+T3_DELEGATE = f"{T3_TOOL_PREFIX}delegate_task"   # T3's way to spawn a worker: parent evidence
 
 
 def _t3_system(blocks: Any) -> bool:
@@ -598,7 +599,7 @@ def scan_facts(events: list[dict[str, Any]]) -> Facts:
                     sk = skill_name(inp.get("skill"))
                     if sk:
                         seen_skills.setdefault(sk, None)
-                elif name == "Agent" and inp.get("subagent_type") == "worker":
+                elif (name == "Agent" and inp.get("subagent_type") == "worker") or name == T3_DELEGATE:
                     f.spawned_workers += 1
                 elif name == "Bash" and "parent-lock" in str(inp.get("command", "")):
                     f.ran_parent_lock = True
@@ -768,7 +769,7 @@ def classify_codex(f: codex_sessions.CodexFacts, cwd: str) -> str:
         return "worker"
     if f.headless:
         return "headless"
-    if "dispatch" in f.skills:
+    if "dispatch" in f.skills or f.t3_delegated:
         return "parent"
     return "chat"
 

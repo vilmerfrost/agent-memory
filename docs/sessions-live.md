@@ -504,3 +504,8 @@ the cost of each kept change. Keep these keys:
 ```
 
 Without `--json`: a total line, a token / time line and one line per project.
+
+T3 details. `delegate_task` counts as parent evidence, in Claude (`mcp__t3-code__delegate_task`) and in Codex
+(`delegate_task` in namespace `mcp__t3_code`). A delegated child thread carries no parent link in its transcript, so
+it stays `chat`. A home listed in the roots file gives its own `CLAUDE.md` the source name `claude-md:guarded` and its
+`AGENTS.md` the name `agents-md:guarded`, one name across all threads. A ping from a `t3` root says `chat`.

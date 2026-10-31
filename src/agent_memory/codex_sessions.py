@@ -174,6 +174,7 @@ class CodexFacts:
     prompts: int = 0
     tool_calls: int = 0
     spawned_workers: int = 0
+    t3_delegated: bool = False   # called T3's delegate_task: parent evidence
 
     @property
     def headless(self) -> bool:
@@ -348,6 +349,9 @@ def scan_facts(events: list[dict[str, Any]], file_stem: str = "") -> CodexFacts:
             name = str(p.get("name") or "")
             if name == "spawn_agent":
                 f.spawned_workers += 1
+            elif name == "delegate_task" and p.get("namespace") == "mcp__t3_code":
+                f.spawned_workers += 1
+                f.t3_delegated = True
             if not (has_items and covered_by_items(p)):
                 f.tool_calls += 1
         elif t == "response_item" and pt in ("custom_tool_call", "local_shell_call") and not has_items:

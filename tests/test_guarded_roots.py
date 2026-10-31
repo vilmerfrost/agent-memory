@@ -6,6 +6,7 @@ tests/test_guarded_roots_archive.py."""
 from __future__ import annotations
 
 import shutil
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -13,11 +14,13 @@ import psycopg
 import pytest
 from psycopg.rows import dict_row
 
-from agent_memory import claude_roots, deviations, session_summary, sessions_ingest, timing_sync
+from agent_memory import claude_roots, deviations, dispatch_share, instruction_sources, session_live, session_summary, sessions_ingest, timing_sync
 from guarded_support import (
     claude_session,
     codex_session,
     guarded_home,
+    rollout_events,
+    rollout_name,
     plain_sdk_events,
     session_id,
     set_mtime,
@@ -516,3 +519,97 @@ def test_a_t3_chat_grades_and_scans_like_any_chat(listed: Path, setup_home: Home
 
 def _pad() -> list[dict[str, Any]]:
     return [{"type": "progress", "data": "x" * 400} for _ in range(deviations.MIN_BYTES // 400 + 1)]
+
+
+def test_t3_delegation_is_parent_evidence(listed: Path) -> None:
+    sid = session_id(1)
+    events = t3_events(sid, blocks=(tool("mcp__t3-code__delegate_task", "t1", task="fix it", target="claude"),))
+    claude_session(guarded_home(listed, "native", "thread-a"), sid, events)
+    [row] = collect_all()
+    assert (row.kind, row.meta["spawned_workers"]) == ("parent", 1)
+
+
+def test_a_t3_cancel_alone_is_no_parent_evidence(listed: Path) -> None:
+    sid = session_id(1)
+    events = t3_events(sid, blocks=(tool("mcp__t3-code__task_cancel", "t1", taskId="x"),))
+    claude_session(guarded_home(listed, "native", "thread-a"), sid, events)
+    assert [r.kind for r in collect_all()] == ["chat"]
+
+
+def test_a_t3_codex_delegation_is_parent_evidence_and_another_namespace_is_not(listed: Path) -> None:
+    home = guarded_home(listed, "owner-admissions", "thread-a")
+    call = {"type": "response_item", "timestamp": "2026-10-14T09:00:03Z", "payload": {
+        "type": "function_call", "name": "delegate_task", "arguments": "{}", "call_id": "c1", "namespace": "mcp__t3_code"}}
+    write_jsonl(home / "sessions/2026/10/14" / rollout_name(THREAD), [*rollout_events(THREAD), call])
+    other = {**call, "payload": {**call["payload"], "namespace": "mcp__other"}}
+    write_jsonl(home / "sessions/2026/10/14" / rollout_name(OTHER_THREAD), [*rollout_events(OTHER_THREAD), other])
+    kinds = {r.session_id: r.kind for r in collect_all()}
+    assert kinds == {f"codex:{THREAD}": "parent", f"codex:{OTHER_THREAD}": "chat"}
+
+
+def test_guarded_instruction_files_have_one_name_across_threads(listed: Path) -> None:
+    row = sessions_ingest.SessionRow(session_id(1), "chat", None, "", None, None, 0, [], [], {})
+    names = instruction_sources._Names(row, "claude")
+    homes = [guarded_home(listed, "native", t) for t in ("thread-a", "thread-b")]
+    for home in homes:
+        (home / "projects").mkdir()
+    assert {names.of(h / "CLAUDE.md") for h in homes} == {"claude-md:guarded"}
+    assert names.of(listed / "CLAUDE.md") != "claude-md:guarded"
+
+
+def test_guarded_agents_file_has_one_name_across_homes(listed: Path) -> None:
+    row = sessions_ingest.SessionRow("codex:x", "chat", None, "", None, None, 0, [], [], {}, tool="codex")
+    names = instruction_sources._Names(row, "codex")
+    homes = [guarded_home(listed, "owner-admissions", t) for t in ("thread-a", "thread-b")]
+    for home in homes:
+        (home / "sessions").mkdir()
+    assert {names.of(h / "AGENTS.md") for h in homes} == {"agents-md:guarded"}
+
+
+def _usage_rollout(path: Path, thread: str, tokens: int) -> Path:
+    from test_dispatch_share import T0  # local: that module's clock
+
+    return write_jsonl(path, [
+        {"timestamp": T0.isoformat(), "type": "session_meta", "payload": {"id": thread}},
+        {"timestamp": (T0 + timedelta(minutes=2)).isoformat(), "type": "event_msg", "payload": {
+            "type": "token_count", "info": {"total_token_usage": {
+                "input_tokens": tokens, "cached_input_tokens": 0, "output_tokens": 0, "total_tokens": tokens}}}},
+    ])
+
+
+def test_a_rollout_in_two_homes_counts_once_in_the_token_share(tmp_path: Path) -> None:
+    from test_dispatch_share import T0
+
+    a, b = tmp_path / "a", tmp_path / "b"
+    for home in (a, b):
+        _usage_rollout(home / "sessions" / rollout_name(THREAD), THREAD, 100)
+    _usage_rollout(b / "sessions" / rollout_name(OTHER_THREAD), OTHER_THREAD, 50)
+    start, end = T0, T0 + timedelta(minutes=20)
+    one = dispatch_share.codex_window(b, start, end, f"codex:{THREAD}")
+    two = dispatch_share.codex_window([a, b], start, end, f"codex:{THREAD}")
+    assert (one["total"], one["own"]) == (150, 100) and (two["total"], two["own"]) == (150, 100)
+
+
+def test_a_claude_session_in_two_roots_counts_once_in_the_token_share(tmp_path: Path) -> None:
+    from test_dispatch_share import T0, msg
+
+    a, b = tmp_path / "a", tmp_path / "b"
+    for root in (a, b):
+        write_jsonl(root / "proj" / "s1.jsonl", [msg(1, "m1", 10, 0)])
+    got = dispatch_share.claude_window([a, b], T0, T0 + timedelta(minutes=20), "s1")
+    assert (got["total"], got["sessions"], got["files"]) == (10, 1, 1)
+
+
+def _ping(path: Path, sid: str) -> session_live.Ping:
+    return session_live.Ping(event="Stop", session_id=sid, cwd="/work/demo-repo", transcript=path)
+
+
+def test_a_ping_from_a_t3_root_is_a_chat_and_a_plain_sdk_ping_stays_headless(listed: Path, setup_home: Home, monkeypatch: pytest.MonkeyPatch) -> None:  # noqa: F811
+    monkeypatch.setenv("CLAUDE_CODE_ENTRYPOINT", "sdk-ts")
+    sid = session_id(1)
+    path = claude_session(guarded_home(listed, "native", "thread-a"), sid)
+    rec = session_live.build_record(_ping(path, sid), {}, NOW)
+    assert rec["kind"] == "chat" and rec["meta"]["claude_root"].startswith("t3-")
+    other = session_id(2)
+    plain = write_jsonl(setup_home.projects / "-work-demo-repo" / f"{other}.jsonl", plain_sdk_events(other))
+    assert session_live.build_record(_ping(plain, other), {}, NOW)["kind"] == "headless"
