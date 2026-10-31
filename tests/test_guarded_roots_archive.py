@@ -194,6 +194,14 @@ def test_restore_refuses_a_listed_codex_home_and_a_pattern_folder(setup: tuple[A
     assert a.tmp.is_dir()
 
 
+def test_a_plain_listed_codex_home_is_a_source_root(setup: tuple[Arc, Path]) -> None:
+    a, _control = setup
+    home = a.tmp / "runtime" / "codex-plain"
+    write_roots(a.tmp / "claude", f"plain\t{home}\tcodex")
+    with pytest.raises(archive.ArchiveError, match="transcript source root"):
+        archive.check_archive_dir(home / "archive", archive.source_roots())
+
+
 def test_dry_run_counts_guarded_files_and_writes_nothing(setup: tuple[Arc, Path]) -> None:
     a, control = setup
     claude_session(guarded_home(control, "native", "thread-a"), session_id(1))

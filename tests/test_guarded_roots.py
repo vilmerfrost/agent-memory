@@ -122,6 +122,13 @@ def test_two_stars_match_one_level_each(setup_home: Home, control: Path) -> None
     assert found == [control / "native" / "aa" / "home" / "projects", control / "native" / "ab" / "home" / "projects"]
 
 
+def test_a_hidden_folder_is_no_match(setup_home: Home, control: Path) -> None:  # noqa: F811
+    write_roots(setup_home.claude, f"t3\t{control}/native/*/home")
+    (control / "native" / ".partial-copy" / "home" / "projects").mkdir(parents=True)
+    claude_session(guarded_home(control, "native", "thread-a"), session_id(1))
+    assert [r.label for r in claude_roots.claude_roots()[1:]] == [f"t3-{thread_hash('thread-a')[:12]}"]
+
+
 def test_no_file_is_exact(control: Path, setup_home: Home) -> None:  # noqa: F811
     claude_session(guarded_home(control, "native", "thread-a"), session_id(1))
     codex_session(guarded_home(control, "transitions", "thread-b"), THREAD)
