@@ -613,3 +613,15 @@ def test_a_ping_from_a_t3_root_is_a_chat_and_a_plain_sdk_ping_stays_headless(lis
     other = session_id(2)
     plain = write_jsonl(setup_home.projects / "-work-demo-repo" / f"{other}.jsonl", plain_sdk_events(other))
     assert session_live.build_record(_ping(plain, other), {}, NOW)["kind"] == "headless"
+
+
+def test_the_exact_tool_seconds_of_the_timing_refresh_is_no_change_for_an_ingest(setup_home: Home, db: str) -> None:  # noqa: F811
+    write_jsonl(setup_home.project() / f"{session_id(9)}.jsonl", plain_sdk_events(session_id(9)))
+    [row] = sessions_ingest.collect(setup_home.projects, days=7, now=NOW, tools=("claude",))[0]
+    row.profile = {**(row.profile or {}), "tool_seconds": 139.946}
+    assert sessions_ingest.upsert([row], db_url=db, now=NOW) == (1, 0)
+    with psycopg.connect(db) as conn:
+        conn.execute("update sessions set tool_seconds = 139.946252788 where session_id = %s", (row.session_id,))
+    assert sessions_ingest.upsert([row], db_url=db, now=NOW) == (0, 0)
+    row.profile = {**row.profile, "tool_seconds": 140.0}
+    assert sessions_ingest.upsert([row], db_url=db, now=NOW) == (0, 1)
