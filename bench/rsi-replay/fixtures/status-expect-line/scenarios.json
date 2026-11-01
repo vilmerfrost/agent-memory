@@ -14,7 +14,7 @@
       "id": "gate-rerun",
       "role": "root parent",
       "where_you_are": "The integration test run failed on one test. You committed a one-line fix. You start `parent-integrate test` again from the _integration checkout.",
-      "known_numbers": "The last parent-integrate test took 7 min 20 s.",
+      "known_numbers": "The last parent-integrate test took 7 min 20 s and used 2% of the Claude 5-hour limit.",
       "run": "parent-integrate test"
     },
     {
