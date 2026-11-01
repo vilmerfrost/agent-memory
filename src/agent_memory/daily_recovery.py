@@ -77,6 +77,33 @@ def record(result, *, state: Path, now: datetime, push: bool, notify=None) -> No
         write(path, data)
 
 
+def last_auth_failure(routines_log: Path) -> str | None:
+    """The time of the newest amem-daily run when that run failed on Claude authentication, else None. Recovery acts
+    only on the state file that `record` writes, so this is the check that a real expiry cannot read as idle."""
+    from agent_memory import claude_auth, daily
+    try:
+        runs = [r for r in daily.RL.parse_file(routines_log).runs if r.routine == daily.NAME]
+    except OSError:
+        return None
+    if not runs or runs[-1].status != "fail":
+        return None
+    if not any(claude_auth.is_auth_error(str(x)) for x in runs[-1].meta.get("failures") or []):
+        return None
+    return runs[-1].started_at.strftime(daily.TS_FORMAT)
+
+
+def log_detail(status: str, *, state: Path, routines_log: Path) -> tuple[str, list[str]]:
+    """(extra summary fields, -fail details) for the routine line. A quiet check adds nothing."""
+    if status == "auth_expired":
+        since = last_auth_failure(routines_log)
+        return f" auth=expired since={since}", [f"auth: amem-daily failed on Claude authentication at {since} and no "
+                                                "recovery is pending; renew the dedicated automation token"]
+    data = read(path_for(state))
+    if data.get("status") == "pending":
+        return f" auth=pending night={data.get('night')} attempts={data.get('attempts')}", []
+    return "", []
+
+
 def recover(*, state: Path, routines_log: Path, now: datetime | None = None,
             config_path: Path | None = None, push: bool = True, notify=None) -> str:
     from agent_memory import config, daily, rsi_schedule
@@ -87,7 +114,8 @@ def recover(*, state: Path, routines_log: Path, now: datetime | None = None,
             return "busy"
         data = read(path)
         if data.get("status") != "pending":
-            return "idle"
+            # Nothing to resume. "idle" must still not cover a failure that left no recovery state.
+            return "auth_expired" if last_auth_failure(routines_log) else "idle"
         if now >= datetime.fromisoformat(data["deadline"]) or data["attempts"] >= MAX_ATTEMPTS:
             data["status"] = "expired"
             write(path, data)

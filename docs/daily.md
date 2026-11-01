@@ -50,6 +50,15 @@ Recovery stops at local noon or 40 attempts, whichever comes first, and reports
 the incomplete night. After successful processing it sends a recovery notice;
 partial experiment results remain partial in the night report.
 
+Recovery acts only on the state file that the daily job writes. It does not start
+from `routines.log`. The check against the log only makes an expiry visible: when
+no recovery is pending and the newest `amem-daily` run failed on Claude
+authentication, the line is `amem-auth-recovery FAIL status=auth_expired
+auth=expired since=<time>` with one `-fail` detail, until a daily run passes. While
+a recovery is pending, the line adds `auth=pending night=<night> attempts=<n>`.
+`status=idle` means no recovery is pending and the newest daily run did not fail on
+authentication.
+
 Install `deploy/launchd/com.vilmerfrost.amem-auth-recovery.plist` only after this
 code is available in the installed main checkout. Keep matching copies in
 `~/agent-config/launchd/` and `~/Library/LaunchAgents/`, and register

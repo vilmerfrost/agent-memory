@@ -13,24 +13,25 @@ from agent_memory import daily
 
 def cmd_recover(args: argparse.Namespace) -> int:
     from agent_memory import daily_recovery
+    state, log = daily.state_path(args.state), daily.routines_log_path(args.routines_log)
     try:
-        status = daily_recovery.recover(state=daily.state_path(args.state),
-                                        routines_log=daily.routines_log_path(args.routines_log),
-                                        push=not args.no_push)
+        status = daily_recovery.recover(state=state, routines_log=log, push=not args.no_push)
+        fields, details = daily_recovery.log_detail(status, state=state, routines_log=log)
     except (OSError, ValueError) as exc:
         print(f"amem: auth recovery failed: {type(exc).__name__}", file=sys.stderr)
         return 1
-    failed = status in ("daily_failed", "expired", "night_pending", "brief_pending")
-    line = f"{datetime.now().astimezone().strftime(daily.TS_FORMAT)} amem-auth-recovery {'FAIL' if failed else 'PASS'} status={status}"
-    log = daily.routines_log_path(args.routines_log)
+    failed = status in ("daily_failed", "expired", "night_pending", "brief_pending", "auth_expired")
+    ts = datetime.now().astimezone().strftime(daily.TS_FORMAT)
+    lines = [f"{ts} amem-auth-recovery {'FAIL' if failed else 'PASS'} status={status}{fields}",
+             *(f"{ts} amem-auth-recovery-fail {d}" for d in details)]
     try:
         log.parent.mkdir(parents=True, exist_ok=True)
         with log.open("a", encoding="utf-8") as fh:
-            fh.write(line + "\n")
+            fh.write("".join(line + "\n" for line in lines))
     except OSError:
         print("amem: auth recovery cannot append routine status", file=sys.stderr)
         return 1
-    print(line)
+    print("\n".join(lines))
     return 1 if failed else 0
 
 

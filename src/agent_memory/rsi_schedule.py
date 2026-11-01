@@ -978,10 +978,15 @@ def run_brief_job(*, root: Path | None = None, night: str | None = None, now: da
         res.status = "FAIL"
         res.items.append("dashboard: night snapshot upload failed; local brief retained")
     ready = sum(1 for x in b["passed"] if x["actions"].get("apply"))
-    res.fields.update(night_status=b["status"], ready=ready, staged_not_ready=len(b["passed"]) - ready,
+    signal = b.get("night_signal") or {}
+    res.fields.update(night_status=b["status"], experiments=sum(bool(x["experiment_id"]) for x in b["experiments"]["items"]),
+                      ready=ready, staged_not_ready=len(b["passed"]) - ready,
                       failed=len(b["failed"]), pending=b["pending_decisions"]["total"],
                       apply=b["pending_decisions"]["with_apply"], usd=float(b["costs"]["total_usd"] or 0.0),
                       db=b["health"]["database"]["status"])
+    if signal:      # the brief job itself passed: the bad night is a field and a warning, never this line's FAIL
+        res.fields.update(night_state=signal["state"], night_reason=signal["code"])
+        res.warnings.append(f"night {signal['state']}: {signal['reason']}")
     if b["health"]["database"]["status"] != "ok":
         res.items.append(f"database: rows not read ({b['health']['database']['detail'] or 'unavailable'})")
         res.status = "FAIL"
