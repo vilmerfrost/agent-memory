@@ -23,7 +23,7 @@ Mission 005 (evidence packs, rsi_evidence_pack.py), one rule at a time:
                           eval verdict counts
 
 A rule key is `<instruction_source>:<rule_id>`, as in ClickHouse (`claude-md:global:zsh-quote-globs`): rule
-ids are slugs, so the last ':' splits it.
+ids are slugs or slug paths (`<h1>/<h2>`), so the last ':' splits it.
 """
 
 from __future__ import annotations
@@ -39,7 +39,10 @@ from agent_memory.integrations import refs
 from agent_memory.integrations.evidence import EvidenceRef, NamedQuery
 from agent_memory.integrations.sanitize import scrub_text
 
-RULE_P = r"[A-Za-z0-9][A-Za-z0-9._@-]{0,99}(:[A-Za-z0-9][A-Za-z0-9._@-]{0,99}){1,3}"
+_RULE_SEG = r"[A-Za-z0-9][A-Za-z0-9._@-]{0,99}"
+# `<instruction source>:<rule id>`. A rule id is a catalog path, `<h1>/<h2>`, so "/" joins segments of the last part
+# only. Each piece starts with a letter or digit, so `..`, `//` and a leading or trailing "/" never pass.
+RULE_P = rf"{_RULE_SEG}(:{_RULE_SEG}){{0,2}}:{_RULE_SEG}(/{_RULE_SEG}){{0,3}}"
 EXP_P = refs.EXPERIMENT_RE.pattern
 UUID_P = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
 HASH_P = r"[0-9a-f]{64}"

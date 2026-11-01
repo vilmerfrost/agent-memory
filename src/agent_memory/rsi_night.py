@@ -53,7 +53,7 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
 from agent_memory import config, edits_targets as ET, night_coverage as NC, rsi_approval as AP, rsi_artifact as RA
-from agent_memory import rsi_targets
+from agent_memory import rsi_targets, rule_catalog
 from agent_memory.rsi_relevance import section_rule_id
 from agent_memory.rsi_budget import Budget, BudgetConfig, BudgetConfigError, BudgetExhausted, Usage
 
@@ -116,6 +116,15 @@ class ExperimentFailed(RuntimeError):
 
 class HypothesisParseError(ValueError):
     """The whole model reply is unusable (not JSON, wrong shape)."""
+
+
+class SectionUnavailable(ValueError):
+    """The loop cannot show the model the rule's section. `code` (a LOOP_FAULTS code) is what the report keeps. It is
+    the loop's fault, not the candidate's: no model call runs and no attempt is charged."""
+
+    def __init__(self, code: str, msg: str) -> None:
+        super().__init__(msg)
+        self.code = code
 
 
 class HypothesisRejected(ValueError):
@@ -280,6 +289,10 @@ class Hypothesis:
 
 
 HYP_FIELDS = {"what": 200, "why": 400, "target": 300, "expected": 200, "risk": 10, "confidence": 0, "edit": 0}
+# A hypothesis with an edit object: the edit is the intervention and `what` only describes it, so an overlong `what`
+# must not throw a valid edit away. It is widened, not cut: the injection scan and the placement check in
+# WriterImplementer.implement both read the words after character 200, and a cut would hide a wrong placement.
+WHAT_WITH_EDIT_MAX = 1_000
 HYP_REQUIRED = ("what", "why", "target")
 # Text that an instruction-edit hypothesis never needs: commands, code, links, secrets, approval verbs and the
 # usual prompt-injection phrasing. A false positive only drops one hypothesis; nothing runs because of it.
@@ -325,7 +338,7 @@ def parse_hypothesis(obj: Any, allowlist: Sequence[str]) -> Hypothesis:
     if target not in set(allowlist) or Path(target).name in SELF_FILES:
         raise HypothesisRejected("not_allowlisted", f"target {target} is not in the allowlist of instruction targets",
                                  "target", target)
-    what = _clean_text(obj["what"], "what", HYP_FIELDS["what"])
+    what = _clean_text(obj["what"], "what", HYP_FIELDS["what"] if obj.get("edit") is None else WHAT_WITH_EDIT_MAX)
     why = _clean_text(obj["why"], "why", HYP_FIELDS["why"])
     expected = _clean_text(obj["expected"], "expected", HYP_FIELDS["expected"]) if obj.get("expected") else ""
     risk = obj.get("risk", "medium")
@@ -365,7 +378,13 @@ REJECT_REASONS = {
     "duplicate": "the same change was proposed twice",
     "ignored": "the reply held more than 10 ideas; the rest were not read",
     "invalid": "the idea broke the hypothesis rules",
+    "no_ideas": "the idea writer read the rule's section and proposed no change",
+    "stale_pending": "an idea stored on an earlier night no longer matches the file, so it was dropped",
+    "rule_section_missing": "the rule this candidate names matches no section of the file, so no model call ran",
+    "rule_section_not_listed": "the rule's section did not fit the prompt, so no model call ran",
 }
+# The loop's own faults: reported like a rejection, never charged to the candidate as an attempt.
+LOOP_FAULTS = ("rule_section_missing", "rule_section_not_listed")
 REJECTED_MAX = 10
 
 
@@ -561,6 +580,12 @@ RECURRENCE_SQL = ("greatest(1, case when jsonb_typeof(metrics->'sessions') = 'nu
 POOL_FETCH = 10
 # Why a candidate cannot run: no replay case declares its file, so any experiment would end INCONCLUSIVE.
 NO_TEST_CASE = "no test case uses this file"
+# ... cases declare the file, but none declares the section its rule resolves to.
+NO_SECTION_CASE = "no test case covers this rule's section"
+# ... its rule key names a rule, and no section of the file matches that rule any more.
+RULE_SECTION_LOST = "the rule this candidate names matches no section of the file"
+# ... a higher-ranked candidate resolves to the same section tonight. This one waits.
+SAME_SECTION = "another candidate holds this rule's section tonight"
 
 
 def rank(a: TriageAnswers, recurrence: int, history: Sequence[str], weights: Mapping[str, float]) -> float:
@@ -1120,6 +1145,12 @@ def bind_canonical_sections(reply: str, payloads: Mapping[str, Mapping[str, str]
     return json.dumps(obj)
 
 
+def reply_digest(reply: Any) -> dict[str, Any]:
+    """What the report keeps of a hypothesizer reply: its length and hash, never its text (Night Desk decision 18)."""
+    text = reply if isinstance(reply, str) else ""
+    return {"chars": len(text), "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest()}
+
+
 def _envelope_usage(stdout: str) -> Usage:
     try:
         env = json.loads(stdout)
@@ -1173,10 +1204,12 @@ class ClaudeCliHypothesizer:
     def __init__(self, cfg: Mapping[str, Any]) -> None:
         self.cfg = dict(cfg)
         self.last_left_out = 0    # characters of the last target text the prompt could not hold (0 = all shown)
+        self.last_reply: dict[str, Any] | None = None    # the last raw reply's digest and tokens, never its text
 
     def reply(self, candidate: Mapping[str, Any], *, evidence_text: str, targets: Sequence[str], cap: int,
               target_text: str, budget: Budget) -> str:
         from agent_memory import distill, edits_writer
+        self.last_reply = None
         model = str(self.cfg.get("model") or edits_writer.writer_model())
         argv = [*distill.writer_argv(edits_writer.CLAUDE_ENV, model=model), *UNATTENDED_CLAUDE_FLAGS]
         if self.cfg.get("effort"):
@@ -1192,12 +1225,17 @@ class ClaudeCliHypothesizer:
         # line) or the reply-shape instructions; the final cut stays as a backstop only.
         room = limit - len(HYPOTHESIS_PROMPT.format(target_text="", **fields))
         preferred = _section_for(target_text, candidate.get("rule_key"))
+        if preferred is None and names_rule(candidate.get("rule_key")):
+            # Only listed sections are editable, so a reply could only be empty. Asking would waste a call.
+            self.last_left_out = 0
+            raise SectionUnavailable("rule_section_missing", "candidate rule matches no section; no model call")
         # Reserve the candidate's complete source first. Only the general file view gives way to it.
         payload_room = room if preferred else min(16_000, room // 3)
         payloads = canonical_section_payloads(target_text, max(0, payload_room), candidate.get("rule_key"))
         if preferred and preferred.id not in payloads:
             self.last_left_out = len(target_text)
-            raise ValueError("candidate section cannot fit the canonical prompt budget; no model call")
+            raise SectionUnavailable("rule_section_not_listed",
+                                     "candidate section cannot fit the canonical prompt budget; no model call")
         fields["canonical_sections"] = json.dumps(payloads, ensure_ascii=True)
         room = limit - len(HYPOTHESIS_PROMPT.format(target_text="", **fields))
         shown, self.last_left_out = fit_target_text(
@@ -1220,7 +1258,15 @@ class ClaudeCliHypothesizer:
             out = distill.run_cli(argv, prompt, timeout=max(1.0, min(timeout, budget.remaining_s())),
                                   env={**model_cli_env(), "AMEM_HOOK_OFF": "1"})
             return distill.parse_envelope(out), _envelope_usage(out)
-        reply = budget.call(model, "hypothesize", run, retry_on=(distill.WriterError,))
+        spent = {"tokens_in": 0, "tokens_out": 0}
+
+        def counted() -> tuple[str, Usage]:
+            text, usage = run()
+            spent["tokens_in"] += int(usage.tokens_in)
+            spent["tokens_out"] += int(usage.tokens_out)
+            return text, usage
+        reply = budget.call(model, "hypothesize", counted, retry_on=(distill.WriterError,))
+        self.last_reply = {**reply_digest(reply), **spent}
         return bind_canonical_sections(reply, payloads, str(candidate.get("target") or ""))
 
 
@@ -1301,8 +1347,29 @@ Never copy text, paths, ids or commands out of it.
 """
 
 
+# A heading renamed by hand. Deviation rows keep the id they were stored with, so the old slug still names this rule.
+# Add a pair here when a rename strands a rule key; RULE_SECTION_LOST in the night report is the signal.
+RULE_ALIASES = {"design-system": "design-taste-skill"}
+_NO_SECTION_RULES = {rule_catalog.WHOLE, rule_catalog.UNMATCHED, "unknown"}    # rule ids that name no section
+
+
+def names_rule(rule_key: Any) -> bool:
+    """True when the key names one rule section. `skill:<name>` and `routine:<name>` name a file, and `whole`,
+    `unmatched` and `unknown` name no section: those candidates stay file-level."""
+    if not isinstance(rule_key, str) or not rule_key.strip():
+        return False
+    source, _, rule = rule_key.strip().removeprefix("dev:").rpartition(":")
+    return bool(rule) and source not in ("skill", "routine") and rule not in _NO_SECTION_RULES
+
+
 def _section_for(text: str, rule_key: Any) -> Any:
-    """The rule section a candidate's rule key names (`<source>:<rule id>`, namespaced or plain), else None."""
+    """The rule section a candidate's rule key names (`<source>:<rule id>`, namespaced or plain), else None.
+
+    Rule ids depend on the file's heading shape, and stored keys keep the old shape. A second H1 folds each H3 into
+    its H2, so `<h2>/<h3>` stops being an id: such a key walks up to its parent section, segment by segment, and only
+    when the child heading is really inside that parent. A key whose child heading is gone stays unresolved, so it
+    can never land on an unrelated parent (`<h1>/<removed h2>` on the H1's empty section). A renamed heading resolves
+    through RULE_ALIASES only. Bare substrings never match."""
     from agent_memory import edits_sections
     if not isinstance(rule_key, str) or not rule_key.strip():
         return None
@@ -1314,9 +1381,21 @@ def _section_for(text: str, rule_key: Any) -> Any:
     wanted = [rule, rule.split("--", 1)[-1]]
     if (deleg := ET.delegation_rule_id(rule_key)) is not None:
         wanted.append(deleg)       # a generated copy's delegation rule, read in the source parent/DELEGATION.md
+    wanted += ["/".join(RULE_ALIASES.get(part, part) for part in w.split("/")) for w in wanted]
+
+    def hit(w: str) -> Any:
+        return next((s for s in secs if s.id == w or s.id.endswith("/" + w)), None)
+
     for w in wanted:
-        for s in secs:
-            if s.id == w or s.id.endswith("/" + w):
+        if (s := hit(w)) is not None:
+            return s
+    lines = text.splitlines()
+    for w in wanted:
+        parts = w.split("/")
+        for cut in range(len(parts) - 1, 0, -1):
+            s = hit("/".join(parts[:cut]))
+            if s is not None and set(parts[cut:]) <= {
+                    rule_catalog.slug(title) for _, title, _ in rule_catalog._headings(lines[s.start:s.end])}:
                 return s
     return None
 
@@ -2704,10 +2783,12 @@ class Night:
         if self._skip_skill_candidates():      # earlier nights' skill candidates wait too (skill_refresh)
             self.skill_refresh.skipped.update(c["dedupe_key"] for c in pool if c.get("source") == "skill_scores")
             pool = [c for c in pool if c.get("source") != "skill_scores"]
-        # A candidate whose file no replay case uses can only end INCONCLUSIVE: covered candidates take the triage
-        # slots first. Up to `limit` uncovered ones are still listed (no triage call) so the report says why.
-        covered = [c for c in pool if self._test_cases(c.get("target"))]
-        uncovered = [c for c in pool if not self._test_cases(c.get("target"))]
+        # A candidate that no replay case can test can only end INCONCLUSIVE: covered candidates take the triage slots
+        # first. Coverage is the same section-level gate triage applies, so a covered section is never crowded out by
+        # file-covered candidates that triage would drop anyway. Up to `limit` uncovered ones are still listed (no
+        # triage call) so the report says why.
+        covered = [c for c in pool if self._cases_for(c)]
+        uncovered = [c for c in pool if not self._cases_for(c)]
         return covered[:limit] + uncovered[:limit]
 
     def _reconsider_production(self) -> None:
@@ -2759,11 +2840,38 @@ class Night:
         if section_id is None and rule_key and target in self.allowlist:
             with contextlib.suppress(OSError, ValueError):
                 sec = _section_for(rsi_targets.untilde(target).read_text(), rule_key)
+                if sec is None and names_rule(rule_key):
+                    return []        # a rule no section matches gets no file-level cases for free
                 section_id = sec.id if sec else None
         ids = sorted(cov.get(target or "", []))
         if section_id is not None:
             return [cid for cid in ids if section_id in self._case_sections.get((target, cid), [])]
         return ids
+
+    def _cases_for(self, c: Mapping[str, Any]) -> list[str]:
+        """The cases that can test this candidate tonight. A writer night edits one section, so it needs a case on
+        that section; other nights use the file."""
+        if isinstance(self.ad.implementer, WriterImplementer):
+            return self._test_cases(c.get("target"), (c.get("meta") or {}).get("last_tested_rule_key") or c.get("rule_key"))
+        return self._test_cases(c.get("target"))
+
+    def _rule_section(self, c: Mapping[str, Any]) -> tuple[Any, bool]:
+        """(the section this candidate's rule key resolves to, whether the key names a rule that no section matches).
+        A writer night only; a file-level candidate or an unreadable file answers (None, False)."""
+        key = (c.get("meta") or {}).get("last_tested_rule_key") or c.get("rule_key")
+        if not isinstance(self.ad.implementer, WriterImplementer) or not key or c.get("target") not in self.allowlist:
+            return None, False
+        try:
+            sec = _section_for(rsi_targets.untilde(c["target"]).read_text(), key)
+        except (OSError, ValueError):
+            return None, False
+        return sec, sec is None and names_rule(key)
+
+    def _no_case_reason(self, c: Mapping[str, Any], lost: bool) -> str:
+        """Why a candidate has no replay case, in words that match what the gate checked."""
+        if lost:
+            return RULE_SECTION_LOST
+        return NO_SECTION_CASE if self._test_cases(c.get("target")) else NO_TEST_CASE
 
     def _writer_block(self, c: Mapping[str, Any]) -> str | None:
         if not isinstance(getattr(self.ad, "implementer", None), WriterImplementer) or c.get("target") not in self.allowlist:
@@ -2832,8 +2940,8 @@ class Night:
             self._poll()
             hist = self._history(c["dedupe_key"])
             in_scope = self._in_scope(c.get("target"))
-            section_key = (c.get("meta") or {}).get("last_tested_rule_key") or c.get("rule_key")
-            tests = self._test_cases(c.get("target"), section_key) if isinstance(self.ad.implementer, WriterImplementer) else self._test_cases(c.get("target"))
+            tests = self._cases_for(c)
+            section, lost = self._rule_section(c)
             writer_block = self._writer_block(c)
             ans = None
             # No replay case uses the file: no paid triage call, the deterministic heuristic ranks it for the report.
@@ -2845,13 +2953,19 @@ class Night:
             r = rank(ans, recurrence(c), hist, self.cfg.weights)
             explore = self.cfg.experiment_goal[0] > 0
             eligible = in_scope and bool(tests) and not writer_block and (explore or (ans.action == "experiment" and r >= self.cfg.min_rank))
-            why = (writer_block if writer_block else "eligible" if eligible else "no in-scope target" if not in_scope else NO_TEST_CASE if not tests
+            no_case = self._no_case_reason(c, lost) if not tests else None
+            why = (writer_block if writer_block else "eligible" if eligible else "no in-scope target" if not in_scope else no_case if no_case
                    else "triage: wait" if ans.action != "experiment" else "rank below the minimum")
-            results.append((c, ans, r, eligible, why, hist))
+            results.append((c, ans, r, eligible, why, hist, tests, no_case, section, lost))
         self.health["jev"] = getattr(self.ad.triage, "health", self.health["jev"])
         order = sorted(results, key=lambda x: (not x[3], x[1].action != "experiment", -x[2], x[0]["dedupe_key"]))
         slots = min(self.budget.experiments_left(), self.cfg.experiment_goal[1])
-        for c, ans, r, eligible, why, hist in order:
+        held: set[tuple[Any, str]] = set()      # one candidate per section a night: stale aliases share a section
+        for c, ans, r, eligible, why, hist, tests, no_case, section, lost in order:
+            if eligible and section is not None:
+                if (c.get("target"), section.id) in held:
+                    eligible, why, no_case = False, SAME_SECTION, SAME_SECTION
+                held.add((c.get("target"), section.id))
             selected = eligible and slots > 0
             if selected:
                 slots -= 1
@@ -2883,15 +2997,17 @@ class Night:
                              'production_feedback_sessions_after': metrics['measurements']['sessions_after']}
                     self._update_candidate(c['id'], meta=extra)
                     c['meta'] = {**(c.get('meta') or {}), **extra}
-            tests = self._test_cases(c.get("target"))
-            self.report["candidates"].append({"id": str(c.get("id")) if c.get("id") else None, "key": c["dedupe_key"],
-                                              "source": c["source"], "rank": r, "selected": selected, "reason": reason,
-                                              # additive (Night Desk): the file, the cases that use it, or why not
-                                              "target": c.get("target"), "test_cases": tests,
-                                              "triage": {**ans.as_dict(), "explanation": triage_explanation(ans)},
-                                              "skip_reason": None if tests else NO_TEST_CASE,
-                                              # additive: the lock code when a win can only be a suggested hand edit
-                                              "suggest_only": self._suggest_only(c.get("target"))})
+            entry = {"id": str(c.get("id")) if c.get("id") else None, "key": c["dedupe_key"],
+                     "source": c["source"], "rank": r, "selected": selected, "reason": reason,
+                     # additive (Night Desk): the file, the cases that passed the gate, or why not
+                     "target": c.get("target"), "test_cases": tests,
+                     "triage": {**ans.as_dict(), "explanation": triage_explanation(ans)},
+                     "skip_reason": no_case,
+                     # additive: the lock code when a win can only be a suggested hand edit
+                     "suggest_only": self._suggest_only(c.get("target"))}
+            if lost:      # a fixed code, not a retry: the fault is the loop's, so no attempt is charged
+                entry["hypotheses_rejected"] = rejection_entries([{"code": "rule_section_missing"}])
+            self.report["candidates"].append(entry)
         self._pool_rows = {str(c.get("id") or c["dedupe_key"]): c for c, *_ in results}
 
     # -- S4-S8 -----------------------------------------------------------------------------------------
@@ -2984,11 +3100,20 @@ class Night:
         meta = dict(c.get("meta") or {})
         cap = self.budget.hypothesis_cap()
         pending = [h for h in meta.get("pending_hypotheses") or [] if isinstance(h, dict)]
+        stale: list[dict[str, Any]] = []
+        digest = None
         if isinstance(self.ad.implementer, WriterImplementer):
             unbound = [h for h in pending if not isinstance(h.get("edit"), dict)]
             if unbound:
                 self._update_candidate(c.get("id"), meta={"unbound_pending_hypotheses": unbound})
             pending = [h for h in pending if isinstance(h.get("edit"), dict)]
+            # A stored idea from an earlier night: its edit must still match the file before it takes a slot. A stale
+            # one is dropped here at no charge, and the candidate asks for a fresh idea below.
+            current = [h for h in pending if not self._pending_is_stale(h, cand)]
+            if len(current) < len(pending):
+                stale = [{"index": None, "code": "stale_pending", "field": "edit"}] * (len(pending) - len(current))
+                self._update_candidate(c.get("id"), meta={"pending_hypotheses": current})
+            pending = current
         if pending:
             reply = json.dumps({"hypotheses": pending[:cap]})
         else:
@@ -3000,8 +3125,12 @@ class Night:
                 with self._interruptible():
                     reply = self.ad.hypothesizer.reply(cand, evidence_text=evidence_text, targets=self.allowlist,
                                                        cap=cap, target_text=target_text, budget=self.budget)
+                digest = getattr(self.ad.hypothesizer, "last_reply", None) or reply_digest(reply)
             except (NightAborted, BudgetExhausted):
                 raise
+            except SectionUnavailable as exc:
+                self._defer_loop_fault(c, exc.code, stale)
+                return
             except Exception as exc:  # noqa: BLE001 - S5 failed for this candidate: it stays for a later night
                 self.degraded = True       # the candidate is deferred in the database; the window need not be reread
                 self.notes.append(f"hypothesizer failed for {c['dedupe_key']}: {type(exc).__name__}: {str(exc)[:150]}")
@@ -3021,9 +3150,17 @@ class Night:
             hyps = [h for h in hyps if h.edit is not None]
         if rejected:
             self.notes.append(f"{len(rejected)} hypothesis(es) rejected for {c['dedupe_key']}")
+        elif not hyps:
+            rejected = [{"index": None, "code": "no_ideas", "field": None}]     # the writer declined: a real answer
+            self.notes.append(f"no ideas proposed for {c['dedupe_key']}")
+        if stale:
+            self.notes.append(f"{len(stale)} stored idea(s) dropped as stale for {c['dedupe_key']}")
+        rejected = [*stale, *rejected]
         for ce in self.report["candidates"]:       # additive (Night Desk decision 18): why each idea was thrown out
             if ce.get("key") == c["dedupe_key"]:
                 ce.update(hypotheses_accepted=len(hyps), hypotheses_rejected=rejection_entries(rejected))
+                if digest:                         # additive: a length, a hash and tokens, never the reply's text
+                    ce["hypothesizer_reply"] = digest
         self._update_candidate(c["id"], meta={"hypotheses_rejected": rejected[-10:]} if rejected else None)
         if not hyps:
             # Counted as an attempt: a candidate that never yields a usable hypothesis retires (it returns as
@@ -3090,6 +3227,34 @@ class Night:
                     self.report["experiments"].append(self._skipped_entry(c, x, refs, resource=exc.kind,
                                                                           detail=str(exc)))
                 raise
+
+    def _pending_is_stale(self, h: Mapping[str, Any], cand: Mapping[str, Any]) -> bool:
+        """A stored idea whose declared edit no longer fits the file: its section is gone, its `before` bytes differ,
+        or the candidate's rule now resolves to another section. These are the writer's own refusals, checked before
+        a slot is spent on them. An unreadable file says nothing about the idea, so it stays."""
+        from agent_memory import edits_sections
+        edit = h["edit"]
+        try:
+            text = rsi_targets.untilde(str(h.get("target") or cand.get("target"))).read_text(encoding="utf-8")
+        except (OSError, ValueError):
+            return False
+        try:
+            now = edits_sections.section_text(text, str(edit.get("section_id")))
+        except edits_sections.SectionError:
+            return True
+        named = _section_for(text, cand.get("rule_key"))
+        return (now.strip("\r\n") != str(edit.get("before")).strip("\r\n")
+                or (named is not None and named.id != edit.get("section_id")))
+
+    def _defer_loop_fault(self, c: Mapping[str, Any], code: str, stale: Sequence[Mapping[str, Any]] = ()) -> None:
+        """The loop could not show the model the rule's section. The candidate waits with its attempts unchanged and
+        the report keeps a fixed code. No degraded night: every other candidate is fine."""
+        self.notes.append(f"{c['dedupe_key']}: {REJECT_REASONS[code]}")
+        self._update_candidate(c.get("id"), status="deferred", reason=REJECT_REASONS[code])
+        for entry in self.report["candidates"]:
+            if entry["key"] == c["dedupe_key"]:
+                entry.update(selected=False, reason="deferred: " + REJECT_REASONS[code], skip_reason=REJECT_REASONS[code],
+                             hypotheses_rejected=rejection_entries([*stale, {"code": code}]))
 
     def _skipped_entry(self, c: Mapping[str, Any], h: Hypothesis, refs: list[str], *,
                        policy: str | None = None, resource: str | None = None, detail: str = "") -> dict[str, Any]:
@@ -3530,6 +3695,8 @@ class Night:
                     shortfall.append("fewer permitted candidates than the daily target")
                 if any(c.get("hypotheses_accepted") == 0 for c in r["candidates"]):
                     shortfall.append("a candidate produced no valid hypothesis")
+                if any(x.get("code") in LOOP_FAULTS for c in r["candidates"] for x in c.get("hypotheses_rejected") or []):
+                    shortfall.append("a candidate's rule section could not be shown to the model")
                 shortfall = shortfall or ["candidate preparation did not fill the remaining slots"]
             r["experiment_goal"] = {"minimum": minimum, "target": target, "attempted": attempted,
                                     "replayed": replayed, "minimum_met": replayed >= minimum,
@@ -3762,6 +3929,12 @@ def validate_report(obj: Any) -> list[str]:
         if isinstance(c, dict) and "hypotheses_accepted" in c and (
                 isinstance(c["hypotheses_accepted"], bool) or not isinstance(c["hypotheses_accepted"], int)):
             errs.append(f"{w}.hypotheses_accepted must be an int")
+        if isinstance(c, dict) and "hypothesizer_reply" in c:      # optional (2026-11-01): a length and hash, no text
+            hr = c["hypothesizer_reply"]
+            if not (isinstance(hr, dict) and set(hr) <= {"chars", "sha256", "tokens_in", "tokens_out"}
+                    and isinstance(hr.get("sha256"), str) and RA.HEX64.fullmatch(hr["sha256"])
+                    and all(type(hr.get(k, 0)) is int for k in ("chars", "tokens_in", "tokens_out"))):
+                errs.append(f"{w}.hypothesizer_reply must hold only a length, a sha256 and token counts")
     for i, e in enumerate(need(obj, "experiments", list, "report") or []):
         w = f"experiments[{i}]"
         xid = need(e, "experiment_id", str, w, True)

@@ -443,11 +443,11 @@ def test_night_rule_key_gating_on_the_live_heading_shape(staged_home, path, rule
     assert n.notes == []
 
 
-def test_sub_section_rule_key_falls_back_to_file_coverage(staged_home):
-    """### sub-sections fold into their ## section, so a sub-section key names no section of its own. The night
-    then keeps file-level coverage at triage; the writer's chosen section is gated again before the replay."""
+def test_sub_section_rule_key_resolves_to_its_parent_section(staged_home):
+    """### sub-sections fold into their ## section, so a sub-section key resolves to that section, and the night
+    gates it on that section's cases. File-level coverage for such a key let stale keys beat live ones (2026-11-01)."""
     key = "claude-md:global:global-claude-code-context/explaining-completed-work/response-budget"
-    assert N._section_for(SYNTH_CLAUDE, key) is None
+    assert N._section_for(SYNTH_CLAUDE, key).id == REPORT_SEC
     n = night()
-    assert "summary-report" in n._test_cases(CLAUDE, key)
+    assert n._test_cases(CLAUDE, key) == ["summary-report"]
     assert n._test_cases(CLAUDE, section_id=REPORT_SEC) == ["summary-report"]
