@@ -145,7 +145,18 @@ report with the reasons as notes and an optional `skipped` object (`by`, `reason
 report mean "not analyzed", not "nothing found". The brief's headline names the cause ("The night did not run:
 prerequisite amem-daily failed (deviations: ...)", "The night did not run: the credentials and budget check failed
 (...)"), its sections say "not analyzed" / "not checked", and its cost basis says no call was made. A night whose
-own preflight failed (no `skipped`) keeps the old headline.
+own preflight failed (no `skipped`) says the reason from its notes.
+
+**A bad night looks bad** (2026-11-01). The brief's optional `night_signal` covers every status other than `ok`, and
+any night under its daily minimum of experiments, whatever its status says. It holds `state` (`FAILED`, `PARTLY
+FAILED`, `DID NOT RUN`, `ABORTED`, `STOPPED EARLY`), `code`, `reason` and `reasons`. The push title carries the state
+and the first reason (`Night 2026-10-31 FAILED: no experiments ran: 3 of 3 candidates gave no usable idea`) at priority
+4, in the same one push. A normal night keeps its title and priority 3. The brief's optional `experiment_shortfall`
+says why fewer experiments ran than the daily target, from `experiment_goal`, the candidates' counts and the rejection
+codes. The `amem-rsi-brief` line stays PASS when the brief was written: `night_status` is the report's status, and a
+bad night adds `night_state=<state> night_reason=<code>` and one `-warn` line. `experiments=` counts the experiments
+that started. The "failed sandbox evals" count reads `rsi_eval_results` only: evals-parent logs to `routines.log`, so a
+red run counts as a routine failure.
 
 Since 2026-10-23 (verify run of night 2026-10-23, partial, $0.14):
 
@@ -174,6 +185,10 @@ Since 2026-10-23 (verify run of night 2026-10-23, partial, $0.14):
   "Suggested edits for locked files" without an Apply command. `candidates[]`, `experiments[]` and `patterns[]` carry
   `suggest_only` (the lock code, or null). The report notes
   `candidates: N on a locked file kept as suggest-only (hand-edited or outside improve's allowed targets: ...): ...`.
+  A suggestion stays in every later brief until it is closed or it expires. It expires after the proposal TTL
+  (`rsi_approval.SUGGESTION_TTL`, 72 h from the experiment's end). `amem rsi suggestion <experiment> applied|dismissed`
+  closes it (Vilmer's terminal only; `meta.suggestion_state`; it changes no file). On its last day it joins the
+  morning push once (`meta.suggestion_reminded`). No new table and no migration: the row is `rsi_experiments`.
 - **Delegation-policy ideas target their source** (2026-10-29). A rule under `# Desktop delegation policy v1.1` in
   `~/.claude/CLAUDE.md` or `~/.codex/AGENTS.md` (rule key `claude-md:global:desktop-delegation-policy-v1-1/<h2>` or
   `agents-md:global:...`) targets `~/agent-config/parent/DELEGATION.md`, which both files copy (config-check requires

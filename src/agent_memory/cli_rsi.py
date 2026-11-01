@@ -2,7 +2,8 @@
 
 Read-only: targets, baseline check, freeze-status, verify-decision, show.
 Writes the RSI sandbox only: baseline create, tracking-plan (scripts, never run here).
-Writes RSI tables: propose, push, decide (Vilmer's TTY), decide-poll (the single promotion worker), checkpoint.
+Writes RSI tables: propose, push, decide and suggestion (Vilmer's TTY), decide-poll (the single promotion worker),
+checkpoint.
 """
 
 from __future__ import annotations
@@ -140,6 +141,24 @@ def cmd_decide(args: argparse.Namespace) -> int:
         print(f"amem: rsi decide failed: {type(exc).__name__}", file=sys.stderr)
         return 1
     print(f"rsi decide: {res} (the promotion worker acts within minutes)")
+    return 0 if res in ("recorded", "already") else 1
+
+
+def cmd_suggestion(args: argparse.Namespace) -> int:
+    """Close a suggested hand edit, so later briefs stop showing it. It changes no file. Vilmer's terminal only: an
+    agent must not hide a suggestion from him."""
+    if AP.agent_session_reason() or not sys.stdin.isatty():
+        print("amem: rsi suggestion: refused outside Vilmer's own terminal (agent session or no TTY)", file=sys.stderr)
+        return 2
+    if (code := _write_guard("rsi suggestion")) is not None:
+        return code
+    try:
+        with store.connect() as conn:
+            res = AP.set_suggestion_state(conn, args.experiment, args.state, reason=args.reason)
+    except psycopg.Error as exc:
+        print(f"amem: rsi suggestion failed: {type(exc).__name__}", file=sys.stderr)
+        return 1
+    print(f"rsi suggestion: {args.experiment} {args.state}: {res}")
     return 0 if res in ("recorded", "already") else 1
 
 
@@ -332,6 +351,12 @@ def register(sub: argparse._SubParsersAction) -> None:
     p.add_argument("--hash")
     p.add_argument("--reason")
     p.set_defaults(func=cmd_decide)
+
+    p = s.add_parser("suggestion", help="Vilmer's terminal only: close a suggested hand edit so briefs stop showing it")
+    p.add_argument("experiment")
+    p.add_argument("state", choices=list(AP.SUGGESTION_STATES))
+    p.add_argument("--reason")
+    p.set_defaults(func=cmd_suggestion)
 
     p = s.add_parser("decide-page", help="write the static decide page (Apply needs a TOTP code) for hosting")
     p.add_argument("--out", type=Path, required=True)

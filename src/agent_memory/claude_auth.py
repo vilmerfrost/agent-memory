@@ -55,6 +55,7 @@ def is_auth_error(message: str) -> bool:
         "oauth token revoked", "invalid authentication credentials", "authentication_error",
         "oauth token is invalid", "api error: 401", "invalid bearer token",
         "not logged in", "please run /login", "please login again",
+        "claude authentication failed",  # amem-daily's own -fail line
         AUTH_FAILURE.lower(),
     ))
 
