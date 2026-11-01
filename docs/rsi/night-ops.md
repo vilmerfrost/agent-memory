@@ -209,9 +209,23 @@ Since 2026-10-23 (verify run of night 2026-10-23, partial, $0.14):
     are left out. Older reports have neither field; readers treat them as empty.
 - **Only candidates with a test case take the experiment slot** (2026-10-25). Replay cases now cover the meltdown,
   pepe and anatomy skills (see [Subscription migration](subscription-migration.md), "Skill coverage"). Now:
-  - Each candidate in report.json carries the additive fields `target`, `test_cases` (the case ids that use its
-    file) and `skip_reason` (null, or "no test case uses this file"). Night Desk can show `skip_reason` per candidate.
-  - A candidate whose file no case uses gets no Jev triage call and never takes the experiment slot.
+  - Each candidate in report.json carries the additive fields `target`, `test_cases` (the case ids that passed the
+    gate: on a writer night, the cases that declare the candidate's section) and `skip_reason`. Night Desk can show
+    `skip_reason` per candidate. It is null, or one of: "no test case uses this file", "no test case covers this
+    rule's section", "the rule this candidate names matches no section of the file", "another candidate holds this
+    rule's section tonight".
+  - A candidate that no case can test gets no Jev triage call and never takes the experiment slot. On a writer night
+    this gate runs on the rule's section, and before the pool cap, so file-covered candidates cannot crowd out a
+    covered section.
+  - **Stored rule keys go stale** (2026-11-01). A rule id depends on the file's heading shape, and a key keeps the
+    shape it was stored with. `rsi_night._section_for` resolves `<h2>/<h3>` to the parent section only when the child
+    heading is inside that parent, and a renamed heading through `RULE_ALIASES`. It never matches a bare substring. A
+    key that still matches nothing gets `rule_section_missing`: no model call and no attempt. When that code shows up
+    for a renamed heading, add the pair to `RULE_ALIASES`. Keys that resolve to one section share one slot a night;
+    the highest ranked runs and the others wait.
+  - **Attempts** count the candidate's own misses only. A loop fault (`LOOP_FAULTS`) and a stale stored idea
+    (`stale_pending`) charge nothing. A real decline (`no_ideas`) counts: a candidate that never yields an idea still
+    retires, and returns when it is seen again.
   - Jev's triage state (`rsi_night.triage_state`, 2026-10-27) holds: `recurrence` from `recurrence(c)` (distinct
     occurrences or sessions, the rank's measure; before, it showed `seen_count`, the nights that sighted it),
     `sessions`, `followed_grade`, `result_grade`, `objective_result`, earlier verdicts, `test_cases` (how many
@@ -294,6 +308,7 @@ shows "not saved" when a field is missing.
 | Test task names | covered (1df19d2) | `experiments[].test_setup.tasks[]` `{id, title}`; two-provider runs: `experiments[].provider_results[].test_setup.tasks` |
 | Judge's reason per task | covered (1df19d2), tightened | `experiments[].judge_pairs[]` `{case, title, rep, order, winner, raw_winner, reason, error}`. Now each pair also has the task `title`, and `reason` / `error` are one redacted line of at most 200 characters. The same list is in `provider_results[].judge_pairs` and on the `rsi_experiments.meta` row |
 | Why a dropped idea was thrown out | added | `candidates[].hypotheses_rejected[]` `{index, code, field, reason, target?}` and `candidates[].hypotheses_accepted` (only on a candidate that reached the idea writer) |
+| Why a night is empty | added 2026-11-01 | `candidates[].hypothesizer_reply` `{chars, sha256, tokens_in?, tokens_out?}` for each fresh reply: its length, hash and tokens, never its text. Optional |
 | Full pinned / refused file list | added | `blocked.refused_files[]` `{target, reason}` (every allowlisted file improve refuses tonight) and `blocked.targets[]` (see next row). The `candidates: N on a target improve refuses (...)` note is no longer cut at 200 characters (2000 is a backstop only) |
 | Blocked ideas split by reason | added | `blocked.groups` `{no_target, hand_edited, grades_loop, pinned, outside_allowed}`, `blocked.total` (= the sum, = the two `candidates:` notes added up, from the same database read), `blocked.targets[]` `{target, reason, ideas}` (every file, idea count per file, sorted by group then count) |
 | Per-candidate 🔒 reason on "Most-broken rules" | added | `patterns[].target` (the rule's file, even when out of scope) and `patterns[].blocked` (a group code, or null when the loop may edit it) |
@@ -319,7 +334,12 @@ shows "not saved" when a field is missing.
 `field` is a hypothesis field name or null; `target` appears only for `not_allowlisted` and only when it is a valid
 `~/…/*.md` path): `unparseable`, `not_an_object`, `unknown_fields`, `missing_fields`, `bad_target`,
 `not_allowlisted`, `not_text`, `empty`, `too_long`, `control_chars`, `looks_like_command`, `bad_risk`,
-`bad_confidence`, `over_cap`, `duplicate`, `ignored`, `invalid`.
+`bad_confidence`, `over_cap`, `duplicate`, `ignored`, `invalid`, `no_ideas`, `stale_pending`, `rule_section_missing`,
+`rule_section_not_listed`. The last two (`LOOP_FAULTS`) are the loop's own faults: no model call ran, and
+`index` is null. `rule_section_missing` can appear on a candidate that triage never selected.
+
+`what` may run to 1,000 characters when the idea carries an edit object, because the edit is the intervention. It is
+never cut: the injection scan and the writer's placement check read all of it. An idea without an edit stays at 200.
 
 ## The morning brief
 
