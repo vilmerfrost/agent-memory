@@ -145,7 +145,37 @@ report with the reasons as notes and an optional `skipped` object (`by`, `reason
 report mean "not analyzed", not "nothing found". The brief's headline names the cause ("The night did not run:
 prerequisite amem-daily failed (deviations: ...)", "The night did not run: the credentials and budget check failed
 (...)"), its sections say "not analyzed" / "not checked", and its cost basis says no call was made. A night whose
-own preflight failed (no `skipped`) keeps the old headline.
+own preflight failed (no `skipped`) says the reason from its notes.
+
+**A bad night looks bad** (2026-11-01). The brief's optional `night_signal` covers every status other than `ok`, and
+any night under its daily minimum of experiments, whatever its status says. It holds `state` (`FAILED`, `PARTLY
+FAILED`, `DID NOT RUN`, `ABORTED`, `STOPPED EARLY`), `code`, `reason` and `reasons`. The push title carries the state
+and the first reason (`Night 2026-10-31 FAILED: no experiments ran: 3 of 3 candidates gave no usable idea`), in the same
+one push. Only `FAILED`, `DID NOT RUN` and a night with no report go at priority 4 (Vilmer, 2026-11-01). `PARTLY
+FAILED`, which met its minimum, `ABORTED` and `STOPPED EARLY` keep their title at the normal priority 3, so a high
+priority still means something; a safety slip or a last-day item still raises the push. A normal night keeps its title
+and priority 3. The brief's optional `experiment_shortfall` says why fewer experiments ran than the daily target, from
+`experiment_goal`, the candidates' counts and the rejection codes. The `amem-rsi-brief` line stays PASS when the brief
+was written: `night_status` is the report's status, and a bad night adds `night_state=<state> night_reason=<code>` and
+one `-warn` line. `experiments=` counts the experiments that started. The "failed sandbox evals" count reads
+`rsi_eval_results` only: evals-parent logs to `routines.log`, so a red run counts as a routine failure.
+
+**The title names what really stopped the night** (2026-11-01). Causes run in this order, in fixed words: a crash (`the
+night stopped on an internal error`, or `a database error`), a sandbox outage, the idea writer failing (`Claude
+authentication failed while writing ideas`, or `the idea writer failed on 1 of 3 candidates`), ideas of no use,
+experiments that broke, missing evidence, and last the rows the loop could not ask, which sit in every report and
+explain a night only when no candidate got past them. `night_reason` is `crash`, `sandbox`, `auth`, `hypothesizer` or
+`no_experiments`. Exception and model text stay in the report's notes: a title or a body never carries them, and a
+preflight title says `the client compatibility check failed` or names authentication instead of the raw line. The
+report gives the same reasons in `experiment_goal.shortfall_reasons`, and a failed idea-writer call keeps the code
+`hypothesizer_failed` or `hypothesizer_auth`.
+
+**A night with no report still pushes** (2026-11-01). A night can leave no `report.json`: a config error, a lock or
+database failure in its own preflight, a `client_maintenance` skip, a watchdog kill, or a run launchd never started.
+The brief job stays FAIL, and its one push says `Night <night> DID NOT REPORT: <why>` at priority 4, with that morning's
+escalations, safety slips and last-day items. The reason comes from the night's `amem-rsi-night` line in fixed words
+(`night_reason` on the brief's line); a held lock and an unreadable report file get their own words. The push does not
+say what waits or what was tested, because nothing is known about it. A normal night still sends one push.
 
 Since 2026-10-23 (verify run of night 2026-10-23, partial, $0.14):
 
@@ -174,6 +204,10 @@ Since 2026-10-23 (verify run of night 2026-10-23, partial, $0.14):
   "Suggested edits for locked files" without an Apply command. `candidates[]`, `experiments[]` and `patterns[]` carry
   `suggest_only` (the lock code, or null). The report notes
   `candidates: N on a locked file kept as suggest-only (hand-edited or outside improve's allowed targets: ...): ...`.
+  A suggestion stays in every later brief until it is closed or it expires. It expires after the proposal TTL
+  (`rsi_approval.SUGGESTION_TTL`, 72 h from the experiment's end). `amem rsi suggestion <experiment> applied|dismissed`
+  closes it (Vilmer's terminal only; `meta.suggestion_state`; it changes no file). On its last day it joins the
+  morning push once (`meta.suggestion_reminded`). No new table and no migration: the row is `rsi_experiments`.
 - **Delegation-policy ideas target their source** (2026-10-29). A rule under `# Desktop delegation policy v1.1` in
   `~/.claude/CLAUDE.md` or `~/.codex/AGENTS.md` (rule key `claude-md:global:desktop-delegation-policy-v1-1/<h2>` or
   `agents-md:global:...`) targets `~/agent-config/parent/DELEGATION.md`, which both files copy (config-check requires
@@ -209,9 +243,27 @@ Since 2026-10-23 (verify run of night 2026-10-23, partial, $0.14):
     are left out. Older reports have neither field; readers treat them as empty.
 - **Only candidates with a test case take the experiment slot** (2026-10-25). Replay cases now cover the meltdown,
   pepe and anatomy skills (see [Subscription migration](subscription-migration.md), "Skill coverage"). Now:
-  - Each candidate in report.json carries the additive fields `target`, `test_cases` (the case ids that use its
-    file) and `skip_reason` (null, or "no test case uses this file"). Night Desk can show `skip_reason` per candidate.
-  - A candidate whose file no case uses gets no Jev triage call and never takes the experiment slot.
+  - Each candidate in report.json carries the additive fields `target`, `test_cases` (the case ids that passed the
+    gate: on a writer night, the cases that declare the candidate's section) and `skip_reason`. Night Desk can show
+    `skip_reason` per candidate. It is null, or one of: "no test case uses this file", "no test case covers this
+    rule's section", "the rule this candidate names matches no section of the file", "another candidate holds this
+    rule's section tonight".
+  - A candidate that no case can test gets no Jev triage call and never takes the experiment slot. On a writer night
+    this gate runs on the rule's section, and before the pool cap, so file-covered candidates cannot crowd out a
+    covered section.
+  - **Stored rule keys go stale** (2026-11-01). A rule id depends on the file's heading shape, and a key keeps the
+    shape it was stored with. `rsi_night._section_for` resolves `<h2>/<h3>` to the parent section only when the child
+    heading is inside that parent, and a renamed heading through `RULE_ALIASES`. It never matches a bare substring. A
+    key that still matches nothing gets `rule_section_missing`: no model call and no attempt. When that code shows up
+    for a renamed heading, add the pair to `RULE_ALIASES`. Keys that resolve to one section share one slot a night;
+    the highest ranked runs and the others wait, with no Jev call, so aliases cannot fill the pool. When that row ends
+    with no experiment (a decline, a deferral, no evidence) and the night is still under its daily minimum, the next
+    alias takes the slot, at most `target_experiments` tries a night (Vilmer, 2026-11-01: the daily minimum wins). A
+    failed experiment counts as the section's try. A section over 16,000 characters (`SECTION_MAX`) can never be
+    listed, so it is deferred before triage with `rule_section_not_listed`: no slot, no Jev call, no evidence pack.
+  - **Attempts** count the candidate's own misses only. A loop fault (`LOOP_FAULTS`) and a stale stored idea
+    (`stale_pending`) charge nothing. A real decline (`no_ideas`) counts: a candidate that never yields an idea still
+    retires, and returns when it is seen again.
   - Jev's triage state (`rsi_night.triage_state`, 2026-10-27) holds: `recurrence` from `recurrence(c)` (distinct
     occurrences or sessions, the rank's measure; before, it showed `seen_count`, the nights that sighted it),
     `sessions`, `followed_grade`, `result_grade`, `objective_result`, earlier verdicts, `test_cases` (how many
@@ -294,6 +346,7 @@ shows "not saved" when a field is missing.
 | Test task names | covered (1df19d2) | `experiments[].test_setup.tasks[]` `{id, title}`; two-provider runs: `experiments[].provider_results[].test_setup.tasks` |
 | Judge's reason per task | covered (1df19d2), tightened | `experiments[].judge_pairs[]` `{case, title, rep, order, winner, raw_winner, reason, error}`. Now each pair also has the task `title`, and `reason` / `error` are one redacted line of at most 200 characters. The same list is in `provider_results[].judge_pairs` and on the `rsi_experiments.meta` row |
 | Why a dropped idea was thrown out | added | `candidates[].hypotheses_rejected[]` `{index, code, field, reason, target?}` and `candidates[].hypotheses_accepted` (only on a candidate that reached the idea writer) |
+| Why a night is empty | added 2026-11-01 | `candidates[].hypothesizer_reply` `{chars, sha256, tokens_in?, tokens_out?}` for each fresh reply: its length, hash and tokens, never its text. Optional |
 | Full pinned / refused file list | added | `blocked.refused_files[]` `{target, reason}` (every allowlisted file improve refuses tonight) and `blocked.targets[]` (see next row). The `candidates: N on a target improve refuses (...)` note is no longer cut at 200 characters (2000 is a backstop only) |
 | Blocked ideas split by reason | added | `blocked.groups` `{no_target, hand_edited, grades_loop, pinned, outside_allowed}`, `blocked.total` (= the sum, = the two `candidates:` notes added up, from the same database read), `blocked.targets[]` `{target, reason, ideas}` (every file, idea count per file, sorted by group then count) |
 | Per-candidate 🔒 reason on "Most-broken rules" | added | `patterns[].target` (the rule's file, even when out of scope) and `patterns[].blocked` (a group code, or null when the loop may edit it) |
@@ -319,7 +372,13 @@ shows "not saved" when a field is missing.
 `field` is a hypothesis field name or null; `target` appears only for `not_allowlisted` and only when it is a valid
 `~/…/*.md` path): `unparseable`, `not_an_object`, `unknown_fields`, `missing_fields`, `bad_target`,
 `not_allowlisted`, `not_text`, `empty`, `too_long`, `control_chars`, `looks_like_command`, `bad_risk`,
-`bad_confidence`, `over_cap`, `duplicate`, `ignored`, `invalid`.
+`bad_confidence`, `over_cap`, `duplicate`, `ignored`, `invalid`, `no_ideas`, `stale_pending`, `rule_section_missing`,
+`rule_section_not_listed`, `hypothesizer_failed`, `hypothesizer_auth`. `rule_section_missing` and
+`rule_section_not_listed` (`LOOP_FAULTS`) are the loop's own faults: no model call ran, and `index` is null. Both can
+appear on a candidate that triage never selected. The last two (`IDEA_FAULTS`) mean the call itself failed.
+
+`what` may run to 1,000 characters when the idea carries an edit object, because the edit is the intervention. It is
+never cut: the injection scan and the writer's placement check read all of it. An idea without an edit stays at 200.
 
 ## The morning brief
 

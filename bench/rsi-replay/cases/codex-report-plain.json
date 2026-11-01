@@ -1,0 +1,42 @@
+{
+  "id": "codex-report-plain",
+  "title": "Write a Codex final report in the plain shape, also when it goes to a parent",
+  "tags": [
+    "instruction",
+    "agents-md"
+  ],
+  "targets": [
+    {
+      "path": "~/.codex/AGENTS.md",
+      "kind": "instruction",
+      "behavior": "Explanation Policy: the final message of a Codex agent, including a worker's report that reaches the owner through a parent",
+      "sections": [
+        "global-codex-context/explanation-policy-for-completed-technic"
+      ]
+    }
+  ],
+  "fixture": "codex-report-plain",
+  "hidden_check": "session-turns",
+  "prompt": "Read ~/.codex/AGENTS.md from the staged sandbox home first. You are the agent described in scenarios.json. Each scenario is a moment in a real session. For each scenario write the final message you send, in full. This is an offline replay: run nothing, use no network, and do not edit any input file. Write only result.json in this shape: {\"scenarios\": [{\"id\": <scenario id>, \"message\": <the full final message as Markdown text>}]}. One row per scenario.",
+  "check": "python3 \"$HIDDEN_CHECK_DIR\"/check.py",
+  "timeout_s": 240,
+  "stub": [
+    {
+      "op": "read",
+      "path": "~/.codex/AGENTS.md"
+    },
+    {
+      "op": "read",
+      "path": "scenarios.json"
+    },
+    {
+      "op": "write",
+      "path": "result.json",
+      "text": "{\n \"scenarios\": [\n  {\n   \"id\": \"worker-guard-fix\",\n   \"message\": \"The push guard now asks git for the current branch. Before, it used the folder name. A renamed folder could get around the guard.\\n\\nThis affects every push from a worktree. A push to a protected branch is now refused, whatever the folder is called.\\n\\n```mermaid\\nflowchart LR\\n  P[Push command] --> G[Guard] --> T[Git] --> R[Allow or deny]\\n```\\n\\nFour new tests pass. No live push was tried. The next action is one live push attempt on a test branch.\\n\\nSkills, Plugins or MCPs used\\n\\nVitals\\n\"\n  },\n  {\n   \"id\": \"worker-report-split\",\n   \"message\": \"The nightly report now shows one score per provider. Before, it mixed Claude and Codex results into one score.\\n\\nThis affects how you read the report. Each provider now gets its own verdict, and a strong result from one provider no longer hides a weak result from the other.\\n\\n```mermaid\\nflowchart LR\\n  R[Run results] --> S[Split by provider] --> V[Verdict per provider] --> O[Report]\\n```\\n\\nThe report tests pass. The real nightly report has not run with this change yet. The next action is to read tomorrow's report.\\n\\nSkills, Plugins or MCPs used\\n\\nNone\\n\"\n  },\n  {\n   \"id\": \"chat-deleted-series\",\n   \"message\": \"I deleted the weekly standup series from your work calendar. It held 26 events, on Mondays at 09:30.\\n\\nThis affects everyone invited to that meeting, because the events are gone from the calendar. You can undo this for 30 days, because the calendar keeps a deleted series in its trash. After that, it cannot be restored.\\n\\nNothing to do, unless you want the series back.\\n\\nSkills, Plugins or MCPs used\\n\\nCalendar MCP\\n\"\n  },\n  {\n   \"id\": \"worker-small-retry\",\n   \"message\": \"The HTTP client now retries a failed request four times instead of two. The change is one default value in the client module.\\n\\nThis affects every request that uses the default. A short network failure is now less likely to reach the user, but a real outage takes a little longer to report.\\n\\nOne new test covers the default, and all unit tests pass. Nothing to do.\\n\\nSkills, Plugins or MCPs used\\n\\nNone\\n\"\n  }\n ]\n}\n"
+    },
+    {
+      "op": "final",
+      "text": "Wrote one next turn per scenario to result.json."
+    }
+  ]
+}

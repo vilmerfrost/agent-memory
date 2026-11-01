@@ -241,7 +241,8 @@ def test_full_brief_has_every_section_and_a_complete_proposal_block(rdb: str, sa
     assert "1 improvement ready to apply, 2 failed or inconclusive, 1 decision waiting for you. Total cost $0.42." in md
     assert "Checkpoint advanced: 2026-10-17T03:00:00+00:00 -> 2026-10-18T03:00:00+00:00." in md
     assert "- 42 new or changed sessions since 2026-10-17T03:00:00+00:00." in md
-    assert "- 7 deviations, 2 eval failures, 1 routine failure." in md
+    assert ("- 7 deviations, 2 failed sandbox evals (rsi_eval_results only; a red evals-parent run counts as a routine "
+            "failure), 1 routine failure." in md)
     assert "**closing-line** (n=8, 5 sessions): Closing line missing after long tasks" in md
 
     (blk,) = b["passed"]

@@ -55,7 +55,7 @@ def test_night_message_says_what_happened_and_stays_quiet_otherwise() -> None:
     skipped = alerts.night_message(brief(status="preflight_failed", notes=[
         "skipped by amem-rsi-night: prerequisite amem-daily: last run FAIL at 2026-10-21T09:20:05+0200"]))
     assert skipped is not None
-    assert skipped[0] == "Night 2026-10-24: skipped"
+    assert skipped[0] == "Night 2026-10-24 DID NOT RUN: the deviation scan (amem-daily) failed"
     assert "Skipped: the deviation scan (amem-daily) failed." in skipped[1]
     waiting = alerts.night_message(brief(pending_decisions={"total": 2}))
     assert waiting is not None and "Waiting for your OK: 2." in waiting[1]

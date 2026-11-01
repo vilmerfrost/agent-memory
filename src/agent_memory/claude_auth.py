@@ -4,6 +4,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
+from datetime import datetime
 import os
 from pathlib import Path
 import stat
@@ -55,8 +56,27 @@ def is_auth_error(message: str) -> bool:
         "oauth token revoked", "invalid authentication credentials", "authentication_error",
         "oauth token is invalid", "api error: 401", "invalid bearer token",
         "not logged in", "please run /login", "please login again",
+        "claude authentication failed",  # amem-daily's own -fail line
         AUTH_FAILURE.lower(),
     ))
+
+
+def names_auth(detail: str) -> bool:
+    """`detail` (an error, a note) is about a login: a Claude auth error, or the subscription client's fixed codes and
+    words, which also cover Codex. Only for choosing words; `is_auth_error` alone decides a Claude recovery."""
+    return is_auth_error(detail) or any(s in detail.lower() for s in ("subscription_auth", "subscription login required"))
+
+
+def token_changed_at() -> datetime | None:
+    """When the dedicated token file last changed, else None. A file time only: the file is not read here."""
+    home_arg = os.environ.get("AMEM_CLAUDE_AUTH_HOME")
+    if not home_arg and os.environ.get("AMEM_NO_DOTENV") == "1":
+        return None
+    home = Path(home_arg) if home_arg else config.REPO_ROOT / ".subscription-auth" / "claude"
+    try:
+        return datetime.fromtimestamp((home / ".env").stat().st_mtime).astimezone()
+    except OSError:
+        return None
 
 
 def environment(base: dict[str, str]) -> dict[str, str]:

@@ -1,16 +1,19 @@
 """Phone alerts the existing pushes missed, through the same ntfy channel (`edits_push._publish`, notify.env).
 
 Since 2026-10-26 the morning has one push: the 07:30 brief job's `push_morning`. It carries
-- the night's result, when there is something to say (skipped, partly run, tested, or a decision waits);
+- the night's result, when there is something to say (skipped, partly run, tested, or a decision waits). A bad or
+  empty night (the brief's `night_signal`) says so in the title with the plain reason. FAILED, DID NOT RUN and a night
+  that left no report go at priority 4 (`rsi_brief.urgent`). With no report, this push still goes and says so;
 - what amem-daily used to push itself before it moved to 00:40: new escalations (counts and routine names only,
   never run summaries, failures or ids), slips of the safety rules (working around a guard, the push and merge
-  policy, the safety guards), and staged proposals on their last day.
+  policy, the safety guards), and staged proposals and suggested hand edits on their last day.
 A quiet night with none of those sends nothing; a quiet night with new escalations still pushes.
 
 Each part goes out once: escalation ids are marked pushed in amem-daily's state file after ntfy answered 200, the
-rows record the rest (`rsi_proposals.meta.reminded`, `deviations.meta.alert`). `remind_proposals` (with re-armed
-buttons) and `push_safety_slips` stay as stand-alone commands. Messages carry plain words, rule names and file
-names only, then `redact`, like the other pushes. Raises nothing that should stop a routine: callers log a warning.
+rows record the rest (`rsi_proposals.meta.reminded`, `rsi_experiments.meta.suggestion_reminded`,
+`deviations.meta.alert`). `remind_proposals` (with re-armed buttons) and `push_safety_slips` stay as stand-alone
+commands. Messages carry plain words, rule names and file names only, then the brief's `scrub` (secrets, home paths,
+emails). Raises nothing that should stop a routine: callers log a warning.
 """
 
 from __future__ import annotations
@@ -26,7 +29,9 @@ from psycopg.types.json import Jsonb
 
 from agent_memory import edits_push, redact, store
 from agent_memory import rsi_approval as AP
+from agent_memory import rsi_brief as BR
 
+NAMED_SKIPS = ("auth", "client", "database", "lock")   # night_signal codes whose fixed words are the reason itself
 REMIND_WITHIN = timedelta(hours=30)   # the daily 07:30 brief push catches every proposal on its last day
 SAFETY_RULES = ("approval-without-handing-work-back", "safety-guards", "push-and-merge-policy")
 SAFETY_DAYS = 3
@@ -38,6 +43,8 @@ VERDICT_WORDS = {
     "INCONCLUSIVE": "the test could not tell, nothing changed",
     "IMPROVES": "it won and waits for your OK",
 }
+SUGGESTED_WORDS = "it won, the file is locked, so apply it by hand"   # a win with no proposal: nothing waits for an OK
+UNSTAGED_WORDS = "it won but nothing was staged"
 
 
 def _cap(s: str) -> str:
@@ -114,6 +121,9 @@ def remind_proposals(*, db_url: str | None = None, push: bool = True, notify: di
 
 
 def _skip_words(b: Mapping[str, Any]) -> str:
+    signal = b.get("night_signal") or {}
+    if signal.get("code") in NAMED_SKIPS:
+        return str(signal["reason"])
     for n in b.get("notes") or []:
         m = re.match(r"skipped by amem-rsi-night: prerequisite ([\w-]+): (last run \w+|still running)", str(n))
         if m and m.group(2) == "still running":
@@ -122,41 +132,69 @@ def _skip_words(b: Mapping[str, Any]) -> str:
         if m:
             return ("the deviation scan (amem-daily) failed" if m.group(1) == "amem-daily"
                     else f"the routine it depends on ({m.group(1)}) did not pass")
-    sk = b.get("skipped") or {}
-    return str(sk.get("summary") or "a check before the night failed")
+    return str(signal.get("reason") or (b.get("skipped") or {}).get("summary") or "a check before the night failed")
+
+
+def _tested_words(x: Mapping[str, Any]) -> str:
+    verdict, status = str(x.get("verdict") or ""), x.get("status")
+    if verdict == "IMPROVES" and status == "suggested":
+        return SUGGESTED_WORDS
+    if verdict == "IMPROVES" and status not in (None, "staged"):
+        return UNSTAGED_WORDS
+    return VERDICT_WORDS.get(verdict, "the test did not finish")
 
 
 def night_message(b: Mapping[str, Any]) -> tuple[str, str] | None:
-    """(title, body) for the night, or None for a quiet night (it ran, tested nothing, nothing waits)."""
+    """(title, body) for the night, or None for a quiet night (it ran, tested nothing, nothing waits). A bad or empty
+    night is never quiet: its title carries the brief's night_signal."""
     night, status = str(b.get("night") or "?"), str(b.get("status") or "?")
     pending = int((b.get("pending_decisions") or {}).get("total") or 0)
     exps = list((b.get("experiments") or {}).get("items") or [])
+    hand = len(b.get("suggested") or [])
     total = (b.get("costs") or {}).get("total_usd")
     cost = f"Cost ${float(total):.2f}." if total is not None else ""
+    signal = b.get("night_signal") or {}
     lines: list[str] = []
+    if status == BR.NO_REPORT:              # nothing else is known, so nothing here says what waits or what was tested
+        why = signal.get("reason") or "no reason was recorded"
+        return (BR.scrub(f"Night {night} {signal.get('state') or BR.NO_REPORT_STATE}: {why}")[:120],
+                BR.scrub(f"The night left no report: {why}.\nDetails: routines.log, the amem-rsi-night line.")[:1500])
     if status == "preflight_failed":
-        title = f"Night {night}: skipped"
-        lines.append(f"Skipped: {_skip_words(b)}. Nothing was read or tested.")
+        why = _skip_words(b)
+        title = f"Night {night} {signal.get('state') or 'DID NOT RUN'}: {why}"
+        lines.append(f"Skipped: {why}. Nothing was read or tested.")
     else:
-        if not exps and status == "ok" and not pending:
+        if not exps and status == "ok" and not pending and not signal:
             return None
         for x in exps:
-            verdict = str(x.get("verdict") or "")
-            lines.append(f"Tested {rule_name(str(x.get('candidate_key') or '?'))}: "
-                         f"{VERDICT_WORDS.get(verdict, 'the test did not finish')}.")
-        if not exps:
+            if x.get("status") == "deferred_policy":      # not run: one experiment per candidate per night
+                continue
+            lines.append(f"Tested {rule_name(str(x.get('candidate_key') or '?'))}: {_tested_words(x)}.")
+        ran = bool(lines)
+        if not ran:
             lines.append("Nothing was tested.")
-        if status != "ok":
-            lines.append(f"The night only partly ran ({status.replace('_', ' ')}).")
-        title = f"Night {night}: " + (lines[0].rstrip(".") if exps else status.replace("_", " "))
+        if signal:
+            lines.insert(0, f"Why: {'; '.join(signal['reasons'][:3])}.")
+            title = f"Night {night} {signal['state']}: {signal['reason']}"
+        else:
+            if status != "ok":
+                lines.append(f"The night only partly ran ({status.replace('_', ' ')}).")
+            title = f"Night {night}: " + (lines[0].rstrip(".") if ran else status.replace("_", " "))
     degraded = [str(s) for s in ((b.get("health") or {}).get("degraded") or [])]
     if degraded:
         lines.append("Not working: " + ", ".join(degraded[:4]) + ".")
-    lines.append(f"Waiting for your OK: {pending}." if pending else "Nothing waits for your OK.")
+    if pending:
+        lines.append(f"Waiting for your OK: {pending}.")
+    elif hand:
+        lines.append(f"No proposal waits for your OK. Suggested hand edits open: {hand}.")
+    else:
+        lines.append("Nothing waits for your OK.")
+    if pending and hand:
+        lines.append(f"Suggested hand edits open: {hand}.")
     if cost:
         lines.append(cost)
     lines.append("Details: Night Desk, Last night.")
-    return redact.redact(title)[:120], redact.redact("\n".join(lines))[:1500]
+    return BR.scrub(title)[:120], BR.scrub("\n".join(lines))[:1500]
 
 
 def push_night(b: Mapping[str, Any], *, notify: dict[str, str] | None = None,
@@ -168,8 +206,10 @@ def push_night(b: Mapping[str, Any], *, notify: dict[str, str] | None = None,
     if msg is None:
         return "quiet"
     title, body = msg
-    priority = 4 if extra is not None and (extra.safety or extra.expiring) else 3
-    tags = ["warning"] if extra is not None and extra.safety else ["crescent_moon"]
+    bad = str(b.get("status")) != "ok" or bool(b.get("night_signal"))
+    urgent = extra is not None and bool(extra.safety or extra.expiring or extra.expiring_suggestions)
+    priority = 4 if BR.urgent(b) or urgent else 3
+    tags = ["warning"] if bad or (extra is not None and extra.safety) else ["crescent_moon"]
     return edits_push._publish(lambda topic: {"topic": topic, "title": title, "message": body, "priority": priority,
                                               "tags": tags}, title, body, notify)
 
@@ -180,17 +220,18 @@ def push_night(b: Mapping[str, Any], *, notify: dict[str, str] | None = None,
 @dataclass
 class MorningExtras:
     """What joins the night's push: new escalations (amem-daily's counts-and-routines push: `escalations` is the
-    open count, `new_rows` the ones not pushed yet), safety-rule slips not alerted yet, and staged proposals on
-    their last day not reminded yet. Ids never reach the message."""
+    open count, `new_rows` the ones not pushed yet), safety-rule slips not alerted yet, and staged proposals and
+    suggested hand edits on their last day not reminded yet. Ids never reach the message."""
     open_escalations: int = 0
     new_rows: list[dict[str, Any]] = field(default_factory=list)
     kept_ids: set[str] = field(default_factory=set)
     safety: list[dict[str, Any]] = field(default_factory=list)
     expiring: list[dict[str, Any]] = field(default_factory=list)
+    expiring_suggestions: list[dict[str, Any]] = field(default_factory=list)
     problems: list[str] = field(default_factory=list)   # a part that could not be read (a warning, not a failure)
 
     def empty(self) -> bool:
-        return not (self.new_rows or self.safety or self.expiring)
+        return not (self.new_rows or self.safety or self.expiring or self.expiring_suggestions)
 
 
 def escalation_lines(new_rows: list[Mapping[str, Any]], open_count: int) -> tuple[str, str]:
@@ -214,7 +255,8 @@ def expiring_lines(rows: list[Mapping[str, Any]], now: datetime) -> list[str]:
 def morning_message(b: Mapping[str, Any], extra: MorningExtras,
                     now: datetime | None = None) -> tuple[str, str] | None:
     """The night's message plus amem-daily's parts, or None when there is nothing at all to say. The title is the
-    night's when it has one, else the most urgent part's (safety, then last-day proposals, then escalations)."""
+    night's when it has one, else the most urgent part's (safety, last-day proposals, last-day hand edits, then
+    escalations)."""
     now = now or datetime.now(UTC)
     night = night_message(b)
     parts: list[tuple[str, list[str]]] = []          # (title, lines)
@@ -225,6 +267,11 @@ def morning_message(b: Mapping[str, Any], extra: MorningExtras,
         n = len(extra.expiring)
         e_title = f"{n} proposal{'s' if n != 1 else ''} on the last day"
         parts.append((e_title, [e_title + " (decide in Night Desk):"] + expiring_lines(extra.expiring, now)))
+    if extra.expiring_suggestions:
+        n = len(extra.expiring_suggestions)
+        h_title = f"{n} suggested hand edit{'s' if n != 1 else ''} on the last day"
+        parts.append((h_title, [h_title + " (apply or dismiss, see the brief):"]
+                      + expiring_lines(extra.expiring_suggestions, now)))
     if extra.new_rows:
         x_title, x_body = escalation_lines(extra.new_rows, extra.open_escalations)
         parts.append((x_title, [x_body]))
@@ -242,7 +289,7 @@ def morning_message(b: Mapping[str, Any], extra: MorningExtras,
             lines.append("")
         lines += part
     lines += details or ["Details: Night Desk."]
-    return redact.redact(title)[:120], redact.redact("\n".join(lines))[:2000]
+    return BR.scrub(title)[:120], BR.scrub("\n".join(lines))[:2000]
 
 
 def gather_morning(*, db_url: str | None = None, state_file: Any = None,
@@ -281,6 +328,7 @@ def gather_morning(*, db_url: str | None = None, state_file: Any = None,
                         "and expires_at <= %s and coalesce(meta->>'reminded', '') = '' order by expires_at",
                         (now, now + REMIND_WITHIN))
             x.expiring = cur.fetchall()
+            x.expiring_suggestions = AP.open_suggestions(cur, now=now, within=REMIND_WITHIN)
     except Exception as exc:  # noqa: BLE001 - one part only
         x.problems.append(f"alerts: {type(exc).__name__}: {str(exc)[:160]}")
     return x
@@ -301,7 +349,7 @@ def mark_morning(extra: MorningExtras, result: str, *, db_url: str | None = None
             daily.save_state(daily.state_path(state_file), pushed, now.astimezone())
         except OSError as exc:
             problems.append(f"escalations: cannot write the state file: {type(exc).__name__}")
-    if extra.safety or extra.expiring:
+    if extra.safety or extra.expiring or extra.expiring_suggestions:
         try:
             with store.connect(db_url) as conn:
                 if extra.safety:
@@ -310,6 +358,9 @@ def mark_morning(extra: MorningExtras, result: str, *, db_url: str | None = None
                 if extra.expiring:
                     conn.execute("update rsi_proposals set meta = meta || %s where id = any(%s)",
                                  (Jsonb({"reminded": result}), [r["id"] for r in extra.expiring]))
+                if extra.expiring_suggestions:
+                    conn.execute("update rsi_experiments set meta = meta || %s where id = any(%s)",
+                                 (Jsonb({"suggestion_reminded": result}), [r["id"] for r in extra.expiring_suggestions]))
         except Exception as exc:  # noqa: BLE001
             problems.append(f"alerts: cannot mark what was sent: {type(exc).__name__}")
     return problems

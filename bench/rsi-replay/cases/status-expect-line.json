@@ -1,0 +1,42 @@
+{
+  "id": "status-expect-line",
+  "title": "Start heavy work with a measured estimate in the same message",
+  "tags": [
+    "instruction",
+    "claude-md"
+  ],
+  "targets": [
+    {
+      "path": "~/.claude/CLAUDE.md",
+      "kind": "instruction",
+      "behavior": "Long Work and Status: what an agent writes and runs at the moment it starts heavy work or reruns after a failure",
+      "sections": [
+        "global-claude-code-context/long-work-and-status"
+      ]
+    }
+  ],
+  "fixture": "status-expect-line",
+  "hidden_check": "session-turns",
+  "prompt": "Read ~/.claude/CLAUDE.md from the staged sandbox home first. You are the agent described in scenarios.json. Each scenario is a moment in a real session. For each scenario write your complete next turn: every tool call you make now, in order, up to the point where you need a result you do not have, and all the text you send in that turn. An empty calls list is allowed. Tool arguments use the names in scenarios.json. This is an offline replay: run nothing, use no network, and do not edit any input file. Write only result.json in this shape: {\"scenarios\": [{\"id\": <scenario id>, \"message\": <all the text you send in that turn>, \"calls\": [{\"tool\": <tool name>, ...its arguments}]}]}. One row per scenario.",
+  "check": "python3 \"$HIDDEN_CHECK_DIR\"/check.py",
+  "timeout_s": 180,
+  "stub": [
+    {
+      "op": "read",
+      "path": "~/.claude/CLAUDE.md"
+    },
+    {
+      "op": "read",
+      "path": "scenarios.json"
+    },
+    {
+      "op": "write",
+      "path": "result.json",
+      "text": "{\n \"scenarios\": [\n  {\n   \"id\": \"worker-suite-checklist\",\n   \"message\": \"Starting item 3.\\nExpect: ~2 min, usage not measured\",\n   \"calls\": [\n    {\n     \"tool\": \"Bash\",\n     \"command\": \"uv run --locked --quiet python -u scripts/integration_tests.py\",\n     \"run_in_background\": true\n    }\n   ]\n  },\n  {\n   \"id\": \"gate-rerun\",\n   \"message\": \"Running the integration tests again after the one-line fix.\\nExpect: ~7 min, ~2% of Claude 5h\",\n   \"calls\": [\n    {\n     \"tool\": \"Bash\",\n     \"command\": \"parent-integrate test\",\n     \"run_in_background\": true\n    }\n   ]\n  },\n  {\n   \"id\": \"brief-says-few-minutes\",\n   \"message\": \"Starting the full suite.\\nExpect: ~11 min, usage not measured\",\n   \"calls\": [\n    {\n     \"tool\": \"Bash\",\n     \"command\": \"uv run pytest -q\",\n     \"run_in_background\": true\n    }\n   ]\n  },\n  {\n   \"id\": \"live-eval-usage\",\n   \"message\": \"Starting the live evaluation run.\\nExpect: ~14 min, ~4% of Claude 5h\",\n   \"calls\": [\n    {\n     \"tool\": \"Bash\",\n     \"command\": \"./run-evals --live\",\n     \"run_in_background\": true\n    }\n   ]\n  },\n  {\n   \"id\": \"no-number-at-hand\",\n   \"message\": \"I look up the measured time before I start the browser suite.\",\n   \"calls\": [\n    {\n     \"tool\": \"Bash\",\n     \"command\": \"amem timing tests\"\n    }\n   ]\n  },\n  {\n   \"id\": \"dispatch-three-workers\",\n   \"message\": \"I measure the run before I spawn the workers.\",\n   \"calls\": [\n    {\n     \"tool\": \"Bash\",\n     \"command\": \"~/Projects/agent-memory/.venv/bin/python -m agent_memory.cli_dispatch start --repo shop-api --workers 3 --brief-chars 5120\"\n    }\n   ]\n  },\n  {\n   \"id\": \"dispatch-tool-printed\",\n   \"message\": \"Spawning the workers.\\nExpect: 18 min, ~9% of Claude 5h\",\n   \"calls\": [\n    {\n     \"tool\": \"Agent\",\n     \"description\": \"worker one\"\n    },\n    {\n     \"tool\": \"Agent\",\n     \"description\": \"worker two\"\n    },\n    {\n     \"tool\": \"Agent\",\n     \"description\": \"worker three\"\n    }\n   ]\n  },\n  {\n   \"id\": \"one-test-control\",\n   \"message\": \"Running the one test.\",\n   \"calls\": [\n    {\n     \"tool\": \"Bash\",\n     \"command\": \"uv run pytest -q tests/test_cart.py::test_total\"\n    }\n   ]\n  },\n  {\n   \"id\": \"three-failed\",\n   \"message\": \"Rerunning only the three failed tests.\",\n   \"calls\": [\n    {\n     \"tool\": \"Bash\",\n     \"command\": \"uv run pytest -q tests/test_tax.py::test_vat tests/test_tax.py::test_zero tests/test_cart.py::test_discount\"\n    }\n   ]\n  },\n  {\n   \"id\": \"vendored-history\",\n   \"message\": \"I read the function and the comments around it.\",\n   \"calls\": [\n    {\n     \"tool\": \"Read\",\n     \"file_path\": \"third_party/chromium/base/run_loop.cc\"\n    }\n   ]\n  }\n ]\n}\n"
+    },
+    {
+      "op": "final",
+      "text": "Wrote one next turn per scenario to result.json."
+    }
+  ]
+}

@@ -77,6 +77,67 @@ def record(result, *, state: Path, now: datetime, push: bool, notify=None) -> No
         write(path, data)
 
 
+def last_auth_failure(routines_log: Path) -> str | None:
+    """The time of the newest amem-daily run when that run failed on Claude authentication, else None. Recovery acts
+    only on the state file that `record` writes, so this is the check that a real expiry cannot read as idle."""
+    from agent_memory import claude_auth, daily
+    try:
+        runs = [r for r in daily.RL.parse_file(routines_log).runs if r.routine == daily.NAME]
+    except OSError:
+        return None
+    if not runs or runs[-1].status != "fail":
+        return None
+    if not any(claude_auth.is_auth_error(str(x)) for x in runs[-1].meta.get("failures") or []):
+        return None
+    return runs[-1].started_at.strftime(daily.TS_FORMAT)
+
+
+def token_renewed(since: str, config_path: Path | None = None) -> bool:
+    """True when the dedicated token changed after the failure at `since` and it now reads as a valid login, so the
+    expired status can end before the next amem-daily. Local checks only, the ones the night job uses: the file's time,
+    its shape, and `claude auth status`. No model call and no hosted write; a bad token still shows at the next daily."""
+    from agent_memory import claude_auth, config, daily, rsi_night as N
+    from agent_memory.rsi_subscription_config import credential_problem
+    changed = claude_auth.token_changed_at()
+    if changed is None or changed <= datetime.strptime(since, daily.TS_FORMAT):
+        return False
+    try:
+        claude_auth.environment({})
+        cfg = N.load_config(config_path or config.REPO_ROOT / "config/rsi-night.subscription.json")
+        return credential_problem("claude", cfg.hypothesizer["auth"]) is None
+    except (claude_auth.AuthUnavailable, N.ConfigError, KeyError, OSError):
+        return False
+
+
+def recovered_message(night: str) -> tuple[str, str]:
+    """(title, body) of the end of a recovery: the night's real state, so a recovery that ended on an empty night does
+    not read as recovered and nothing more."""
+    from agent_memory import rsi_artifact as RA, rsi_brief as BR
+    try:
+        rep, _ = BR.load_report(BR.find_report(RA.sandbox_dir(), night)[0])
+    except BR.ReportError:
+        return "Claude automation recovered: night left no report", BR.scrub(
+            f"The daily scan completed, but night {night} left no report. Check routines.log, the amem-rsi-night line.")
+    sig = BR.night_signal(rep)
+    if not sig:
+        return ("Claude automation recovered",
+                "The daily scan completed and the missed night was processed. Check the night report for results.")
+    return (f"Claude automation recovered: night {sig['state']}",
+            BR.scrub(f"The daily scan completed. Night {night} {sig['state']}: {sig['reason']}. Check the night report."))
+
+
+def log_detail(status: str, *, state: Path, routines_log: Path) -> tuple[str, list[str]]:
+    """(extra summary fields, -fail details) for the routine line. A quiet check adds nothing."""
+    if status == "auth_expired":
+        since = last_auth_failure(routines_log)
+        return f" auth=expired since={since}", [f"auth: amem-daily failed on Claude authentication at {since} and no "
+                                                "recovery is pending; renew the dedicated automation token"]
+    data = read(path_for(state))
+    if data.get("status") == "pending":
+        return f" auth=pending night={data.get('night')} attempts={data.get('attempts')}", []
+    return "", []
+
+
 def recover(*, state: Path, routines_log: Path, now: datetime | None = None,
             config_path: Path | None = None, push: bool = True, notify=None) -> str:
     from agent_memory import config, daily, rsi_schedule
@@ -87,7 +148,10 @@ def recover(*, state: Path, routines_log: Path, now: datetime | None = None,
             return "busy"
         data = read(path)
         if data.get("status") != "pending":
-            return "idle"
+            # Nothing to resume. "idle" must still not cover a failure that left no recovery state, but a token
+            # renewed since that failure ends the status: the FAIL line would repeat until the next amem-daily.
+            since = last_auth_failure(routines_log)
+            return "auth_expired" if since and not token_renewed(since, config_path) else "idle"
         if now >= datetime.fromisoformat(data["deadline"]) or data["attempts"] >= MAX_ATTEMPTS:
             data["status"] = "expired"
             write(path, data)
@@ -135,5 +199,5 @@ def recover(*, state: Path, routines_log: Path, now: datetime | None = None,
         data["finished_at"] = now.isoformat()
         write(path, data)
         if push:
-            daily.send("Claude automation recovered", "The daily scan completed and the missed night was processed. Check the night report for results.", notify)
+            daily.send(*recovered_message(data["night"]), notify)
         return "complete"

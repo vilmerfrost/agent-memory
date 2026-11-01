@@ -1,0 +1,116 @@
+{
+ "scenarios": [
+  {
+   "id": "worker-suite-checklist",
+   "message": "Starting item 3.\nExpect: ~2 min, usage not measured",
+   "calls": [
+    {
+     "tool": "Bash",
+     "command": "uv run --locked --quiet python -u scripts/integration_tests.py",
+     "run_in_background": true
+    }
+   ]
+  },
+  {
+   "id": "gate-rerun",
+   "message": "Running the integration tests again after the one-line fix.\nExpect: ~7 min, ~2% of Claude 5h",
+   "calls": [
+    {
+     "tool": "Bash",
+     "command": "parent-integrate test",
+     "run_in_background": true
+    }
+   ]
+  },
+  {
+   "id": "brief-says-few-minutes",
+   "message": "Starting the full suite.\nExpect: ~11 min, usage not measured",
+   "calls": [
+    {
+     "tool": "Bash",
+     "command": "uv run pytest -q",
+     "run_in_background": true
+    }
+   ]
+  },
+  {
+   "id": "live-eval-usage",
+   "message": "Starting the live evaluation run.\nExpect: ~14 min, ~4% of Claude 5h",
+   "calls": [
+    {
+     "tool": "Bash",
+     "command": "./run-evals --live",
+     "run_in_background": true
+    }
+   ]
+  },
+  {
+   "id": "no-number-at-hand",
+   "message": "I look up the measured time before I start the browser suite.",
+   "calls": [
+    {
+     "tool": "Bash",
+     "command": "amem timing tests"
+    }
+   ]
+  },
+  {
+   "id": "dispatch-three-workers",
+   "message": "I measure the run before I spawn the workers.",
+   "calls": [
+    {
+     "tool": "Bash",
+     "command": "~/Projects/agent-memory/.venv/bin/python -m agent_memory.cli_dispatch start --repo shop-api --workers 3 --brief-chars 5120"
+    }
+   ]
+  },
+  {
+   "id": "dispatch-tool-printed",
+   "message": "Spawning the workers.\nExpect: 18 min, ~9% of Claude 5h",
+   "calls": [
+    {
+     "tool": "Agent",
+     "description": "worker one"
+    },
+    {
+     "tool": "Agent",
+     "description": "worker two"
+    },
+    {
+     "tool": "Agent",
+     "description": "worker three"
+    }
+   ]
+  },
+  {
+   "id": "one-test-control",
+   "message": "Running the one test.",
+   "calls": [
+    {
+     "tool": "Bash",
+     "command": "uv run pytest -q tests/test_cart.py::test_total"
+    }
+   ]
+  },
+  {
+   "id": "three-failed",
+   "message": "Rerunning only the three failed tests.",
+   "calls": [
+    {
+     "tool": "Bash",
+     "command": "uv run pytest -q tests/test_tax.py::test_vat tests/test_tax.py::test_zero tests/test_cart.py::test_discount"
+    }
+   ]
+  },
+  {
+   "id": "vendored-history",
+   "message": "I read the function and the comments around it.",
+   "calls": [
+    {
+     "tool": "Read",
+     "file_path": "third_party/chromium/base/run_loop.cc"
+    }
+   ]
+  }
+ ]
+}

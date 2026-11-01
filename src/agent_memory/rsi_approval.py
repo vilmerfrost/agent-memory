@@ -34,7 +34,50 @@ TOKEN_TTL = timedelta(hours=72)
 DECISION_TTL = timedelta(hours=24)
 IMPROVE_TIMEOUT = 600.0
 MAX_ATTEMPTS = 3
-AGENT_ENV = ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SESSION_ID", "RSI_SANDBOX", "IMPROVE_SESSION")
+AGENT_ENV = ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "CODEX_SESSION_ID",
+             "CODEX_SANDBOX", "RSI_SANDBOX", "IMPROVE_SESSION")
+
+
+# A suggested hand edit (rsi_experiments.meta.suggestion) has no proposal row, so its life is kept on the experiment
+# row: open for the proposal TTL unless `amem rsi suggestion` closes it (meta.suggestion_state).
+SUGGESTION_TTL = TOKEN_TTL
+SUGGESTION_STATES = ("applied", "dismissed")
+_SUGGESTION_END = "coalesce(finished_at, created_at) + %(ttl)s"
+_OPEN_SUGGESTIONS = f"""
+select id, night, meta->'suggestion' as suggestion, meta->>'candidate_key' as candidate_key,
+       meta->'suggestion'->>'summary' as title, {_SUGGESTION_END} as expires_at
+from rsi_experiments
+where meta ? 'suggestion' and not meta ? 'suggestion_state' and {_SUGGESTION_END} > %(now)s
+"""
+
+
+def open_suggestions(cur: Any, *, now: datetime | None = None, within: timedelta | None = None) -> list[dict[str, Any]]:
+    """Open suggestions, oldest first: not applied, not dismissed, not expired. `cur` has dict rows. With `within`:
+    only those that end within it and have had no last-day reminder."""
+    sql = _OPEN_SUGGESTIONS
+    params: dict[str, Any] = {"ttl": SUGGESTION_TTL, "now": now or datetime.now(UTC)}
+    if within is not None:
+        sql += f" and {_SUGGESTION_END} <= %(until)s and not meta ? 'suggestion_reminded'"
+        params["until"] = params["now"] + within
+    cur.execute(sql + " order by expires_at, id", params)
+    return cur.fetchall()
+
+
+def set_suggestion_state(conn: psycopg.Connection, experiment_id: str, state: str, *,
+                         reason: str | None = None) -> str:
+    """Close one suggestion: 'recorded', 'already' (closed earlier) or 'not found'."""
+    if state not in SUGGESTION_STATES:
+        raise ValueError(f"state must be one of {SUGGESTION_STATES}")
+    row = conn.execute("select meta ? 'suggestion', meta ? 'suggestion_state' from rsi_experiments where id = %s",
+                       (experiment_id,)).fetchone()
+    if row is None or not row[0]:
+        return "not found"
+    if row[1]:
+        return "already"
+    record = {"state": state, "at": datetime.now(UTC).isoformat(), "reason": redact.redact(reason or "")[:300]}
+    conn.execute("update rsi_experiments set meta = meta || %s where id = %s",
+                 (Jsonb({"suggestion_state": record}), experiment_id))
+    return "recorded"
 
 
 def agent_session_reason(environ: dict[str, str] | None = None) -> str | None:

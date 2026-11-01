@@ -28,8 +28,15 @@ command or a code span to the brief. Ids and hashes must match strict patterns o
 
 Phone: `push_brief` sends one summary through the existing ntfy publisher (`edits_push._publish`, with its macOS
 fallback) and refuses unless AMEM_RSI_BRIEF_PUSH=1. Mission 005 never sets it. The text is built from counts,
-enums, short hashes, file names and ids only, then scrubbed again (home paths, emails, secrets). The per-proposal
-Apply / Reject phone buttons stay `amem rsi push`.
+enums, short hashes, file names, ids and the report's fixed reason strings only, then scrubbed again (home paths,
+emails, secrets). The per-proposal Apply / Reject phone buttons stay `amem rsi push`.
+
+A bad night looks bad (`night_signal`): a status other than ok, or a night under its daily minimum of experiments,
+gets one fixed word and a plain reason in the phone title and the same reason in the headline. FAILED, DID NOT RUN
+and a night with no report (`no_report_brief`) go at priority 4 (`urgent`); the other words stay at 3. A normal
+night's title and priority do not change. `experiment_shortfall` says why fewer experiments ran, the cause that
+really stopped the night first, in fixed words: exception and model text never reach a title. The scheduled morning
+push (alerts.push_morning) reads the same two fields.
 """
 
 from __future__ import annotations
@@ -48,7 +55,8 @@ from typing import Any
 import psycopg
 from psycopg.rows import dict_row
 
-from agent_memory import config, coverage as CV, edits_push, night_coverage as NC, redact, rsi_artifact as RA, store
+from agent_memory import (claude_auth, config, coverage as CV, edits_push, night_coverage as NC, redact,
+                          rsi_artifact as RA, store)
 
 REPORT_FORMAT = "rsi-night/1"
 BRIEF_FORMAT = "rsi-brief/1"
@@ -356,6 +364,7 @@ class Db:
     experiments: dict[str, dict[str, Any]] = field(default_factory=dict)
     backlog: int | None = None               # candidates kept for future nights (new | deferred)
     watch: list[dict[str, Any]] = field(default_factory=list)   # deviations to look at by hand (_WATCH_SQL)
+    suggestions: list[dict[str, Any]] = field(default_factory=list)   # open hand edits, any night (AP.open_suggestions)
 
 
 # The watch list (folded in from the deviations-daily task, 2026-10-26): deviations of the last WATCH_HOURS
@@ -436,10 +445,13 @@ def read_db(rep: Mapping[str, Any], *, db_url: str | None = None) -> Db:
                     db.candidates[r["id"]] = db.candidates[r["dedupe_key"]] = r
                 cur.execute("select count(*) as n from rsi_candidates where status in ('new', 'deferred')")
                 db.backlog = int(cur.fetchone()["n"])
-                cur.execute("select id, night, status, verdict from rsi_experiments where id = any(%s)", (eids,))
+                cur.execute("select id, night, status, verdict, meta ? 'suggestion_state' as suggestion_closed "
+                            "from rsi_experiments where id = any(%s)", (eids,))
                 db.experiments = {r["id"]: r for r in cur.fetchall()}
                 cur.execute(_WATCH_SQL, (watch_hours(),))
                 db.watch = cur.fetchall()
+                from agent_memory import rsi_approval as AP
+                db.suggestions = AP.open_suggestions(cur)
     except psycopg.Error as exc:
         return Db("unavailable", type(exc).__name__)
     return db
@@ -508,17 +520,21 @@ def gap_list(gaps: list[Mapping[str, Any]]) -> str:
     return "; ".join(out) + (f"; and {len(by) - MAX_GAPS} more datasets" if len(by) > MAX_GAPS else "")
 
 
-def verdict_line(v: Mapping[str, Any]) -> str:
-    """The verdict as one markdown line. Only all_clear says "No problem found"."""
+def verdict_line(v: Mapping[str, Any], *, tested: bool = True, night_state: str | None = None) -> str:
+    """The verdict as one markdown line. Only all_clear says "No problem found". The verdict is about the data, so it
+    says so when nothing was tested (`tested`) or the night itself went wrong (`night_state`)."""
     gaps = v.get("gaps") or []
     listed = gap_list(gaps)
     c = v.get("conclusion")
     if c == "all_clear":
         empty = f" Nothing new to check in: {', '.join(v['empty'])}." if v.get("empty") else ""
-        return f"**Verdict: No problem found.** Every dataset the night's conclusions need was analysed.{empty}"
+        failed = f" The data was fine, but the night {night_state}." if night_state else ""
+        return f"**Verdict: No problem found.** Every dataset the night's conclusions need was analysed.{empty}{failed}"
     if c == "findings":
-        return (f"**Verdict: Findings ({v.get('findings', 0)}).** See the patterns and experiments below."
-                + (f" Coverage gaps: {listed}." if gaps else ""))
+        head = (f"**Verdict: Findings ({v.get('findings', 0)}).** See the patterns and experiments below." if tested else
+                f"**Verdict: Findings ({v.get('findings', 0)}), but nothing was tested.** These are analysis notes only: "
+                "no experiment ran, so nothing improved.")
+        return head + (f" Coverage gaps: {listed}." if gaps else "")
     if c == "incomplete":
         return f"**Verdict: Analysis incomplete.** Missing evidence, so this is not an all clear: {listed or '-'}."
     return f"**{v.get('headline') or 'Verdict unknown'}:** {v.get('detail') or '-'}. This is not an all clear."
@@ -826,7 +842,8 @@ def proposal_block(e: Mapping[str, Any], db: Db, artifacts_root: Path, suites: l
     }
 
 
-def suggestion_block(e: Mapping[str, Any], artifacts_root: Path) -> dict[str, Any]:
+def suggestion_block(e: Mapping[str, Any], artifacts_root: Path, *, night: Any = None,
+                     expires_at: Any = None) -> dict[str, Any]:
     """One suggested edit for a locked file (report status `suggested`): what, why, the diff summary of the tested
     bytes, evidence, baseline vs candidate and the hash. It has no proposal and no actions: the file is pinned or
     outside improve's allowed targets, so it is applied by hand or not at all. Never an Apply command."""
@@ -850,8 +867,23 @@ def suggestion_block(e: Mapping[str, Any], artifacts_root: Path) -> dict[str, An
                                   "metrics": compare_arms(e.get("arms"))},
         "risk": e.get("risk") if e.get("risk") in RISKS else None,
         "confidence": e.get("confidence") if _num(e.get("confidence")) else None,
-        "artifact_hash": h, "cost_usd": e.get("cost_usd"),
+        "artifact_hash": h, "cost_usd": e.get("cost_usd"), "night": text(night, 40) or None,
+        "expires_at": _iso(expires_at),
     }
+
+
+def stored_suggestion(row: Mapping[str, Any]) -> dict[str, Any] | None:
+    """An open suggestion from rsi_experiments as a report-shaped experiment for suggestion_block, or None when the
+    row is not one the brief can turn into commands. An earlier night's report is not read: the row is the record."""
+    s, eid = _obj(row.get("suggestion")), row.get("id")
+    h = s.get("artifact_hash")
+    if not (isinstance(eid, str) and EXPERIMENT_RE.fullmatch(eid) and isinstance(h, str) and RA.HEX64.fullmatch(h)
+            and s.get("lock") in LOCK_WORDS):
+        return None
+    return {"experiment_id": eid, "candidate_key": row.get("candidate_key"), "target": s.get("target"),
+            "artifact_hash": h, "verdict": s.get("verdict"), "verdict_reasons": s.get("verdict_reasons"),
+            "arms": s.get("arms"), "hypothesis": {"what": s.get("summary"), "why": s.get("why")},
+            "evidence_refs": s.get("evidence_refs"), "suggestion": s}
 
 
 WHY_NOT = {
@@ -903,7 +935,7 @@ def arm_scenarios(arms: Any, arm: str) -> str | None:
 
 HEADLINES = {
     "ok": "The night finished.",
-    "partial": "The night finished in part: some stages did not complete (see Service health).",
+    "partial": "The night finished in part: some stages did not complete, and the report names no cause.",
     "aborted": "The night was aborted: experiments that were running are marked interrupted.",
     "budget_exhausted": "The night stopped early: the budget ran out, and the remaining work was skipped.",
     "preflight_failed": "The night did not run: preflight failed (see Service health).",
@@ -934,12 +966,254 @@ def writer_info(rep: Mapping[str, Any]) -> dict[str, Any] | None:
             "all_fell_back": w.get("all_fell_back") is True, "top_reason": top}
 
 
+# rsi_night's experiment_goal.shortfall_reasons in plain words. A reason not listed here is shown as it is.
+NO_HYPOTHESIS = "a candidate produced no valid hypothesis"
+SHORTFALL_WORDS = {
+    NO_HYPOTHESIS: "a candidate gave no usable idea",
+    "an experiment did not produce any replay runs": "an experiment stopped before its replay ran",
+    "no permitted candidate with applicable replay cases": "no candidate had a replay test it could use",
+    "fewer permitted candidates than the daily target": "fewer candidates could be tested than the daily target",
+    "candidate preparation did not fill the remaining slots": "preparing candidates did not fill the remaining slots",
+    "budget_exhausted": "the budget ran out", "aborted": "the night was aborted",
+    "preflight_failed": "the night did not start",
+}
+NO_IDEAS = "no_ideas"                     # a hypotheses_rejected code: the writer proposed no change
+NOT_SHOWN = "a candidate's rule section could not be shown to the model"     # shortfall reason of the codes below
+LOOP_FAULTS = ("rule_section_missing", "rule_section_not_listed")           # rsi_night.LOOP_FAULTS: no model call ran
+IDEA_FAULTS = ("hypothesizer_auth", "hypothesizer_failed")                  # rsi_night.IDEA_FAULTS: the call itself failed
+EXPERIMENT_STOPPED = "an experiment did not produce any replay runs"
+PREPARATION = "candidate preparation did not fill the remaining slots"
+NIGHT_CRASHED = "the night stopped on an internal error"                    # rsi_night.NIGHT_CRASHED
+SANDBOX_DOWN = "the sandbox was down, so no experiment could run"           # the words for rsi_night.SANDBOX_DOWN
+AUTH_WORDS = "Claude authentication failed"
+NO_EVIDENCE = "required evidence unavailable"                               # rsi_night's skip_reason
+# The night's own words for what stopped it. The cause they name is read from the report in plain words, so they, and
+# the guess that preparation fell short, are not shown beside it.
+STOP_REASONS = (NIGHT_CRASHED, "the sandbox was unavailable", "the idea writer failed", PREPARATION)
+SELECTION_REASONS = ("no permitted candidate with applicable replay cases", "fewer permitted candidates than the daily target")
+
+
+def _reject_word(r: Mapping[str, Any]) -> str:
+    return text(r.get("reason"), 120) or text(r.get("code"), 40).replace("_", " ") or "no reason recorded"
+
+
+def _tally(words: Mapping[str, int]) -> str:
+    return "; ".join(f"{n} x {w}" for w, n in words.items())
+
+
+def crash_cause(note: str) -> tuple[str, str]:
+    """(code, fixed words) for a night's `error:` note. The note holds an exception's text, which never goes further."""
+    if claude_auth.names_auth(note):
+        return "auth", AUTH_WORDS
+    if re.search(r"psycopg|OperationalError|InterfaceError|database", note, re.I):
+        return "crash", "the night stopped on a database error"
+    return "crash", NIGHT_CRASHED
+
+
+def stopped_by(rep: Mapping[str, Any]) -> tuple[str, str] | None:
+    """What stopped the night's work before any candidate was at fault, as (code, fixed words): a crash (its `error:`
+    note), or a sandbox that was down (its health, or a candidate deferred for it). Else None."""
+    crash = next((str(n) for n in rep.get("notes") or [] if str(n).startswith("error:")), None)
+    if crash:
+        return crash_cause(crash)
+    down = rep["health"].get("sandbox") not in (*HEALTHY, *NEUTRAL, None) or any(
+        isinstance(c, dict) and c.get("skip_reason") == "sandbox unavailable" for c in rep["candidates"])
+    return ("sandbox", SANDBOX_DOWN) if down else None
+
+
+def idea_failures(rep: Mapping[str, Any]) -> tuple[int, bool]:
+    """(calls of the idea writer that failed, whether one failed on authentication). The candidate's fixed code, or the
+    `hypothesizer failed for` note on a report from before the codes. Only the count and the kind go further."""
+    notes = [str(n) for n in rep.get("notes") or [] if str(n).startswith("hypothesizer failed for ")]
+    codes = [str(r.get("code")) for c in rep["candidates"] if isinstance(c, dict)
+             for r in c.get("hypotheses_rejected") or [] if isinstance(r, dict) and r.get("code") in IDEA_FAULTS]
+    return max(len(notes), len(codes)), "hypothesizer_auth" in codes or any(claude_auth.names_auth(n) for n in notes)
+
+
+def experiment_shortfall(rep: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Why the night ran fewer experiments than its daily target, in plain words (report `experiment_goal`, each
+    candidate's hypothesis counts and rejection codes), or None (target met, or an older report without the goal).
+    Reasons come from the report's fixed strings and codes; a code this brief does not know is still counted.
+    A candidate the loop could not ask (LOOP_FAULTS) is not selected any more, so it is counted on its own.
+    Causes run in the order that stopped the night: what stopped all work (`stopped_by`), the idea writer failing, ideas
+    with no use, experiments that broke, evidence that was missing, and last the rows the loop could not ask, which sit
+    in every report and so explain a night only when nothing else does. `code` names the first of the first two."""
+    goal = rep.get("experiment_goal")
+    if not isinstance(goal, dict) or goal.get("target_met") is True:
+        return None
+    candidates = [c for c in rep["candidates"] if isinstance(c, dict)]
+    selected = [c for c in candidates if c.get("selected") is True]
+    stop = stopped_by(rep)
+    failed_ideas, auth = idea_failures(rep)
+    no_ideas = thrown = 0
+    why: dict[str, int] = {}
+    for c in selected:
+        if c.get("hypotheses_accepted") != 0:
+            continue
+        real = [r for r in c.get("hypotheses_rejected") or [] if isinstance(r, dict) and r.get("code") != NO_IDEAS]
+        if not real:
+            no_ideas += 1
+            continue
+        thrown += 1
+        for r in real:
+            why[_reject_word(r)] = why.get(_reject_word(r), 0) + 1
+    unasked: dict[str, int] = {}
+    for c in candidates:
+        for r in c.get("hypotheses_rejected") or []:
+            if isinstance(r, dict) and r.get("code") in LOOP_FAULTS and c.get("selected") is not True:
+                unasked[_reject_word(r)] = unasked.get(_reject_word(r), 0) + 1
+    barren = no_ideas + thrown
+    reasons = [str(r) for r in goal.get("shortfall_reasons") or []
+               if not (stop or failed_ideas) or r not in STOP_REASONS]
+    if stop:                                  # the candidates were never the question
+        reasons = [r for r in reasons if r not in SELECTION_REASONS]
+    idea_words =(f"{AUTH_WORDS} while writing ideas" if auth else
+                  f"the idea writer failed on {failed_ideas} of {_plural(len(selected), 'candidate')}" if failed_ideas else "")
+    evidence = sum(c.get("skip_reason") == NO_EVIDENCE for c in candidates)
+    evidence_words = f"{_plural(evidence, 'candidate')} had no usable evidence" if evidence else ""
+    broke = SHORTFALL_WORDS[EXPERIMENT_STOPPED] if EXPERIMENT_STOPPED in reasons else ""
+    never = f"{_plural(sum(unasked.values()), 'candidate')} never reached the model" if unasked else ""
+    causes = [stop[1] if stop else "", idea_words]
+    if barren:
+        parts = ([f"{no_ideas} returned no ideas"] if no_ideas else []) + (
+            [f"{thrown} had every idea thrown out: {_tally(why)}"] if thrown else [])
+        causes.append(f"{barren} of {_plural(len(selected), 'selected candidate')} gave no usable idea "
+                      f"({'; '.join(parts)})")
+    causes += [broke, evidence_words]
+    if unasked:
+        causes.append(f"{never} ({_tally(unasked)})")
+    others = [SHORTFALL_WORDS.get(r) or text(r, 160) for r in reasons if r != EXPERIMENT_STOPPED
+              and not (barren and r == NO_HYPOTHESIS) and not (unasked and r in (NOT_SHOWN, NO_HYPOTHESIS))]
+    causes = list(dict.fromkeys(c for c in [*causes, *others] if c)) or ["the report names no cause"]
+    # The first cause in few words. Lost rows come last when a candidate got past them, or something else stopped it.
+    asked = any("hypotheses_accepted" in c for c in candidates)
+    short = next(c for c in (stop[1] if stop else "", idea_words,
+                             f"{barren} of {_plural(len(selected), 'candidate')} gave no usable idea" if barren else "",
+                             broke, evidence_words, "" if asked else never, *others, never, causes[0]) if c)
+    code = stop[0] if stop else "auth" if auth else "hypothesizer" if failed_ideas else None
+    return {"replayed": goal.get("replayed"), "attempted": goal.get("attempted"), "minimum": goal.get("minimum"),
+            "target": goal.get("target"), "minimum_met": goal.get("minimum_met") is True, "selected": len(selected),
+            "no_ideas": no_ideas, "ideas_thrown_out": thrown, "never_asked": sum(unasked.values()), "causes": causes,
+            "why": "; ".join(causes), "short": short, "code": code}
+
+
+def experiment_words(e: Mapping[str, Any]) -> str:
+    """A failed experiment's first reason. ExperimentFailed carries the night's own words. Any other exception's text
+    (`KeyError: ...`) is raw, so it does not go further."""
+    first = str(next(iter(e.get("verdict_reasons") or []), ""))
+    if claude_auth.names_auth(first):
+        return "authentication failed"
+    if first.startswith("ExperimentFailed: ") or not re.match(r"[A-Z]\w*: ", first):
+        return text(first, 90).removeprefix("ExperimentFailed: ")
+    return "an internal error"
+
+
+PREFLIGHT_WORDS = (("lock:", "lock", "another night held the lock"),
+                   ("database unavailable", "database", "the database could not be reached"))
+
+
+def _preflight_cause(sk: Mapping[str, Any] | None, notes: list[str]) -> tuple[str, str]:
+    """(code, plain reason) for a night that did not run. A preflight note can hold an exception's text and a skip
+    summary a failed step's raw line, so what can be named goes in fixed words and the rest loses its detail."""
+    marks = ("skipped by amem-rsi-night: ", "preflight: ")       # the first: nights before report["skipped"] existed
+    note = next((n.split(m, 1)[1] for m in marks for n in notes if m in n), "")
+    seen = " ".join([*(sk["items"] if sk else []), sk["summary"] if sk else "", note])
+    if "client compatibility" in seen:
+        return "client", ("the client compatibility check failed" + (" on authentication" if claude_auth.names_auth(seen) else ""))
+    if claude_auth.names_auth(seen):
+        return "auth", (f"{AUTH_WORDS}, so the deviation scan (amem-daily) did not finish" if "amem-daily" in seen else AUTH_WORDS)
+    if sk and sk["reason"] == "prerequisites":
+        m = re.search(r"; and \d+ more prerequisite problems? \(see the notes\)$", sk["summary"])
+        more = m.group(0) if m else ""
+        return "skipped", sk["summary"].removesuffix(more).split(" (", 1)[0] + more
+    if sk:
+        return "skipped", sk["summary"]
+    for mark, code, words in PREFLIGHT_WORDS:
+        if mark in note:
+            return code, words
+    return "preflight", text(note, 160).split(" (", 1)[0] or "preflight failed"
+
+
+def night_signal(rep: Mapping[str, Any]) -> dict[str, Any] | None:
+    """How a bad night must look: `state` (one fixed word for the phone title and the routine line), `code` and
+    `reason` (the first cause, in plain words) and `reasons` (all of them). None for a normal night: status ok, and
+    the daily minimum met or not recorded. An empty night counts as bad whatever its status says."""
+    status = rep["status"]
+    sf = experiment_shortfall(rep)
+    missed = bool(sf) and not sf["minimum_met"]
+    if status == "ok" and not missed:
+        return None
+    notes = [str(n) for n in rep.get("notes") or []]
+    sk = skip_info(rep)
+    causes: list[tuple[str, str]] = []
+    state = "PARTLY FAILED"
+    if sk or status == "preflight_failed":
+        state = "DID NOT RUN"
+        causes.append(_preflight_cause(sk, notes))
+    elif status == "aborted":
+        state = "ABORTED"
+        causes.append(("aborted", next((text(n, 160) for n in notes if n.startswith("interrupted by")), "it was interrupted")))
+    elif status == "budget_exhausted":
+        state = "STOPPED EARLY"
+        causes.append(("budget", "subscription usage accounting was unavailable"
+                       if any("subscription_usage_unknown" in n for n in notes) else "the budget ran out"))
+    elif missed:
+        state = "FAILED"
+    if missed:
+        ran = sf["replayed"]
+        causes.append((sf["code"] or "no_experiments",
+                       (f"no experiments ran: {sf['short']}" if not ran else
+                        f"only {ran} of the {sf['minimum']} required experiments ran: {sf['short']}")))
+    elif not sf and (stop := stopped_by(rep)):      # a crash on a report with no goal, or after the target was met
+        causes.append(stop)
+    bad = sorted(k for k, v in rep["health"].items() if v not in HEALTHY + NEUTRAL)
+    if bad:
+        services = ", ".join(f"{text(k, 32)} {text(rep['health'][k], 40)}" for k in bad)
+        causes.append(("service", f"{services} (see Service health)"))
+    w = writer_info(rep)
+    if w and w["all_fell_back"]:
+        causes.append(("writer", f"no writer change was tested: {w['top_reason'] or 'no reason recorded'}"))
+    broken = [e for e in rep["experiments"] if isinstance(e, dict) and e.get("status") in ("failed", "interrupted")]
+    if broken:
+        first = experiment_words(broken[0])
+        causes.append(("experiment_failed", f"{_plural(len(broken), 'experiment')} failed" + (f": {first}" if first else "")))
+    if sf and not missed:
+        causes.append(("target_missed", f"{sf['replayed']} of {sf['target']} daily experiments ran: {sf['short']}"))
+    if not causes:
+        causes.append(("unknown", "the report names no cause"))
+    return {"state": state, "code": causes[0][0], "reason": causes[0][1], "reasons": [c[1] for c in causes]}
+
+
+NO_REPORT = "no_report"                   # the brief job's word for a night that left no readable report.json
+NO_REPORT_STATE = "DID NOT REPORT"
+# Priority 4 (Vilmer, 2026-11-01). PARTLY FAILED, ABORTED and STOPPED EARLY keep their title at the normal priority, so
+# the high priority still means something on the mornings that need it.
+URGENT_STATES = ("FAILED", "DID NOT RUN", NO_REPORT_STATE)
+
+
+def urgent(b: Mapping[str, Any]) -> bool:
+    """Whether this night's push goes at the high priority: read by both pushes."""
+    return (b.get("night_signal") or {}).get("state") in URGENT_STATES
+
+
+def no_report_brief(night: str, code: str, reason: str) -> dict[str, Any]:
+    """What the morning push needs to know of a night that left no report: its night key and why. Nothing else is
+    known about the night, so this is not a brief to show or store."""
+    return {"format": BRIEF_FORMAT, "night": night, "status": NO_REPORT,
+            "night_signal": {"state": NO_REPORT_STATE, "code": code, "reason": reason, "reasons": [reason]}}
+
+
 def headline(rep: Mapping[str, Any]) -> str:
     sk = skip_info(rep)
     if sk:
         return _sentence(f"The night did not run: {sk['summary']}")
     if rep['status'] == 'budget_exhausted' and any('subscription_usage_unknown' in str(n) for n in rep.get('notes', [])):
         return 'The night stopped early: subscription usage accounting was unavailable.'
+    sig = night_signal(rep)
+    if rep["status"] == "partial" and sig and sig["code"] != "unknown":
+        return _sentence(f"The night finished in part: {'; '.join(sig['reasons'][:3])}")
+    if rep["status"] == "preflight_failed" and sig and sig["reason"] != "preflight failed":
+        return _sentence(f"The night did not run: preflight failed: {sig['reason']}")
     return HEADLINES[rep["status"]]
 
 
@@ -993,7 +1267,18 @@ def build_brief(rep: Mapping[str, Any], db: Db, *, artifacts_root: Path, report:
     exps = rep["experiments"]
     suites = required_suites()
     passed = [proposal_block(e, db, artifacts_root, suites) for e in exps if e["status"] == "staged"]
-    suggested = [suggestion_block(e, artifacts_root) for e in exps if e["status"] == "suggested"]
+    # This night's suggestions, then every earlier one still open: a hand edit has no proposal row, so without the
+    # stored rows it would be shown once and forgotten. Closed on the row (applied, dismissed): not shown.
+    open_rows = {r["id"]: r for r in db.suggestions}
+    tonight = [e for e in exps if e["status"] == "suggested"
+               and not (db.experiments.get(e["experiment_id"]) or {}).get("suggestion_closed")]
+    suggested = [suggestion_block(e, artifacts_root, night=rep["night"],
+                                  expires_at=(open_rows.get(e["experiment_id"]) or {}).get("expires_at")) for e in tonight]
+    shown = {e["experiment_id"] for e in exps if e["status"] == "suggested"}
+    for r in db.suggestions:
+        stored = stored_suggestion(r) if r["id"] not in shown else None
+        if stored:
+            suggested.append(suggestion_block(stored, artifacts_root, night=r.get("night"), expires_at=r.get("expires_at")))
     failed = [failed_item(e) for e in exps if e["status"] not in ("staged", "suggested")]
     policy_deferred = sum(e["status"] == "deferred_policy" for e in exps)
     d = rep["delta"]
@@ -1057,7 +1342,10 @@ def build_brief(rep: Mapping[str, Any], db: Db, *, artifacts_root: Path, report:
     notes = [text(n, 200) for n in (rep.get("notes") or [])          # the writer's note is shown as a warning instead
              if not (writer_warning and str(n).startswith(WRITER_NEVER_RAN))][:MAX_NOTES]
     ck = rep["checkpoint"]
+    signal, shortfall = night_signal(rep), experiment_shortfall(rep)
     return {
+        **({"night_signal": signal} if signal else {}),        # additive: only on a bad or empty night
+        **({"experiment_shortfall": shortfall} if shortfall else {}),
         "format": BRIEF_FORMAT, "night": rep["night"], "status": rep["status"],
         "generated_at": (now or datetime.now(UTC)).isoformat(), "report": report or {},
         "started_at": text(rep.get("started_at"), 40) or None, "finished_at": text(rep.get("finished_at"), 40) or None,
@@ -1232,6 +1520,9 @@ def _suggestion_md(i: int, b: dict[str, Any]) -> list[str]:
     out = [f"### {i}. {b['title']}", "",
            f"- **Suggested edit for a locked file: apply by hand.** {b['target'] or 'The file'} is {b['lock_words']}, "
            "so the loop never applies this change and no Apply command exists for it."]
+    if b.get("expires_at"):
+        out.append(f"- **Open since night {b['night']}:** shown here until you apply or dismiss it, or until it expires "
+                   f"{_when(b['expires_at'])} UTC.")
     ch, ds = b["change"], b["diff_summary"]
     out.append(f"- **What would change:** {_sentence(b['what']) or '(no description)'}"
                + (f" Section: {b['section_id']}." if b["section_id"] else ""))
@@ -1255,6 +1546,8 @@ def _suggestion_md(i: int, b: dict[str, Any]) -> list[str]:
                                                    for m in bvc["metrics"]])), ""]
     out.append(f"- **Tested artifact:** `{b['artifact_hash']}` (experiment {b['experiment_id']}; the exact bytes the "
                "sandbox replay tested).")
+    out.append(f"- **Close it:** `amem rsi suggestion {b['experiment_id']} applied` or "
+               f"`amem rsi suggestion {b['experiment_id']} dismissed`, in your own terminal.")
     return out
 
 
@@ -1272,7 +1565,8 @@ def usd4(v: Any) -> str:
 def render_markdown(b: dict[str, Any]) -> str:
     title = (f"# RSI manual verification: {_obj(b.get('manual_run')).get('id')}" if b.get("manual_run") else
              f"# RSI morning brief: night {b['night']}")
-    out = [title, "", f"{b['headline']} {b['summary']}"]
+    signal = b.get("night_signal") or {}
+    out = [title, "", (f"**Night {signal['state']}.** " if signal else "") + f"{b['headline']} {b['summary']}"]
     ck = b["checkpoint"]
     sk = b.get("skipped")
     not_run = "not analyzed: the night did not run" if sk else ""
@@ -1286,7 +1580,8 @@ def render_markdown(b: dict[str, Any]) -> str:
                      "again.")
     out.append(run)
     if b.get("verdict"):
-        out.append(verdict_line(b["verdict"]))
+        out.append(verdict_line(b["verdict"], tested=any(x["experiment_id"] for x in b["experiments"]["items"]),
+                                night_state=signal.get("state")))
     for n in b["notes"]:
         out.append(f"- Note: {n}")
     for w in b.get("prerequisite_warnings") or []:
@@ -1314,7 +1609,9 @@ def render_markdown(b: dict[str, Any]) -> str:
     else:
         out.append(f"- {_plural(s['sessions'], 'new or changed session')}{since}." if s["sessions"]
                    else f"- No new sessions{since}.")
-        out.append(f"- {_plural(s['deviations'], 'deviation')}, {_plural(s['eval_failures'], 'eval failure')}, "
+        # eval_failures counts rsi_eval_results only (rsi_evidence_pack.delta_since). evals-parent logs to routines.log.
+        out.append(f"- {_plural(s['deviations'], 'deviation')}, {_plural(s['eval_failures'], 'failed sandbox eval')} "
+                   "(rsi_eval_results only; a red evals-parent run counts as a routine failure), "
                    f"{_plural(s['routine_failures'], 'routine failure')}.")
 
     out += ["", "## Important patterns", ""]
@@ -1356,6 +1653,7 @@ def render_markdown(b: dict[str, Any]) -> str:
 
     out += ["", "## Experiments performed", ""]
     ex = b["experiments"]["items"]
+    short = b.get("experiment_shortfall")
     if ex:
         out += _table(["experiment", "candidate", "baseline (A) pass", "candidate (B) pass", "verdict", "status", "cost"],
                       [[x["experiment_id"] or "(not started)", x["candidate_key"] or "-", _fmt(x["baseline_pass"]),
@@ -1381,8 +1679,12 @@ def render_markdown(b: dict[str, Any]) -> str:
                     x.get("baseline_scenarios") or x.get("candidate_scenarios")):
                 out.append(f"- {x['experiment_id']}: baseline {x.get('baseline_scenarios') or 'score unknown'}, "
                            f"candidate {x.get('candidate_scenarios') or 'score unknown'}.")
+        if short:
+            out.append(f"- {short['replayed']} of {short['target']} daily experiments produced replay runs. "
+                       f"Why fewer: {short['why']}.")
     else:
-        out.append("- None ran: the night did not run." if sk else "- None ran.")
+        out.append("- None ran: the night did not run." if sk else f"- None ran. Why: {short['why']}." if short
+                   else "- None ran.")
 
     out += ["", "## Improvements that passed", ""]
     for i, blk in enumerate(b["passed"], 1):
@@ -1472,8 +1774,10 @@ def render_markdown(b: dict[str, Any]) -> str:
         a = it["actions"]
         out += [_apply_md(a, it.get("apply_blocked") or [], indent="  ", bold=False), f"  - Reject: `{a['reject']}`",
                 f"  - Details: `{a['details']}`"]
+    hand = len(b.get("suggested") or [])
     if not pd["items"]:
-        out.append("- Nothing waits for you.")
+        out.append(f"- No proposal waits for you. {_plural(hand, 'suggested hand edit')} "
+                   f"{'is' if hand == 1 else 'are'} still open." if hand else "- Nothing waits for you.")
     else:
         out.append(f"- Apply offered for {pd['with_apply']} of {_plural(pd['total'], 'proposal')}: only fully "
                    "evaluated IMPROVES proposals (independent judge and live Jev, verified artifact) get one.")
@@ -1503,8 +1807,10 @@ def notification(b: Mapping[str, Any]) -> tuple[str, str]:
     s = b["sessions"]
     ready = sum(1 for x in b["passed"] if x["actions"].get("apply"))
     sk = b.get("skipped")
+    signal = b.get("night_signal") or {}
     lines = [f"Night {b['status']}. Ready to apply {ready}, staged not ready {len(b['passed']) - ready}, "
              f"failed or inconclusive {sum(x.get('status') != 'deferred_policy' for x in b['failed'])}.",
+             *([f"Why: {_sentence('; '.join(signal['reasons'][:3]))}"] if signal else []),
              f"Not run: skipped by the night job ({sk['reason']}); nothing analyzed. Cost {usd(b['costs']['total_usd'])}."
              if sk and sk.get("reason") in SKIP_REASONS else
              f"Sessions {int(s['sessions'])}, candidates {int(b['candidates']['total'])}, "
@@ -1512,8 +1818,10 @@ def notification(b: Mapping[str, Any]) -> tuple[str, str]:
     v = b.get("verdict") or {}
     if v.get("conclusion") in VERDICT_HEADLINES:
         n = len(v.get("gaps") or [])
+        untested = v["conclusion"] == "findings" and not any(x.get("experiment_id") for x in b["experiments"]["items"])
         lines.append(f"Verdict: {VERDICT_HEADLINES[v['conclusion']]}"
                      + (f" ({int(v.get('findings') or 0)})" if v["conclusion"] == "findings" else "")
+                     + (", nothing tested" if untested else "")
                      + (f", {_plural(n, 'coverage gap')}" if n else "") + ".")
     deg = [f"{k} {_word(b['health']['services'][k])}" for k in b["health"]["degraded"] if NAME_RE.fullmatch(k)]
     other = len(b["health"]["degraded"]) - len(deg)
@@ -1533,7 +1841,10 @@ def notification(b: Mapping[str, Any]) -> tuple[str, str]:
     if pd["items"]:
         lines.append("Apply / Reject: amem rsi decide <id> apply|reject in your terminal, or the buttons from amem rsi push.")
     night = b["night"] if NIGHT_RE.fullmatch(str(b["night"])) else "?"
-    return scrub(f"RSI brief {night}: {len(pd['items'])} to decide")[:120], scrub("\n".join(lines))[:3500]
+    n = len(pd["items"])
+    title = (f"RSI night {night} {signal['state']}" + (f", {n} to decide" if n else "") + f": {signal['reason']}"
+             if signal else f"RSI brief {night}: {n} to decide")
+    return scrub(title)[:120], scrub("\n".join(lines))[:3500]
 
 
 def push_brief(b: Mapping[str, Any], *, notify: dict[str, str] | None = None,
@@ -1543,5 +1854,8 @@ def push_brief(b: Mapping[str, Any], *, notify: dict[str, str] | None = None,
     if not push_allowed(environ):
         raise PushRefused(PUSH_OFF)
     title, body = notification(b)
-    return edits_push._publish(lambda topic: {"topic": topic, "title": title, "message": body, "priority": 3,
-                                              "tags": ["sunrise"]}, title, body, notify)
+    bad = bool(b.get("night_signal"))
+    return edits_push._publish(lambda topic: {"topic": topic, "title": title, "message": body,
+                                              "priority": 4 if urgent(b) else 3,
+                                              "tags": ["warning" if bad else "sunrise"]},
+                               title, body, notify)

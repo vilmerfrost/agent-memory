@@ -42,7 +42,7 @@ from typing import Any
 import psycopg
 
 from agent_memory.integrations import refs, sb_queries
-from agent_memory.integrations.evidence import EvidenceRef, QueryResult, Retriever, exists, record, run_query
+from agent_memory.integrations.evidence import EvidenceRef, QueryResult, Retriever, Unavailable, exists, record, run_query
 from agent_memory.integrations.pastdev import QUERY_RE
 
 SERVICE = {"sb": "supabase", "ch": "clickhouse", "lf": "langfuse", "pd": "pastdev", "ncm": "ncm"}
@@ -65,6 +65,7 @@ class Step:
     query: str
     params: Mapping[str, str]
     why: str
+    subject_rule: str | None = None     # the rule a step's free words came from (recall), for the egress gate
 
 
 Plan = Callable[[Mapping[str, str], Sequence[tuple[Step, QueryResult]], int], list[Step]]
@@ -241,7 +242,8 @@ def _repeat(p: Mapping[str, str], done: Sequence[tuple[Step, QueryResult]], phas
                  Step("ch", "rule_weekly_rate", {"rule": rule, "weeks": "8"}, "the rule's weekly rate, from ClickHouse")]
         words = _words(rule)
         if words:
-            steps.append(Step("pd", "recall", {"query": words, "limit": "10"}, "decision memory: similar past decisions"))
+            steps.append(Step("pd", "recall", {"query": words, "limit": "10"}, "decision memory: similar past decisions",
+                              subject_rule=rule))
         return steps
     if phase == 2:
         steps = []
@@ -324,16 +326,34 @@ def finding(conn: psycopg.Connection, step: Step, ev: EvidenceRef) -> dict[str, 
             "metrics": ev.metrics, "summary": ev.summary}
 
 
+def _refused(st: Step, gate: Any) -> str | None:
+    """Why the egress gate keeps this step's rule off an external source, else None. Supabase is the home of these
+    rows, so only a step that leaves the Mac asks. A rule from a row is as untrusted as one typed by hand."""
+    rule = st.params.get("rule") or st.subject_rule
+    if gate is None or st.source == "sb" or not rule:
+        return None
+    try:
+        gate.check_rule(rule)
+    except Unavailable as exc:
+        return str(exc)[:200]
+    return None
+
+
 def ask(name: str, params: Mapping[str, str], retrievers: Mapping[str, Retriever | None],
-        connect: Callable[[], psycopg.Connection], *, now: Callable[[], datetime] | None = None) -> Answer:
+        connect: Callable[[], psycopg.Connection], *, now: Callable[[], datetime] | None = None,
+        gate: Any = None) -> Answer:
+    """`gate`: rsi_evidence_providers.EgressGate, the night's own rule check. `amem evidence ask` passes it, so a key
+    the night would refuse is refused here too; the step answers `unavailable` and the rest of the plan runs."""
     q = QUESTIONS[name]
     p = q.check(params)
     ans = Answer(q.name, q.text, p, asked_at=(now or (lambda: datetime.now(UTC)))().isoformat(timespec="seconds"))
     for phase in range(MAX_PHASES):
         for st in q.plan(p, ans.steps, phase):
             r = retrievers.get(st.source)
-            res = run_query(r, st.query, st.params) if r is not None else QueryResult(st.source, "unavailable",
-                                                                                      detail="no retriever")
+            refused = _refused(st, gate)
+            res = (QueryResult(st.source, "unavailable", detail=refused) if refused
+                   else run_query(r, st.query, st.params) if r is not None
+                   else QueryResult(st.source, "unavailable", detail="no retriever"))
             ans.steps.append((st, res))
     with connect() as conn:
         ans.findings = [finding(conn, st, ev) for st, res in ans.steps if res.status == "ok" for ev in res.refs]
