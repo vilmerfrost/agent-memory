@@ -73,8 +73,8 @@ is ignored: `sessions ingest` makes the subagent rows.
 
 | Event | Writes |
 |---|---|
-| `SessionStart` | A minimal row: `session_id`, `tool` claude, `cwd` → `repo`, `project_dir` (the transcript folder), `started_at`, a best-effort `kind` (`eval` for eval clones, `headless` when `CLAUDE_CODE_ENTRYPOINT` starts with `sdk`, else `chat`), `meta.live`, `meta.start_source`, `meta.model`. An existing row keeps its kind and facts; `meta` is merged. |
-| `Stop` | Token columns, `models`, `turns`, `last_activity_at`, `ended_at`, `meta.subagent_tokens`, and the profile columns (title, model, effort, time, outcome; see "Profile columns"). SessionStart sets `category` / `project` and the title an earlier scan saw. |
+| `SessionStart` | A minimal row: `session_id`, `tool` claude, `cwd` → `repo`, `project_dir` (the transcript folder), `started_at`, a best-effort `kind` (`eval` for eval clones, `chat` for a T3 ping, `headless` when `CLAUDE_CODE_ENTRYPOINT` starts with `sdk`, else `chat`), `interface` (see "Interface"), `meta.live`, `meta.start_source`, `meta.model`, and `meta.client` = `t3` on a T3 ping. An existing row keeps its kind and facts; `meta` is merged. |
+| `Stop` | Token columns, `models`, `turns`, `last_activity_at`, `ended_at`, `interface`, `meta.subagent_tokens`, and the profile columns (title, model, effort, time, outcome; see "Profile columns"). SessionStart sets `category` / `project` and the title an earlier scan saw. |
 | `SessionEnd` (optional) | As Stop, never debounced, plus `meta.ended`. |
 
 Cheap by design:
@@ -194,8 +194,8 @@ but it is user-typed, so it is redacted like other text and capped at 200 chars.
 `category` = the session kind: `routine`, `chat` (local or cloud), `parent`, `worker`
 (subagents, dispatch workers), `eval`, `headless` (`claude -p`, `codex exec`). An SDK session with
 parent evidence (`parent-lock`, the `dispatch` skill, a spawned `worker`) is a `parent`. A hook
-cannot see that evidence, so a ping files it as `headless` until ingest; a ping never changes the
-kind of a stored row.
+cannot see that evidence, so a ping files it as `headless` (a T3 ping as `chat`) until ingest; a
+ping never changes the kind of a stored row.
 
 `project` = where the work happened, first match wins:
 
@@ -260,6 +260,85 @@ t3-transitions	/path/to/control/transitions/*/home	codex
   transition can hold a rollout twice), gives one row: the newest file, a tie goes to the earlier
   home. The other file counts as skipped. The archive keeps each file under its own key. With one
   home nothing changes. A rollout reached twice through a symlink gives one row.
+
+### Interface
+
+`interface` (migration `20261101120000_session_interface.sql`): the app a session ran in. Null means
+"not derived yet". One pure function decides it (`session_interface.derive`, stored meta only).
+Transcript ingest, cloud digests, the live ping and the backfill all call it.
+
+| Value | App |
+|---|---|
+| `t3-code` | T3 Code |
+| `claude-desktop` | The Claude desktop app |
+| `chatgpt-desktop` | The ChatGPT desktop app (Codex Desktop) |
+| `ide` | The Claude Code extension in an editor |
+| `cli` | `claude` or `codex` in a terminal |
+| `sdk` | A script or a headless run: `claude -p`, `codex exec`, an RSI native session |
+| `cloud` | A cloud routine or a cloud chat |
+| `unknown` | The row names no app this list knows |
+
+Claude Code, first match wins:
+
+1. `cloud`: `meta.cloud` is true, or the id starts with `cloud:`.
+2. `t3-code`: `meta.client` = `t3`, or `meta.claude_root` is a T3 root.
+3. `claude-desktop`: `meta.entrypoints` has `claude-desktop`.
+4. `ide`: it has `claude-vscode`.
+5. `cli`: it has `cli`.
+6. `sdk`: an entrypoint starts with `sdk`, or `meta.source` starts with `rsi-native-session/`.
+7. `unknown`.
+
+So a mixed row takes the app a person used: `[claude-desktop, sdk-cli]` is `claude-desktop`. An `sdk-ts`
+row without T3 evidence stays `sdk`, and an entrypoint not listed here is `unknown`: nothing is guessed.
+
+Codex, first match wins:
+
+1. `t3-code`: `meta.originator` is `T3 Code`.
+2. `chatgpt-desktop`: originator `Codex Desktop`.
+3. `cli`: originator `codex-tui`.
+4. `sdk`: originator `codex_exec`, or `meta.source` is `exec` or starts with `rsi-native-session/`.
+5. `t3-code`: no originator and `meta.codex_root` is a T3 root.
+6. `unknown` (`zeron-native` too). `source` alone never names the app: `vscode` appears for several.
+
+`meta.client` = `t3` is the evidence behind `t3-code` for a Claude row. Ingest sets it from T3's system
+prompt, its tools or a T3 root. A ping sets it from its own evidence (below).
+
+**Subagents.** A subagent uses its own evidence first. Its `sdk` or `unknown` is no real evidence, since a
+subagent of a T3 session has the same `sdk-ts` entrypoint as its parent. So those two take the parent's
+value when the parent's value is known (not null, not `unknown`). A real own value stays, and a Codex
+subagent's originator is its own evidence. Ingest applies this to stored rows after the upsert, for
+subagents and parents alike, so it works in any order: in one run, or a parent that arrives in a later run.
+
+**Updates.** Null is no value. `unknown` and `sdk` never replace a stored stronger value (`sdk` does replace
+`unknown`). Otherwise the new value wins. Ingest and the ping share this rule
+(`session_interface.STORED_OR_NEW_SQL`). So a `t3-code` from a ping survives an ingest that only sees `sdk-ts`.
+
+**Ping evidence.** A ping reads no transcript for this. It knows `CLAUDE_CODE_ENTRYPOINT`, the transcript's
+root label and `T3CODE_THREAD_ID`.
+
+- A ping is T3 when the transcript is under a T3 root, or when `T3CODE_THREAD_ID` is non-empty and the
+  entrypoint is `sdk-ts`. The entrypoint counts: a `claude -p` started from a shell inside T3 inherits the
+  thread id, has entrypoint `sdk-cli`, and stays `sdk`.
+- A T3 ping sets `meta.client` = `t3` and kind `chat`, so ingest and ping agree.
+- The entrypoint goes to `derive` only: ingest owns `meta.entrypoints`.
+- A spool record carries `interface`. A record of an older version has no key and still flushes, as null.
+- Without the column (between a code merge and the migration) a ping spools, as for any database
+  error, and nothing is lost.
+
+**Backfill.** `amem sessions interface [--apply [--log FILE] | --revert LOG] [--json]` fills rows where
+`interface` is null, from stored meta only: no transcript read, no git, no network. A parent is resolved
+before its subagents. The default is a dry run in a read-only transaction that prints the counts per
+value. `--apply` writes in one transaction, only this column, and re-checks `interface is null` at write
+time. It deletes nothing, and a second `--apply` changes zero rows. `sessions` has no update trigger, so
+no other field moves.
+
+`--apply` also writes a local log of the rows it changed (default
+`<claude home>/parent/amem-sessions-interface-<time>.json`), since a row may not record who wrote its
+value. `--revert LOG` sets the logged rows back to null when they still hold the logged value. A row that
+ingest or a ping changed since stays as it is.
+
+Run the backfill right after the migration. A subagent row that an ingest stored before its parent has a
+value is not a candidate for the backfill. It gets its parent's value when one of the two is next ingested.
 
 ### Model, effort, duration
 
@@ -508,4 +587,5 @@ Without `--json`: a total line, a token / time line and one line per project.
 T3 details. `delegate_task` counts as parent evidence, in Claude (`mcp__t3-code__delegate_task`) and in Codex
 (`delegate_task` in namespace `mcp__t3_code`). A delegated child thread carries no parent link in its transcript, so
 it stays `chat`. A home listed in the roots file gives its own `CLAUDE.md` the source name `claude-md:guarded` and its
-`AGENTS.md` the name `agents-md:guarded`, one name across all threads. A ping from a `t3` root says `chat`.
+`AGENTS.md` the name `agents-md:guarded`, one name across all threads. A T3 ping (a `t3` root, or
+`T3CODE_THREAD_ID` on an `sdk-ts` entrypoint; see "Interface") says `chat`.

@@ -1,4 +1,4 @@
-"""`amem sessions ingest|summarize|tokens|cost|find|hosts|instruction-sources` and
+"""`amem sessions ingest|summarize|tokens|cost|find|hosts|interface|instruction-sources` and
 `amem deviations scan|report|reref|rules`
 (docs/deviations.md, docs/sessions-live.md). `amem sessions ping` is session_live.main (cli.main
 routes it). `sessions summarize` without `--dry-run` needs AMEM_SUMMARY_LIVE=1 (else exit 2).
@@ -170,6 +170,35 @@ def cmd_sessions_hosts(args: argparse.Namespace) -> int:
                                   if args.apply else "; dry run: nothing written (--apply to write)")
     except (OSError, psycopg.Error) as exc:
         return _err("sessions hosts", exc)
+    print(json.dumps(doc, sort_keys=True) if args.json else line)
+    return 0
+
+
+def cmd_sessions_interface(args: argparse.Namespace) -> int:
+    """Fill sessions.interface from stored meta for rows stored before ingest wrote it (docs/sessions-live.md)."""
+    from agent_memory import session_interface_backfill as backfill
+
+    if args.apply and args.revert:
+        print("amem: sessions interface: --apply and --revert cannot be combined", file=sys.stderr)
+        return USAGE_EXIT
+    write = args.apply or args.revert
+    if (code := (_write_guard if write else _read_guard)("sessions interface")) is not None:
+        return code
+    try:
+        if args.revert:
+            n = backfill.revert(args.revert)
+            doc: dict[str, Any] = {"reverted": n}
+            line = f"sessions interface: reverted {n} row(s) from {args.revert}"
+        else:
+            plan = backfill.plan()
+            log = (args.log or backfill.default_log()) if args.apply else None
+            applied = backfill.apply(plan, log) if log else None
+            doc = {**plan.to_json(), "dry_run": not args.apply, "applied": applied, "log": str(log) if log else None}
+            line = plan.line() + (f"; applied: {applied} row(s) written; log {log} "
+                                  f"(undo: amem sessions interface --revert {log})"
+                                  if log else "; dry run: nothing written (--apply to write)")
+    except (OSError, ValueError, psycopg.Error) as exc:
+        return _err("sessions interface", exc)
     print(json.dumps(doc, sort_keys=True) if args.json else line)
     return 0
 
@@ -404,6 +433,17 @@ def register(sub: Any) -> None:
     p.add_argument("--revert", action="store_true", help="remove every host --apply wrote")
     p.add_argument("--json", action="store_true", help="counts and one row per candidate session")
     p.set_defaults(func=cmd_sessions_hosts)
+
+    p = s_sub.add_parser("interface", help="fill sessions.interface (the app a session ran in) for rows without "
+                                           "one, from stored meta only (no transcript, git or network); dry run "
+                                           "unless --apply")
+    p.add_argument("--apply", action="store_true", help="write the values (only rows still null, only this column)")
+    p.add_argument("--log", type=Path, default=None, help="where --apply writes its undo log "
+                                                          "(default <claude home>/parent/amem-sessions-interface-*.json)")
+    p.add_argument("--revert", type=Path, default=None, metavar="LOG",
+                   help="set the rows of an --apply log back to null, when they still hold the logged value")
+    p.add_argument("--json", action="store_true", help="counts and one row per candidate session")
+    p.set_defaults(func=cmd_sessions_interface)
 
     p = s_sub.add_parser("instruction-sources",
                          help="backfill sessions.instruction_sources (authority and version of every instruction "

@@ -48,8 +48,9 @@ AMEM = str(Path(sys.executable).parent / "amem")
 # Env names a test must never inherit: they pick or authenticate a store
 # (AMEM_DB_URL, AMEM_BACKEND, AMEM_SUPABASE_URL/KEY, PG* for libpq), carry a key
 # (TYPESAFE_API_KEY, SUPABASE_*), or change behaviour (AMEM_JEV_LIVE,
-# AMEM_REQUIRE_REMOTE, AMEM_QUESTIONS_DIR, ...). Tests set what they need.
-ISOLATED_PREFIXES = ("AMEM_", "PG", "TYPESAFE_", "SUPABASE_")
+# AMEM_REQUIRE_REMOTE, AMEM_QUESTIONS_DIR, ...; T3CODE_THREAD_ID, which a run inside T3 Code
+# inherits and a ping reads). Tests set what they need.
+ISOLATED_PREFIXES = ("AMEM_", "PG", "TYPESAFE_", "SUPABASE_", "T3CODE_")
 
 
 SECURITY_ENV = "AMEM_ADMIN_SECURITY"           # agent_memory.credentials.SECURITY_ENV
