@@ -86,6 +86,7 @@ from agent_memory import (
     session_resume,
     session_tokens,
     store,
+    t3_workers,
 )
 
 KINDS = ("chat", "parent", "worker", "headless", "eval", "routine")
@@ -685,6 +686,8 @@ def session_row(path: Path, project_dir: str, *, parent_session: str | None = No
     root_label = claude_roots.label_of(path)
     facts.t3_client = facts.t3_client or claude_roots.is_t3(root_label)
     kind = classify(facts, project_dir=project_dir, cwd=cwd, subagent=subagent)
+    t3_record = None if subagent or kind == "eval" else t3_workers.lookup(claude_home() / "parent", [cwd, *facts.cwds])
+    kind = "worker" if t3_record else kind
     meta: dict[str, Any] = {
         "cwd": cwd or None,
         "cwds": facts.cwds,  # every cwd the session visited (skills.MATCH_SQL)
@@ -709,6 +712,8 @@ def session_row(path: Path, project_dir: str, *, parent_session: str | None = No
         sid = f"{parent_session}/{path.stem}"
     else:
         sid = path.stem
+    if t3_record:
+        t3_workers.apply(meta, t3_record)
     rname = routine_name(facts)
     if rname:
         meta["routine"] = rname
@@ -811,6 +816,8 @@ def codex_row(path: Path, rel_dir: str, titles: dict[str, str] | None = None,
     f = codex_sessions.scan_facts(events, path.stem)
     cwd, scratch_only = work_cwd(f.cwds, "")
     kind = classify_codex(f, cwd)
+    t3_record = None if f.subagent or kind == "eval" else t3_workers.lookup(claude_home() / "parent", [cwd, *f.cwds])
+    kind = "worker" if t3_record else kind
     meta: dict[str, Any] = {
         "cwd": cwd or None,
         "cwds": f.cwds,  # every cwd the session visited (skills.MATCH_SQL)
@@ -828,6 +835,8 @@ def codex_row(path: Path, rel_dir: str, titles: dict[str, str] | None = None,
     if f.subagent:
         meta["parent_session"] = codex_sessions.PREFIX + f.parent_thread if f.parent_thread else None
         meta["agent_type"] = f.agent_role
+    if t3_record:
+        t3_workers.apply(meta, t3_record)
     # Codex app worktrees (~/.codex/worktrees/<task>) are named after the task: the main
     # checkout names the repo.
     main = main_checkout(Path(cwd)) if cwd else None
@@ -1008,13 +1017,14 @@ def rollup_subagents(rows: list[SessionRow], *, several_roots: bool = False) -> 
     `<session>/subagents/agent-*.jsonl` next to the parent transcript (a subagent file not in
     this ingest is read for its tokens only; a pure copy, session_resume, adds nothing), and with
     `several_roots` the subagent rows of this ingest in another root. Codex: the subagent rows of this ingest whose
-    `meta.parent_session` is the parent. The subagents keep their own rows: a sum over all
-    rows never adds this field."""
+    `meta.parent_session` is the parent. T3 workers count the same way, from either provider, because
+    a T3 worker is a session of its own with no file under its parent. The subagents keep their own
+    rows: a sum over all rows never adds this field."""
     by_id = {r.session_id: r for r in rows}
     sums: dict[str, tuple[session_tokens.Tokens, int]] = {}
     sub_dirs: dict[str, set[Path]] = {}
     for r in rows if several_roots else ():
-        if r.tool == "claude" and r.path is not None and "parent_session" in r.meta:
+        if r.tool == "claude" and r.path is not None and t3_workers.in_parent_folder(r.meta):
             sub_dirs.setdefault(str(r.meta["parent_session"]), set()).add(r.path.parent)
 
     def add(parent: str, t: session_tokens.Tokens) -> None:
@@ -1023,7 +1033,10 @@ def rollup_subagents(rows: list[SessionRow], *, several_roots: bool = False) -> 
         sums[parent] = (total, n + 1)
 
     for r in rows:
-        if r.tool == "claude" and r.path is not None and "parent_session" not in r.meta:
+        if t3_workers.is_worker(r.meta):
+            if r.meta.get("parent_session") and r.tokens is not None:
+                add(str(r.meta["parent_session"]), r.tokens.tokens)
+        elif r.tool == "claude" and r.path is not None and "parent_session" not in r.meta:
             dirs = {r.path.parent / r.path.stem / "subagents", *sub_dirs.get(r.session_id, ())}
             files = {f.stem: f for d in sorted(dirs, reverse=True) if d.is_dir() for f in d.glob("agent-*.jsonl")}
             for f in (files[stem] for stem in sorted(files)):

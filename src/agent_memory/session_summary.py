@@ -46,7 +46,7 @@ from typing import Any
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
-from agent_memory import config, distill, redact, session_commits, session_resume, sessions_ingest, store
+from agent_memory import config, distill, redact, session_commits, session_resume, sessions_ingest, store, t3_workers
 
 LIVE_ENV = "AMEM_SUMMARY_LIVE"
 CLAUDE_ENV = "AMEM_SUMMARY_CLAUDE"
@@ -160,7 +160,7 @@ def own_events(events: list[dict[str, Any]], rec: dict[str, Any]) -> list[dict[s
     `sessionId`) are the earlier session's. Codex: all lines (the digest drops a fork's copy)."""
     if rec.get("tool") == "codex":
         return events
-    own = (rec.get("meta") or {}).get("parent_session") or rec["session_id"]
+    own = t3_workers.own_session(rec.get("meta"), rec["session_id"])
     return [e for e in events if not (isinstance(e.get("sessionId"), str) and e["sessionId"]
                                       and e["sessionId"] != own)]
 
@@ -187,7 +187,7 @@ def commits_of(events: list[dict[str, Any]], rec: dict[str, Any],
     fallback = fallback_of(rec)
     if rec.get("tool") == "codex":
         return session_commits.codex_commits(events, cwd=cwd, fallback=fallback, stats=stats)
-    own = (rec.get("meta") or {}).get("parent_session") or rec["session_id"]
+    own = t3_workers.own_session(rec.get("meta"), rec["session_id"])
     return session_commits.claude_commits(events, cwd=cwd, own_session=own, fallback=fallback, stats=stats)
 
 

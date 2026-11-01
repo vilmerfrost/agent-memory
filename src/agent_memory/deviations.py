@@ -59,7 +59,7 @@ import psycopg
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
-from agent_memory import codex_sessions, config, distill, jev, questions, rule_catalog, sessions_ingest, store
+from agent_memory import codex_sessions, config, distill, jev, questions, rule_catalog, sessions_ingest, store, t3_workers
 from agent_memory import instruction_sources as instr
 from agent_memory import redact as _redact
 from agent_memory.codex_sessions import payload
@@ -1181,7 +1181,7 @@ def transcript_path(row: SessionRow, root: Path | None = None) -> Path:
         return home / row.project_dir / name
     root = root or sessions_ingest.projects_for(row.meta)
     parent = row.meta.get("parent_session")
-    if parent:
+    if t3_workers.in_parent_folder(row.meta):
         stem = row.session_id.split("/", 1)[1] if "/" in row.session_id else row.session_id
         return root / row.project_dir / str(parent) / "subagents" / f"{stem}.jsonl"
     return root / row.project_dir / f"{row.session_id}.jsonl"
@@ -1200,7 +1200,7 @@ def released_marker(row: SessionRow, root: Path | None = None) -> Path | None:
     if row.tool == "codex" or ".." in row.project_dir:
         return None
     root = root or sessions_ingest.projects_for(row.meta)
-    top = str(row.meta.get("parent_session") or row.session_id)
+    top = t3_workers.own_session(row.meta, row.session_id)
     if "/" in top or ".." in top:
         return None
     marker = root / row.project_dir / f"{top}{RELEASED_SUFFIX}"
@@ -1381,7 +1381,7 @@ def _scan_one(row: SessionRow, *, dry_run: bool, timeout: float, qset: questions
         # A resumed transcript's copied lines are the earlier session's (session_resume): its
         # own scan finds them, so they are left out here (no finding twice).
         events = load_events(path)
-        digest = build_digest(own_events(path, events, row.session_id, row.meta.get("parent_session")))
+        digest = build_digest(own_events(path, events, t3_workers.own_session(row.meta, row.session_id)))
         # Graded against the version in force when it is recorded (docs/deviations.md).
         instructions = load_versioned(row, db_url, events)
         out.digest_chars = len(digest)
