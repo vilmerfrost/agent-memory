@@ -263,7 +263,7 @@ def cmd_sessions_find(args: argparse.Namespace) -> int:
         if args.ingest:
             roots = [r.projects for r in sessions_ingest.transcript_roots(args.projects_dir)]
             files, new, updated = session_find.ingest(args.agent_id, roots)
-            if not files:
+            if not files and not session_find.is_t3_worker(args.agent_id):
                 print(f"amem: sessions find: no transcript agent-{args.agent_id}.jsonl under "
                       f"{roots[0]}/*/*/subagents/", file=sys.stderr)
                 return 1
