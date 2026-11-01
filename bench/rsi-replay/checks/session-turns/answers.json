@@ -1,7 +1,11 @@
 {
   "worker-session-rules": {
-    "denied-false-match": {"denied_marks": ["values.example"]},
-    "denied-build": {"denied_marks": ["run build", "vite build", "web/dist", "cp -r web", "cp -R web"]},
+    "denied-false-match": {"denied_marks": ["values.example"],
+                           "printed": "secret-read-block: command names a secret pattern (api_key)",
+                           "blocked_path": "deploy/values.example.yaml", "head": "7c1e9ab"},
+    "denied-build": {"denied_marks": ["run build", "vite build", "web/dist", "cp -r web", "cp -R web"],
+                     "printed": "parent-guard: build output web/dist is a symlink outside the worktree",
+                     "blocked_path": "web/dist", "head": "3fd01c2"},
     "sibling-test-red": {"owned_file": "tests/test_case_counts.py"},
     "brief-main-path": {"doc": "docs/infra.md"}
   },
@@ -13,19 +17,17 @@
   },
   "status-expect-line": {
     "worker-suite-checklist": {"measured_min": 1.57},
-    "gate-rerun": {"measured_min": 7.33},
+    "gate-rerun": {"measured_min": 7.33, "usage_pct": 2},
     "brief-says-few-minutes": {"measured_min": 11.0},
-    "live-eval-usage": {"measured_min": 14.0},
+    "live-eval-usage": {"measured_min": 14.0, "usage_pct": 4},
     "dispatch-three-workers": {"repo": "shop-api", "workers": 3, "brief_chars": 5120},
     "dispatch-tool-printed": {"printed": "Expect: 18 min, ~9% of Claude 5h", "workers": 3},
-    "three-failed": {"failed": ["tests/test_tax.py::test_vat", "tests/test_tax.py::test_zero", "tests/test_cart.py::test_discount"],
-                     "full": "pytest -q"}
+    "three-failed": {"failed": ["tests/test_tax.py::test_vat", "tests/test_tax.py::test_zero", "tests/test_cart.py::test_discount"]}
   },
   "codex-report-plain": {
-    "worker-guard-fix": {"integrations": ["vitals"], "diagram": true, "affects": ["push"], "internal": []},
-    "worker-report-split": {"integrations": [], "diagram": true, "affects": ["provider"], "internal": []},
-    "chat-deleted-series": {"integrations": ["calendar"], "diagram": false, "affects": ["standup"], "internal": [],
-                            "deletion": true},
-    "worker-small-retry": {"integrations": [], "diagram": false, "affects": ["retr"], "internal": []}
+    "worker-guard-fix": {"integrations": ["vitals"], "diagram": true, "affects": ["push"], "internal": ["fix/guard-rename"]},
+    "worker-report-split": {"integrations": [], "diagram": true, "affects": ["provider"], "internal": ["feat/provider-split"]},
+    "chat-deleted-series": {"integrations": ["calendar"], "diagram": false, "affects": ["standup"], "internal": []},
+    "worker-small-retry": {"integrations": [], "diagram": false, "affects": ["retr"], "internal": ["fix/retry-default"]}
   }
 }

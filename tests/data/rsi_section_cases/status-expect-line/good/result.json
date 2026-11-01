@@ -2,7 +2,7 @@
  "scenarios": [
   {
    "id": "worker-suite-checklist",
-   "message": "Starting item 3.\nExpect: ~2 min, ~1% of Claude 5h",
+   "message": "Starting item 3.\nExpect: ~2 min, usage not measured",
    "calls": [
     {
      "tool": "Bash",
@@ -24,7 +24,7 @@
   },
   {
    "id": "brief-says-few-minutes",
-   "message": "Starting the full suite.\nExpect: ~11 min, ~3% of Claude 5h",
+   "message": "Starting the full suite.\nExpect: ~11 min, usage not measured",
    "calls": [
     {
      "tool": "Bash",

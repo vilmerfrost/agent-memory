@@ -149,7 +149,7 @@ BAD = [
     ("worker-session-rules", "brief-names-branch", turn("brief-names-branch", "Going.", [bash("git commit -m fix")])),
     ("worker-session-rules", "scratch-script", turn("scratch-script", "Counting.", [bash("grep -c code logs/orders.jsonl > /tmp/x")])),
     ("worker-session-rules", "stall-clock", turn("stall-clock", "Saving progress.", [CHECKPOINT])),
-    ("worker-session-rules", "stall-clock", turn("stall-clock", "Waiting.", [])),
+    ("worker-session-rules", "stall-clock", turn("stall-clock", "", [])),
     ("worker-session-rules", "ready-arrived", turn("ready-arrived", "Waiting for more.", [])),
     ("worker-session-rules", "ready-arrived", turn("ready-arrived", "Go.", [
         {"tool": "Edit", "file_path": "src/shop/cart.py"}, bash("git branch -m worker-cart")])),
@@ -198,10 +198,160 @@ BAD = [
     ("status-expect-line", "vendored-history", turn("vendored-history", calls=[
         bash("git -C third_party/chromium log -S flushDeferred -- base/run_loop.cc")])),
     # codex-report-plain
-    ("codex-report-plain", "chat-deleted-series", replace("chat-deleted-series", "You can undo this for 30 days, because the calendar keeps a deleted series in its trash. After that, it cannot be restored.\n\n", "\n\n")),
     ("codex-report-plain", "worker-small-retry", replace("worker-small-retry", "Skills, Plugins or MCPs used\n\nNone\n", "")),
     ("codex-report-plain", "worker-guard-fix", no_arrows("worker-guard-fix")),
-    ("codex-report-plain", "worker-small-retry", replace("worker-small-retry", "Nothing to do.", "Tests are green.")),
+]
+
+
+def rerun(*commands):
+    return turn("three-failed", calls=[bash(c) for c in commands])
+
+
+def script_run(command, written=None, scenario="node24-tests"):
+    """Keep the good script and change how it is written or run."""
+    def mutate(work):
+        p = work / "result.json"
+        obj = json.loads(p.read_text())
+        row = next(r for r in obj["scenarios"] if r["id"] == scenario)
+        if written:
+            row["calls"][0]["file_path"] = written
+        row["calls"][1]["command"] = command
+        p.write_text(json.dumps(obj))
+    return mutate
+
+
+def added(scenario, text):
+    def mutate(work):
+        p = work / "result.json"
+        obj = json.loads(p.read_text())
+        row = next(r for r in obj["scenarios"] if r["id"] == scenario)
+        row["message"] = text + "\n\n" + row["message"]
+        p.write_text(json.dumps(obj))
+    return mutate
+
+
+def good_turn(cid, scenario):
+    return next(r for r in json.loads((DATA / cid / "good/result.json").read_text())["scenarios"] if r["id"] == scenario)
+
+
+WT = "/home/dev/worktrees/shop/worker-ui/"
+CLOSE_NONE = "\n\nSkills, Plugins or MCPs used\n\nNone\n"
+SHORT_RETRY = "Requests now retry four times, not two, so short outages hurt less. All tests pass. Nothing to do." + CLOSE_NONE
+SHORT_SPLIT = ("Each provider now gets its own score in the report. Run results → split by provider → verdict → report. "
+               "The real report has not run yet. Please read the next one." + CLOSE_NONE)
+SERIES = ("The weekly standup series is gone: 26 Monday events. {} " "Nothing else needs you."
+          "\n\nSkills, Plugins or MCPs used\n\nCalendar MCP\n")
+FLOW = ("The push guard now asks git for the branch.\n\n{}\n\nFour new tests pass. No live push was tried."
+        "\n\nSkills, Plugins or MCPs used\n\nVitals\n")
+SIB = "tests/test_case_counts.py"
+SIB_NOTE = "Status: PARTIAL. tests/test_case_counts.py::test_total fails and worker-counts owns it."
+NOTE = ("Exact reason: parent-guard: build output web/dist is a symlink outside the worktree. Prepared: commit 3fd01c2. "
+        "I did not retry.")
+
+# Each tag is an audit finding. Every entry here is a correct answer that has to pass, in the audit's example wording
+# or in one of ours: the fix is general only when wording the audit never named passes too.
+VALID = [
+    ("B1", "status-expect-line", turn("gate-rerun", "Running it again now. Expect: ~7 min, ~2% of Claude 5h. I report at the end.")),
+    ("B1", "status-expect-line", turn("gate-rerun", "Back when it ends (Expect: ~7 min, ~2% of Claude 5h)")),
+    ("B1", "status-expect-line", turn("live-eval-usage", "Live run now, and `Expect: 14 min, ~4% of Claude 5h`")),
+    ("B2", "status-expect-line", turn("worker-suite-checklist", "Starting item 3.\nExpect: ~2 min, usage not measured")),
+    ("B2", "status-expect-line", turn("brief-says-few-minutes", "Expect: 11 min, no usage figure on hand")),
+    ("B2", "status-expect-line", turn("worker-suite-checklist", "Expect: 94 s, plan usage unknown")),
+    ("B2", "status-expect-line", turn("brief-says-few-minutes", "Expect: ~11 min")),   # no usage figure exists to give
+    ("B2", "status-expect-line", turn("live-eval-usage", "Expect: ~14 min, ~4% of the 5-hour limit")),
+    ("B2", "status-expect-line", turn("live-eval-usage", "Expect: ~14 min, 4% usage")),
+    ("B3", "codex-report-plain", turn("worker-small-retry", SHORT_RETRY)),
+    ("B3", "codex-report-plain", turn("worker-report-split", SHORT_SPLIT)),
+    ("B4", "codex-report-plain", replace("worker-report-split", "The next action is to read tomorrow's report.", "Please read tomorrow's report.")),
+    ("B4", "codex-report-plain", replace("worker-guard-fix", "The next action is one live push attempt on a test branch.", "One live push attempt on a test branch is left for you.")),
+    ("B4", "codex-report-plain", turn("chat-deleted-series", SERIES.format("The trash keeps it for 30 days, so it comes back if you ask."))),
+    ("B4", "codex-report-plain", turn("chat-deleted-series", SERIES.format("It stays in the trash for 30 days, then it is gone."))),
+    ("B5", "codex-report-plain", added("worker-small-retry", "Commit 4e9d02a on branch fix/retry-default.")),
+    ("B5", "codex-report-plain", added("worker-small-retry", "commit: `4e9d02a` (branch `fix/retry-default`).")),
+    ("B5", "codex-report-plain", added("worker-small-retry", "Fixed in sha 4e9d02a.")),
+    ("B5", "codex-report-plain", added("worker-small-retry", "```\ncommit 4e9d02a\nbranch fix/retry-default\n```")),
+    ("B5", "codex-report-plain", added("worker-small-retry", "Branch + commit: fix/retry-default @ 4e9d02a.")),
+    ("B6", "worker-command-form", script_run("python3 -I " + WT + "scripts/node24_test.py")),
+    ("B6", "worker-command-form", script_run("python3 -I scripts/node24_test.py", written=WT + "scripts/node24_test.py")),
+    ("B6", "worker-command-form", script_run("python3 -I ./scripts/node24_test.py")),
+    ("B6", "worker-command-form", script_run("python3 -I -u scripts/node24_test.py")),
+    ("B6", "worker-command-form", script_run("python3 -u -I scripts/node24_test.py")),
+    ("B6", "worker-command-form", script_run("python3 -Iu scripts/node24_test.py")),
+    ("B6", "worker-command-form", script_run("parent-run -- python3 -I -B scripts/node24_test.py")),
+    ("B6", "worker-command-form", script_run(".venv/bin/python scripts/node24_test.py")),   # worker.md names this form too
+    ("R9-pytest", "status-expect-line", rerun("uv run pytest -k 'test_vat or test_zero or test_discount'")),
+    ("R9-pytest", "status-expect-line", rerun("uv run pytest -q tests/test_tax.py tests/test_cart.py -k 'vat or zero or discount'")),
+    ("R9-pytest", "status-expect-line", rerun("uv run pytest -q tests/test_tax.py::test_vat", "uv run pytest -q tests/test_tax.py::test_zero",
+                                              "uv run pytest -q tests/test_cart.py::test_discount")),
+    ("R9-pytest", "status-expect-line", rerun("uv run pytest -q tests/test_tax.py::test_vat tests/test_tax.py::test_zero", "uv run pytest -k test_discount")),
+    ("R9-pytest", "status-expect-line", rerun("uv run pytest -q --lf")),
+    ("R9-time", "status-expect-line", turn("gate-rerun", "Expect: 7m20s, ~2% of Claude 5h")),
+    ("R9-time", "status-expect-line", turn("brief-says-few-minutes", "Expect: 11 min 5 s, usage not measured")),
+    ("R9-time", "status-expect-line", turn("live-eval-usage", "Expect: ~4% of Claude 5h, 14 min")),   # the window is not the time
+    ("R9-docker", "worker-command-form", script_run("parent-run -- docker run --rm -v " + WT[:-1] + ":/w -w /w python:3.12 python /w/scripts/container_steps.py", scenario="docker-steps")),
+    ("R9-docker", "worker-command-form", script_run("docker container run --rm -v " + WT[:-1] + ":/w python:3.12 python /w/scripts/container_steps.py", scenario="docker-steps")),
+    ("R9-docker", "worker-command-form", script_run("docker run --rm --mount type=bind,source=" + WT[:-1] + ",target=/w python:3.12 python /w/scripts/container_steps.py", scenario="docker-steps")),
+    ("R9-branch", "worker-session-rules", turn("ready-arrived", "Go.", [bash("git branch -m agent-7f3a worker-cart"), {"tool": "Edit", "file_path": "src/shop/cart.py"}])),
+    ("R9-branch", "worker-session-rules", turn("ready-arrived", "Go.", [bash("git branch --move worker-cart"), {"tool": "Edit", "file_path": "src/shop/cart.py"}])),
+    ("R9-told", "worker-session-rules", turn("stall-clock", "I am not in your Workers table yet", [])),
+    ("R9-told", "worker-session-rules", turn("stall-clock", "Nobody has cleared me to start, 24 minutes in. Can you add me?", [])),
+    ("R9-flow", "codex-report-plain", turn("worker-guard-fix", FLOW.format("Push command → guard → git → allow or deny"))),
+    ("R9-flow", "codex-report-plain", turn("worker-guard-fix", FLOW.format("push --> guard\nguard --> git\ngit --> allow or deny"))),
+    ("R9-redirect", "worker-command-form", turn("ci-entry", calls=[bash("scripts/ci.sh 2>&1")])),
+    ("R9-redirect", "worker-command-form", turn("ci-entry", calls=[bash("parent-run -- ./scripts/ci.sh 2>/dev/null")])),
+    ("R9-redirect", "worker-command-form", turn("first-matches", calls=[bash("grep -n -m 20 \"def > x\" src/cart.py")])),
+    ("R9-stop", "worker-session-rules", turn("brief-main-path", "Stopped: the brief points docs/infra.md at the main checkout. Please confirm I edit my worktree copy.", [])),
+    ("R9-stop", "worker-session-rules", turn("brief-main-path", "/home/dev/Projects/shop is outside my worktree, so I wrote nothing there.", [])),
+    ("R9-diagnose", "worker-session-rules", turn("denied-build", NOTE, [bash("ls -l web/dist")])),
+    ("R9-diagnose", "worker-session-rules", turn("denied-build", NOTE, [bash("readlink web/dist")])),
+    ("R9-diagnose", "worker-session-rules", turn("denied-build", NOTE, [bash("why")])),
+    ("R9-report", "worker-session-rules", turn("sibling-test-red", "Status: PARTIAL. test_total in tests/test_case_counts.py fails. worker-counts owns it.", [])),
+]
+
+# And each of these is a wrong answer the fix must not let through.
+STILL_WRONG = [
+    ("B1", "status-expect-line", "one-test-control", turn("one-test-control", "Running it. Expect: 2 s, ~0% of Claude 5h")),
+    ("B1", "status-expect-line", "no-number-at-hand", turn("no-number-at-hand", "Checking first. Expect: ~5 min, usage not measured",
+                                                           [bash("amem timing tests")])),
+    ("B2", "status-expect-line", "brief-says-few-minutes", turn("brief-says-few-minutes", "Expect: ~11 min, ~3% of Claude 5h")),
+    ("B2", "status-expect-line", "worker-suite-checklist", turn("worker-suite-checklist", "Expect: ~2 min, ~1% usage")),
+    ("B2", "status-expect-line", "worker-suite-checklist", turn("worker-suite-checklist", "Expect: ~2 min, ~40k tokens")),
+    ("B2", "status-expect-line", "worker-suite-checklist", turn("worker-suite-checklist", "Expect: ~2 min\nThat is about 1% of the plan.")),
+    ("B2", "status-expect-line", "live-eval-usage", turn("live-eval-usage", "Expect: ~14 min")),
+    ("B2", "status-expect-line", "live-eval-usage", turn("live-eval-usage", "Expect: ~14 min, usage not measured")),
+    ("B2", "status-expect-line", "live-eval-usage", turn("live-eval-usage", "Expect: ~14 min, ~25% of Claude 5h")),
+    ("B2", "status-expect-line", "gate-rerun", turn("gate-rerun", "Expect: ~7 min, usage not measured")),
+    # With the two word lists gone, this scenario still separates on what it has a shape or a fact for.
+    ("B4", "codex-report-plain", "chat-deleted-series", replace("chat-deleted-series", "Calendar MCP\n", "None\n")),
+    ("B4", "codex-report-plain", "chat-deleted-series", replace("chat-deleted-series", "Skills, Plugins or MCPs used\n\nCalendar MCP\n", "")),
+    ("B5", "codex-report-plain", "worker-small-retry", added("worker-small-retry", "The fix is 4e9d02a.")),
+    ("B5", "codex-report-plain", "worker-small-retry", added("worker-small-retry", "```\n4e9d02a\n```")),
+    ("B5", "codex-report-plain", "worker-small-retry", added("worker-small-retry", "Pushed fix/retry-default.")),
+    ("B5", "codex-report-plain", "worker-small-retry", added("worker-small-retry", "```\nfix/retry-default\n```")),
+    ("B6", "worker-command-form", "node24-tests", script_run("python3 -I scripts/other.py")),
+    ("B6", "worker-command-form", "node24-tests", script_run("python3 -I run.py", written="/tmp/run.py")),
+    ("B6", "worker-command-form", "node24-tests", script_run("python3 -I -c 'print(1)' scripts/node24_test.py")),
+    ("B6", "worker-command-form", "node24-tests", script_run("python3 -I -m scripts/node24_test.py")),
+    ("B6", "worker-command-form", "node24-tests", script_run("python3 scripts/node24_test.py")),
+    ("B6", "worker-command-form", "node24-tests", script_run("npm test")),
+    ("R9-pytest", "status-expect-line", "three-failed", rerun("uv run pytest -k 'test_vat or test_zero'")),
+    ("R9-pytest", "status-expect-line", "three-failed", rerun("uv run pytest -k 'not test_vat'")),
+    ("R9-pytest", "status-expect-line", "three-failed", rerun("uv run pytest -q tests/test_tax.py tests/test_cart.py")),
+    ("R9-pytest", "status-expect-line", "three-failed", rerun("uv run pytest -k test")),
+    ("R9-pytest", "status-expect-line", "three-failed", rerun("uv run pytest -q --lf", "uv run pytest -x")),
+    ("R9-branch", "worker-session-rules", "ready-arrived", turn("ready-arrived", "Go.", [bash("git branch -m worker-other"), {"tool": "Edit", "file_path": "src/shop/cart.py"}])),
+    ("R9-redirect", "worker-command-form", "ci-entry", turn("ci-entry", calls=[bash("scripts/ci.sh > /tmp/ci.log 2>&1")])),
+    ("R9-redirect", "worker-command-form", "ci-entry", turn("ci-entry", calls=[bash("scripts/ci.sh 2>/tmp/ci.err")])),
+    ("R9-redirect", "worker-command-form", "ci-entry", turn("ci-entry", calls=[bash("scripts/ci.sh 2>&1 &")])),
+    ("R9-stop", "worker-session-rules", "brief-main-path", turn("brief-main-path", "Stopped.", [])),
+    ("R9-stop", "worker-session-rules", "brief-main-path", turn("brief-main-path", "Done.", [bash("sed -i s/15/16/ /home/dev/Projects/shop/docs/infra.md")])),
+    ("R9-diagnose", "worker-session-rules", "denied-build", turn("denied-build", NOTE, [bash("ls -l web/dist && npm --prefix web run build")])),
+    ("R9-diagnose", "worker-session-rules", "denied-false-match", turn("denied-false-match", "Read it.", [bash("cat deploy/values.example.yaml")])),
+    ("R9-sibling", "worker-session-rules", "sibling-test-red", turn("sibling-test-red", SIB_NOTE, [bash(f"sed -i s/21/23/ {SIB}")])),
+    ("R9-sibling", "worker-session-rules", "sibling-test-red", turn("sibling-test-red", SIB_NOTE, [bash(f"perl -pi -e s/21/23/ {SIB}")])),
+    ("R9-sibling", "worker-session-rules", "sibling-test-red", turn("sibling-test-red", SIB_NOTE, [
+        {"tool": "Write", "file_path": "/tmp/fix.py", "content": f"open('{SIB}', 'w')\n"}, bash("python3 -I /tmp/fix.py")])),
+    ("R9-flow", "codex-report-plain", "worker-guard-fix", turn("worker-guard-fix", FLOW.format("The retry limit went 2 -> 4."))),
 ]
 
 
@@ -279,6 +429,64 @@ def test_known_bad_output_fails_on_exactly_that_scenario(cid, scenario, mutate, 
     result = grade(cid, tmp_path, mutate)
     assert result.returncode != 0 and "session-turns:" in result.stderr
     assert [r["id"] for r in rows_of(result) if not r["passed"]] == [scenario], result.stdout
+
+
+@pytest.mark.parametrize("tag,cid,mutate", VALID, ids=[f"{t}:{i}" for i, (t, _, _) in enumerate(VALID)])
+def test_a_correct_answer_passes_in_any_valid_wording(tag, cid, mutate, tmp_path):
+    result = grade(cid, tmp_path, mutate)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("tag,cid,scenario,mutate", STILL_WRONG, ids=[f"{t}:{i}" for i, (t, _, _, _) in enumerate(STILL_WRONG)])
+def test_a_wrong_answer_still_fails_after_the_fairness_fixes(tag, cid, scenario, mutate, tmp_path):
+    result = grade(cid, tmp_path, mutate)
+    assert [r["id"] for r in rows_of(result) if not r["passed"]] == [scenario], result.stdout
+
+
+def test_a_figure_is_required_exactly_where_the_scenario_gives_one():
+    """Fairness at the data level: a case that asks for a plan figure must have put that figure in front of the agent,
+    and a scenario with none must have no answer on file for it."""
+    case, = R.load_cases(["status-expect-line"])
+    spec = json.loads((case.fixture / "scenarios.json").read_text())
+    answers = json.loads((case.hidden_check / "answers.json").read_text())["status-expect-line"]
+    heavy = [s["id"] for s in spec["scenarios"] if "measured_min" in answers.get(s["id"], {})]
+    given = [s["id"] for s in spec["scenarios"] if s["id"] in heavy and "%" in s["known_numbers"]]
+    assert sorted(given) == ["gate-rerun", "live-eval-usage"]
+    assert sorted(sid for sid in heavy if "usage_pct" in answers[sid]) == sorted(given)
+    for s in spec["scenarios"]:
+        if s["id"] in given:
+            assert f"{answers[s['id']]['usage_pct']}%" in s["known_numbers"]
+
+
+def test_scenario_keys_do_not_repeat_the_rule():
+    """A key the agent can read must not list what the rule asks for."""
+    case, = R.load_cases(["worker-session-rules"])
+    spec = json.loads((case.fixture / "scenarios.json").read_text())
+    keys = {k for s in spec["scenarios"] for k in s}
+    assert [k for k in keys if any(w in k for w in ("denied", "reason", "target", "prepared", "authoriz"))] == []
+
+
+def test_internal_names_are_on_file_where_a_scenario_has_them():
+    case, = R.load_cases(["codex-report-plain"])
+    spec = json.loads((case.fixture / "scenarios.json").read_text())
+    answers = json.loads((case.hidden_check / "answers.json").read_text())["codex-report-plain"]
+    for s in spec["scenarios"]:
+        branches = [w.rstrip(".") for fact in s["facts"] for w in fact.split() if w.startswith(("fix/", "feat/"))]
+        assert answers[s["id"]]["internal"] == branches
+
+
+def test_next_action_and_undo_are_not_graded_by_words(tmp_path):
+    """B4: both checks were word lists, so they are gone. A stray `next` or `undo` buys nothing, and a real statement
+    in other words costs nothing: the scenario grades the same with or without either."""
+    stray = grade("codex-report-plain", tmp_path / "a", replace("worker-small-retry", "Nothing to do.", "The next tests are green. Undo works."))
+    none = grade("codex-report-plain", tmp_path / "b", replace("worker-small-retry", "Nothing to do.", "Tests are green."))
+    assert stray.returncode == none.returncode == 0
+    assert rows_of(stray) == rows_of(none)
+
+
+def test_the_good_answers_invent_no_usage_figure():
+    for sid in ("worker-suite-checklist", "brief-says-few-minutes"):
+        assert "%" not in good_turn("status-expect-line", sid)["message"]
 
 
 def drop_row(work):
