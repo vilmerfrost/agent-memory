@@ -40,7 +40,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from agent_memory import claude_roots, config, session_resume, session_tokens, sessions_ingest
+from agent_memory import claude_roots, config, session_interface, session_resume, session_tokens, sessions_ingest
 
 EVENTS = ("SessionStart", "Stop", "SessionEnd")
 DEBOUNCE_SECONDS = 20.0
@@ -285,13 +285,14 @@ PING_SQL = f"""
 insert into sessions (session_id, tool, kind, repo, project_dir, started_at, ended_at, meta,
                       tokens_input, tokens_output, tokens_cache_read, tokens_cache_creation, models, turns,
                       last_activity_at, tokens_updated_at, category, project, {', '.join(_PROFILE)},
-                      title_updated_at, outcome_at)
+                      title_updated_at, outcome_at, interface)
 values (%s, 'claude', %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
         case when %s::bigint is null then null else now() end, %s, %s, {', '.join(['%s'] * len(_PROFILE))},
-        case when %s::text is null then null else now() end, case when %s::text is null then null else now() end)
+        case when %s::text is null then null else now() end, case when %s::text is null then null else now() end, %s)
 on conflict (session_id) do update
     set category = coalesce(sessions.category, excluded.category),
         project = coalesce(sessions.project, excluded.project),
+        interface = {session_interface.STORED_OR_NEW_SQL},
         title_updated_at = case when {_NEWER} and excluded.title is not null
                                      and excluded.title is distinct from sessions.title
                                 then now() else sessions.title_updated_at end,
@@ -342,7 +343,8 @@ def record_params(r: dict[str, Any]) -> tuple[Any, ...]:
     return (r["session_id"], r["kind"], repo, r["project_dir"], _ts(r.get("started_at")), _ts(r.get("ended_at")),
             Jsonb(meta), *t, Jsonb(models) if models is not None else None, turns,
             _ts(r.get("last_activity_at")), t[0], category, project, title,
-            *(prof[c] for c in sessions_ingest.PROFILE_COLS), name, evidence, title, name)
+            *(prof[c] for c in sessions_ingest.PROFILE_COLS), name, evidence, title, name,
+            _label(r.get("interface")))   # a record of an older version has no key: null keeps what is stored
 
 
 def best_kind(project_dir: str, cwd: str) -> str:
@@ -353,6 +355,14 @@ def best_kind(project_dir: str, cwd: str) -> str:
     if os.environ.get("CLAUDE_CODE_ENTRYPOINT", "").startswith("sdk"):
         return "headless"
     return "chat"
+
+
+def t3_ping(root_label: str | None, entrypoint: str) -> bool:
+    """A T3 Code session, from what a hook knows: a T3 root, or T3's thread id on an `sdk-ts` entrypoint.
+    The entrypoint counts: a `claude -p` started from a shell inside T3 inherits the thread id, has
+    entrypoint `sdk-cli`, and is no T3 session."""
+    return claude_roots.is_t3(root_label) or (entrypoint == "sdk-ts"
+                                              and bool(os.environ.get("T3CODE_THREAD_ID", "").strip()))
 
 
 def _project_dir(p: Ping) -> str:
@@ -399,14 +409,20 @@ def build_record(p: Ping, entry: dict[str, Any], now: datetime) -> dict[str, Any
     meta.update(sessions_ingest.team_info(cwd, repo))
     if p.agent_type:
         meta["agent_type"] = p.agent_type
+    entrypoint = os.environ.get("CLAUDE_CODE_ENTRYPOINT", "")
+    t3 = t3_ping(root_label, entrypoint)
+    if t3:
+        meta["client"] = "t3"   # the key `sessions ingest` stores for the same evidence
     kind = best_kind(project_dir, cwd)
-    if kind == "headless" and claude_roots.is_t3(root_label):
-        kind = "chat"      # a T3 root's SDK session; `sessions ingest` sets the real kind later
+    if kind == "headless" and t3:
+        kind = "chat"      # T3 runs chats through the SDK; `sessions ingest` sets the real kind later
+    # The entrypoint goes to `derive` only: ingest owns `meta.entrypoints`.
+    interface = session_interface.derive("claude", {**meta, "entrypoints": [entrypoint]}, session_id=p.session_id)
     rec: dict[str, Any] = {"v": RECORD_VERSION, "event": p.event, "session_id": p.session_id,
                            "kind": kind, "repo": repo, "project_dir": project_dir,
                            "started_at": _iso(now), "ended_at": None, "last_activity_at": _iso(now),
                            "tokens": None, "models": None, "turns": None, "meta": meta,
-                           "category": sessions_ingest.category_of(kind),
+                           "interface": interface, "category": sessions_ingest.category_of(kind),
                            "project": sessions_ingest.project_of(cwd, kind=kind, scratch_only=_scratch,
                                                                  project_dir=project_dir, repo=repo)}
     if p.event == "SessionStart":
