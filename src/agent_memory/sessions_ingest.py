@@ -21,7 +21,8 @@ Kind, first match wins:
              (also through the SDK: `meta.entrypoints` keeps the entrypoint)
 5. chat      a T3 Code chat: T3 runs chats through the SDK, so `sdk-ts` alone says nothing. Evidence:
              T3's own system prompt sentence or `mcp__t3-code__` tools in the request the transcript
-             records (t3_evidence), or a root labelled `t3` / `t3-*`. Stored as `meta.client = t3`
+             records (t3_evidence), or a root labelled `t3` / `t3-*`. Stored as `meta.client = t3`.
+             A ping has its own T3 evidence (session_live.build_record) and stores the same key
 6. headless  `claude -p` / SDK: `entrypoint` starts with `sdk` (`sdk-cli`, `sdk-ts`)
 7. chat      everything else
 
@@ -76,7 +77,16 @@ from typing import Any
 
 from psycopg.types.json import Jsonb
 
-from agent_memory import claude_roots, codex_sessions, config, session_commits, session_resume, session_tokens, store
+from agent_memory import (
+    claude_roots,
+    codex_sessions,
+    config,
+    session_commits,
+    session_interface,
+    session_resume,
+    session_tokens,
+    store,
+)
 
 KINDS = ("chat", "parent", "worker", "headless", "eval", "routine")
 TOOLS = ("claude", "codex")
@@ -1048,7 +1058,7 @@ PROFILE_COLS = ("model", "model_last", "effort", "effort_last", "efforts", "dura
 _KEEP_COLS = ("title", *PROFILE_COLS, "outcome", "outcome_evidence")
 _ALL_COLS = ("session_id", "tool", "kind", "repo", "project_dir", "started_at", "ended_at", "transcript_bytes",
              "skills", "instructions", "meta", *_TOKEN_COLS, "last_activity_at", "category", "project", "env",
-             "experiment_id", *_KEEP_COLS, "instruction_sources")
+             "experiment_id", *_KEEP_COLS, "instruction_sources", "interface")
 _FACT_COLS = ("tool", "kind", "repo", "project_dir", "started_at", "ended_at", "transcript_bytes", "skills",
               "instructions", "category", "project", "env", "experiment_id")
 _FACT_ASSIGNMENTS = [
@@ -1080,6 +1090,7 @@ on conflict (session_id) do update
           then jsonb_build_object('transcript_available',true) else '{{}}'::jsonb end,
         {', '.join(f'{c} = coalesce(excluded.{c}, sessions.{c})' for c in (*_TOKEN_COLS, *_KEEP_COLS))},
         instruction_sources = coalesce(excluded.instruction_sources, sessions.instruction_sources),
+        interface = {session_interface.STORED_OR_NEW_SQL},
         last_activity_at = greatest(sessions.last_activity_at, excluded.last_activity_at),
         tokens_updated_at = case when excluded.tokens_input is not null and {_TOKENS_DIFFER}
                                  then now() else sessions.tokens_updated_at end,
@@ -1096,6 +1107,7 @@ on conflict (session_id) do update
        or {_KEPT_DIFFER}
        or (excluded.instruction_sources is not null
            and excluded.instruction_sources is distinct from sessions.instruction_sources)
+       or {session_interface.STORED_OR_NEW_SQL} is distinct from sessions.interface
        or excluded.last_activity_at > coalesce(sessions.last_activity_at, '-infinity'::timestamptz)
 returning (xmax = 0) as inserted
 """
@@ -1177,6 +1189,7 @@ def _params(r: SessionRow, now: datetime | None = None,
             "instructions": Jsonb(r.instructions), "meta": Jsonb(r.meta), **dict(zip(_TOKEN_COLS, tv)),
             "last_activity_at": last, "category": category, "project": project, "title": r.title,
             "instruction_sources": Jsonb(sources) if sources is not None else None,
+            "interface": session_interface.derive(r.tool, r.meta, session_id=r.session_id),
             **env_values(r),
             **profile_values(r.profile), **outcome_values(r.signals, r.end, last, now, r.kind, r.commits,
                                                         r.meta.get("outcome_method_version", 2))}
@@ -1202,6 +1215,25 @@ def instruction_params(conn: Any, rows: list[SessionRow]) -> dict[str, tuple[lis
     return out
 
 
+_WEAK_SUBAGENTS_SQL = """
+select s.session_id, s.tool, s.interface, s.meta, p.interface
+from sessions s join sessions p on p.session_id = s.meta ->> 'parent_session'
+where (s.session_id = any(%(ids)s) or p.session_id = any(%(ids)s))
+  and s.interface = any(%(weak)s) and p.interface <> %(unknown)s and p.interface <> s.interface
+"""
+
+
+def link_subagents(conn: Any, ids: list[str]) -> None:
+    """A subagent with no real evidence of its own takes its parent's interface. This runs on stored
+    rows, after the upsert, for subagents and parents alike, so the order of the two does not matter:
+    in one run, or a parent that arrives in a later run."""
+    params = {"ids": ids, "weak": list(session_interface.WEAK), "unknown": session_interface.UNKNOWN}
+    for sid, tool, stored, meta, parent in conn.execute(_WEAK_SUBAGENTS_SQL, params).fetchall():
+        value = session_interface.derive(tool, meta, session_id=sid, parent=parent)
+        if value != stored:
+            conn.execute("update sessions set interface = %s where session_id = %s", (value, sid))
+
+
 def upsert(rows: list[SessionRow], *, db_url: str | None = None, now: datetime | None = None) -> tuple[int, int]:
     """(new, updated). Unchanged rows are not touched. One transaction."""
     from agent_memory import instruction_sources
@@ -1219,6 +1251,7 @@ def upsert(rows: list[SessionRow], *, db_url: str | None = None, now: datetime |
                 new += 1
             else:
                 updated += 1
+        link_subagents(conn, [r.session_id for r in rows])
         from agent_memory import timing_store
         timing_store.upsert_conn(conn, (span for r in rows for span in r.timing_spans))
         timing_store.refresh_profiles(conn, (r.session_id for r in rows if r.tool=='codex'))
