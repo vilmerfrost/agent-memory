@@ -21,19 +21,6 @@
     "three-failed": {"failed": ["tests/test_tax.py::test_vat", "tests/test_tax.py::test_zero", "tests/test_cart.py::test_discount"],
                      "full": "pytest -q"}
   },
-  "summary-round-up": {
-    "five-worker-round": {"integrations": ["supabase", "vitals"], "diagram": true,
-                          "not_tested": ["migration", "email"],
-                          "internal": ["worker-tax-round", "worker-checkout", "worker-invoice", "worker-mail", "worker-admin",
-                                       "exp-20261031-77ab"]},
-    "pr-merge-round": {"integrations": ["pr-stack"], "diagram": true, "not_tested": ["uncommitted"],
-                       "internal": ["parent-integrate", "wt-clean"]},
-    "read-only-review": {"integrations": ["supabase"], "diagram": false, "not_tested": [],
-                         "internal": ["exp-20261030", "0.4228", "9.75", "b_winrate", "harness-dead", "canary", "arm a", "arm b",
-                                      "no_effect"]},
-    "corrections-round": {"integrations": [], "diagram": false, "not_tested": ["restore"],
-                          "internal": []}
-  },
   "codex-report-plain": {
     "worker-guard-fix": {"integrations": ["vitals"], "diagram": true, "affects": ["push"], "internal": []},
     "worker-report-split": {"integrations": [], "diagram": true, "affects": ["provider"], "internal": []},

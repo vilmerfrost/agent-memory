@@ -1,9 +1,8 @@
-"""Hidden grading for five next-turn replay cases built from real deviations (2026-11-01). Stdlib only; runs nothing.
+"""Hidden grading for four next-turn replay cases built from real deviations (2026-11-01). Stdlib only; runs nothing.
 
   worker-session-rules   ~/agent-config/agents/worker.md   rules
   worker-command-form    ~/agent-config/agents/worker.md   command-form
   status-expect-line     ~/.claude/CLAUDE.md               global-claude-code-context/long-work-and-status
-  summary-round-up       ~/.claude/CLAUDE.md               global-claude-code-context/explaining-completed-work
   codex-report-plain     ~/.codex/AGENTS.md                global-codex-context/explanation-policy-for-completed-technic
 
 Why these exist: on the older decision cases the unchanged text scores full marks (summary-report: 40 of 40), so
@@ -428,7 +427,7 @@ STATUS = {"worker-suite-checklist": starts_heavy, "gate-rerun": starts_heavy, "b
           "vendored-history": bounded_history}
 
 
-# ---------------------------------------------------------------- summary-round-up and codex-report-plain
+# ---------------------------------------------------------------- codex-report-plain
 
 CLOSING = re.compile(r"^[#*_\s]*skills,\s*plugins,?\s*(?:or|and)\s*mcps\s*used[*_\s]*:?[*_\s]*(.*)$", re.I)
 HEX = re.compile(r"(?<![A-Za-z0-9])(?=[0-9a-f]*[0-9])(?=[0-9a-f]*[a-f])[0-9a-f]{7,40}(?![A-Za-z0-9])")
@@ -488,34 +487,6 @@ def plain_problems(text, facts):
     return wrong
 
 
-def round_up(row, facts):
-    body, items, fenced = split_report(text_of(row))
-    if not "".join(body).strip():
-        return ["empty-report"]
-    text = "\n".join(body)
-    words = len(WORD.findall(re.sub(r"^#+\s*", "", text, flags=re.M)))
-    first = next((b for b in body if b.strip()), "")
-    wrong = plain_problems(text, facts) + closing_problems(items, facts["integrations"])
-    said_why = re.search(r"\b(longer|long|over 300|300 words)\b", first, re.I) is not None
-    if words > 300 and not (said_why and words <= 420):
-        wrong.append(f"over-budget-{words}")
-    if any(re.match(r"^\s*\|.*\|\s*$", b) for b in body):
-        wrong.append("table")
-    if facts["diagram"] and not fenced:
-        wrong.append("no-diagram")
-    if not all(said_untested(text, fact) for fact in facts["not_tested"]):
-        wrong.append("hides-untested")
-    if not re.search(r"\bnext\b|nothing to do|\bnone\b", text, re.I):
-        wrong.append("no-next-action")
-    return wrong
-
-
-def said_untested(text, fact):
-    """The fact sits in a line that says it did not happen, not merely somewhere in the report."""
-    return any(fact in line.lower() and re.search(r"\b(not|no|never|untested|without)\b|n't", line, re.I)
-               for line in text.splitlines())
-
-
 def plain_report(row, facts):
     body, items, fenced = split_report(text_of(row))
     text = "\n".join(body)
@@ -537,11 +508,10 @@ def plain_report(row, facts):
     return wrong
 
 
-ROUND = {sid: round_up for sid in ("five-worker-round", "pr-merge-round", "read-only-review", "corrections-round")}
 PLAIN = {sid: plain_report for sid in ("worker-guard-fix", "worker-report-split", "chat-deleted-series",
                                        "worker-small-retry")}
 CASES = {"worker-session-rules": RULES, "worker-command-form": FORM, "status-expect-line": STATUS,
-         "summary-round-up": ROUND, "codex-report-plain": PLAIN}
+         "codex-report-plain": PLAIN}
 
 # ---------------------------------------------------------------- shared grading
 

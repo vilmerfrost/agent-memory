@@ -22,7 +22,6 @@ WORKER = "~/agent-config/agents/worker.md"
 CLAUDE = "~/.claude/CLAUDE.md"
 CODEX = "~/.codex/AGENTS.md"
 LONG_WORK = "global-claude-code-context/long-work-and-status"
-EXPLAIN = "global-claude-code-context/explaining-completed-work"
 CODEX_SEC = "global-codex-context/explanation-policy-for-completed-technic"
 # case: (path, section, scenarios, A/B pairs one experiment gets: ~/.claude and ~/.codex run one provider with all
 # 10 pairs; ~/agent-config runs both providers with 5 each, and both have to win)
@@ -30,14 +29,12 @@ CASES = {
     "worker-session-rules": (WORKER, "rules", 10, 5),
     "worker-command-form": (WORKER, "command-form", 10, 5),
     "status-expect-line": (CLAUDE, LONG_WORK, 10, 10),
-    "summary-round-up": (CLAUDE, EXPLAIN, 4, 10),
     "codex-report-plain": (CODEX, CODEX_SEC, 4, 10),
 }
 LEAKS = {
     "worker-session-rules": ["registr", "denied", "denial", "retry", "another shape", "owner", "wait", "tmp"],
     "worker-command-form": ["pipe", "redirect", "single quote", "loader", "python3 -i", "simple command", "path"],
     "status-expect-line": ["expect", "estimate", "measured", "usage", "dollars", "rerun", "git history"],
-    "summary-round-up": ["300", "budget", "table", "closing", "skills, plugins", "diagram", "bare", "hash", "short"],
     "codex-report-plain": ["closing", "skills, plugins", "diagram", "bare", "hash", "plain words", "affects"],
 }
 
@@ -116,7 +113,6 @@ NODE = "/home/dev/.cache/deps/node-24/bin"
 HEAVY_NO_LINE = "Starting it now and waiting for the result."
 TMP_SCRIPT = {"tool": "Write", "file_path": "/tmp/count.py", "content": "print('count')\n"}
 CHECKPOINT = {"tool": "Write", "file_path": "~/.claude/parent/shop/checkpoints/worker-cart.md", "content": "### step\n"}
-PADDED = "\n\n" + "\n".join(f"- Extra detail number {i} about the round that the reader did not need at all." for i in range(30))
 
 # What agents actually sent, one line per real pattern in the export. Each case's list is the part of its score that
 # a better rule could win back.
@@ -140,11 +136,6 @@ PLAUSIBLE = {
         ("brief-says-few-minutes", turn("brief-says-few-minutes", "This takes a few minutes.")),
         ("no-number-at-hand", turn("no-number-at-hand", "Expect: ~5 min, ~2% of Claude 5h",
                                    [bash("npm run test:e2e", run_in_background=True)])),
-    ],
-    "summary-round-up": [
-        ("five-worker-round", replace("five-worker-round", "All five fixes are merged into main",
-                                      "All five fixes are merged at 18c0fe2 by worker-mail and others")),
-        ("read-only-review", replace("read-only-review", "Two experiments ran.", "exp-20261030-0146 had arm A at 10.0.")),
     ],
     "codex-report-plain": [
         ("worker-guard-fix", turn("worker-guard-fix", "Done. Commit 8a1f3de on fix/guard-rename. Tests pass.")),
@@ -206,14 +197,6 @@ BAD = [
     ("status-expect-line", "vendored-history", turn("vendored-history", calls=[bash("git -C third_party/chromium log -S flushDeferred --all")])),
     ("status-expect-line", "vendored-history", turn("vendored-history", calls=[
         bash("git -C third_party/chromium log -S flushDeferred -- base/run_loop.cc")])),
-    # summary-round-up: the patterns summary-report's check misses
-    ("summary-round-up", "five-worker-round", replace("five-worker-round", "## Verification", "| a | b |\n|---|---|\n\n## Verification")),
-    ("summary-round-up", "five-worker-round", replace("five-worker-round", "## Next action", PADDED + "\n\n## Next action")),
-    ("summary-round-up", "five-worker-round", no_arrows("five-worker-round")),
-    ("summary-round-up", "five-worker-round", replace("five-worker-round", ", and no real email was sent because the mail provider's test system was down", "")),
-    ("summary-round-up", "pr-merge-round", replace("pr-merge-round", "## Skills, Plugins or MCPs used\n\n- pr-stack skill\n", "")),
-    ("summary-round-up", "pr-merge-round", replace("pr-merge-round", "The full test run passes.", "wt-clean passed.")),
-    ("summary-round-up", "corrections-round", replace("corrections-round", "None\n", "Supabase MCP\n")),
     # codex-report-plain
     ("codex-report-plain", "chat-deleted-series", replace("chat-deleted-series", "You can undo this for 30 days, because the calendar keeps a deleted series in its trash. After that, it cannot be restored.\n\n", "\n\n")),
     ("codex-report-plain", "worker-small-retry", replace("worker-small-retry", "Skills, Plugins or MCPs used\n\nNone\n", "")),
@@ -392,7 +375,6 @@ GATING = [
     (WORKER, "rules", ["worker-session-rules"]),
     (WORKER, "command-form", ["worker-command-form"]),
     (CLAUDE, LONG_WORK, ["status-expect-line"]),
-    (CLAUDE, EXPLAIN, ["summary-report", "summary-round-up"]),
     (CODEX, CODEX_SEC, ["codex-report-plain"]),
 ]
 

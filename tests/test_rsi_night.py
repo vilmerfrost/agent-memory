@@ -380,8 +380,9 @@ def test_candidate_under_a_symlink_of_an_allowlisted_file_is_in_scope(env: Simpl
     worker = [c for c in rep["candidates"] if c["key"] == "dev:agent:worker:rules"]
     assert len(worker) == 1 and worker[0]["target"] == "~/agent-config/agents/worker.md"
     assert worker[0]["selected"] and worker[0]["reason"].startswith("selected: rank ")
-    assert worker[0]["test_cases"] == ["worker-credential-runner", "worker-dod-gaps", "worker-final-report",
-                                       "worker-helper-lifecycle", "worker-helper-routing", "worker-server-launch"]
+    assert worker[0]["test_cases"] == ["worker-command-form", "worker-credential-runner", "worker-dod-gaps",
+                                       "worker-final-report", "worker-helper-lifecycle", "worker-helper-routing",
+                                       "worker-server-launch", "worker-session-rules"]
     assert worker[0]["skip_reason"] is None
     assert "candidates:" not in " ".join(rep["notes"])
     assert candidate(env.url, "dev:agent:worker:rules")["target"] == "~/.claude/agents/worker.md"   # dry: unchanged
@@ -721,8 +722,8 @@ def test_jev_fixture_triage_ranks_with_the_typed_answers(env: SimpleNamespace) -
         c = {"source": "deviations", "kind": "edit_instruction", "target": "~/.claude/CLAUDE.md",
              "rule_key": f"claude-md:global:{rid}", "seen_count": 1,
              "metrics": {"sessions": n, "followed_grade_mean": grade, "result_grade_mean": 0.5}}
-        state = N.triage_state(c, [], True, ["docs-typo", "fix-add", "report-todos", "shell-habits", "summary-report"],
-                               {})
+        state = N.triage_state(c, [], True, ["docs-typo", "fix-add", "report-todos", "shell-habits",
+                                             "status-expect-line", "summary-report"], {})
         k = jev.fixture_key(state, qset.jev_questions())
         assert (config.JEV_FIXTURES_DIR / f"{k}.json").is_file(), (key, k)
         fx = json.loads((config.JEV_FIXTURES_DIR / f"{k}.json").read_text())

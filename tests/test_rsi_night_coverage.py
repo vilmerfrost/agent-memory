@@ -19,7 +19,7 @@ from rsi_night_support import (RULE_A, FakeReplayer, adapters, candidate, clean_
 NIGHT = "2026-10-26"
 MELTDOWN = "~/.agents/skills/meltdown/SKILL.md"
 HANDOFF = "~/.agents/skills/handoff/SKILL.md"
-AGENTS_MD = "~/.codex/AGENTS.md"
+SUMMARIZE = "~/.agents/skills/summarize/SKILL.md"       # a file no replay case declares
 
 
 @pytest.fixture
@@ -30,7 +30,7 @@ def env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pg_url: str) -> SimpleN
     monkeypatch.delenv("RSI_ARTIFACTS_DIR", raising=False)
     strip_agent_env(monkeypatch)
     home = make_home(tmp_path, monkeypatch)
-    for rel in (MELTDOWN, HANDOFF, AGENTS_MD):
+    for rel in (MELTDOWN, HANDOFF, SUMMARIZE):
         p = home / rel[2:]
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(f"---\nname: {p.parent.name}\n---\n\n# Rules\n\n- One rule.\n")
@@ -64,7 +64,7 @@ def run(env: SimpleNamespace, **kw: Any) -> dict[str, Any]:
 def test_uncovered_skill_never_takes_the_experiment_slot(env: SimpleNamespace) -> None:
     seed_rule(env.url, RULE_A, "a", sessions=1)            # a delta, and a covered CLAUDE.md candidate
     insert(env.url, "dev:skill:handoff:closing", HANDOFF, 40)          # most recurrent, but no case uses the file
-    insert(env.url, "dev:agents-md:global:computer-use", AGENTS_MD, 30)
+    insert(env.url, "dev:skill:summarize:intro", SUMMARIZE, 30)
     insert(env.url, "dev:skill:meltdown:intro", MELTDOWN, 20)
     triage, replayer = CountingTriage(), FakeReplayer("INCONCLUSIVE")
     rep = run(env, triage=triage, replayer=replayer,
@@ -72,7 +72,7 @@ def test_uncovered_skill_never_takes_the_experiment_slot(env: SimpleNamespace) -
     cands = {c["key"]: c for c in rep["candidates"]}
     # Covered candidates take the two triage slots, even though the uncovered ones recur more.
     assert set(triage.assessed) == {"dev:skill:meltdown:intro", "dev:claude-md:global:" + RULE_A[0]}
-    for key, target in (("dev:skill:handoff:closing", HANDOFF), ("dev:agents-md:global:computer-use", AGENTS_MD)):
+    for key, target in (("dev:skill:handoff:closing", HANDOFF), ("dev:skill:summarize:intro", SUMMARIZE)):
         c = cands[key]
         assert not c["selected"] and c["reason"] == "deferred: no test case uses this file"
         assert c["skip_reason"] == "no test case uses this file" and c["test_cases"] == [] and c["target"] == target

@@ -56,7 +56,7 @@ def test_shipped_cases_load_and_are_stable():
                                      "meltdown-brief", "parent-authority", "parent-dod-review", "parent-merge-cleanup",
                                      "parent-repo-profile", "parent-safety-guards", "parent-work-trigger", "pepe-lock",
                                      "report-todos", "shell-habits", "status-expect-line", "summary-report",
-                                     "summary-round-up", "worker-command-form", "worker-credential-runner",
+                                     "worker-command-form", "worker-credential-runner",
                                      "worker-dod-gaps", "worker-final-report", "worker-helper-lifecycle",
                                      "worker-helper-routing", "worker-server-launch", "worker-session-rules"]
     assert all(c.fixture.is_dir() and c.stub and c.check for c in cases)
