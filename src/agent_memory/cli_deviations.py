@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sqlite3
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
@@ -171,6 +172,28 @@ def cmd_sessions_hosts(args: argparse.Namespace) -> int:
     except (OSError, psycopg.Error) as exc:
         return _err("sessions hosts", exc)
     print(json.dumps(doc, sort_keys=True) if args.json else line)
+    return 0
+
+
+def cmd_sessions_t3_workers(args: argparse.Namespace) -> int:
+    """Record T3 children from before registration existed, so the next ingest saves them as workers."""
+    from agent_memory import sessions_ingest, t3_workers
+
+    db = args.t3_db or Path.home() / ".t3" / "userdata" / "statev2.sqlite"
+    parent_dir = sessions_ingest.claude_home() / "parent"
+    try:
+        children = t3_workers.read_children(db)
+        since = min((sessions_ingest.parse_ts(c.created_at) for c in children), default=None)
+        roots = [r.projects for r in sessions_ingest.transcript_roots()] + [r.home for r in sessions_ingest.codex_roots()]
+        files = t3_workers.transcripts_since(roots, since) if since else []
+        plan = t3_workers.plan(db, parent_dir, files)
+        applied = t3_workers.apply_plan(plan, parent_dir) if args.apply else None
+    except (OSError, ValueError, sqlite3.Error) as exc:
+        return _err("sessions t3-workers", exc)
+    line = plan.line() + (f"; wrote {applied} record(s), the next `amem sessions ingest` fixes the rows"
+                          if args.apply else "; dry run: nothing written (--apply to write)")
+    print(json.dumps({"children": [c.__dict__ for c in plan.children], "skipped": plan.skipped, "applied": applied},
+                     sort_keys=True) if args.json else line)
     return 0
 
 
@@ -434,6 +457,11 @@ def register(sub: Any) -> None:
     p.add_argument("--json", action="store_true", help="counts and one row per candidate session")
     p.set_defaults(func=cmd_sessions_hosts)
 
+    p = s_sub.add_parser("t3-workers", help="record T3 children from before registration, so ingest saves them as workers")
+    p.add_argument("--apply", action="store_true", help="write the local records (default: dry run)")
+    p.add_argument("--t3-db", type=Path, default=None, help="T3's state database (default: ~/.t3/userdata/statev2.sqlite)")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_sessions_t3_workers)
     p = s_sub.add_parser("interface", help="fill sessions.interface (the app a session ran in) for rows without "
                                            "one, from stored meta only (no transcript, git or network); dry run "
                                            "unless --apply")
