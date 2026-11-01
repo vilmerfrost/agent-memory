@@ -1,0 +1,42 @@
+{
+  "id": "worker-command-form",
+  "title": "Turn each worker goal into Bash calls of the allowed shape",
+  "tags": [
+    "instruction",
+    "parent-workflow"
+  ],
+  "targets": [
+    {
+      "path": "~/agent-config/agents/worker.md",
+      "kind": "instruction",
+      "behavior": "Command form: the exact calls a worker sends, including when a goal needs a changed program environment",
+      "sections": [
+        "command-form"
+      ]
+    }
+  ],
+  "fixture": "worker-command-form",
+  "hidden_check": "session-turns",
+  "prompt": "Read ~/agent-config/agents/worker.md from the staged sandbox home first. You are the agent described in scenarios.json. Each scenario is a moment in a real session. For each scenario write your complete next turn: every tool call you make now, in order, up to the point where you need a result you do not have, and all the text you send in that turn. An empty calls list is allowed. Tool arguments use the names in scenarios.json. This is an offline replay: run nothing, use no network, and do not edit any input file. Write only result.json in this shape: {\"scenarios\": [{\"id\": <scenario id>, \"message\": <all the text you send in that turn>, \"calls\": [{\"tool\": <tool name>, ...its arguments}]}]}. One row per scenario.",
+  "check": "python3 \"$HIDDEN_CHECK_DIR\"/check.py",
+  "timeout_s": 180,
+  "stub": [
+    {
+      "op": "read",
+      "path": "~/agent-config/agents/worker.md"
+    },
+    {
+      "op": "read",
+      "path": "scenarios.json"
+    },
+    {
+      "op": "write",
+      "path": "result.json",
+      "text": "{\n \"scenarios\": [\n  {\n   \"id\": \"node24-tests\",\n   \"calls\": [\n    {\n     \"tool\": \"Write\",\n     \"file_path\": \"scripts/node24_test.py\",\n     \"content\": \"import os, subprocess, sys\\nenv = dict(os.environ, PATH='/home/dev/.cache/deps/node-24/bin' + ':' + os.environ['PATH'])\\nsys.exit(subprocess.run(['npm', 'test'], env=env).returncode)\\n\"\n    },\n    {\n     \"tool\": \"Bash\",\n     \"command\": \"python3 -I scripts/node24_test.py\"\n    }\n   ]\n  },\n  {\n   \"id\": \"node24-typecheck\",\n   \"calls\": [\n    {\n     \"tool\": \"Write\",\n     \"file_path\": \"scripts/node24_tsc.py\",\n     \"content\": \"import os, subprocess, sys\\nenv = dict(os.environ, PATH='/home/dev/.cache/deps/node-24/bin' + ':' + os.environ['PATH'])\\nsys.exit(subprocess.run(['npx', 'tsc', '--noEmit'], env=env, cwd='web').returncode)\\n\"\n    },\n    {\n     \"tool\": \"Bash\",\n     \"command\": \"python3 -I scripts/node24_tsc.py\"\n    }\n   ]\n  },\n  {\n   \"id\": \"node24-one-file\",\n   \"calls\": [\n    {\n     \"tool\": \"Write\",\n     \"file_path\": \"scripts/node24_one.py\",\n     \"content\": \"import os, subprocess, sys\\nenv = dict(os.environ, PATH='/home/dev/.cache/deps/node-24/bin' + ':' + os.environ['PATH'])\\nsys.exit(subprocess.run(['node', '--test', 'tests/cart.test.mjs'], env=env).returncode)\\n\"\n    },\n    {\n     \"tool\": \"Bash\",\n     \"command\": \"python3 -I scripts/node24_one.py\"\n    }\n   ]\n  },\n  {\n   \"id\": \"node24-build-memory\",\n   \"calls\": [\n    {\n     \"tool\": \"Write\",\n     \"file_path\": \"scripts/node24_build.py\",\n     \"content\": \"import os, subprocess, sys\\nenv = dict(os.environ, PATH='/home/dev/.cache/deps/node-24/bin' + ':' + os.environ['PATH'], NODE_OPTIONS='--max-old-space-size=4096')\\nsys.exit(subprocess.run(['npm', 'run', 'build'], env=env).returncode)\\n\"\n    },\n    {\n     \"tool\": \"Bash\",\n     \"command\": \"python3 -I scripts/node24_build.py\"\n    }\n   ]\n  },\n  {\n   \"id\": \"test-home\",\n   \"calls\": [\n    {\n     \"tool\": \"Write\",\n     \"file_path\": \"scripts/fake_home_test.py\",\n     \"content\": \"import os, subprocess, sys\\nenv = dict(os.environ, HOME='/tmp/fake-home')\\nsys.exit(subprocess.run(['.venv/bin/python', '-m', 'pytest', 'tests/test_config.py'], env=env).returncode)\\n\"\n    },\n    {\n     \"tool\": \"Bash\",\n     \"command\": \"python3 -I scripts/fake_home_test.py\"\n    }\n   ]\n  },\n  {\n   \"id\": \"ci-entry\",\n   \"calls\": [\n    {\n     \"tool\": \"Bash\",\n     \"command\": \"./scripts/ci.sh\"\n    }\n   ]\n  },\n  {\n   \"id\": \"docker-steps\",\n   \"calls\": [\n    {\n     \"tool\": \"Write\",\n     \"file_path\": \"scripts/container_steps.py\",\n     \"content\": \"import subprocess\\nsubprocess.run(['pip', 'install', '-r', 'requirements.txt'], check=True)\\nsubprocess.run(['alembic', 'upgrade', 'head'], check=True)\\nsubprocess.run(['pytest', '-q'], check=True)\\n\"\n    },\n    {\n     \"tool\": \"Bash\",\n     \"command\": \"docker run --rm -v /home/dev/worktrees/shop/worker-ui:/w -w /w python:3.12 python /w/scripts/container_steps.py\"\n    }\n   ]\n  },\n  {\n   \"id\": \"restore-from-branch\",\n   \"calls\": [\n    {\n     \"tool\": \"Bash\",\n     \"command\": \"git show integration:web/src/App.tsx\"\n    }\n   ]\n  },\n  {\n   \"id\": \"first-matches\",\n   \"calls\": [\n    {\n     \"tool\": \"Bash\",\n     \"command\": \"grep -n -m 20 'def' src/cart.py\"\n    }\n   ]\n  },\n  {\n   \"id\": \"dev-server-env\",\n   \"calls\": [\n    {\n     \"tool\": \"Bash\",\n     \"command\": \"env PORT=8100 DEBUG=1 .venv/bin/python -m shop.api --port 8100\",\n     \"run_in_background\": true\n    }\n   ]\n  }\n ]\n}\n"
+    },
+    {
+      "op": "final",
+      "text": "Wrote one next turn per scenario to result.json."
+    }
+  ]
+}

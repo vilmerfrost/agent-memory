@@ -1,0 +1,20 @@
+{
+ "scenarios": [
+  {
+   "id": "five-worker-round",
+   "message": "## Result\n\nAll five fixes are merged into main, and the full test run passes. One step is still open: the hosted database needs a migration before the checkout fix works in production.\n\n## Important changes\n\n- **Checkout:** a double click no longer creates two orders.\n- **Tax:** VAT now rounds on each line, not on the whole order.\n- **Invoices:** the export now shows the customer's VAT number.\n- **Email:** a failed email now retries three times.\n- **Admin:** the order list filters by status and date.\n\n## Diagram\n\n```mermaid\nflowchart LR\n  B[Browser] --> A[API] --> O[Order store]\n  A --> Q[Job queue] --> M[Mail worker] --> P[Mail provider]\n```\n\n## Verification\n\nAll automated tests pass, and the admin screens were checked at three widths. Not tested: the hosted migration was not applied, and no real email was sent because the mail provider's test system was down.\n\n## Next action\n\nApply the migration on the hosted database, then send one real test email.\n\n## Skills, Plugins or MCPs used\n\n- Supabase MCP\n- Vitals MCP\n"
+  },
+  {
+   "id": "pr-merge-round",
+   "message": "## Result\n\nBoth guard fixes are merged, and the old branches are gone.\n\n## Important changes\n\n- The push guard now reads the branch from the command. A renamed folder no longer tricks it.\n- The cleanup step now keeps a worktree that holds uncommitted files.\n\n## Diagram\n\n```mermaid\nflowchart LR\n  G[Git command] --> H[Guard] --> R[Allow or deny]\n```\n\n## Verification\n\nThe full test run passes. Not tested: the cleanup fix was not tried on a live worktree with uncommitted files.\n\n## Next action\n\nNone. Tell me if you want a live cleanup trial.\n\n## Skills, Plugins or MCPs used\n\n- pr-stack skill\n"
+  },
+  {
+   "id": "read-only-review",
+   "message": "## Result\n\nLast night's replays produced no improvement, and the likely cause is the test setup, not the rule changes.\n\n## Important changes\n\n- Two experiments ran. Both unchanged texts already scored at or near full marks, so a change had no room to improve.\n- The third experiment never ran its checks, because its test home was missing a file.\n\n## Verification\n\nThis was a read-only review. I changed nothing, and the missing file is still missing.\n\n## Next action\n\nDecide whether to repair the test home before tonight's run.\n\n## Skills, Plugins or MCPs used\n\n- Supabase MCP\n"
+  },
+  {
+   "id": "corrections-round",
+   "message": "## Result\n\nSix claims in my last report were wrong. The serious one: the archive job failed because the disk is 94% full.\n\n## Important changes\n\n- The archive routine failed, and the other three passed.\n- The backup covers only the database, not the media bucket.\n- The retention job deletes after 90 days, not 30.\n- The pull request for the retention change is still open and waits for review.\n- Restore was never tested.\n- Disk use is 94%, not 61%.\n\n## Verification\n\nI rechecked each claim against the logs. Restore itself is still untested.\n\n## Next action\n\nFree disk space, then rerun the archive routine.\n\n## Skills, Plugins or MCPs used\n\nNone\n"
+  }
+ ]
+}

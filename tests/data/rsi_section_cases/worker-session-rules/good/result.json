@@ -1,0 +1,78 @@
+{
+ "scenarios": [
+  {
+   "id": "brief-names-branch",
+   "message": "Reads are finished. Nothing is written yet. I wait for the root to confirm my registration before edits, checkpoint writes or pushes.",
+   "calls": []
+  },
+  {
+   "id": "spawn-note",
+   "message": "Reads are finished. Nothing is written yet. I wait for the root to confirm my registration before edits, checkpoint writes or pushes.",
+   "calls": []
+  },
+  {
+   "id": "scratch-script",
+   "message": "Reads are finished. Nothing is written yet. I wait for the root to confirm my registration before edits, checkpoint writes or pushes.",
+   "calls": [
+    {
+     "tool": "Grep",
+     "pattern": "error_code",
+     "path": "logs/orders.jsonl"
+    }
+   ]
+  },
+  {
+   "id": "checkpoint-due",
+   "message": "Reads are finished. Nothing is written yet. I wait for the root to confirm my registration before edits, checkpoint writes or pushes.",
+   "calls": []
+  },
+  {
+   "id": "stall-clock",
+   "message": "Root: my registration is still missing after 24 minutes. I have written nothing and I keep waiting.",
+   "calls": []
+  },
+  {
+   "id": "ready-arrived",
+   "message": "Registered. Starting the fix.",
+   "calls": [
+    {
+     "tool": "Bash",
+     "command": "git branch -m worker-cart"
+    },
+    {
+     "tool": "Edit",
+     "file_path": "src/shop/cart.py",
+     "old_string": "round(x, 1)",
+     "new_string": "round(x, 2)"
+    }
+   ]
+  },
+  {
+   "id": "denied-false-match",
+   "message": "Action: read the rate setting. Target: deploy/values.example.yaml. Exact reason: secret-read-block: command names a secret pattern (api_key). Authorization: task item 3 of the brief. Prepared result: commit 7c1e9ab. I did not retry. Please decide.",
+   "calls": []
+  },
+  {
+   "id": "denied-build",
+   "message": "Action: production build of web. Target: web/dist. Exact reason: parent-guard: build output web/dist is a symlink outside the worktree. Authorization: task item 2 of the brief. Prepared result: commit 3fd01c2. I did not retry.",
+   "calls": []
+  },
+  {
+   "id": "sibling-test-red",
+   "message": "Status: PARTIAL. My two cases are committed. tests/test_case_counts.py::test_total fails: it expects 21 cases and sees 23. worker-counts owns that file, so I did not change it. It needs 23.",
+   "calls": []
+  },
+  {
+   "id": "brief-main-path",
+   "message": "Updating the Postgres version in my worktree.",
+   "calls": [
+    {
+     "tool": "Edit",
+     "file_path": "docs/infra.md",
+     "old_string": "Postgres 15",
+     "new_string": "Postgres 16"
+    }
+   ]
+  }
+ ]
+}

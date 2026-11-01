@@ -320,7 +320,7 @@ def bound(path, section):
 
 SECTION_CASES = [
     (CLAUDE, SHELL_SEC, ["shell-habits"]),
-    (CLAUDE, REPORT_SEC, ["summary-report"]),
+    (CLAUDE, REPORT_SEC, ["summary-report", "summary-round-up"]),
     (DELEGATION, APPROVAL_SEC, ["delegation-approval"]),
 ]
 
@@ -330,7 +330,7 @@ def test_section_bound_replay_selects_the_new_case(path, section, expected):
     rel = REL.select(bound(path, section), R.load_cases())
     assert sorted(rel["eligible_cases"]) == expected and rel["uncovered_targets"] == []
     chosen, reps, pairs = R.plan_pairs(bound(path, section), R.load_cases(), min_pairs=5, max_pairs=5)
-    assert [c.id for c in chosen] == expected and reps == 5 and pairs == 5
+    assert [c.id for c in chosen] == expected and reps == -(-5 // len(expected)) and pairs == 5
 
 
 def night():
@@ -349,18 +349,19 @@ def test_night_section_gating_picks_the_new_case(path, section, expected):
 
 
 def test_whole_file_coverage_keeps_the_old_claude_md_cases():
-    assert night()._test_cases(CLAUDE) == ["docs-typo", "fix-add", "report-todos", "shell-habits", "summary-report"]
+    assert night()._test_cases(CLAUDE) == ["docs-typo", "fix-add", "report-todos", "shell-habits",
+                                           "status-expect-line", "summary-report", "summary-round-up"]
     assert night()._test_cases(DELEGATION) == ["delegation-approval"]
 
 
 def test_small_whole_file_plan_still_runs_the_generic_cases_first():
     """The ids sort after the generic CLAUDE.md cases, so a whole-file change capped at 3 pairs (the synthetic
-    closing-line demo) keeps docs-typo, fix-add and report-todos; the live 5-pair plan runs all five once."""
+    closing-line demo) keeps docs-typo, fix-add and report-todos; the night's 10-pair plan runs all seven."""
     whole = {"files": [{"path": CLAUDE, "kind": "instruction"}]}
     small, _, _ = R.plan_pairs(whole, R.load_cases(), min_pairs=3, max_pairs=3)
-    full, reps, pairs = R.plan_pairs(whole, R.load_cases(), min_pairs=5, max_pairs=5)
+    full, reps, pairs = R.plan_pairs(whole, R.load_cases(), min_pairs=5, max_pairs=10)
     assert [c.id for c in small] == ["docs-typo", "fix-add", "report-todos"]
-    assert [c.id for c in full] == night()._test_cases(CLAUDE) and (reps, pairs) == (1, 5)
+    assert [c.id for c in full] == night()._test_cases(CLAUDE) and (reps, pairs) == (2, 10)
 
 
 # Same heading shape as the live files (two H1 blocks in CLAUDE.md, one H1 title in DELEGATION.md), so the rule
@@ -425,7 +426,7 @@ def staged_home(tmp_path, monkeypatch):
 RULE_KEYS = [
     (CLAUDE, "claude-md:global:global-claude-code-context/shell-habits", SHELL_SEC, ["shell-habits"]),
     (CLAUDE, "claude-md:global:global-claude-code-context/explaining-completed-work", REPORT_SEC,
-     ["summary-report"]),
+     ["summary-report", "summary-round-up"]),
     (CLAUDE, "claude-md:global:shell-habits", SHELL_SEC, ["shell-habits"]),
     (DELEGATION, "claude-md:global:approval-without-handing-work-back", APPROVAL_SEC, ["delegation-approval"]),
     (CLAUDE, "claude-md:global:global-claude-code-context/secrets", "global-claude-code-context/secrets", []),
@@ -450,4 +451,4 @@ def test_sub_section_rule_key_falls_back_to_file_coverage(staged_home):
     assert N._section_for(SYNTH_CLAUDE, key) is None
     n = night()
     assert "summary-report" in n._test_cases(CLAUDE, key)
-    assert n._test_cases(CLAUDE, section_id=REPORT_SEC) == ["summary-report"]
+    assert n._test_cases(CLAUDE, section_id=REPORT_SEC) == ["summary-report", "summary-round-up"]

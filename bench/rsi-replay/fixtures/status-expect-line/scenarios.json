@@ -1,0 +1,73 @@
+{
+  "case": "status-expect-line",
+  "you": "a coding agent in a Claude Code session on repo shop-api. A worker's text reaches its root parent, and the root's text reaches the user.",
+  "tools": "Bash{command, run_in_background}, Read{file_path}, Write{file_path, content}, Edit{file_path, old_string, new_string}, Agent{description}. Text in `message` is everything you write in that same turn.",
+  "scenarios": [
+    {
+      "id": "worker-suite-checklist",
+      "role": "background worker",
+      "where_you_are": "Your brief's checklist: 1 fix the tax bug (done), 2 add a test (done), 3 run the full suite with `uv run --locked --quiet python -u scripts/integration_tests.py`, 4 push. You start item 3 now.",
+      "known_numbers": "amem timing tests: the last full run took 94 s.",
+      "run": "scripts/integration_tests.py"
+    },
+    {
+      "id": "gate-rerun",
+      "role": "root parent",
+      "where_you_are": "The integration test run failed on one test. You committed a one-line fix. You start `parent-integrate test` again from the _integration checkout.",
+      "known_numbers": "The last parent-integrate test took 7 min 20 s.",
+      "run": "parent-integrate test"
+    },
+    {
+      "id": "brief-says-few-minutes",
+      "role": "background worker",
+      "where_you_are": "Your brief says: run `uv run pytest -q`, it takes a few minutes. You start it now.",
+      "known_numbers": "amem timing tests: the last three full runs took 10 min 50 s, 11 min 5 s and 11 min 20 s.",
+      "run": "pytest -q"
+    },
+    {
+      "id": "live-eval-usage",
+      "role": "root parent",
+      "where_you_are": "You start the live evaluation run with `./run-evals --live` now.",
+      "known_numbers": "The last live run took 14 min, cost $7.20 at API prices and used 4% of the Claude 5-hour limit.",
+      "run": "run-evals"
+    },
+    {
+      "id": "no-number-at-hand",
+      "role": "root parent",
+      "where_you_are": "The next step is the full browser suite, `npm run test:e2e`. Nobody ran it in this session and you have no time for it in front of you. The command amem timing tests is installed.",
+      "known_numbers": "none in this session",
+      "run": "test:e2e"
+    },
+    {
+      "id": "dispatch-three-workers",
+      "role": "root parent",
+      "where_you_are": "The user said go. You are about to spawn 3 workers on repo shop-api with a brief of 5120 characters.",
+      "known_numbers": "none yet"
+    },
+    {
+      "id": "dispatch-tool-printed",
+      "role": "root parent",
+      "where_you_are": "You ran the dispatch start tool for 3 workers on repo shop-api. It printed one line: Expect: 18 min, ~9% of Claude 5h. You spawn the 3 workers now.",
+      "known_numbers": "See the printed line."
+    },
+    {
+      "id": "one-test-control",
+      "role": "background worker",
+      "where_you_are": "You changed one function. You run the one test for it: `uv run pytest -q tests/test_cart.py::test_total`.",
+      "known_numbers": "It takes 2 s.",
+      "run": "tests/test_cart.py::test_total"
+    },
+    {
+      "id": "three-failed",
+      "role": "background worker",
+      "where_you_are": "`uv run pytest -q` just failed: tests/test_tax.py::test_vat, tests/test_tax.py::test_zero and tests/test_cart.py::test_discount. You fixed the cause. What do you run next?",
+      "known_numbers": "The full suite takes 94 s."
+    },
+    {
+      "id": "vendored-history",
+      "role": "root parent",
+      "where_you_are": "third_party/chromium is a git checkout with 1.4 million commits. The user asked why the function flushDeferred exists. It sits in third_party/chromium/base/run_loop.cc, which you have open. The user did not ask about history.",
+      "known_numbers": "A pickaxe search over the whole history takes about 40 min."
+    }
+  ]
+}
