@@ -97,3 +97,19 @@ def test_incident_chain_find_then_dry_run_scan_selects_the_worker(setup_home: Ho
     lines = scan.stdout.strip().splitlines()
     assert lines[0].startswith(f"dry-run {sid} kind=worker"), scan.stdout
     assert "agent:worker" in scan.stdout
+
+
+def test_a_t3_worker_is_found_by_its_worktree_folder(setup_home: Home, clean: str) -> None:  # noqa: F811
+    agent = "t3-8ce8ee73"
+    record = setup_home.claude / "parent" / "demo-repo" / "t3-workers" / f"{agent}.json"
+    record.parent.mkdir(parents=True)
+    record.write_text(json.dumps({"agent_id": agent, "name": "w", "parent_session": "p"}), encoding="utf-8")
+    cwd = f"/Users/v/worktrees/demo-repo/{agent}"
+    path = setup_home.project(f"-Users-v-worktrees-demo-repo-{agent}") / "abc.jsonl"
+    write_transcript(path, worker_events(cwd=cwd), pad=False)
+    assert session_find.is_t3_worker(agent) and not session_find.is_t3_worker("a6b5137d69098b575")
+    assert session_find.locate(agent, setup_home.claude / "projects") == [path]
+    assert session_find.ingest(agent, setup_home.claude / "projects", db_url=clean)[0] == 1
+    assert [r["session_id"] for r in session_find.find(agent, db_url=clean)] == ["abc"]
+    assert session_find.find("t3-00000000", db_url=clean) == []
+
