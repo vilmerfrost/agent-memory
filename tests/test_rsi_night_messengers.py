@@ -110,9 +110,9 @@ def considered(rep: dict[str, Any]) -> set[str]:
     return {c["key"] for c in rep["candidates"]}
 
 
-def test_the_constant_names_both_messengers() -> None:
-    assert N.MESSENGER_ROUTINES == ("routine-audit", "config-check")
-    assert N.MESSENGER_KEYS == ("routine:routine-audit", "routine:config-check")
+def test_the_constant_names_the_messengers() -> None:
+    assert N.MESSENGER_ROUTINES == ("routine-audit", "config-check", "amem-auth-recovery")
+    assert N.MESSENGER_KEYS == ("routine:routine-audit", "routine:config-check", "routine:amem-auth-recovery")
 
 
 def test_sighting_code_alone_gives_no_messenger_sighting() -> None:

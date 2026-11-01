@@ -14,8 +14,8 @@ from typing import Any
 import psycopg
 import pytest
 
-from agent_memory import cli, synth
-from agent_memory.integrations import clickhouse as CH, evidence as E, langfuse as LF, pastdev as PD, questions as Q
+from agent_memory import cli, rsi_evidence_providers as P, synth
+from agent_memory.integrations import clickhouse as CH, egress, evidence as E, langfuse as LF, pastdev as PD, questions as Q
 
 
 @pytest.fixture(scope="module")
@@ -126,6 +126,70 @@ def test_repeat_failures_with_a_rule_param(world: tuple[str, dict[str, Any]]) ->
     assert "lf.trace" not in params
     with pytest.raises(ValueError, match="bad value"):
         Q.QUESTIONS["repeat_failures"].check({"rule": "x' or 1=1"})
+
+
+REPO_RULE = "claude-md:p_0123456789abcdef:global-context/shell-habits"
+REPO_PLAIN = "claude-md:p_0123456789abcdef:shell-habits"      # no slash: its words go to past.dev as a recall query
+
+
+def _gate(*deny: str) -> P.EgressGate:
+    gate = P.EgressGate(None, {})
+    gate._deny = egress.Deny(deny)
+    return gate
+
+
+@pytest.mark.parametrize("rule", [REPO_RULE, REPO_PLAIN])
+def test_a_rule_the_gate_refuses_never_reaches_an_external_source(world: tuple[str, dict[str, Any]], rule: str) -> None:
+    url, gold = world
+    rs = _retrievers(url, gold)
+    ans = Q.ask("repeat_failures", {"rule": rule}, rs, lambda: psycopg.connect(url), gate=_gate())
+    status = dict(_status(ans))
+    assert status["ch.rule_gap"] == status["ch.rule_weekly_rate"] == "unavailable"
+    assert status.get("pd.recall", "unavailable") == "unavailable" and ("pd.recall" in status) is (rule == REPO_PLAIN)
+    assert status["sb.attempts_for"] == "ok" and rs["ch"].calls == [] and rs["pd"].calls == []
+    assert all("policy-excluded" in res.detail for st, res in ans.steps if st.source in ("ch", "pd"))
+
+
+def test_the_top_rule_goes_through_the_gate_too(world: tuple[str, dict[str, Any]], monkeypatch: pytest.MonkeyPatch) -> None:
+    url, gold = world
+    rs = _retrievers(url, gold)
+    monkeypatch.setattr(Q, "_top_rule", lambda done: REPO_PLAIN)
+    ans = Q.ask("repeat_failures", {}, rs, lambda: psycopg.connect(url), gate=_gate())
+    assert dict(_status(ans))["ch.rule_weekly_rate"] == "unavailable" and dict(_status(ans))["pd.recall"] == "unavailable"
+    assert [name for name, _ in rs["ch"].calls] == ["rule_gap"] and "rule" not in rs["ch"].calls[0][1]
+    assert rs["pd"].calls == []
+
+
+def test_a_withheld_word_in_a_slash_key_is_refused(world: tuple[str, dict[str, Any]]) -> None:
+    url, gold = world
+    rs = _retrievers(url, gold)
+    ans = Q.ask("repeat_failures", {"rule": "claude-md:global:privateco-rules/shell-habits"}, rs,
+                lambda: psycopg.connect(url), gate=_gate("privateco"))
+    assert rs["ch"].calls == [] and dict(_status(ans))["ch.rule_gap"] == "unavailable"
+
+
+def test_a_rule_the_gate_accepts_still_runs(world: tuple[str, dict[str, Any]]) -> None:
+    url, gold = world
+    rs = _retrievers(url, gold)
+    ans = Q.ask("repeat_failures", {"rule": "claude-md:global:synth-quote-globs"}, rs, lambda: psycopg.connect(url),
+                gate=_gate("privateco"))
+    status = dict(_status(ans))
+    assert status["ch.rule_gap"] == status["ch.rule_weekly_rate"] == status["pd.recall"] == "ok"
+
+
+def test_the_ask_command_builds_the_gate(world: tuple[str, dict[str, Any]], monkeypatch: pytest.MonkeyPatch,
+                                         capsys: pytest.CaptureFixture[str]) -> None:
+    url, gold = world
+    seen: dict[str, Any] = {}
+
+    def ask(name: str, params: Any, retrievers: Any, connect: Any, **kw: Any) -> Any:
+        seen.update(kw)
+        return Q.Answer(name, "text", dict(params))
+
+    monkeypatch.setenv("AMEM_DB_URL", url)
+    monkeypatch.setattr(Q, "ask", ask)
+    assert cli.main(["evidence", "ask", "repeat_failures"]) == 0
+    assert isinstance(seen["gate"], P.EgressGate)
 
 
 def test_record_writes_one_answer_row_and_never_rewrites_stored_links(world: tuple[str, dict[str, Any]]) -> None:

@@ -34,7 +34,8 @@ TOKEN_TTL = timedelta(hours=72)
 DECISION_TTL = timedelta(hours=24)
 IMPROVE_TIMEOUT = 600.0
 MAX_ATTEMPTS = 3
-AGENT_ENV = ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SESSION_ID", "RSI_SANDBOX", "IMPROVE_SESSION")
+AGENT_ENV = ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "CODEX_SESSION_ID",
+             "CODEX_SANDBOX", "RSI_SANDBOX", "IMPROVE_SESSION")
 
 
 # A suggested hand edit (rsi_experiments.meta.suggestion) has no proposal row, so its life is kept on the experiment

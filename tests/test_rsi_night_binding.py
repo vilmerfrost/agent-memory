@@ -18,11 +18,12 @@ import psycopg
 import pytest
 from psycopg.types.json import Jsonb
 
-from agent_memory import config, distill, edits_sections as ES, rsi_approval as AP, rsi_evidence_pack as EP
+from agent_memory import config, distill, edits_sections as ES, rsi_approval as AP, rsi_brief as BR, rsi_evidence_pack as EP
 from agent_memory import rsi_evidence_providers as P, rsi_night as N
 from agent_memory.integrations import egress, sb_queries
 from agent_memory.rsi_budget import Budget, BudgetConfig, Usage
-from rsi_night_support import FakeReplayer, FakeStager, adapters, candidate, clean_db, make_home, strip_agent_env
+from rsi_night_support import (FakeEvidence, FakeReplayer, FakeStager, adapters, candidate, clean_db, make_home,
+                               strip_agent_env)
 
 PROFILE = config.REPO_ROOT / "config" / "rsi-night.subscription.json"
 NIGHT = "2026-10-18"
@@ -31,6 +32,7 @@ CLAUDE = "~/.claude/CLAUDE.md"
 EXPLAINING = "global-claude-code-context/explaining-completed-work"
 CLI_TOOLS = "global-claude-code-context/available-cli-tools"
 TASTE = "global-claude-code-context/design-taste-skill"
+SHELL = "global-claude-code-context/shell-habits"
 
 # The live file's shape: two H1 blocks, H3s folded under H2s, and the heading that replaced "Design System".
 TWO_H1 = """# Desktop delegation policy v1.1
@@ -125,7 +127,8 @@ def payloads_in(prompt: str) -> dict[str, Any]:
 
 def small_change(section_text: str) -> str:
     """One added sentence, every other requirement kept: the shape the writer's content policy accepts."""
-    return section_text.replace("Give the smallest clear explanation.", "Give the smallest clear explanation first.")
+    return (section_text.replace("Give the smallest clear explanation.", "Give the smallest clear explanation first.")
+            .replace("- Quote patterns.", "- Quote patterns first."))
 
 
 def one_idea(payloads: dict[str, Any], *, what: str = "Say the rule in fewer words") -> str:
@@ -408,7 +411,8 @@ def writer_reply(prompt: str) -> tuple[str, Usage]:
     section = json.loads(prompt.split("Exact declared replacement (do not add, omit, paraphrase or relocate any part):\n", 1)[1]
                          .split("\n", 1)[0])["after"]
     return json.dumps({"new_section": section, "topic": "plain rule words", "why": "plain words are easy to follow",
-                       "summary": "the rule body is shorter", "kind": "prose", "kind_reason": "one prose change"}), Usage()
+                       "summary": "the rule body is shorter", "kind": "prose", "kind_reason": "one prose change"}), Usage(
+                           tokens_in=100, tokens_out=50)     # a subscription call with no usage stops the night
 
 
 def night(env: SimpleNamespace, answer: Any, *, max_prompt_chars: int = 96_000) -> tuple[dict[str, Any], FakeModel]:
@@ -497,17 +501,181 @@ def test_a_section_that_cannot_fit_the_prompt_is_a_loop_fault(env: SimpleNamespa
     assert not any("hypothesizer failed" in n for n in rep["notes"])
 
 
+def aliases(env: SimpleNamespace) -> tuple[str, str, str]:
+    return (seed(env, "claude-md:global:explaining-completed-work/core-rule", sessions=30),
+            seed(env, STALE_RULE, sessions=12),
+            seed(env, "claude-md:global:explaining-completed-work/visual-first-rule", sessions=3))
+
+
 def test_aliases_of_one_section_take_one_slot_and_the_top_ranked_one_runs(env: SimpleNamespace) -> None:
-    top = seed(env, "claude-md:global:explaining-completed-work/core-rule", sessions=30)
-    mid = seed(env, STALE_RULE, sessions=12)
-    low = seed(env, "claude-md:global:explaining-completed-work/visual-first-rule", sessions=3)
-    rep, model = night(env, lambda prompt: '{"hypotheses": []}')          # a decline must not hand the slot to an alias
+    top, mid, low = aliases(env)
+    rep, model = night(env, lambda prompt: one_idea(payloads_in(prompt)))
     assert len(model.prompts) == 1
     assert [c["key"] for c in rep["candidates"] if c["selected"]] == [top]
     for key in (mid, low):
         c = entry(rep, key)
         assert c["skip_reason"] == N.SAME_SECTION and c["reason"] == "deferred: " + N.SAME_SECTION
         assert candidate(env.url, key)["status"] == "deferred" and attempts(env, key) == 0
+
+
+def test_a_decline_hands_the_slot_to_the_next_alias_inside_the_minimum(env: SimpleNamespace) -> None:
+    """The daily minimum wins over one section, one try (parent decision 2026-11-01): one decline must not empty a
+    night that had work. This reverses the 14:27 choice that a decline never hands the slot on."""
+    top, mid, low = aliases(env)
+    replies = iter(['{"hypotheses": []}'])
+    rep, model = night(env, lambda prompt: next(replies, None) or one_idea(payloads_in(prompt)))
+    assert len(model.prompts) == 2
+    assert [e["candidate_key"] for e in rep["experiments"] if e["experiment_id"]] == [mid]
+    assert rep["experiment_goal"]["minimum_met"] and entry(rep, mid)["selected"] and entry(rep, mid)["skip_reason"] is None
+    assert candidate(env.url, top)["status"] == "deferred" and attempts(env, top) == 1
+    assert entry(rep, low)["skip_reason"] == N.SAME_SECTION and attempts(env, low) == 0     # the section has its experiment
+
+
+def test_a_holder_with_no_evidence_hands_the_slot_on_too(env: SimpleNamespace) -> None:
+    top, mid, _ = aliases(env)
+
+    class Thin(FakeEvidence):
+        def pack(self, candidate: Any) -> Any:
+            if candidate["dedupe_key"] == top:
+                raise RuntimeError("no pack tonight")
+            return super().pack(candidate)
+
+    FakeModel(env.monkeypatch, lambda prompt: one_idea(payloads_in(prompt)))
+    cfg = N.load_config(PROFILE)
+    ad = adapters(implementer=N.WriterImplementer(cfg.implementer, call=writer_reply), stager=FakeStager(), evidence=Thin(),
+                  replayer=FakeReplayer("NO_EFFECT"), hypothesizer=N.ClaudeCliHypothesizer({"model": OPUS, "max_prompt_chars": 96_000}))
+    rep = N.Night(cfg, ad, night=NIGHT, db_url=env.url, install_signals=False).run()
+    assert entry(rep, top)["skip_reason"] == "required evidence unavailable"
+    assert [e["candidate_key"] for e in rep["experiments"] if e["experiment_id"]] == [mid]
+    assert rep["experiment_goal"]["minimum_met"]
+
+
+def test_alias_backfill_stops_at_the_target(env: SimpleNamespace) -> None:
+    keys = [seed(env, f"claude-md:global:explaining-completed-work/{rule}", sessions=30 - i) for i, rule in enumerate(
+        ("core-rule", "response-budget", "compression-rules", "visual-first-rule", "closing-line"))]
+    _, model = night(env, lambda prompt: '{"hypotheses": []}')
+    target = N.load_config(PROFILE).experiment_goal[1]
+    assert len(model.prompts) == 1 + target
+    assert attempts(env, keys[0]) == 1 and sum(attempts(env, k) for k in keys) == 1 + target
+
+
+def test_no_alias_runs_once_the_minimum_is_met_by_another_section(env: SimpleNamespace) -> None:
+    other = seed(env, f"claude-md:global:{SHELL}", sessions=2)
+    top, mid, low = aliases(env)
+
+    def answer(prompt: str) -> str:
+        return '{"hypotheses": []}' if EXPLAINING in payloads_in(prompt) else one_idea(payloads_in(prompt))
+    rep, model = night(env, answer)
+    assert len(model.prompts) == 2 and attempts(env, mid) == 0 and attempts(env, low) == 0
+    assert [e["candidate_key"] for e in rep["experiments"] if e["experiment_id"]] == [other]
+
+
+def test_a_holder_with_an_experiment_keeps_the_section_even_below_the_minimum(env: SimpleNamespace) -> None:
+    """A failed experiment is not a decline: the section had its try tonight."""
+    aliases(env)
+    model = FakeModel(env.monkeypatch, lambda prompt: one_idea(payloads_in(prompt)))
+    cfg = N.load_config(PROFILE)
+    ad = adapters(implementer=N.WriterImplementer(cfg.implementer, call=writer_reply), replayer=FakeReplayer("NO_EFFECT"),
+                  stager=FakeStager(refuse="refused for the test"),
+                  hypothesizer=N.ClaudeCliHypothesizer({"model": OPUS, "max_prompt_chars": 96_000}))
+    rep = N.Night(cfg, ad, night=NIGHT, db_url=env.url, install_signals=False).run()
+    assert len(model.prompts) == 1 and rep["experiment_goal"]["replayed"] == 0
+
+
+def test_aliases_do_not_fill_the_pool_or_cost_jev_calls(env: SimpleNamespace) -> None:
+    limit = N.load_config(PROFILE).candidates["max_considered"]
+    stale = [seed(env, f"claude-md:copy{i}:explaining-completed-work/core-rule", sessions=30 - i) for i in range(limit + 2)]
+    other = seed(env, f"claude-md:global:{SHELL}", sessions=2)
+    assessed: list[str] = []
+
+    class Triage(N.JevTriage):
+        def assess(self, c: Any, **kw: Any) -> Any:
+            assessed.append(c["dedupe_key"])
+            return super().assess(c, **kw)
+
+    FakeModel(env.monkeypatch, lambda prompt: one_idea(payloads_in(prompt)))
+    cfg = N.load_config(PROFILE)
+    ad = adapters(implementer=N.WriterImplementer(cfg.implementer, call=writer_reply), stager=FakeStager(),
+                  replayer=FakeReplayer("NO_EFFECT"), triage=Triage("fixture"),
+                  hypothesizer=N.ClaudeCliHypothesizer({"model": OPUS, "max_prompt_chars": 96_000}))
+    rep = N.Night(cfg, ad, night=NIGHT, db_url=env.url, install_signals=False).run()
+    assert sorted(assessed) == sorted([stale[0], other])
+    assert entry(rep, other)["selected"] and entry(rep, stale[0])["selected"]
+    listed = [c for c in rep["candidates"] if c["skip_reason"] == N.SAME_SECTION]
+    assert len(listed) == limit and all(c["test_cases"] for c in listed)
+
+
+def test_a_lost_rule_costs_no_jev_call_no_evidence_pack_and_no_slot(env: SimpleNamespace) -> None:
+    lost = seed(env, LOST_RULE, sessions=30, meta={"attempts": 1})
+    good = seed(env, LIVE_RULE, sessions=2)
+    assessed: list[str] = []
+
+    class Triage(N.JevTriage):
+        def assess(self, c: Any, **kw: Any) -> Any:
+            assessed.append(c["dedupe_key"])
+            return super().assess(c, **kw)
+
+    FakeModel(env.monkeypatch, lambda prompt: one_idea(payloads_in(prompt)))
+    cfg = N.load_config(PROFILE)
+    evidence = FakeEvidence()
+    ad = adapters(implementer=N.WriterImplementer(cfg.implementer, call=writer_reply), stager=FakeStager(), evidence=evidence,
+                  replayer=FakeReplayer("NO_EFFECT"), triage=Triage("fixture"),
+                  hypothesizer=N.ClaudeCliHypothesizer({"model": OPUS, "max_prompt_chars": 96_000}))
+    rep = N.Night(cfg, ad, night=NIGHT, db_url=env.url, install_signals=False).run()
+    assert assessed == [good] and [p["dedupe_key"] for p in evidence.packs] == [good]
+    assert not entry(rep, lost)["selected"] and attempts(env, lost) == 1
+
+
+def oversize_home(env: SimpleNamespace) -> None:
+    extra = "- Keep this requirement in place for the night.\n" * 400
+    text = TWO_H1.replace("Give the smallest clear explanation.\n", "Give the smallest clear explanation.\n" + extra)
+    assert len(ES.section_text(text, EXPLAINING)) > N.SECTION_MAX
+    (env.home / ".claude" / "CLAUDE.md").write_text(text)
+
+
+def test_a_section_over_the_cap_is_deferred_before_it_takes_a_slot(env: SimpleNamespace) -> None:
+    oversize_home(env)
+    key = seed(env, LIVE_RULE, sessions=30, meta={"attempts": 1})
+    good = seed(env, f"claude-md:global:{SHELL}", sessions=2)
+    assessed: list[str] = []
+
+    class Triage(N.JevTriage):
+        def assess(self, c: Any, **kw: Any) -> Any:
+            assessed.append(c["dedupe_key"])
+            return super().assess(c, **kw)
+
+    model = FakeModel(env.monkeypatch, lambda prompt: one_idea(payloads_in(prompt)))
+    cfg = N.load_config(PROFILE)
+    evidence = FakeEvidence()
+    ad = adapters(implementer=N.WriterImplementer(cfg.implementer, call=writer_reply), stager=FakeStager(), evidence=evidence,
+                  replayer=FakeReplayer("NO_EFFECT"), triage=Triage("fixture"),
+                  hypothesizer=N.ClaudeCliHypothesizer({"model": OPUS, "max_prompt_chars": 96_000}))
+    rep = N.Night(cfg, ad, night=NIGHT, db_url=env.url, install_signals=False).run()
+    c = entry(rep, key)
+    assert not c["selected"] and c["test_cases"] == [] and codes(c) == ["rule_section_not_listed"]
+    assert c["skip_reason"] == N.SECTION_TOO_LONG and attempts(env, key) == 1
+    assert assessed == [good] and len(model.prompts) == 1 and [p["dedupe_key"] for p in evidence.packs] == [good]
+    assert N.validate_report(rep) == []
+
+
+def test_a_loop_fault_after_a_slot_makes_the_night_degraded(env: SimpleNamespace) -> None:
+    """The old guard's `degraded`: a fault that got past triage cost a slot and an evidence pack, so the night says so."""
+    fault = seed(env, LIVE_RULE, sessions=30, meta={"attempts": 1})
+    good = seed(env, f"claude-md:global:{SHELL}", sessions=2)
+
+    class Stand(N.ClaudeCliHypothesizer):
+        def reply(self, candidate: Any, **kw: Any) -> str:
+            if candidate["dedupe_key"] == fault:
+                raise N.SectionUnavailable("rule_section_not_listed", "no room tonight")
+            return super().reply(candidate, **kw)
+
+    FakeModel(env.monkeypatch, lambda prompt: one_idea(payloads_in(prompt)))
+    cfg = N.load_config(PROFILE)
+    ad = adapters(implementer=N.WriterImplementer(cfg.implementer, call=writer_reply), stager=FakeStager(),
+                  replayer=FakeReplayer("NO_EFFECT"), hypothesizer=Stand({"model": OPUS, "max_prompt_chars": 96_000}))
+    rep = N.Night(cfg, ad, night=NIGHT, db_url=env.url, install_signals=False).run()
+    assert rep["status"] == "partial" and rep["experiment_goal"]["minimum_met"]
+    assert entry(rep, good)["selected"] and attempts(env, fault) == 1
 
 
 def test_a_covered_file_with_an_uncovered_section_says_so(env: SimpleNamespace) -> None:
@@ -569,3 +737,80 @@ def test_a_pending_idea_on_a_removed_section_or_another_section_is_stale(env: Si
     key = seed(env, LIVE_RULE, meta={"pending_hypotheses": [gone, other]})
     rep, model = night(env, lambda prompt: one_idea(payloads_in(prompt)))
     assert len(model.prompts) == 1 and codes(entry(rep, key)) == ["stale_pending", "stale_pending"]
+
+
+def test_the_stale_check_reads_the_same_key_as_the_writer(env: SimpleNamespace) -> None:
+    """R3. The writer resolves c["rule_key"]. A last-tested key on another section must not drop a valid stored idea."""
+    idea = pending(ES.section_text(TWO_H1, EXPLAINING))
+    key = seed(env, LIVE_RULE, meta={"pending_hypotheses": [idea], "last_tested_rule_key": f"claude-md:global:{SHELL}"})
+    rep, model = night(env, lambda prompt: pytest.fail("a current stored idea needs no model call"))
+    assert model.prompts == [] and "stale_pending" not in codes(entry(rep, key))
+    [e] = [e for e in rep["experiments"] if e["experiment_id"]]
+    assert e["implementer"] == "writer", e["implementer_fallback_reason"]
+
+
+# --------------------------------------------------------------------------- the report names the true cause (B7)
+
+
+class Broken(N.ClaudeCliHypothesizer):
+    """The adapter failing as the live one does: the exception text holds model or client words."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__({"model": OPUS})
+        self.message = message
+
+    def reply(self, candidate: Any, **kw: Any) -> str:
+        raise distill.WriterError(self.message)
+
+
+def broken_night(env: SimpleNamespace, **kw: Any) -> dict[str, Any]:
+    cfg = N.load_config(PROFILE)
+    ad = adapters(implementer=N.WriterImplementer(cfg.implementer, call=writer_reply), stager=FakeStager(),
+                  replayer=kw.pop("replayer", FakeReplayer("NO_EFFECT")),
+                  hypothesizer=kw.pop("hypothesizer", N.ClaudeCliHypothesizer({"model": OPUS})))
+    night_ = N.Night(cfg, ad, night=NIGHT, db_url=env.url, install_signals=False)
+    for name, value in kw.items():
+        env.monkeypatch.setattr(night_, name, value)
+    return night_.run()
+
+
+@pytest.mark.parametrize("message,code,words", [
+    ("model said SECRET-MODEL-WORDS", "hypothesizer_failed", "the idea writer failed on 1 of 1 candidate"),
+    ("Failed to authenticate: OAuth session expired", "hypothesizer_auth", "Claude authentication failed while writing ideas"),
+])
+def test_a_hypothesizer_exception_reaches_the_title_in_fixed_words(env: SimpleNamespace, message: str, code: str,
+                                                                   words: str) -> None:
+    key = seed(env, LIVE_RULE)
+    rep = broken_night(env, hypothesizer=Broken(message))
+    assert N.validate_report(rep) == []
+    assert codes(entry(rep, key)) == [code] and entry(rep, key)["hypotheses_rejected"][0]["reason"] == N.REJECT_REASONS[code]
+    assert N.IDEA_WRITER_FAILED in rep["experiment_goal"]["shortfall_reasons"]
+    assert BR.night_signal(rep)["reason"] == f"no experiments ran: {words}"
+
+
+def test_a_crash_before_selection_reports_the_crash_not_a_shortage(env: SimpleNamespace) -> None:
+    seed(env, LIVE_RULE)
+
+    def crash(pool: Any) -> None:
+        raise KeyError("SECRET-MODEL-WORDS")
+
+    rep = broken_night(env, _triage=crash)
+    assert rep["status"] == "partial" and N.validate_report(rep) == []
+    assert rep["experiment_goal"]["shortfall_reasons"] == [N.NIGHT_CRASHED]
+    sig = BR.night_signal(rep)
+    assert sig["code"] == "crash" and sig["reason"] == "no experiments ran: the night stopped on an internal error"
+    assert "SECRET-MODEL-WORDS" not in json.dumps(sig)
+
+
+def test_a_sandbox_outage_reports_the_sandbox(env: SimpleNamespace) -> None:
+    seed(env, LIVE_RULE)
+    rep = broken_night(env, replayer=FakeReplayer("NO_EFFECT", health="unavailable"))
+    assert N.validate_report(rep) == []
+    assert rep["experiment_goal"]["shortfall_reasons"] == [N.SANDBOX_DOWN]
+    sig = BR.night_signal(rep)
+    assert sig["code"] == "sandbox" and sig["reason"] == "no experiments ran: the sandbox was down, so no experiment could run"
+
+
+def test_a_normal_shortage_keeps_its_reasons(env: SimpleNamespace) -> None:
+    rep, _ = night(env, lambda prompt: '{"hypotheses": []}')
+    assert rep["experiment_goal"]["shortfall_reasons"] == ["no permitted candidate with applicable replay cases"]
