@@ -1,0 +1,31 @@
+{
+  "worker-session-rules": {
+    "denied-false-match": {"denied_marks": ["values.example"]},
+    "denied-build": {"denied_marks": ["run build", "vite build", "web/dist", "cp -r web", "cp -R web"]},
+    "sibling-test-red": {"owned_file": "tests/test_case_counts.py"},
+    "brief-main-path": {"doc": "docs/infra.md"}
+  },
+  "worker-command-form": {
+    "node24-tests": {"runs": ["npm", "test"]},
+    "node24-typecheck": {"runs": ["tsc"]},
+    "node24-one-file": {"runs": ["tests/cart.test.mjs"]},
+    "node24-build-memory": {"runs": ["build", "max-old-space-size=4096"]}
+  },
+  "status-expect-line": {
+    "worker-suite-checklist": {"measured_min": 1.57},
+    "gate-rerun": {"measured_min": 7.33},
+    "brief-says-few-minutes": {"measured_min": 11.0},
+    "live-eval-usage": {"measured_min": 14.0},
+    "dispatch-three-workers": {"repo": "shop-api", "workers": 3, "brief_chars": 5120},
+    "dispatch-tool-printed": {"printed": "Expect: 18 min, ~9% of Claude 5h", "workers": 3},
+    "three-failed": {"failed": ["tests/test_tax.py::test_vat", "tests/test_tax.py::test_zero", "tests/test_cart.py::test_discount"],
+                     "full": "pytest -q"}
+  },
+  "codex-report-plain": {
+    "worker-guard-fix": {"integrations": ["vitals"], "diagram": true, "affects": ["push"], "internal": []},
+    "worker-report-split": {"integrations": [], "diagram": true, "affects": ["provider"], "internal": []},
+    "chat-deleted-series": {"integrations": ["calendar"], "diagram": false, "affects": ["standup"], "internal": [],
+                            "deletion": true},
+    "worker-small-retry": {"integrations": [], "diagram": false, "affects": ["retr"], "internal": []}
+  }
+}

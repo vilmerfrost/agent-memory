@@ -1,0 +1,20 @@
+{
+ "scenarios": [
+  {
+   "id": "worker-guard-fix",
+   "message": "The push guard now asks git for the current branch. Before, it used the folder name. A renamed folder could get around the guard.\n\nThis affects every push from a worktree. A push to a protected branch is now refused, whatever the folder is called.\n\n```mermaid\nflowchart LR\n  P[Push command] --> G[Guard] --> T[Git] --> R[Allow or deny]\n```\n\nFour new tests pass. No live push was tried. The next action is one live push attempt on a test branch.\n\nSkills, Plugins or MCPs used\n\nVitals\n"
+  },
+  {
+   "id": "worker-report-split",
+   "message": "The nightly report now shows one score per provider. Before, it mixed Claude and Codex results into one score.\n\nThis affects how you read the report. Each provider now gets its own verdict, and a strong result from one provider no longer hides a weak result from the other.\n\n```mermaid\nflowchart LR\n  R[Run results] --> S[Split by provider] --> V[Verdict per provider] --> O[Report]\n```\n\nThe report tests pass. The real nightly report has not run with this change yet. The next action is to read tomorrow's report.\n\nSkills, Plugins or MCPs used\n\nNone\n"
+  },
+  {
+   "id": "chat-deleted-series",
+   "message": "I deleted the weekly standup series from your work calendar. It held 26 events, on Mondays at 09:30.\n\nThis affects everyone invited to that meeting, because the events are gone from the calendar. You can undo this for 30 days, because the calendar keeps a deleted series in its trash. After that, it cannot be restored.\n\nNothing to do, unless you want the series back.\n\nSkills, Plugins or MCPs used\n\nCalendar MCP\n"
+  },
+  {
+   "id": "worker-small-retry",
+   "message": "The HTTP client now retries a failed request four times instead of two. The change is one default value in the client module.\n\nThis affects every request that uses the default. A short network failure is now less likely to reach the user, but a real outage takes a little longer to report.\n\nOne new test covers the default, and all unit tests pass. Nothing to do.\n\nSkills, Plugins or MCPs used\n\nNone\n"
+  }
+ ]
+}

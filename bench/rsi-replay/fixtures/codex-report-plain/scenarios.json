@@ -1,0 +1,49 @@
+{
+  "case": "codex-report-plain",
+  "you": "a Codex agent ending a task. A worker's final message goes to its parent agent, and the parent relays it to the owner of the repo. A chat agent's final message goes straight to the owner.",
+  "scenarios": [
+    {
+      "id": "worker-guard-fix",
+      "role": "worker, reporting to its parent",
+      "facts": [
+        "Commit 8a1f3de on branch fix/guard-rename.",
+        "The push guard used the folder name to decide which branch a push targets. A renamed folder got around it.",
+        "The guard now asks git for the current branch. Flow: push command, guard, git, allow or deny.",
+        "tests/test_guard.py has 4 new tests and passes. No live push was tried."
+      ],
+      "integrations_used": ["Vitals"]
+    },
+    {
+      "id": "worker-report-split",
+      "role": "worker, reporting to its parent",
+      "facts": [
+        "Commit 2c70bb9 on branch feat/provider-split.",
+        "The nightly report mixed Claude and Codex results in one score.",
+        "The report now shows one score per provider, and scores are no longer pooled. Flow: run results, split by provider, per-provider verdict, report.",
+        "tests/test_report.py passes. The real nightly report has not run with this change."
+      ],
+      "integrations_used": []
+    },
+    {
+      "id": "chat-deleted-series",
+      "role": "chat agent, talking to the owner",
+      "facts": [
+        "The owner asked to delete the weekly standup calendar series.",
+        "You deleted the series of 26 events, Mondays at 09:30, from the work calendar.",
+        "The calendar keeps deleted series in its trash for 30 days."
+      ],
+      "integrations_used": ["Calendar MCP"]
+    },
+    {
+      "id": "worker-small-retry",
+      "role": "worker, reporting to its parent",
+      "facts": [
+        "Commit 4e9d02a on branch fix/retry-default.",
+        "The HTTP client retry default went from 2 to 4 in src/client.py.",
+        "One unit test covers the new default and passes. The whole unit suite of 212 tests passes.",
+        "The brief needs nothing further from anyone."
+      ],
+      "integrations_used": []
+    }
+  ]
+}

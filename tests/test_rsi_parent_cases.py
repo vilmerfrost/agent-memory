@@ -42,8 +42,8 @@ def manifest(path):
 
 def expected_cases(path):
     return ["parent-repo-profile"] if path == PARENT else [
-        "worker-credential-runner", "worker-dod-gaps", "worker-final-report", "worker-helper-lifecycle",
-        "worker-helper-routing", "worker-server-launch"]
+        "worker-command-form", "worker-credential-runner", "worker-dod-gaps", "worker-final-report",
+        "worker-helper-lifecycle", "worker-helper-routing", "worker-server-launch", "worker-session-rules"]
 
 
 def bind_synthetic_section(root, digest, path):
