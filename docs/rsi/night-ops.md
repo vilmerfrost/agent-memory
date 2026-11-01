@@ -150,13 +150,32 @@ own preflight failed (no `skipped`) says the reason from its notes.
 **A bad night looks bad** (2026-11-01). The brief's optional `night_signal` covers every status other than `ok`, and
 any night under its daily minimum of experiments, whatever its status says. It holds `state` (`FAILED`, `PARTLY
 FAILED`, `DID NOT RUN`, `ABORTED`, `STOPPED EARLY`), `code`, `reason` and `reasons`. The push title carries the state
-and the first reason (`Night 2026-10-31 FAILED: no experiments ran: 3 of 3 candidates gave no usable idea`) at priority
-4, in the same one push. A normal night keeps its title and priority 3. The brief's optional `experiment_shortfall`
-says why fewer experiments ran than the daily target, from `experiment_goal`, the candidates' counts and the rejection
-codes. The `amem-rsi-brief` line stays PASS when the brief was written: `night_status` is the report's status, and a
-bad night adds `night_state=<state> night_reason=<code>` and one `-warn` line. `experiments=` counts the experiments
-that started. The "failed sandbox evals" count reads `rsi_eval_results` only: evals-parent logs to `routines.log`, so a
-red run counts as a routine failure.
+and the first reason (`Night 2026-10-31 FAILED: no experiments ran: 3 of 3 candidates gave no usable idea`), in the same
+one push. Only `FAILED`, `DID NOT RUN` and a night with no report go at priority 4 (Vilmer, 2026-11-01). `PARTLY
+FAILED`, which met its minimum, `ABORTED` and `STOPPED EARLY` keep their title at the normal priority 3, so a high
+priority still means something; a safety slip or a last-day item still raises the push. A normal night keeps its title
+and priority 3. The brief's optional `experiment_shortfall` says why fewer experiments ran than the daily target, from
+`experiment_goal`, the candidates' counts and the rejection codes. The `amem-rsi-brief` line stays PASS when the brief
+was written: `night_status` is the report's status, and a bad night adds `night_state=<state> night_reason=<code>` and
+one `-warn` line. `experiments=` counts the experiments that started. The "failed sandbox evals" count reads
+`rsi_eval_results` only: evals-parent logs to `routines.log`, so a red run counts as a routine failure.
+
+**The title names what really stopped the night** (2026-11-01). Causes run in this order, in fixed words: a crash (`the
+night stopped on an internal error`, or `a database error`), a sandbox outage, the idea writer failing (`Claude
+authentication failed while writing ideas`, or `the idea writer failed on 1 of 3 candidates`), ideas of no use,
+experiments that broke, missing evidence, and last the rows the loop could not ask, which sit in every report and
+explain a night only when no candidate got past them. `night_reason` is `crash`, `sandbox`, `auth`, `hypothesizer` or
+`no_experiments`. Exception and model text stay in the report's notes: a title or a body never carries them, and a
+preflight title says `the client compatibility check failed` or names authentication instead of the raw line. The
+report gives the same reasons in `experiment_goal.shortfall_reasons`, and a failed idea-writer call keeps the code
+`hypothesizer_failed` or `hypothesizer_auth`.
+
+**A night with no report still pushes** (2026-11-01). A night can leave no `report.json`: a config error, a lock or
+database failure in its own preflight, a `client_maintenance` skip, a watchdog kill, or a run launchd never started.
+The brief job stays FAIL, and its one push says `Night <night> DID NOT REPORT: <why>` at priority 4, with that morning's
+escalations, safety slips and last-day items. The reason comes from the night's `amem-rsi-night` line in fixed words
+(`night_reason` on the brief's line); a held lock and an unreadable report file get their own words. The push does not
+say what waits or what was tested, because nothing is known about it. A normal night still sends one push.
 
 Since 2026-10-23 (verify run of night 2026-10-23, partial, $0.14):
 
@@ -237,7 +256,11 @@ Since 2026-10-23 (verify run of night 2026-10-23, partial, $0.14):
     heading is inside that parent, and a renamed heading through `RULE_ALIASES`. It never matches a bare substring. A
     key that still matches nothing gets `rule_section_missing`: no model call and no attempt. When that code shows up
     for a renamed heading, add the pair to `RULE_ALIASES`. Keys that resolve to one section share one slot a night;
-    the highest ranked runs and the others wait.
+    the highest ranked runs and the others wait, with no Jev call, so aliases cannot fill the pool. When that row ends
+    with no experiment (a decline, a deferral, no evidence) and the night is still under its daily minimum, the next
+    alias takes the slot, at most `target_experiments` tries a night (Vilmer, 2026-11-01: the daily minimum wins). A
+    failed experiment counts as the section's try. A section over 16,000 characters (`SECTION_MAX`) can never be
+    listed, so it is deferred before triage with `rule_section_not_listed`: no slot, no Jev call, no evidence pack.
   - **Attempts** count the candidate's own misses only. A loop fault (`LOOP_FAULTS`) and a stale stored idea
     (`stale_pending`) charge nothing. A real decline (`no_ideas`) counts: a candidate that never yields an idea still
     retires, and returns when it is seen again.
@@ -350,8 +373,9 @@ shows "not saved" when a field is missing.
 `~/…/*.md` path): `unparseable`, `not_an_object`, `unknown_fields`, `missing_fields`, `bad_target`,
 `not_allowlisted`, `not_text`, `empty`, `too_long`, `control_chars`, `looks_like_command`, `bad_risk`,
 `bad_confidence`, `over_cap`, `duplicate`, `ignored`, `invalid`, `no_ideas`, `stale_pending`, `rule_section_missing`,
-`rule_section_not_listed`. The last two (`LOOP_FAULTS`) are the loop's own faults: no model call ran, and
-`index` is null. `rule_section_missing` can appear on a candidate that triage never selected.
+`rule_section_not_listed`, `hypothesizer_failed`, `hypothesizer_auth`. `rule_section_missing` and
+`rule_section_not_listed` (`LOOP_FAULTS`) are the loop's own faults: no model call ran, and `index` is null. Both can
+appear on a candidate that triage never selected. The last two (`IDEA_FAULTS`) mean the call itself failed.
 
 `what` may run to 1,000 characters when the idea carries an edit object, because the edit is the intervention. It is
 never cut: the injection scan and the writer's placement check read all of it. An idea without an edit stays at 200.

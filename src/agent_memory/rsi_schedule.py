@@ -925,6 +925,38 @@ def wait_for_night(night: str, root: Path | None, wait_s: float, *, poll_s: floa
     return clock() - start
 
 
+# Why a night left no report, from its routines.log line: (the start of a -fail or -warn detail, code, fixed words).
+# The details hold exception text, so only these words go further.
+NO_REPORT_CAUSES = (("config:", "config", "its config could not be read"),
+                    ("hard timeout", "timeout", "it ran past its hard time limit and was stopped"),
+                    ("overlap:", "lock", "another night held the lock"),
+                    ("preflight: lock", "lock", "another night held the lock"),
+                    ("preflight: database", "database", "the database could not be reached"),
+                    ("preflight: delta: database", "database", "the database could not be reached"),
+                    ("signal:", "signal", "it was stopped from outside"))
+
+
+def no_report_cause(log: Path, night: str) -> tuple[str, str]:
+    """(code, fixed words) for a night with no report.json, from the newest amem-rsi-night line of that night. A night
+    the job never logged says so: launchd did not start it, or it died before its line."""
+    from agent_memory import rsi_brief as BR
+    try:
+        runs = [r for r in RL.parse_file(log).runs if r.routine == NIGHT_ROUTINE and str(r.meta.get("night")) == night]
+    except OSError:
+        return "unknown", "no reason was recorded"
+    if not runs:
+        return "no_run", "no night run was logged"
+    last = max(runs, key=lambda r: r.line_no)
+    if last.meta.get("skipped") == "client_maintenance":
+        return "maintenance", "a client update held the night back"
+    details = [str(d) for d in [*last.meta.get("failures", []), *last.meta.get("warnings", [])]]
+    for mark, code, words in NO_REPORT_CAUSES:
+        if any(d.startswith(mark) for d in details):
+            return code, words
+    crash = next((d for d in details if d.startswith("night: error:")), None)
+    return BR.crash_cause(crash) if crash else ("unknown", "no reason was recorded")
+
+
 def run_brief_job(*, root: Path | None = None, night: str | None = None, now: datetime | None = None,
                   routines_log: Path | None = None, out_dir: Path | None = None, db_url: str | None = None,
                   write_log: bool = True, wait_s: float = 0.0, poll_s: float = 60.0,
@@ -934,7 +966,8 @@ def run_brief_job(*, root: Path | None = None, night: str | None = None, now: da
     `out_dir` (default ~/.claude/parent/reports). Waits up to `wait_s` for the night to finish (its lock released
     and its report written). Stores the completed snapshot for Night Desk. With `push` (the scheduled CLI run),
     the one morning push (alerts.push_morning): the night's result plus amem-daily's new escalations, safety slips
-    and last-day proposals; nothing when all of them are quiet. `state`: amem-daily's state file (pushed ids)."""
+    and last-day proposals; nothing when all of them are quiet. A night with no report is never quiet: the job stays
+    FAIL, and the push says so and carries the same morning parts. `state`: amem-daily's state file (pushed ids)."""
     from agent_memory import rsi_brief as BR
     t0 = time.monotonic()
     fixed = now is not None
@@ -949,16 +982,38 @@ def run_brief_job(*, root: Path | None = None, night: str | None = None, now: da
             append_log(log, res.lines)
         return res
 
+    def send_morning(b: dict[str, Any]) -> None:
+        if not push:
+            return
+        from agent_memory import alerts
+        try:
+            sent, extra, problems = alerts.push_morning(b, notify=notify, db_url=db_url, state_file=state)
+            res.fields["push"] = sent
+            res.fields["escalations_new"] = len(extra.new_rows)
+            res.fields["safety"] = len(extra.safety)
+            res.fields["expiring"] = len(extra.expiring)
+            res.warnings += [f"push {_one_line(p, 200)}" for p in problems]   # a part left out is a warning
+        except Exception as exc:  # the brief is written; a failed push is a note, not a failed brief
+            res.fields["push"] = "error"
+            res.items.append(f"push: {_one_line(exc, 160)}")
+
+    def no_report(item: str, code: str, why: str) -> JobResult:
+        res.status, res.items = "FAIL", [item]
+        res.fields.update(night_state=BR.NO_REPORT_STATE, night_reason=code)
+        send_morning(BR.no_report_brief(night, code, why))
+        return finish()
+
     if wait_s > 0:
         res.fields["waited_s"] = int(wait_for_night(night, root, wait_s, poll_s=poll_s, sleep=sleep))
     if night_running(root):
-        res.status, res.items = "FAIL", [f"night running: the rsi-night lock is held; no brief for {night} yet"]
-        return finish()
+        return no_report(f"night running: the rsi-night lock is held; no brief for {night} yet", "running",
+                         "it was still running when the brief started")
     try:
         b = BR.make_brief(night=night, root=root, db_url=db_url)
     except BR.ReportError as exc:
-        res.status, res.items = "FAIL", [f"report: {_one_line(exc, 240)}"]
-        return finish()
+        broken = ((root or RA.sandbox_dir()) / "nights" / night / "report.json").exists()
+        code, why = ("report", "its report file could not be read") if broken else no_report_cause(log, night)
+        return no_report(f"report: {_one_line(exc, 240)}", code, why)
     out = Path(out_dir or DEFAULT_REPORTS_DIR).expanduser()
     out.mkdir(parents=True, exist_ok=True)
     from agent_memory import telemetry_analysis
@@ -990,18 +1045,7 @@ def run_brief_job(*, root: Path | None = None, night: str | None = None, now: da
     if b["health"]["database"]["status"] != "ok":
         res.items.append(f"database: rows not read ({b['health']['database']['detail'] or 'unavailable'})")
         res.status = "FAIL"
-    if push:
-        from agent_memory import alerts
-        try:
-            sent, extra, problems = alerts.push_morning(b, notify=notify, db_url=db_url, state_file=state)
-            res.fields["push"] = sent
-            res.fields["escalations_new"] = len(extra.new_rows)
-            res.fields["safety"] = len(extra.safety)
-            res.fields["expiring"] = len(extra.expiring)
-            res.warnings += [f"push {_one_line(p, 200)}" for p in problems]   # a part left out is a warning
-        except Exception as exc:  # the brief is written; a failed push is a note, not a failed brief
-            res.fields["push"] = "error"
-            res.items.append(f"push: {_one_line(exc, 160)}")
+    send_morning(b)
     res.report = str(mdp)
     res.detail.update(brief=b, markdown=md, json_path=str(jsp))
     return finish()

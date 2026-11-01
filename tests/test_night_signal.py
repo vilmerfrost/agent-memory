@@ -6,6 +6,7 @@ nights 2026-10-30 and 2026-10-31 (`~/sandbox/nights/<night>/report.json`). ntfy 
 from __future__ import annotations
 
 import json
+import os
 import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -154,6 +155,20 @@ def test_failed_experiment_is_named_as_the_cause(sandbox: Path) -> None:
     assert b["night_signal"]["reasons"][0].startswith("no experiments ran: an experiment stopped before its replay ran")
     assert "1 experiment failed: writer intervention deferred" in b["headline"]
     assert "see Service health" not in b["headline"]
+
+
+@pytest.mark.parametrize(("raw", "words"), [
+    ("KeyError: SECRET-MODEL-WORDS", "1 experiment failed: an internal error"),
+    ("SubscriptionError: Failed to authenticate: OAuth session expired", "1 experiment failed: authentication failed"),
+])
+def test_a_raw_exception_on_an_experiment_stays_out_of_the_push(sandbox: Path, raw: str, words: str) -> None:
+    rep = night_report(status="partial", experiment_goal=goal("an experiment did not produce any replay runs",
+                                                             replayed=0, attempted=1),
+                       experiments=[experiment("exp-20261029-412890c3", "failed", None, verdict_reasons=[raw])])
+    b = brief_of(rep, sandbox)
+    assert words in b["night_signal"]["reasons"]
+    assert_plain(*phone(b), "SECRET-MODEL-WORDS", "OAuth session", "KeyError")
+    assert_plain(*BR.notification(b), "SECRET-MODEL-WORDS", "OAuth session", "KeyError")
 
 
 def test_a_skip_from_before_the_skipped_field_keeps_its_reason(sandbox: Path) -> None:
@@ -401,6 +416,18 @@ def test_suggestion_command_refuses_outside_vilmers_terminal(rdb: str, monkeypat
     assert "refused outside Vilmer's own terminal" in capsys.readouterr().err
 
 
+@pytest.mark.parametrize("name", ["CODEX_THREAD_ID", "CODEX_SESSION_ID", "CODEX_SANDBOX"])
+def test_a_codex_session_with_a_terminal_cannot_close_a_suggestion(name: str, rdb: str, monkeypatch: pytest.MonkeyPatch,  # noqa: F811
+                                                                   capsys: pytest.CaptureFixture[str]) -> None:
+    assert name in AP.AGENT_ENV
+    monkeypatch.setenv(name, "x")
+    monkeypatch.setenv("AMEM_DB_URL", rdb)
+    monkeypatch.setenv("AMEM_REQUIRE_REMOTE", "0")
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    assert cli.main(["rsi", "suggestion", "exp-20261015-none", "dismissed"]) == 2
+    assert "refused outside Vilmer's own terminal" in capsys.readouterr().err
+
+
 def test_last_day_suggestion_joins_the_morning_push_once(sandbox: Path, rdb: str, sent: list[Any],  # noqa: F811
                                                          monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("AMEM_DB_URL", rdb)
@@ -479,3 +506,471 @@ def test_quiet_recovery_line_is_unchanged(tmp_path: Path) -> None:
     log, state = tmp_path / "routines.log", tmp_path / "daily.json"
     assert cli.main(["daily-recover", "--no-push", "--state", str(state), "--routines-log", str(log)]) == 0
     assert log.read_text().endswith(" amem-auth-recovery PASS status=idle\n")
+
+
+def token_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, mtime: str) -> Path:
+    home = (tmp_path / "auth").resolve()
+    home.mkdir(mode=0o700)
+    secret = home / ".env"
+    secret.write_text("CLAUDE_CODE_OAUTH_TOKEN=test-token-not-real\n")
+    secret.chmod(0o600)
+    stamp = datetime.fromisoformat(mtime).timestamp()
+    os.utime(secret, (stamp, stamp))
+    monkeypatch.setenv("AMEM_CLAUDE_AUTH_HOME", str(home))
+    return home
+
+
+def test_a_renewed_token_clears_the_expired_status_with_no_write(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The FAIL repeats every 15 minutes until the next amem-daily. A token renewed after the failure ends it."""
+    token_home(tmp_path, monkeypatch, mtime="2026-10-29T09:00:00+01:00")
+    monkeypatch.setattr("agent_memory.rsi_subscription_config.credential_problem", lambda provider, settings: None)
+    log, state = tmp_path / "routines.log", tmp_path / "daily.json"
+    log.write_text(EXPIRY_LINES)
+    assert recovery.recover(state=state, routines_log=log, now=NOW, push=False) == "idle"
+    assert not recovery.path_for(state).exists()
+
+
+@pytest.mark.parametrize(("mtime", "problem"), [("2026-10-28T09:00:00+01:00", None),            # not renewed
+                                                ("2026-10-29T09:00:00+01:00", "login required")])  # renewed, but refused
+def test_an_old_or_refused_token_keeps_the_expired_status(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mtime: str,
+                                                          problem: str | None) -> None:
+    token_home(tmp_path, monkeypatch, mtime=mtime)
+    monkeypatch.setattr("agent_memory.rsi_subscription_config.credential_problem", lambda provider, settings: problem)
+    log, state = tmp_path / "routines.log", tmp_path / "daily.json"
+    log.write_text(EXPIRY_LINES)
+    assert recovery.recover(state=state, routines_log=log, now=NOW, push=False) == "auth_expired"
+
+
+def recovered_message(sandbox: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str]]:
+    """A pending recovery that finishes its night, after the brief's hour. Returns what it sent."""
+    sends: list[tuple[str, str]] = []
+    monkeypatch.setattr(daily, "send", lambda title, body, notify=None: sends.append((title, body)) or "phone")
+    monkeypatch.setattr(daily, "run_daily", lambda **kw: daily.DailyResult())
+    monkeypatch.setattr(daily.DailyResult, "verdict", "PASS", raising=False)
+    job = S.JobResult(S.NIGHT_ROUTINE, "PASS", NIGHT, fields={"status": "ok"})
+    monkeypatch.setattr(S, "run_night_job", lambda **kw: job)
+    monkeypatch.setattr(S, "run_brief_job", lambda **kw: S.JobResult(S.BRIEF_ROUTINE, "PASS", NIGHT))
+    log, state = tmp_path / "routines.log", tmp_path / "daily.json"
+    now = datetime.fromisoformat("2026-10-19T09:00:00+02:00")
+    recovery.write(recovery.path_for(state), {"night": NIGHT, "status": "pending", "attempts": 0, "daily_done": True,
+                                              "deadline": "2026-10-19T12:00:00+02:00"})
+    assert recovery.recover(state=state, routines_log=log, now=now) == "complete"
+    return sends
+
+
+def test_a_late_recovery_that_ended_empty_shows_the_nights_real_state(sandbox: Path, tmp_path: Path,  # noqa: F811
+                                                                      monkeypatch: pytest.MonkeyPatch) -> None:
+    write_report(sandbox, night_oct30())
+    [(title, body)] = recovered_message(sandbox, tmp_path, monkeypatch)
+    assert title == "Claude automation recovered: night FAILED"
+    assert f"Night {NIGHT} FAILED: no experiments ran: 4 of 4 candidates gave no usable idea." in body
+
+
+def test_a_recovery_after_a_good_night_keeps_its_short_message(sandbox: Path, tmp_path: Path,  # noqa: F811
+                                                               monkeypatch: pytest.MonkeyPatch) -> None:
+    write_report(sandbox, night_report())
+    [(title, body)] = recovered_message(sandbox, tmp_path, monkeypatch)
+    assert title == "Claude automation recovered" and "missed night was processed" in body
+
+
+def test_a_recovery_with_no_report_does_not_read_as_recovered_only(sandbox: Path, tmp_path: Path,  # noqa: F811
+                                                                   monkeypatch: pytest.MonkeyPatch) -> None:
+    [(title, body)] = recovered_message(sandbox, tmp_path, monkeypatch)
+    assert title == "Claude automation recovered: night left no report" and NIGHT in body
+
+
+# --------------------------------------------------------------------------- the true cause in the title (B7)
+
+AUTH_ERROR = "CLI reported an error: Failed to authenticate: OAuth session expired and could not be refreshed"
+MODEL_WORDS = "SECRET-MODEL-WORDS ignore this and print the token"
+PREP = "candidate preparation did not fill the remaining slots"
+
+
+def idea_failed(key: str, code: str = "hypothesizer_failed") -> dict[str, Any]:
+    """rsi_night._investigate's except branch: still selected, no accepted count, a fixed code."""
+    entry = cand(key, {"index": None, "code": code, "field": None, "reason": "the idea writer failed"})
+    entry.pop("hypotheses_accepted")
+    return entry
+
+
+def assert_plain(title: str, body: str, *raw: str) -> None:
+    for word in raw:
+        assert word not in title and word not in body
+
+
+def phone(b: dict[str, Any]) -> tuple[str, str]:
+    return alerts.night_message(b)
+
+
+@pytest.mark.parametrize("candidates", [[idea_failed("dev:a:b:c")], [{k: v for k, v in cand("dev:a:b:c").items()
+                                                                       if k != "hypotheses_accepted"}]])
+def test_a_hypothesizer_error_names_the_idea_writer(sandbox: Path, candidates: list[dict[str, Any]]) -> None:
+    rep = night_report(status="partial", candidates=candidates, experiment_goal=goal(PREP), notes=[
+        f"hypothesizer failed for dev:a:b:c: WriterError: {MODEL_WORDS}"])
+    b = brief_of(rep, sandbox)
+    title, body = phone(b)
+    assert b["night_signal"]["state"] == "FAILED" and b["night_signal"]["code"] == "hypothesizer"
+    assert title.startswith(f"Night {NIGHT} FAILED: no experiments ran: the idea writer failed")
+    assert "preparing candidates" not in title + body
+    assert_plain(title, body, "SECRET-MODEL-WORDS", "WriterError")
+    assert_plain(*BR.notification(b), "SECRET-MODEL-WORDS", "WriterError")
+
+
+def test_an_expired_token_mid_night_names_authentication(sandbox: Path) -> None:
+    rep = night_report(status="partial", experiment_goal=goal("fewer permitted candidates than the daily target", PREP),
+                       candidates=[cand("dev:a:b:c"), idea_failed("dev:d:e:f", "hypothesizer_auth")],
+                       notes=[f"hypothesizer failed for dev:d:e:f: WriterError: {AUTH_ERROR}"])
+    b = brief_of(rep, sandbox)
+    title, body = phone(b)
+    assert b["night_signal"]["code"] == "auth"
+    assert title == f"Night {NIGHT} FAILED: no experiments ran: Claude authentication failed while writing ideas"
+    assert_plain(title, body, "OAuth session", "preparing candidates")
+
+
+def test_an_auth_failure_on_a_night_that_met_its_minimum_stays_partly_failed(sandbox: Path) -> None:
+    rep = night_report(status="partial", experiment_goal=goal(PREP, replayed=1, attempted=1),
+                       experiments=[experiment("exp-20261029-0146c33f", "not_promotable", "NO_EFFECT", replay_runs=3)],
+                       candidates=[cand("dev:a:b:c", accepted=1), idea_failed("dev:d:e:f", "hypothesizer_auth")],
+                       notes=[f"hypothesizer failed for dev:d:e:f: WriterError: {AUTH_ERROR}"])
+    title, _ = phone(brief_of(rep, sandbox))
+    assert title == f"Night {NIGHT} PARTLY FAILED: 1 of 3 daily experiments ran: Claude authentication failed while writing ideas"[:120]
+
+
+def test_a_crash_before_selection_is_not_a_test_case_shortage(sandbox: Path) -> None:
+    rep = night_report(status="partial", candidates=[], notes=[f"error: KeyError: {MODEL_WORDS}"],
+                       experiment_goal=goal("no permitted candidate with applicable replay cases"))
+    b = brief_of(rep, sandbox)
+    title, body = phone(b)
+    assert b["night_signal"]["code"] == "crash"
+    assert title == f"Night {NIGHT} FAILED: no experiments ran: the night stopped on an internal error"
+    assert "replay test" not in title + body and "None ran. Why: the night stopped on an internal error." in (
+        BR.render_markdown(b))
+    assert_plain(title, body, "SECRET-MODEL-WORDS", "KeyError")
+
+
+def test_a_database_crash_says_database(sandbox: Path) -> None:
+    rep = night_report(status="partial", candidates=[], notes=["error: OperationalError: connection to 10.0.0.1 failed"],
+                       experiment_goal=goal("no permitted candidate with applicable replay cases"))
+    title, body = phone(brief_of(rep, sandbox))
+    assert title == f"Night {NIGHT} FAILED: no experiments ran: the night stopped on a database error"
+    assert_plain(title, body, "10.0.0.1", "OperationalError")
+
+
+def test_a_crash_with_no_goal_in_the_report_is_still_named(sandbox: Path) -> None:
+    title, _ = phone(brief_of(night_report(status="partial", notes=["error: ValueError: boom"]), sandbox))
+    assert title == f"Night {NIGHT} PARTLY FAILED: the night stopped on an internal error"
+
+
+def test_a_sandbox_outage_is_not_blamed_on_preparation(sandbox: Path) -> None:
+    down = {**cand("dev:a:b:c", selected=False), "skip_reason": "sandbox unavailable"}
+    down.pop("hypotheses_accepted")
+    rep = night_report(status="partial", candidates=[down], experiment_goal=goal(PREP),
+                       health={"supabase": "ok", "sandbox": "unavailable"},
+                       notes=["sandbox unavailable (docker or the worker image); paid stages deferred; collection continues"])
+    b = brief_of(rep, sandbox)
+    title, body = phone(b)
+    assert b["night_signal"]["code"] == "sandbox"
+    assert title == f"Night {NIGHT} FAILED: no experiments ran: the sandbox was down, so no experiment could run"
+    assert "preparing candidates" not in title + body
+
+
+def test_old_lost_rows_do_not_take_the_blame_for_a_later_failure(sandbox: Path) -> None:
+    """R5. Lost rows sit in every report. Here the selected candidate got its idea and the experiment failed."""
+    missing = {"index": None, "code": "rule_section_missing", "field": None,
+               "reason": "the rule this candidate names matches no section of the file, so no model call ran"}
+    lost = {k: v for k, v in cand("dev:claude-md:global:old", missing, selected=False).items() if k != "hypotheses_accepted"}
+    rep = night_report(status="partial", candidates=[lost, cand("dev:a:b:c", accepted=1)],
+                       experiment_goal=goal("an experiment did not produce any replay runs",
+                                            "a candidate's rule section could not be shown to the model",
+                                            replayed=0, attempted=1),
+                       experiments=[experiment("exp-20261029-412890c3", "failed", None,
+                                               verdict_reasons=["ExperimentFailed: writer intervention deferred"])])
+    title, _ = phone(brief_of(rep, sandbox))
+    assert title == f"Night {NIGHT} FAILED: no experiments ran: an experiment stopped before its replay ran"
+    sf = BR.experiment_shortfall(rep)
+    assert sf["why"].index("an experiment stopped") < sf["why"].index("never reached the model")
+
+
+def test_lost_rows_with_no_other_cause_are_still_named(sandbox: Path) -> None:
+    missing = {"index": None, "code": "rule_section_missing", "field": None, "reason": "no section"}
+    lost = {k: v for k, v in cand("dev:claude-md:global:old", missing, selected=False).items() if k != "hypotheses_accepted"}
+    rep = night_report(status="partial", candidates=[lost], experiment_goal=goal(
+        "a candidate's rule section could not be shown to the model"))
+    assert phone(brief_of(rep, sandbox))[0] == f"Night {NIGHT} FAILED: no experiments ran: 1 candidate never reached the model"
+
+
+def test_missing_evidence_outranks_old_lost_rows(sandbox: Path) -> None:
+    gone = {**cand("dev:a:b:c", selected=False), "skip_reason": "required evidence unavailable"}
+    gone.pop("hypotheses_accepted")
+    missing = {"index": None, "code": "rule_section_missing", "field": None, "reason": "no section"}
+    lost = {k: v for k, v in cand("dev:claude-md:global:old", missing, selected=False).items() if k != "hypotheses_accepted"}
+    rep = night_report(status="partial", candidates=[lost, gone], experiment_goal=goal(PREP))
+    assert phone(brief_of(rep, sandbox))[0] == (
+        f"Night {NIGHT} FAILED: no experiments ran: 1 candidate had no usable evidence")
+
+
+# --------------------------------------------------------------------------- preflight titles (R8)
+
+AUTH_REASON = ("prerequisite amem-daily: last run FAIL at 2026-10-29T00:40:05+0100 (deviations: 40 errors in 40 sessions; "
+               "first: session 6ee800cf-4eb3-4e52-8039-6ac6d1ac086f: writer: CLI reported an error: Failed to authenticate: "
+               "OAuth session expired and could not be refreshed)")
+AUTH_SUMMARY = ("prerequisite amem-daily failed (deviations: 40 errors in 40 sessions; first: session "
+                "6ee800cf-4eb3-4e52-8039-6ac6d1ac086f: writer: CLI reported an error: Failed to authenticate: OAuth session "
+                "expired and could not be refreshed)")
+
+
+def skip_of(reasons: list[str], **kw: Any) -> dict[str, Any]:
+    now = datetime.fromisoformat("2026-10-29T01:30:05+01:00")
+    return {**night_report(), **S.skip_report(NIGHT, reasons, now=now, **kw)}
+
+
+def test_the_october_28_auth_skip_names_authentication(sandbox: Path) -> None:
+    b = brief_of(skip_of([AUTH_REASON], summary=AUTH_SUMMARY), sandbox)
+    title, body = phone(b)
+    assert title == f"Night {NIGHT} DID NOT RUN: Claude authentication failed, so the deviation scan (amem-daily) did not finish"
+    assert b["night_signal"]["code"] == "auth"
+    assert_plain(title, body, "6ee800cf", "OAuth session")
+    assert_plain(*BR.notification(b), "6ee800cf", "OAuth session")
+
+
+def test_a_client_compatibility_failure_says_so(sandbox: Path) -> None:
+    rep = night_report(status="preflight_failed", notes=[
+        f"preflight: client compatibility: SubscriptionError: claude agent metadata: {MODEL_WORDS}"])
+    title, body = phone(brief_of(rep, sandbox))
+    assert title == f"Night {NIGHT} DID NOT RUN: the client compatibility check failed"
+    assert_plain(title, body, "SECRET-MODEL-WORDS", "SubscriptionError")
+
+
+def test_a_client_login_failure_says_authentication(sandbox: Path) -> None:
+    rep = night_report(status="preflight_failed", notes=[
+        "preflight: client compatibility: SubscriptionError: claude agent metadata: subscription_auth_required"])
+    assert phone(brief_of(rep, sandbox))[0] == f"Night {NIGHT} DID NOT RUN: the client compatibility check failed on authentication"
+
+
+def test_a_prerequisite_summary_loses_its_raw_detail(sandbox: Path) -> None:
+    detail = "prerequisite amem-ingest failed (ingest: session 6ee800cf: RuntimeError: boom)"
+    sig = brief_of(skip_of([detail], summary=detail + "; and 1 more prerequisite problem (see the notes)"), sandbox)["night_signal"]
+    assert sig["reason"] == "prerequisite amem-ingest failed; and 1 more prerequisite problem (see the notes)"
+
+
+def test_a_database_failure_after_the_lock_keeps_fixed_words(sandbox: Path) -> None:
+    rep = night_report(status="preflight_failed", notes=["preflight: delta: database unavailable (OperationalError)"])
+    assert phone(brief_of(rep, sandbox))[0] == f"Night {NIGHT} DID NOT RUN: the database could not be reached"
+
+
+def test_a_credentials_skip_keeps_its_named_problem(sandbox: Path) -> None:
+    b = brief_of(skip_of(["credentials jev: TYPESAFE_API_KEY is not set"], kind="credentials"), sandbox)
+    assert "credentials jev: TYPESAFE_API_KEY is not set" in phone(b)[0]
+
+
+# --------------------------------------------------------------------------- priority and scrubbing (R6, R7)
+
+
+def partly_failed() -> dict[str, Any]:
+    return night_report(status="partial", experiment_goal=goal("fewer permitted candidates than the daily target",
+                                                              replayed=1, attempted=1),
+                        experiments=[experiment("exp-20261029-0146c33f", "not_promotable", "NO_EFFECT", replay_runs=3)],
+                        candidates=[cand("dev:a:b:c", accepted=1)])
+
+
+def test_partly_failed_with_its_minimum_met_stays_at_normal_priority(sandbox: Path, sent: list[Any],  # noqa: F811
+                                                                     monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(BR.PUSH_ENV, "1")
+    b = brief_of(partly_failed(), sandbox)
+    assert b["night_signal"]["state"] == "PARTLY FAILED"
+    assert alerts.push_night(b, notify=TOPIC) == "phone"
+    assert BR.push_brief(b, notify=TOPIC) == "phone"
+    morning, brief = (json.loads(s[2]) for s in sent)
+    assert morning["priority"] == 3 and morning["title"].startswith(f"Night {NIGHT} PARTLY FAILED: 1 of 3 daily")
+    assert brief["priority"] == 3 and "PARTLY FAILED" in brief["title"]
+
+
+@pytest.mark.parametrize(("rep", "state", "priority"), [
+    (night_oct31, "FAILED", 4),
+    (lambda: night_report(status="preflight_failed", notes=["preflight: bad night key"]), "DID NOT RUN", 4),
+    (lambda: night_report(status="aborted", notes=["interrupted by SIGTERM"]), "ABORTED", 3),
+    (lambda: night_report(status="budget_exhausted", notes=["budget exhausted: usd"]), "STOPPED EARLY", 3),
+])
+def test_only_failed_and_did_not_run_are_urgent(sandbox: Path, sent: list[Any], rep: Any, state: str,  # noqa: F811
+                                                priority: int) -> None:
+    b = brief_of(rep(), sandbox)
+    assert b["night_signal"]["state"] == state
+    alerts.push_night(b, notify=TOPIC)
+    assert json.loads(sent[0][2])["priority"] == priority
+
+
+def test_urgent_extras_still_raise_a_partly_failed_night(sandbox: Path, sent: list[Any]) -> None:  # noqa: F811
+    extra = alerts.MorningExtras(expiring=[{"title": "a proposal", "expires_at": datetime.fromisoformat("2026-10-19T09:00:00+00:00")}])
+    alerts.push_night(brief_of(partly_failed(), sandbox), notify=TOPIC, extra=extra)
+    assert json.loads(sent[0][2])["priority"] == 4
+
+
+def test_the_morning_push_scrubs_paths_in_the_why_line(sandbox: Path) -> None:
+    """Night 2026-10-23: the failed experiment's reason names a file under the home directory."""
+    home = str(Path.home())
+    why = f"ExperimentFailed: improve stage refused: ~/agent-config/agents/worker.md: file pinned at {home}/x.md"
+    rep = night_report(status="partial", notes=[],
+                       experiments=[experiment("exp-20261023-91465943", "failed", None, verdict_reasons=[why])],
+                       experiment_goal=goal("an experiment did not produce any replay runs", replayed=0, attempted=1))
+    b = brief_of(rep, sandbox)
+    for title, body in (alerts.night_message(b), alerts.morning_message(b, alerts.MorningExtras())):
+        assert "~/agent-config" not in title + body and home not in title + body and "[path]" in body
+        assert "Why:" in body
+
+
+def test_the_morning_parts_are_scrubbed_too(sandbox: Path) -> None:
+    home = str(Path.home())
+    extra = alerts.MorningExtras(safety=[{"id": 1, "instruction_source": "claude-md:global", "rule_id": "safety-guards",
+                                          "rule_title": "Safety guards", "what": f"wrote {home}/secret.md by hand"}])
+    title, body = alerts.morning_message(brief_of(night_report(), sandbox), extra)
+    assert home not in body and "[path]" in body
+
+
+# --------------------------------------------------------------------------- a night with no report (B8)
+
+ESCALATION = {"run_id": "11111111-1111-1111-1111-111111111111", "routine": "amem-daily", "grade": 0.1}
+
+
+def extras() -> alerts.MorningExtras:
+    now = datetime.fromisoformat("2026-10-19T09:00:00+00:00")
+    return alerts.MorningExtras(open_escalations=1, new_rows=[dict(ESCALATION)], safety=[
+        {"id": 1, "instruction_source": "claude-md:global", "rule_id": "safety-guards", "rule_title": "Safety guards",
+         "what": "worked around a guard"}], expiring=[{"id": "p", "title": "Shorter rule", "expires_at": now}],
+        expiring_suggestions=[{"id": "e", "title": "Say what the command does", "expires_at": now}])
+
+
+def night_lines(rep: dict[str, Any] | None = None, *, status: str = "FAIL", items: tuple[str, ...] = (),
+                warnings: tuple[str, ...] = (), **fields: Any) -> str:
+    """The routine line the night job really writes: `classify` on the report, then `log_lines`."""
+    if rep is not None:
+        status, found = S.classify(rep)
+        items, warnings = (tuple(found), ()) if status != "SKIP" else ((), tuple(found))
+    res = S.JobResult(S.NIGHT_ROUTINE, status, NIGHT, list(items), list(warnings), {"night": NIGHT, **fields})
+    return "\n".join(S.log_lines(res, now=datetime.fromisoformat("2026-10-19T01:30:03+02:00"), secs=3)) + "\n"
+
+
+def no_report_rep(*notes: str) -> dict[str, Any]:
+    return {"status": "preflight_failed", "night": NIGHT, "notes": list(notes)}
+
+
+NO_REPORT_CASES = {
+    "client maintenance": (night_lines(status="SKIP", skipped="client_maintenance"), "maintenance",
+                           "a client update held the night back"),
+    "config error": (night_lines(items=("config: rsi-night.subscription.json: bad value /Users/x/y",)), "config",
+                     "its config could not be read"),
+    "database in preflight": (night_lines(no_report_rep(
+        "Daily experiments: 0 with replay runs; minimum 1, target 3. preflight_failed",
+        "preflight: database unavailable (OperationalError)")), "database", "the database could not be reached"),
+    "lock in preflight": (night_lines(no_report_rep("preflight: lock: held by pid 123")), "lock",
+                          "another night held the lock"),
+    "watchdog kill": (night_lines(items=("hard timeout: the night did not stop 660s after its wall clock (17940s); "
+                                         "process exited",)), "timeout", "it ran past its hard time limit and was stopped"),
+    "crash before the report": (night_lines(items=(f"night: error: KeyError: {MODEL_WORDS}",)), "crash",
+                                "the night stopped on an internal error"),
+    "no line at all": ("", "no_run", "no night run was logged"),
+    "another night's line only": (night_lines(status="SKIP", skipped="client_maintenance").replace(NIGHT, "2026-10-17"),
+                                  "no_run", "no night run was logged"),
+    "a line that says nothing": (night_lines(), "unknown", "no reason was recorded"),
+}
+
+
+@pytest.mark.parametrize("name", sorted(NO_REPORT_CASES))
+def test_a_night_with_no_report_still_pushes_and_keeps_the_morning(name: str, sandbox: Path, sent: list[Any],  # noqa: F811
+                                                                   tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    lines, code, words = NO_REPORT_CASES[name]
+    log = tmp_path / "routines.log"
+    log.write_text(lines)
+    marked: list[str] = []
+    monkeypatch.setattr(alerts, "gather_morning", lambda **kw: extras())
+    monkeypatch.setattr(alerts, "mark_morning", lambda extra, result, **kw: marked.append(result) or [])
+    res = S.run_brief_job(night=NIGHT, root=sandbox, routines_log=log, out_dir=tmp_path / "reports", push=True, notify=TOPIC)
+    assert res.status == "FAIL" and res.items[0].startswith("report: ") and res.fields["push"] == "phone"
+    assert res.fields["night_state"] == "DID NOT REPORT" and res.fields["night_reason"] == code
+    assert marked == ["phone"] and len(sent) == 1
+    msg = json.loads(sent[0][2])
+    assert msg["title"] == f"Night {NIGHT} DID NOT REPORT: {words}" and msg["priority"] == 4 and msg["tags"] == ["warning"]
+    body = msg["message"]
+    assert "Safety rule broken: 1 slip:" in body and "Shorter rule" in body and "Say what the command does" in body
+    assert "escalation" in body.lower() and "Waiting for your OK" not in body and "Nothing waits" not in body
+    assert "SECRET-MODEL-WORDS" not in msg["title"] + body and "/Users/x/y" not in msg["title"] + body
+
+
+def test_a_held_lock_at_brief_time_still_pushes(sandbox: Path, sent: list[Any], tmp_path: Path,  # noqa: F811
+                                                monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(S, "night_running", lambda root=None: True)
+    monkeypatch.setattr(alerts, "gather_morning", lambda **kw: alerts.MorningExtras())
+    res = S.run_brief_job(night=NIGHT, root=sandbox, routines_log=tmp_path / "routines.log", out_dir=tmp_path / "reports",
+                          push=True, notify=TOPIC)
+    assert res.status == "FAIL" and "night running" in res.items[0] and len(sent) == 1
+    assert json.loads(sent[0][2])["title"] == f"Night {NIGHT} DID NOT REPORT: it was still running when the brief started"
+
+
+def test_a_broken_report_file_says_so(sandbox: Path, sent: list[Any], tmp_path: Path,  # noqa: F811
+                                      monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(alerts, "gather_morning", lambda **kw: alerts.MorningExtras())
+    path = sandbox / "nights" / NIGHT / "report.json"
+    path.parent.mkdir(parents=True)
+    path.write_text("{not json")
+    res = S.run_brief_job(night=NIGHT, root=sandbox, routines_log=tmp_path / "routines.log", out_dir=tmp_path / "reports",
+                          push=True, notify=TOPIC)
+    assert res.status == "FAIL" and len(sent) == 1
+    assert json.loads(sent[0][2])["title"] == f"Night {NIGHT} DID NOT REPORT: its report file could not be read"
+
+
+def test_no_report_and_no_push_flag_sends_nothing(sandbox: Path, sent: list[Any], tmp_path: Path) -> None:  # noqa: F811
+    res = S.run_brief_job(night=NIGHT, root=sandbox, routines_log=tmp_path / "routines.log", out_dir=tmp_path / "reports",
+                          push=False)
+    assert res.status == "FAIL" and sent == [] and "push" not in res.fields
+
+
+def test_no_report_with_a_real_morning_read_marks_the_last_day_reminder(sandbox: Path, rdb: str, sent: list[Any],  # noqa: F811
+                                                                        monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("AMEM_BACKEND", "postgres")
+    monkeypatch.delenv("AMEM_REQUIRE_REMOTE", raising=False)
+    monkeypatch.setattr("agent_memory.scoring.escalations", lambda **k: [])
+    e = suggested_entry(sandbox, "exp-20261015-ffff")
+    row(rdb, e, age=AP.SUGGESTION_TTL - timedelta(hours=10))
+    args = dict(night=NIGHT, root=sandbox, routines_log=tmp_path / "routines.log", out_dir=tmp_path / "reports", db_url=rdb,
+                push=True, notify=TOPIC, state=tmp_path / "s.json")
+    res = S.run_brief_job(**args)
+    assert res.fields["push"] == "phone" and res.status == "FAIL"
+    assert "Say what the command does" in json.loads(sent[0][2])["message"]
+    S.run_brief_job(**args)
+    assert "Say what the command does" not in json.loads(sent[1][2])["message"]      # marked once, as on a normal night
+
+
+def test_a_normal_night_still_sends_one_unchanged_push(sandbox: Path, rdb: str, sent: list[Any], tmp_path: Path,  # noqa: F811
+                                                       monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("agent_memory.dashboard.upsert_night", lambda *a, **k: None)
+    monkeypatch.setattr("agent_memory.telemetry_analysis.daily_review", lambda *a, **k: None)
+    monkeypatch.setattr(alerts, "gather_morning", lambda **kw: extras())
+    monkeypatch.setattr(alerts, "mark_morning", lambda *a, **k: [])
+    write_report(sandbox, night_report(experiments=[experiment("exp-20261018-aaaa", "not_promotable", "NO_EFFECT")]))
+    res = S.run_brief_job(night=NIGHT, root=sandbox, routines_log=tmp_path / "routines.log", out_dir=tmp_path / "reports",
+                          db_url=rdb, push=True, notify=TOPIC)
+    assert res.status == "PASS" and res.fields["push"] == "phone" and len(sent) == 1
+    msg = json.loads(sent[0][2])
+    assert msg["title"].startswith(f"Night {NIGHT}: Tested ") and "DID NOT REPORT" not in msg["title"] + msg["message"]
+
+
+def test_a_quiet_normal_night_still_sends_nothing(sandbox: Path, rdb: str, sent: list[Any], tmp_path: Path,  # noqa: F811
+                                                  monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("agent_memory.dashboard.upsert_night", lambda *a, **k: None)
+    monkeypatch.setattr("agent_memory.telemetry_analysis.daily_review", lambda *a, **k: None)
+    monkeypatch.setattr(alerts, "gather_morning", lambda **kw: alerts.MorningExtras())
+    write_report(sandbox, night_report())
+    res = S.run_brief_job(night=NIGHT, root=sandbox, routines_log=tmp_path / "routines.log", out_dir=tmp_path / "reports",
+                          db_url=rdb, push=True, notify=TOPIC)
+    assert res.fields["push"] == "quiet" and sent == []
+
+
+def test_the_watchdog_kill_really_leaves_no_report_and_a_fail_line(sandbox: Path, tmp_path: Path,
+                                                                   monkeypatch: pytest.MonkeyPatch) -> None:
+    """The source itself: the watchdog's last stage logs FAIL and exits, so nothing reaches Night._finish."""
+    exited: list[int] = []
+    killed: list[str] = []
+    dog = S.Watchdog(0.0, 0.0, lambda: killed.append("line"), exit=exited.append)
+    monkeypatch.setattr(S.os, "kill", lambda pid, sig: None)
+    dog._run()
+    assert dog.fired == "kill" and killed == ["line"] and exited == [S.EXIT_HARD_TIMEOUT]
+    assert not (sandbox / "nights" / NIGHT / "report.json").exists()

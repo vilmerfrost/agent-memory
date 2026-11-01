@@ -54,10 +54,13 @@ Recovery acts only on the state file that the daily job writes. It does not star
 from `routines.log`. The check against the log only makes an expiry visible: when
 no recovery is pending and the newest `amem-daily` run failed on Claude
 authentication, the line is `amem-auth-recovery FAIL status=auth_expired
-auth=expired since=<time>` with one `-fail` detail, until a daily run passes. While
-a recovery is pending, the line adds `auth=pending night=<night> attempts=<n>`.
-`status=idle` means no recovery is pending and the newest daily run did not fail on
-authentication.
+auth=expired since=<time>` with one `-fail` detail, until a daily run passes or the
+token is renewed. Renewed means the token file changed after that failure and
+`claude auth status` accepts it: local checks only, with no model call and no hosted
+write. While a recovery is pending, the line adds `auth=pending night=<night>
+attempts=<n>`. `status=idle` means no recovery is pending and no unrenewed Claude
+authentication failure stands. The recovery notice carries the night's real state
+(`Claude automation recovered: night FAILED`), so it does not hide an empty night.
 
 Install `deploy/launchd/com.vilmerfrost.amem-auth-recovery.plist` only after this
 code is available in the installed main checkout. Keep matching copies in

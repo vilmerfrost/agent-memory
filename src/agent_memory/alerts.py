@@ -2,7 +2,8 @@
 
 Since 2026-10-26 the morning has one push: the 07:30 brief job's `push_morning`. It carries
 - the night's result, when there is something to say (skipped, partly run, tested, or a decision waits). A bad or
-  empty night (the brief's `night_signal`) says so in the title with the plain reason, at priority 4;
+  empty night (the brief's `night_signal`) says so in the title with the plain reason. FAILED, DID NOT RUN and a night
+  that left no report go at priority 4 (`rsi_brief.urgent`). With no report, this push still goes and says so;
 - what amem-daily used to push itself before it moved to 00:40: new escalations (counts and routine names only,
   never run summaries, failures or ids), slips of the safety rules (working around a guard, the push and merge
   policy, the safety guards), and staged proposals and suggested hand edits on their last day.
@@ -11,8 +12,8 @@ A quiet night with none of those sends nothing; a quiet night with new escalatio
 Each part goes out once: escalation ids are marked pushed in amem-daily's state file after ntfy answered 200, the
 rows record the rest (`rsi_proposals.meta.reminded`, `rsi_experiments.meta.suggestion_reminded`,
 `deviations.meta.alert`). `remind_proposals` (with re-armed buttons) and `push_safety_slips` stay as stand-alone
-commands. Messages carry plain words, rule names and file names only, then `redact`, like the other pushes. Raises
-nothing that should stop a routine: callers log a warning.
+commands. Messages carry plain words, rule names and file names only, then the brief's `scrub` (secrets, home paths,
+emails). Raises nothing that should stop a routine: callers log a warning.
 """
 
 from __future__ import annotations
@@ -28,7 +29,9 @@ from psycopg.types.json import Jsonb
 
 from agent_memory import edits_push, redact, store
 from agent_memory import rsi_approval as AP
+from agent_memory import rsi_brief as BR
 
+NAMED_SKIPS = ("auth", "client", "database", "lock")   # night_signal codes whose fixed words are the reason itself
 REMIND_WITHIN = timedelta(hours=30)   # the daily 07:30 brief push catches every proposal on its last day
 SAFETY_RULES = ("approval-without-handing-work-back", "safety-guards", "push-and-merge-policy")
 SAFETY_DAYS = 3
@@ -118,6 +121,9 @@ def remind_proposals(*, db_url: str | None = None, push: bool = True, notify: di
 
 
 def _skip_words(b: Mapping[str, Any]) -> str:
+    signal = b.get("night_signal") or {}
+    if signal.get("code") in NAMED_SKIPS:
+        return str(signal["reason"])
     for n in b.get("notes") or []:
         m = re.match(r"skipped by amem-rsi-night: prerequisite ([\w-]+): (last run \w+|still running)", str(n))
         if m and m.group(2) == "still running":
@@ -126,8 +132,7 @@ def _skip_words(b: Mapping[str, Any]) -> str:
         if m:
             return ("the deviation scan (amem-daily) failed" if m.group(1) == "amem-daily"
                     else f"the routine it depends on ({m.group(1)}) did not pass")
-    sk = b.get("skipped") or {}
-    return str(sk.get("summary") or "a check before the night failed")
+    return str(signal.get("reason") or (b.get("skipped") or {}).get("summary") or "a check before the night failed")
 
 
 def _tested_words(x: Mapping[str, Any]) -> str:
@@ -150,6 +155,10 @@ def night_message(b: Mapping[str, Any]) -> tuple[str, str] | None:
     cost = f"Cost ${float(total):.2f}." if total is not None else ""
     signal = b.get("night_signal") or {}
     lines: list[str] = []
+    if status == BR.NO_REPORT:              # nothing else is known, so nothing here says what waits or what was tested
+        why = signal.get("reason") or "no reason was recorded"
+        return (BR.scrub(f"Night {night} {signal.get('state') or BR.NO_REPORT_STATE}: {why}")[:120],
+                BR.scrub(f"The night left no report: {why}.\nDetails: routines.log, the amem-rsi-night line.")[:1500])
     if status == "preflight_failed":
         why = _skip_words(b)
         title = f"Night {night} {signal.get('state') or 'DID NOT RUN'}: {why}"
@@ -185,7 +194,7 @@ def night_message(b: Mapping[str, Any]) -> tuple[str, str] | None:
     if cost:
         lines.append(cost)
     lines.append("Details: Night Desk, Last night.")
-    return redact.redact(title)[:120], redact.redact("\n".join(lines))[:1500]
+    return BR.scrub(title)[:120], BR.scrub("\n".join(lines))[:1500]
 
 
 def push_night(b: Mapping[str, Any], *, notify: dict[str, str] | None = None,
@@ -199,7 +208,7 @@ def push_night(b: Mapping[str, Any], *, notify: dict[str, str] | None = None,
     title, body = msg
     bad = str(b.get("status")) != "ok" or bool(b.get("night_signal"))
     urgent = extra is not None and bool(extra.safety or extra.expiring or extra.expiring_suggestions)
-    priority = 4 if bad or urgent else 3
+    priority = 4 if BR.urgent(b) or urgent else 3
     tags = ["warning"] if bad or (extra is not None and extra.safety) else ["crescent_moon"]
     return edits_push._publish(lambda topic: {"topic": topic, "title": title, "message": body, "priority": priority,
                                               "tags": tags}, title, body, notify)
@@ -280,7 +289,7 @@ def morning_message(b: Mapping[str, Any], extra: MorningExtras,
             lines.append("")
         lines += part
     lines += details or ["Details: Night Desk."]
-    return redact.redact(title)[:120], redact.redact("\n".join(lines))[:2000]
+    return BR.scrub(title)[:120], BR.scrub("\n".join(lines))[:2000]
 
 
 def gather_morning(*, db_url: str | None = None, state_file: Any = None,

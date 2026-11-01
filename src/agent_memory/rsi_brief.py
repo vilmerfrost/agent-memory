@@ -32,9 +32,11 @@ enums, short hashes, file names, ids and the report's fixed reason strings only,
 emails, secrets). The per-proposal Apply / Reject phone buttons stay `amem rsi push`.
 
 A bad night looks bad (`night_signal`): a status other than ok, or a night under its daily minimum of experiments,
-gets one fixed word and a plain reason in the phone title, priority 4 instead of 3, and the same reason in the
-headline. A normal night's title and priority do not change. `experiment_shortfall` says why fewer experiments ran.
-The scheduled morning push (alerts.push_morning) reads the same two fields.
+gets one fixed word and a plain reason in the phone title and the same reason in the headline. FAILED, DID NOT RUN
+and a night with no report (`no_report_brief`) go at priority 4 (`urgent`); the other words stay at 3. A normal
+night's title and priority do not change. `experiment_shortfall` says why fewer experiments ran, the cause that
+really stopped the night first, in fixed words: exception and model text never reach a title. The scheduled morning
+push (alerts.push_morning) reads the same two fields.
 """
 
 from __future__ import annotations
@@ -53,7 +55,8 @@ from typing import Any
 import psycopg
 from psycopg.rows import dict_row
 
-from agent_memory import config, coverage as CV, edits_push, night_coverage as NC, redact, rsi_artifact as RA, store
+from agent_memory import (claude_auth, config, coverage as CV, edits_push, night_coverage as NC, redact,
+                          rsi_artifact as RA, store)
 
 REPORT_FORMAT = "rsi-night/1"
 BRIEF_FORMAT = "rsi-brief/1"
@@ -977,6 +980,17 @@ SHORTFALL_WORDS = {
 NO_IDEAS = "no_ideas"                     # a hypotheses_rejected code: the writer proposed no change
 NOT_SHOWN = "a candidate's rule section could not be shown to the model"     # shortfall reason of the codes below
 LOOP_FAULTS = ("rule_section_missing", "rule_section_not_listed")           # rsi_night.LOOP_FAULTS: no model call ran
+IDEA_FAULTS = ("hypothesizer_auth", "hypothesizer_failed")                  # rsi_night.IDEA_FAULTS: the call itself failed
+EXPERIMENT_STOPPED = "an experiment did not produce any replay runs"
+PREPARATION = "candidate preparation did not fill the remaining slots"
+NIGHT_CRASHED = "the night stopped on an internal error"                    # rsi_night.NIGHT_CRASHED
+SANDBOX_DOWN = "the sandbox was down, so no experiment could run"           # the words for rsi_night.SANDBOX_DOWN
+AUTH_WORDS = "Claude authentication failed"
+NO_EVIDENCE = "required evidence unavailable"                               # rsi_night's skip_reason
+# The night's own words for what stopped it. The cause they name is read from the report in plain words, so they, and
+# the guess that preparation fell short, are not shown beside it.
+STOP_REASONS = (NIGHT_CRASHED, "the sandbox was unavailable", "the idea writer failed", PREPARATION)
+SELECTION_REASONS = ("no permitted candidate with applicable replay cases", "fewer permitted candidates than the daily target")
 
 
 def _reject_word(r: Mapping[str, Any]) -> str:
@@ -987,16 +1001,50 @@ def _tally(words: Mapping[str, int]) -> str:
     return "; ".join(f"{n} x {w}" for w, n in words.items())
 
 
+def crash_cause(note: str) -> tuple[str, str]:
+    """(code, fixed words) for a night's `error:` note. The note holds an exception's text, which never goes further."""
+    if claude_auth.names_auth(note):
+        return "auth", AUTH_WORDS
+    if re.search(r"psycopg|OperationalError|InterfaceError|database", note, re.I):
+        return "crash", "the night stopped on a database error"
+    return "crash", NIGHT_CRASHED
+
+
+def stopped_by(rep: Mapping[str, Any]) -> tuple[str, str] | None:
+    """What stopped the night's work before any candidate was at fault, as (code, fixed words): a crash (its `error:`
+    note), or a sandbox that was down (its health, or a candidate deferred for it). Else None."""
+    crash = next((str(n) for n in rep.get("notes") or [] if str(n).startswith("error:")), None)
+    if crash:
+        return crash_cause(crash)
+    down = rep["health"].get("sandbox") not in (*HEALTHY, *NEUTRAL, None) or any(
+        isinstance(c, dict) and c.get("skip_reason") == "sandbox unavailable" for c in rep["candidates"])
+    return ("sandbox", SANDBOX_DOWN) if down else None
+
+
+def idea_failures(rep: Mapping[str, Any]) -> tuple[int, bool]:
+    """(calls of the idea writer that failed, whether one failed on authentication). The candidate's fixed code, or the
+    `hypothesizer failed for` note on a report from before the codes. Only the count and the kind go further."""
+    notes = [str(n) for n in rep.get("notes") or [] if str(n).startswith("hypothesizer failed for ")]
+    codes = [str(r.get("code")) for c in rep["candidates"] if isinstance(c, dict)
+             for r in c.get("hypotheses_rejected") or [] if isinstance(r, dict) and r.get("code") in IDEA_FAULTS]
+    return max(len(notes), len(codes)), "hypothesizer_auth" in codes or any(claude_auth.names_auth(n) for n in notes)
+
+
 def experiment_shortfall(rep: Mapping[str, Any]) -> dict[str, Any] | None:
     """Why the night ran fewer experiments than its daily target, in plain words (report `experiment_goal`, each
     candidate's hypothesis counts and rejection codes), or None (target met, or an older report without the goal).
     Reasons come from the report's fixed strings and codes; a code this brief does not know is still counted.
-    A candidate the loop could not ask (LOOP_FAULTS) is not selected any more, so it is counted on its own."""
+    A candidate the loop could not ask (LOOP_FAULTS) is not selected any more, so it is counted on its own.
+    Causes run in the order that stopped the night: what stopped all work (`stopped_by`), the idea writer failing, ideas
+    with no use, experiments that broke, evidence that was missing, and last the rows the loop could not ask, which sit
+    in every report and so explain a night only when nothing else does. `code` names the first of the first two."""
     goal = rep.get("experiment_goal")
     if not isinstance(goal, dict) or goal.get("target_met") is True:
         return None
     candidates = [c for c in rep["candidates"] if isinstance(c, dict)]
     selected = [c for c in candidates if c.get("selected") is True]
+    stop = stopped_by(rep)
+    failed_ideas, auth = idea_failures(rep)
     no_ideas = thrown = 0
     why: dict[str, int] = {}
     for c in selected:
@@ -1015,24 +1063,75 @@ def experiment_shortfall(rep: Mapping[str, Any]) -> dict[str, Any] | None:
             if isinstance(r, dict) and r.get("code") in LOOP_FAULTS and c.get("selected") is not True:
                 unasked[_reject_word(r)] = unasked.get(_reject_word(r), 0) + 1
     barren = no_ideas + thrown
-    causes = []
+    reasons = [str(r) for r in goal.get("shortfall_reasons") or []
+               if not (stop or failed_ideas) or r not in STOP_REASONS]
+    if stop:                                  # the candidates were never the question
+        reasons = [r for r in reasons if r not in SELECTION_REASONS]
+    idea_words =(f"{AUTH_WORDS} while writing ideas" if auth else
+                  f"the idea writer failed on {failed_ideas} of {_plural(len(selected), 'candidate')}" if failed_ideas else "")
+    evidence = sum(c.get("skip_reason") == NO_EVIDENCE for c in candidates)
+    evidence_words = f"{_plural(evidence, 'candidate')} had no usable evidence" if evidence else ""
+    broke = SHORTFALL_WORDS[EXPERIMENT_STOPPED] if EXPERIMENT_STOPPED in reasons else ""
+    never = f"{_plural(sum(unasked.values()), 'candidate')} never reached the model" if unasked else ""
+    causes = [stop[1] if stop else "", idea_words]
     if barren:
         parts = ([f"{no_ideas} returned no ideas"] if no_ideas else []) + (
             [f"{thrown} had every idea thrown out: {_tally(why)}"] if thrown else [])
         causes.append(f"{barren} of {_plural(len(selected), 'selected candidate')} gave no usable idea "
                       f"({'; '.join(parts)})")
+    causes += [broke, evidence_words]
     if unasked:
-        causes.append(f"{_plural(sum(unasked.values()), 'candidate')} never reached the model ({_tally(unasked)})")
-    for r in goal.get("shortfall_reasons") or []:
-        if not (barren and r == NO_HYPOTHESIS) and not (unasked and r in (NOT_SHOWN, NO_HYPOTHESIS)):
-            causes.append(SHORTFALL_WORDS.get(str(r)) or text(r, 160))
-    causes = list(dict.fromkeys(c for c in causes if c)) or ["the report names no cause"]
-    short = (f"{barren} of {_plural(len(selected), 'candidate')} gave no usable idea" if barren
-             else f"{_plural(sum(unasked.values()), 'candidate')} never reached the model" if unasked else causes[0])
+        causes.append(f"{never} ({_tally(unasked)})")
+    others = [SHORTFALL_WORDS.get(r) or text(r, 160) for r in reasons if r != EXPERIMENT_STOPPED
+              and not (barren and r == NO_HYPOTHESIS) and not (unasked and r in (NOT_SHOWN, NO_HYPOTHESIS))]
+    causes = list(dict.fromkeys(c for c in [*causes, *others] if c)) or ["the report names no cause"]
+    # The first cause in few words. Lost rows come last when a candidate got past them, or something else stopped it.
+    asked = any("hypotheses_accepted" in c for c in candidates)
+    short = next(c for c in (stop[1] if stop else "", idea_words,
+                             f"{barren} of {_plural(len(selected), 'candidate')} gave no usable idea" if barren else "",
+                             broke, evidence_words, "" if asked else never, *others, never, causes[0]) if c)
+    code = stop[0] if stop else "auth" if auth else "hypothesizer" if failed_ideas else None
     return {"replayed": goal.get("replayed"), "attempted": goal.get("attempted"), "minimum": goal.get("minimum"),
             "target": goal.get("target"), "minimum_met": goal.get("minimum_met") is True, "selected": len(selected),
             "no_ideas": no_ideas, "ideas_thrown_out": thrown, "never_asked": sum(unasked.values()), "causes": causes,
-            "why": "; ".join(causes), "short": short}
+            "why": "; ".join(causes), "short": short, "code": code}
+
+
+def experiment_words(e: Mapping[str, Any]) -> str:
+    """A failed experiment's first reason. ExperimentFailed carries the night's own words. Any other exception's text
+    (`KeyError: ...`) is raw, so it does not go further."""
+    first = str(next(iter(e.get("verdict_reasons") or []), ""))
+    if claude_auth.names_auth(first):
+        return "authentication failed"
+    if first.startswith("ExperimentFailed: ") or not re.match(r"[A-Z]\w*: ", first):
+        return text(first, 90).removeprefix("ExperimentFailed: ")
+    return "an internal error"
+
+
+PREFLIGHT_WORDS = (("lock:", "lock", "another night held the lock"),
+                   ("database unavailable", "database", "the database could not be reached"))
+
+
+def _preflight_cause(sk: Mapping[str, Any] | None, notes: list[str]) -> tuple[str, str]:
+    """(code, plain reason) for a night that did not run. A preflight note can hold an exception's text and a skip
+    summary a failed step's raw line, so what can be named goes in fixed words and the rest loses its detail."""
+    marks = ("skipped by amem-rsi-night: ", "preflight: ")       # the first: nights before report["skipped"] existed
+    note = next((n.split(m, 1)[1] for m in marks for n in notes if m in n), "")
+    seen = " ".join([*(sk["items"] if sk else []), sk["summary"] if sk else "", note])
+    if "client compatibility" in seen:
+        return "client", ("the client compatibility check failed" + (" on authentication" if claude_auth.names_auth(seen) else ""))
+    if claude_auth.names_auth(seen):
+        return "auth", (f"{AUTH_WORDS}, so the deviation scan (amem-daily) did not finish" if "amem-daily" in seen else AUTH_WORDS)
+    if sk and sk["reason"] == "prerequisites":
+        m = re.search(r"; and \d+ more prerequisite problems? \(see the notes\)$", sk["summary"])
+        more = m.group(0) if m else ""
+        return "skipped", sk["summary"].removesuffix(more).split(" (", 1)[0] + more
+    if sk:
+        return "skipped", sk["summary"]
+    for mark, code, words in PREFLIGHT_WORDS:
+        if mark in note:
+            return code, words
+    return "preflight", text(note, 160).split(" (", 1)[0] or "preflight failed"
 
 
 def night_signal(rep: Mapping[str, Any]) -> dict[str, Any] | None:
@@ -1050,9 +1149,7 @@ def night_signal(rep: Mapping[str, Any]) -> dict[str, Any] | None:
     state = "PARTLY FAILED"
     if sk or status == "preflight_failed":
         state = "DID NOT RUN"
-        marks = ("skipped by amem-rsi-night: ", "preflight: ")   # the first: nights before report["skipped"] existed
-        causes.append(("skipped", sk["summary"]) if sk else ("preflight", next(
-            (text(n.split(m, 1)[1], 160) for m in marks for n in notes if m in n), "preflight failed")))
+        causes.append(_preflight_cause(sk, notes))
     elif status == "aborted":
         state = "ABORTED"
         causes.append(("aborted", next((text(n, 160) for n in notes if n.startswith("interrupted by")), "it was interrupted")))
@@ -1064,8 +1161,11 @@ def night_signal(rep: Mapping[str, Any]) -> dict[str, Any] | None:
         state = "FAILED"
     if missed:
         ran = sf["replayed"]
-        causes.append(("no_experiments", (f"no experiments ran: {sf['short']}" if not ran else
-                                          f"only {ran} of the {sf['minimum']} required experiments ran: {sf['short']}")))
+        causes.append((sf["code"] or "no_experiments",
+                       (f"no experiments ran: {sf['short']}" if not ran else
+                        f"only {ran} of the {sf['minimum']} required experiments ran: {sf['short']}")))
+    elif not sf and (stop := stopped_by(rep)):      # a crash on a report with no goal, or after the target was met
+        causes.append(stop)
     bad = sorted(k for k, v in rep["health"].items() if v not in HEALTHY + NEUTRAL)
     if bad:
         services = ", ".join(f"{text(k, 32)} {text(rep['health'][k], 40)}" for k in bad)
@@ -1075,13 +1175,32 @@ def night_signal(rep: Mapping[str, Any]) -> dict[str, Any] | None:
         causes.append(("writer", f"no writer change was tested: {w['top_reason'] or 'no reason recorded'}"))
     broken = [e for e in rep["experiments"] if isinstance(e, dict) and e.get("status") in ("failed", "interrupted")]
     if broken:
-        first = text(next(iter(broken[0].get("verdict_reasons") or []), ""), 90).removeprefix("ExperimentFailed: ")
+        first = experiment_words(broken[0])
         causes.append(("experiment_failed", f"{_plural(len(broken), 'experiment')} failed" + (f": {first}" if first else "")))
     if sf and not missed:
         causes.append(("target_missed", f"{sf['replayed']} of {sf['target']} daily experiments ran: {sf['short']}"))
     if not causes:
         causes.append(("unknown", "the report names no cause"))
     return {"state": state, "code": causes[0][0], "reason": causes[0][1], "reasons": [c[1] for c in causes]}
+
+
+NO_REPORT = "no_report"                   # the brief job's word for a night that left no readable report.json
+NO_REPORT_STATE = "DID NOT REPORT"
+# Priority 4 (Vilmer, 2026-11-01). PARTLY FAILED, ABORTED and STOPPED EARLY keep their title at the normal priority, so
+# the high priority still means something on the mornings that need it.
+URGENT_STATES = ("FAILED", "DID NOT RUN", NO_REPORT_STATE)
+
+
+def urgent(b: Mapping[str, Any]) -> bool:
+    """Whether this night's push goes at the high priority: read by both pushes."""
+    return (b.get("night_signal") or {}).get("state") in URGENT_STATES
+
+
+def no_report_brief(night: str, code: str, reason: str) -> dict[str, Any]:
+    """What the morning push needs to know of a night that left no report: its night key and why. Nothing else is
+    known about the night, so this is not a brief to show or store."""
+    return {"format": BRIEF_FORMAT, "night": night, "status": NO_REPORT,
+            "night_signal": {"state": NO_REPORT_STATE, "code": code, "reason": reason, "reasons": [reason]}}
 
 
 def headline(rep: Mapping[str, Any]) -> str:
@@ -1737,5 +1856,6 @@ def push_brief(b: Mapping[str, Any], *, notify: dict[str, str] | None = None,
     title, body = notification(b)
     bad = bool(b.get("night_signal"))
     return edits_push._publish(lambda topic: {"topic": topic, "title": title, "message": body,
-                                              "priority": 4 if bad else 3, "tags": ["warning" if bad else "sunrise"]},
+                                              "priority": 4 if urgent(b) else 3,
+                                              "tags": ["warning" if bad else "sunrise"]},
                                title, body, notify)

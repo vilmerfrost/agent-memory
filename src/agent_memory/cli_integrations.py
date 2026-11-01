@@ -393,6 +393,7 @@ def cmd_evidence_questions(args: argparse.Namespace) -> int:
 
 
 def cmd_evidence_ask(args: argparse.Namespace) -> int:
+    from agent_memory import rsi_evidence_providers as P
     from agent_memory.integrations import questions
     try:
         params = _params(args.param)
@@ -401,7 +402,8 @@ def cmd_evidence_ask(args: argparse.Namespace) -> int:
         print(f"amem: evidence ask: {exc}", file=sys.stderr)
         return 2
     try:
-        ans = questions.ask(args.question, params, _retrievers(), store.connect)
+        gate = P.EgressGate(P.read_only_connect(store.connect), os.environ)
+        ans = questions.ask(args.question, params, _retrievers(), store.connect, gate=gate)
         recorded: list[str] = []
         if args.record:
             with store.connect() as conn:

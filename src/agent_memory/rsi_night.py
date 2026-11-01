@@ -52,8 +52,8 @@ import psycopg
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
-from agent_memory import config, edits_targets as ET, night_coverage as NC, rsi_approval as AP, rsi_artifact as RA
-from agent_memory import rsi_targets, rule_catalog
+from agent_memory import claude_auth, config, edits_targets as ET, night_coverage as NC, rsi_approval as AP
+from agent_memory import rsi_artifact as RA, rsi_targets, rule_catalog
 from agent_memory.rsi_relevance import section_rule_id
 from agent_memory.rsi_budget import Budget, BudgetConfig, BudgetConfigError, BudgetExhausted, Usage
 
@@ -90,7 +90,8 @@ NEW_TEXT_MAX = 200_000
 
 # Messenger routines only report other routines' failures, so their FAIL is not a defect of their own SKILL.md: no
 # routine:<messenger> candidate, sighted or picked from the pool (Night Desk src/plain.ts MESSENGERS, decision 24).
-MESSENGER_ROUTINES = ("routine-audit", "config-check")
+# amem-auth-recovery's FAIL names amem-daily's expired token or a stage it could not finish; it has no SKILL.md.
+MESSENGER_ROUTINES = ("routine-audit", "config-check", "amem-auth-recovery")
 MESSENGER_KEYS = tuple(f"routine:{r}" for r in MESSENGER_ROUTINES)
 
 # Names this module must never call (tests grep for them): the investigator cannot approve its own work.
@@ -293,6 +294,7 @@ HYP_FIELDS = {"what": 200, "why": 400, "target": 300, "expected": 200, "risk": 1
 # must not throw a valid edit away. It is widened, not cut: the injection scan and the placement check in
 # WriterImplementer.implement both read the words after character 200, and a cut would hide a wrong placement.
 WHAT_WITH_EDIT_MAX = 1_000
+SECTION_MAX = 16_000     # the longest section an edit may replace, and the hypothesizer may list
 HYP_REQUIRED = ("what", "why", "target")
 # Text that an instruction-edit hypothesis never needs: commands, code, links, secrets, approval verbs and the
 # usual prompt-injection phrasing. A false positive only drops one hypothesis; nothing runs because of it.
@@ -352,7 +354,7 @@ def parse_hypothesis(obj: Any, allowlist: Sequence[str]) -> Hypothesis:
         if (not isinstance(edit, dict) or set(edit) != {"section_id", "before", "after"}
                 or not all(isinstance(v, str) and v for v in edit.values())
                 or not re.fullmatch(r"[a-z0-9][a-z0-9/_-]{0,119}", edit["section_id"])
-                or any(len(edit[k]) > 16_000 for k in ("before", "after")) or edit["before"] == edit["after"]):
+                or any(len(edit[k]) > SECTION_MAX for k in ("before", "after")) or edit["before"] == edit["after"]):
             raise HypothesisRejected("bad_edit_contract", "edit must declare one bounded exact section replacement")
     return Hypothesis(what=what, why=why, target=target, expected=expected, risk=risk, confidence=float(conf), edit=edit)
 
@@ -382,9 +384,13 @@ REJECT_REASONS = {
     "stale_pending": "an idea stored on an earlier night no longer matches the file, so it was dropped",
     "rule_section_missing": "the rule this candidate names matches no section of the file, so no model call ran",
     "rule_section_not_listed": "the rule's section did not fit the prompt, so no model call ran",
+    "hypothesizer_failed": "the idea writer call failed",
+    "hypothesizer_auth": "the idea writer call failed on authentication",
 }
 # The loop's own faults: reported like a rejection, never charged to the candidate as an attempt.
 LOOP_FAULTS = ("rule_section_missing", "rule_section_not_listed")
+# The call to the idea writer failed: fixed words for the report, the exception's text stays in the note.
+IDEA_FAULTS = ("hypothesizer_auth", "hypothesizer_failed")
 REJECTED_MAX = 10
 
 
@@ -584,8 +590,16 @@ NO_TEST_CASE = "no test case uses this file"
 NO_SECTION_CASE = "no test case covers this rule's section"
 # ... its rule key names a rule, and no section of the file matches that rule any more.
 RULE_SECTION_LOST = "the rule this candidate names matches no section of the file"
-# ... a higher-ranked candidate resolves to the same section tonight. This one waits.
+# ... its section is over SECTION_MAX, so the hypothesizer could never list it.
+SECTION_TOO_LONG = "the rule's section is too long to show to the model"
+# ... a higher-ranked candidate resolves to the same section tonight. This one waits, and runs only when that one ends
+# with no experiment and the night is still under its daily minimum (Night._experiments).
 SAME_SECTION = "another candidate holds this rule's section tonight"
+# The night's own reasons in experiment_goal.shortfall_reasons when something stopped it before a candidate was at
+# fault. Fixed words: the exception's text stays in the notes.
+NIGHT_CRASHED = "the night stopped on an internal error"
+SANDBOX_DOWN = "the sandbox was unavailable"
+IDEA_WRITER_FAILED = "the idea writer failed"
 
 
 def rank(a: TriageAnswers, recurrence: int, history: Sequence[str], weights: Mapping[str, float]) -> float:
@@ -1105,7 +1119,7 @@ def canonical_section_payloads(text: str, room: int, rule_key: Any = None) -> di
     payloads: dict[str, dict[str, str]] = {}
     for sec in secs:
         before = edits_sections.section_text(text, sec.id)
-        if len(before) > 16_000:
+        if len(before) > SECTION_MAX:
             continue
         payload = {"text": before, "before_sha256": hashlib.sha256(before.encode("utf-8")).hexdigest()}
         proposed = {**payloads, sec.id: payload}
@@ -2146,6 +2160,10 @@ class Night:
         self.next_checkpoint: str | None = None
         self.selected_ids: list[str] = []
         self.standby_ids: list[str] = []
+        self.alias_keys: set[str] = set()   # candidates whose section an earlier row of the pool holds (Night._pool)
+        self.alias_ids: list[str] = []      # ... those triage found eligible, in rank order: Night._experiments' reserve
+        self.triaged = False                # S3 finished: `selected_ids` says something about the candidates
+        self.idea_failures = 0              # calls of the idea writer that failed tonight
         self._pool_rows: dict[str, dict[str, Any]] = {}
         self._evidence: dict[str, dict[str, list[dict[str, Any]]]] = {}   # candidate key -> its pack's details
         self._evidence_text: dict[str, str] = {}      # candidate key -> its rendered (enveloped) evidence pack
@@ -2786,10 +2804,28 @@ class Night:
         # A candidate that no replay case can test can only end INCONCLUSIVE: covered candidates take the triage slots
         # first. Coverage is the same section-level gate triage applies, so a covered section is never crowded out by
         # file-covered candidates that triage would drop anyway. Up to `limit` uncovered ones are still listed (no
-        # triage call) so the report says why.
-        covered = [c for c in pool if self._cases_for(c)]
-        uncovered = [c for c in pool if not self._cases_for(c)]
-        return covered[:limit] + uncovered[:limit]
+        # triage call) so the report says why. A section the model can never be shown counts as uncovered.
+        # One section takes one triage slot: stale aliases share a section, and they would fill the pool and spend a
+        # Jev call each. The later rows of a section are listed too, as that section's reserve, with no Jev call.
+        covered: list[dict[str, Any]] = []
+        spare: list[tuple[dict[str, Any], tuple[Any, str]]] = []
+        uncovered: list[dict[str, Any]] = []
+        held: set[tuple[Any, str]] = set()
+        for c in pool:
+            section = self._section_key(c)
+            if not self._cases_for(c) or self._section_fault(c):
+                uncovered.append(c)
+            elif section in held:
+                spare.append((c, section))
+            else:
+                covered.append(c)
+                if section:
+                    held.add(section)
+        kept = covered[:limit]
+        kept_sections = {self._section_key(c) for c in kept}
+        aliases = [c for c, section in spare if section in kept_sections][:limit]
+        self.alias_keys = {c["dedupe_key"] for c in aliases}
+        return kept + aliases + uncovered[:limit]
 
     def _reconsider_production(self) -> None:
         """A bounded advisory reopening policy. Keep total attempts/history;
@@ -2867,10 +2903,30 @@ class Night:
             return None, False
         return sec, sec is None and names_rule(key)
 
-    def _no_case_reason(self, c: Mapping[str, Any], lost: bool) -> str:
-        """Why a candidate has no replay case, in words that match what the gate checked."""
+    def _section_key(self, c: Mapping[str, Any]) -> tuple[Any, str] | None:
+        sec, _ = self._rule_section(c)
+        return (c.get("target"), sec.id) if sec is not None else None
+
+    def _section_fault(self, c: Mapping[str, Any]) -> str | None:
+        """Why the hypothesizer could never list this candidate's section (a LOOP_FAULTS code), else None. It would
+        refuse the same way after a slot and an evidence pack, night after night and with no attempt charged, so triage
+        asks first. A section over SECTION_MAX stays so until the file changes."""
+        from agent_memory import edits_sections
+        sec, lost = self._rule_section(c)
         if lost:
-            return RULE_SECTION_LOST
+            return "rule_section_missing"
+        if sec is None:
+            return None
+        try:
+            text = rsi_targets.untilde(c["target"]).read_text()
+            return "rule_section_not_listed" if len(edits_sections.section_text(text, sec.id)) > SECTION_MAX else None
+        except (OSError, ValueError):
+            return None
+
+    def _no_case_reason(self, c: Mapping[str, Any], fault: str | None) -> str:
+        """Why a candidate has no replay case, in words that match what the gate checked."""
+        if fault:
+            return RULE_SECTION_LOST if fault == "rule_section_missing" else SECTION_TOO_LONG
         return NO_SECTION_CASE if self._test_cases(c.get("target")) else NO_TEST_CASE
 
     def _writer_block(self, c: Mapping[str, Any]) -> str | None:
@@ -2940,12 +2996,14 @@ class Night:
             self._poll()
             hist = self._history(c["dedupe_key"])
             in_scope = self._in_scope(c.get("target"))
-            tests = self._cases_for(c)
-            section, lost = self._rule_section(c)
+            fault = self._section_fault(c)
+            tests = [] if fault else self._cases_for(c)
+            alias = c["dedupe_key"] in self.alias_keys
             writer_block = self._writer_block(c)
             ans = None
             # No replay case uses the file: no paid triage call, the deterministic heuristic ranks it for the report.
-            if tests and not writer_block and self.execution_ready and (not self.dry_run or self.cfg.stages["triage"] == "fixture"):
+            # An alias waits behind its section, and the same deterministic rank is enough to order that reserve.
+            if tests and not alias and not writer_block and self.execution_ready and (not self.dry_run or self.cfg.stages["triage"] == "fixture"):
                 state = triage_state(c, hist, in_scope, tests, self._baselines(tests))
                 ans = self.ad.triage.assess(c, state=state, budget=self.budget)
             if ans is None:
@@ -2953,19 +3011,17 @@ class Night:
             r = rank(ans, recurrence(c), hist, self.cfg.weights)
             explore = self.cfg.experiment_goal[0] > 0
             eligible = in_scope and bool(tests) and not writer_block and (explore or (ans.action == "experiment" and r >= self.cfg.min_rank))
-            no_case = self._no_case_reason(c, lost) if not tests else None
+            no_case = self._no_case_reason(c, fault) if not tests else None
             why = (writer_block if writer_block else "eligible" if eligible else "no in-scope target" if not in_scope else no_case if no_case
                    else "triage: wait" if ans.action != "experiment" else "rank below the minimum")
-            results.append((c, ans, r, eligible, why, hist, tests, no_case, section, lost))
+            results.append((c, ans, r, eligible, why, hist, tests, no_case, fault, alias))
         self.health["jev"] = getattr(self.ad.triage, "health", self.health["jev"])
         order = sorted(results, key=lambda x: (not x[3], x[1].action != "experiment", -x[2], x[0]["dedupe_key"]))
         slots = min(self.budget.experiments_left(), self.cfg.experiment_goal[1])
-        held: set[tuple[Any, str]] = set()      # one candidate per section a night: stale aliases share a section
-        for c, ans, r, eligible, why, hist, tests, no_case, section, lost in order:
-            if eligible and section is not None:
-                if (c.get("target"), section.id) in held:
-                    eligible, why, no_case = False, SAME_SECTION, SAME_SECTION
-                held.add((c.get("target"), section.id))
+        for c, ans, r, eligible, why, hist, tests, no_case, fault, alias in order:
+            reserve = eligible and alias      # one section, one slot: the row that holds it is in this pool too
+            if reserve:
+                eligible, why, no_case = False, SAME_SECTION, SAME_SECTION
             selected = eligible and slots > 0
             if selected:
                 slots -= 1
@@ -2979,6 +3035,8 @@ class Night:
                 self.selected_ids.append(str(c.get("id") or c["dedupe_key"]))
             elif eligible:
                 self.standby_ids.append(str(c.get("id") or c["dedupe_key"]))
+            elif reserve:
+                self.alias_ids.append(str(c.get("id") or c["dedupe_key"]))
             if not self.dry_run:
                 self.conn.execute(
                     "update rsi_candidates set status = %s, rank = %s, jev = %s, decided_reason = %s, "
@@ -3005,10 +3063,11 @@ class Night:
                      "skip_reason": no_case,
                      # additive: the lock code when a win can only be a suggested hand edit
                      "suggest_only": self._suggest_only(c.get("target"))}
-            if lost:      # a fixed code, not a retry: the fault is the loop's, so no attempt is charged
-                entry["hypotheses_rejected"] = rejection_entries([{"code": "rule_section_missing"}])
+            if fault:     # a fixed code, not a retry: the fault is the loop's, so no attempt is charged
+                entry["hypotheses_rejected"] = rejection_entries([{"code": fault}])
             self.report["candidates"].append(entry)
         self._pool_rows = {str(c.get("id") or c["dedupe_key"]): c for c, *_ in results}
+        self.triaged = True
 
     # -- S4-S8 -----------------------------------------------------------------------------------------
     def _experiments(self) -> None:
@@ -3021,12 +3080,18 @@ class Night:
                     if entry["key"] == c["dedupe_key"]:
                         entry.update(selected=False, reason=reason, skip_reason="sandbox unavailable")
             return
-        target = self.cfg.experiment_goal[1]
-        standby = self.standby_ids if self.cfg.experiment_goal[0] > 0 else []
-        for cid in [*self.selected_ids, *standby]:
+        minimum, target = self.cfg.experiment_goal
+        standby = self.standby_ids if minimum > 0 else []
+        reserve = self.alias_ids if minimum > 0 else []
+        tried = 0
+        for cid in [*self.selected_ids, *standby, *reserve]:
             if self.budget.experiments_left() <= self.cfg.budget.max_experiments - target:
                 break
             self._poll()
+            if cid in reserve:
+                if tried >= target or not self._section_free(self._pool_rows[cid], minimum):
+                    continue
+                tried += 1          # the same section again: at most `target` extra model calls a night
             if cid not in self.selected_ids:
                 # A prior candidate yielded no usable hypothesis: fill its unused slot, within the same caps.
                 c = self._pool_rows[cid]
@@ -3038,8 +3103,20 @@ class Night:
                 self.selected_ids.append(cid)
                 for entry in self.report["candidates"]:
                     if entry["key"] == c["dedupe_key"]:
-                        entry.update(selected=True, reason=reason)
+                        entry.update(selected=True, reason=reason, skip_reason=None)
             self._investigate(self._pool_rows[cid])
+
+    def _section_free(self, c: Mapping[str, Any], minimum: int) -> bool:
+        """Whether a section's next alias may run: the night is still under its daily minimum, and no candidate on this
+        section reached an experiment. One section takes one slot a night, but a holder that ended with none (a decline,
+        a deferral, no evidence) must not cost the night its minimum (Vilmer's decision, 2026-11-01). A failed experiment
+        counts as the section's try."""
+        done = [e for e in self.report["experiments"] if e.get("experiment_id")]
+        if sum(bool(e.get("replay_runs")) for e in done) >= minimum:
+            return False
+        rows = {r["dedupe_key"]: r for r in self._pool_rows.values()}
+        return self._section_key(c) not in {self._section_key(rows[e["candidate_key"]]) for e in done
+                                            if e.get("candidate_key") in rows}
 
     def _investigate(self, c: dict[str, Any]) -> None:
         assert self.conn is not None
@@ -3109,7 +3186,7 @@ class Night:
             pending = [h for h in pending if isinstance(h.get("edit"), dict)]
             # A stored idea from an earlier night: its edit must still match the file before it takes a slot. A stale
             # one is dropped here at no charge, and the candidate asks for a fresh idea below.
-            current = [h for h in pending if not self._pending_is_stale(h, cand)]
+            current = [h for h in pending if not self._pending_is_stale(h, c)]
             if len(current) < len(pending):
                 stale = [{"index": None, "code": "stale_pending", "field": "edit"}] * (len(pending) - len(current))
                 self._update_candidate(c.get("id"), meta={"pending_hypotheses": current})
@@ -3133,8 +3210,13 @@ class Night:
                 return
             except Exception as exc:  # noqa: BLE001 - S5 failed for this candidate: it stays for a later night
                 self.degraded = True       # the candidate is deferred in the database; the window need not be reread
+                self.idea_failures += 1
                 self.notes.append(f"hypothesizer failed for {c['dedupe_key']}: {type(exc).__name__}: {str(exc)[:150]}")
                 self._update_candidate(c["id"], status="deferred", reason=f"hypothesizer failed: {type(exc).__name__}")
+                code = "hypothesizer_auth" if claude_auth.names_auth(str(exc)) else "hypothesizer_failed"
+                for entry in self.report["candidates"]:
+                    if entry["key"] == c["dedupe_key"]:
+                        entry.update(hypotheses_rejected=rejection_entries([*stale, {"code": code}]))
                 return
             left_out = int(getattr(self.ad.hypothesizer, "last_left_out", 0) or 0)
             if left_out:
@@ -3228,27 +3310,30 @@ class Night:
                                                                           detail=str(exc)))
                 raise
 
-    def _pending_is_stale(self, h: Mapping[str, Any], cand: Mapping[str, Any]) -> bool:
+    def _pending_is_stale(self, h: Mapping[str, Any], c: Mapping[str, Any]) -> bool:
         """A stored idea whose declared edit no longer fits the file: its section is gone, its `before` bytes differ,
         or the candidate's rule now resolves to another section. These are the writer's own refusals, checked before
-        a slot is spent on them. An unreadable file says nothing about the idea, so it stays."""
+        a slot is spent on them, so `c` is the row: the writer resolves its `rule_key`, not the last-tested key. An
+        unreadable file says nothing about the idea, so it stays."""
         from agent_memory import edits_sections
         edit = h["edit"]
         try:
-            text = rsi_targets.untilde(str(h.get("target") or cand.get("target"))).read_text(encoding="utf-8")
+            text = rsi_targets.untilde(str(h.get("target") or c.get("target"))).read_text(encoding="utf-8")
         except (OSError, ValueError):
             return False
         try:
             now = edits_sections.section_text(text, str(edit.get("section_id")))
         except edits_sections.SectionError:
             return True
-        named = _section_for(text, cand.get("rule_key"))
+        named = _section_for(text, c.get("rule_key"))
         return (now.strip("\r\n") != str(edit.get("before")).strip("\r\n")
                 or (named is not None and named.id != edit.get("section_id")))
 
     def _defer_loop_fault(self, c: Mapping[str, Any], code: str, stale: Sequence[Mapping[str, Any]] = ()) -> None:
-        """The loop could not show the model the rule's section. The candidate waits with its attempts unchanged and
-        the report keeps a fixed code. No degraded night: every other candidate is fine."""
+        """The loop could not show the model the rule's section, after triage let it through (`_section_fault`), so it
+        cost a slot and an evidence pack. The candidate waits with its attempts unchanged, the report keeps a fixed code,
+        and the night is degraded, as under the old guard: this one should not happen, and nothing else would show it."""
+        self.degraded = True
         self.notes.append(f"{c['dedupe_key']}: {REJECT_REASONS[code]}")
         self._update_candidate(c.get("id"), status="deferred", reason=REJECT_REASONS[code])
         for entry in self.report["candidates"]:
@@ -3687,11 +3772,17 @@ class Night:
             if replayed < target:
                 if status in ("preflight_failed", "budget_exhausted", "aborted"):
                     shortfall.append(status)
+                if self.failed:
+                    shortfall.append(NIGHT_CRASHED)
+                elif not self.execution_ready:
+                    shortfall.append(SANDBOX_DOWN)
                 if attempted > replayed:
                     shortfall.append("an experiment did not produce any replay runs")
-                if not self.selected_ids:
+                if self.idea_failures:
+                    shortfall.append(IDEA_WRITER_FAILED)
+                if self.triaged and self.execution_ready and not self.selected_ids:
                     shortfall.append("no permitted candidate with applicable replay cases")
-                elif len(self.selected_ids) < target:
+                elif self.triaged and self.execution_ready and len(self.selected_ids) < target:
                     shortfall.append("fewer permitted candidates than the daily target")
                 if any(c.get("hypotheses_accepted") == 0 for c in r["candidates"]):
                     shortfall.append("a candidate produced no valid hypothesis")
