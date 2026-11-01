@@ -589,3 +589,18 @@ T3 details. `delegate_task` counts as parent evidence, in Claude (`mcp__t3-code_
 it stays `chat`. A home listed in the roots file gives its own `CLAUDE.md` the source name `claude-md:guarded` and its
 `AGENTS.md` the name `agents-md:guarded`, one name across all threads. A T3 ping (a `t3` root, or
 `T3CODE_THREAD_ID` on an `sdk-ts` entrypoint; see "Interface") says `chat`.
+
+## T3 workers
+
+A T3 worker is a child T3 Code started with `delegate_task`, which the root unlocked with agent-config `bin/parent-register`.
+Registration writes `<claude home>/parent/<repo>/t3-workers/<t3-id>.json`. Ingest matches a session's cwd to that file and saves
+it as kind `worker`, with `meta.parent_session`, `meta.agent_type = t3-worker` and `meta.t3_worker` (name, provider, model, effort,
+thread, why, branch). No new column: `sessions.parent_session_id` is generated from the meta key, so dispatch estimates and token
+rollups count T3 workers like any other, from either provider.
+
+Unlike a subagent, a T3 worker has its own transcript file and its lines carry its own session id. Code that filters lines or
+finds the file uses `t3_workers.own_session` and `t3_workers.in_parent_folder`, not `meta.parent_session`.
+
+`amem sessions t3-workers [--apply]` writes the same local records for children from before registration, from T3's state and the
+parent's `delegate_task` result. It never writes the database: the next `amem sessions ingest` fixes the rows. A locked review or
+recon child has no record and stays a chat, because it wrote nothing.
